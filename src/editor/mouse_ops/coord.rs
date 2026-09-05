@@ -705,14 +705,19 @@ fn raw_col_to_buffer_char(
 }
 
 /// Rendered column → raw column for a table row, keyed by the cell the click falls in (found
-/// by pipe positions).  Content chars map 1:1; leading padding lands on the first content
-/// char; trailing padding clamps just past the chunk's last char so the cursor never jumps
-/// into the next cell.
+/// by pipe positions).  Leading padding lands on the first content char; trailing padding
+/// clamps just past the chunk's last char so the cursor never jumps into the next cell.
 ///
-/// `sub` is the wrap-chunk index of the clicked sub-line within its logical row.  The chunk
-/// layout is computed over the *raw* cell text while the renderer wraps marker-stripped chars,
-/// so styled cells map approximately.  `None` when the line isn't a table row (separator,
-/// border); the caller falls back to the char-by-char map.
+/// Content columns are routed through the cell's [`InlineColMap`](crate::markdown::InlineColMap)
+/// so a click inside a cell with hidden inline markers (`` `code` ``, `**bold**`, a link)
+/// lands on the glyph under the cursor rather than the raw position the same *count* of chars
+/// in — mirroring [`non_table_click_to_raw_col`].  The wrap chunks are computed over the
+/// marker-collapsed (rendered) content, matching what `render_table_row` actually wraps, so the
+/// two agree even on continuation sub-lines.
+///
+/// `sub` is the wrap-chunk index of the clicked sub-line within its logical row.  `None` when
+/// the line isn't a table row (separator, border); the caller falls back to the char-by-char
+/// map.
 fn table_click_to_raw_col(
     raw_line: &str,
     rendered_line: &Line<'_>,
@@ -757,18 +762,37 @@ fn table_click_to_raw_col(
     let trimmed: String = raw_chars[raw_leading..raw_leading + content_chars]
         .iter()
         .collect();
-    let chunks = table_layout::wrap_cell_with_indices(&trimmed, cell_width);
+
+    // Compose with the cell's inline collapse map: markers (backtick delimiters, `**`, a link's
+    // URL) are hidden in the rendered cell, so a rendered content column is fewer chars in than
+    // the raw column it addresses.  `rendered_to_raw` skips exactly those markers.
+    let map = crate::markdown::InlineColMap::build(&trimmed);
+    let rendered_to_raw = map.rendered_to_raw_vec();
+    let raw_content_col = |rendered: usize| rendered_to_raw[rendered.min(map.rendered_len())];
+
+    // Wrap the marker-collapsed content the renderer paints, so chunk offsets are in the same
+    // (rendered) coordinate space as `rend_offset_in_cell`.
+    let trimmed_chars: Vec<char> = trimmed.chars().collect();
+    let rendered_content: String = (0..map.rendered_len())
+        .map(|r| {
+            trimmed_chars
+                .get(rendered_to_raw[r])
+                .copied()
+                .unwrap_or(' ')
+        })
+        .collect();
+    let chunks = table_layout::wrap_cell_with_indices(&rendered_content, cell_width);
     // Blank padding sub-lines of a short cell map to the end of its content.
     let (chunk_start, chunk_len) = chunks
         .get(sub)
         .map(|(start, text)| (*start, text.chars().count()))
-        .unwrap_or((content_chars, 0));
+        .unwrap_or((map.rendered_len(), 0));
 
     let raw_offset_in_cell = if rend_offset_in_cell <= 1 {
-        raw_leading + chunk_start
+        raw_leading + raw_content_col(chunk_start)
     } else {
         let content_col = rend_offset_in_cell - 1;
-        raw_leading + chunk_start + content_col.min(chunk_len)
+        raw_leading + raw_content_col(chunk_start + content_col.min(chunk_len))
     };
 
     Some(raw_cell_start + raw_offset_in_cell.min(raw_chars.len()))

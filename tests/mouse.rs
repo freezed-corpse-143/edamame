@@ -232,6 +232,53 @@ fn same_line_click_inside_table_still_sets_drag_in_progress() {
     );
 }
 
+#[test]
+fn click_in_table_cell_with_code_span_maps_through_hidden_backticks() {
+    // The second cell renders as "code word" — the backticks are hidden — so a click on the
+    // rendered "w" must land on the raw 'w', not the position the same char count into the raw
+    // cell (which would be inside the closing backtick).
+    let src = "| x | `code` word |\n|---|---|\n| a | b |\n";
+    let mut st = state(src);
+    st.mode = Mode::Rendered;
+
+    // The header rendered line is the one carrying the collapsed cell text.
+    let (row, line_text) = st
+        .parsed
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            (
+                i,
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>(),
+            )
+        })
+        .find(|(_, text)| text.contains("code word"))
+        .expect("header row renders the collapsed cell text");
+    assert!(
+        !line_text.contains('`'),
+        "backticks must be hidden in the rendered cell: {line_text:?}",
+    );
+    // Rendered *cell* column of the 'w' in "word" (char count, not byte offset — the `│`
+    // chrome is multibyte).
+    let byte = line_text.find("word").expect("rendered 'word'");
+    let w_col = line_text[..byte].chars().count() as u16;
+
+    let mut anchor: Option<mouse_ops::DragTarget> = None;
+    mouse_ops::apply(&mut st, click(w_col, row as u16), &mut anchor, &[], VP, VW);
+
+    // Raw 'w' sits at char offset 13 in `src`.
+    assert_eq!(st.cursor.offset, 13);
+    assert_eq!(
+        st.buffer
+            .slice_to_string(st.cursor.offset, st.cursor.offset + 1),
+        "w",
+    );
+}
+
 // ── Click-drag selection ────────────────────────────────────────────────────
 
 #[test]

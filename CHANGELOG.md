@@ -8,6 +8,10 @@ Each released version's section is also what ships as the GitHub release notes: 
 
 ## [Unreleased]
 
+### Fixed
+
+- Now maps a click to the correct character in table cells with formatting.
+
 ## [0.1.3] - 2026-09-02
 
 ### Fixed
