@@ -12,24 +12,19 @@ use crate::markdown::renderer::util::{
 use crate::markdown::renderer::Renderer;
 use crate::markdown::table_layout::{self, MIN_COL_WIDTH};
 
-/// Floor contribution of a cell token that contains *breakable* content —
-/// inline code or link text.  Those tokens may hard-split across rendered
-/// rows (preferring punctuation break points), so they don't pin the
-/// column to their full length the way a prose word does.  8 keeps split
-/// chunks readable while letting code/link columns shrink well below the
-/// token's natural width; `compute_widths`' slack distribution still
-/// widens them whenever the viewport has room.
+/// Floor contribution of a cell token containing *breakable* content (inline code or link
+/// text).  Such tokens hard-split across rendered rows, so they don't pin the column to
+/// their full length the way a prose word does; `compute_widths` still widens them when
+/// the viewport has room.
 const BREAKABLE_MIN_WIDTH: usize = 8;
 
-/// Per-cell `min` width for `compute_widths`: the longest run of
-/// non-whitespace characters that cannot be broken across rendered rows.
+/// Per-cell `min` width for `compute_widths`: the longest run of characters that cannot
+/// be broken across rendered rows.
 ///
-/// Prose words are unbreakable, matching the layout policy ("never break
-/// a prose word to fit").  Tokens containing inline-code or link content
-/// are breakable: the wrap stage hard-splits them at character boundaries,
-/// so such a token contributes at most [`BREAKABLE_MIN_WIDTH`] — but never
-/// less than its longest contiguous *unbreakable* (prose) run, so a prose
-/// fragment glued to a code span keeps its word intact.
+/// Prose words are unbreakable ("never break a prose word to fit").  A token containing
+/// inline-code or link content contributes at most [`BREAKABLE_MIN_WIDTH`] — but never
+/// less than its longest contiguous prose run, so prose glued to a code span keeps its
+/// word intact.
 fn cell_min_width(inlines: &[Inline]) -> usize {
     let mut chars: Vec<(char, bool)> = Vec::new();
     flatten_breakable_chars(inlines, false, &mut chars);
@@ -56,10 +51,8 @@ fn cell_min_width(inlines: &[Inline]) -> usize {
 }
 
 /// Flatten a cell's inline tree to `(char, breakable)` pairs, mirroring
-/// `inlines_to_plain`'s traversal.  `Inline::Code` content and link text
-/// (or the URL/filename fallback shown for empty bracket text) are marked
-/// breakable; everything else inherits `breakable` from its enclosing
-/// context (so code nested in a link stays breakable, prose stays not).
+/// `inlines_to_plain`'s traversal.  Code content and link text are breakable; everything
+/// else inherits `breakable` from its enclosing context.
 fn flatten_breakable_chars(inlines: &[Inline], breakable: bool, out: &mut Vec<(char, bool)>) {
     for inline in inlines {
         match inline {
@@ -73,8 +66,7 @@ fn flatten_breakable_chars(inlines: &[Inline], breakable: bool, out: &mut Vec<(c
                 let before = out.len();
                 flatten_breakable_chars(text, true, out);
                 if out.len() == before {
-                    // Empty bracket text renders as the URL / filename
-                    // fallback — measure what's actually painted.
+                    // Empty bracket text paints the URL / filename fallback.
                     out.extend(link_fallback(url).chars().map(|c| (c, true)));
                 }
             }
@@ -99,11 +91,7 @@ impl<'t> Renderer<'t> {
             return;
         }
 
-        // Per-cell `max` (rendered char width) and `min` (longest
-        // unbreakable token — see `cell_min_width`).  Headers participate
-        // in the column metrics alongside data rows because a long header
-        // word should also keep the column from collapsing past its widest
-        // bound.
+        // Headers participate in the column metrics alongside data rows.
         let mut cell_max_widths: Vec<Vec<usize>> = Vec::with_capacity(rows.len() + 1);
         let mut cell_min_widths: Vec<Vec<usize>> = Vec::with_capacity(rows.len() + 1);
         let header_max: Vec<usize> = headers
@@ -145,7 +133,6 @@ impl<'t> Renderer<'t> {
         let header_style = self.theme.table_header;
         let header_border_style = self.theme.table_header_border;
 
-        // Top border: ┌─────┬─────┐
         let top: String = std::iter::once("┌".to_string())
             .chain(widths.iter().enumerate().map(|(i, &w)| {
                 let sep = if i + 1 < col_count { "┬" } else { "┐" };
@@ -154,13 +141,10 @@ impl<'t> Renderer<'t> {
             .collect();
         out.push(Line::styled(top, border_style));
 
-        // Header row — may wrap onto multiple lines like data rows do.
         self.render_table_row(headers, &widths, col_count, header_style, out);
 
-        // Thick separator under the header: ┝━━━━━┿━━━━━┥
-        // Uses the heavy-horizontal box-drawing glyph (`━`) with light-vertical
-        // joins so the stroke renders visibly thicker than the `─` used for
-        // inter-row separators while the side pipes stay light to match `│`.
+        // Heavy horizontals (`━`) with light-vertical joins, so the header rule reads
+        // thicker than the inter-row `─` while the side pipes still match `│`.
         let header_border: String = std::iter::once("┝".to_string())
             .chain(widths.iter().enumerate().map(|(i, &w)| {
                 let corner = if i + 1 < col_count { "┿" } else { "┥" };
@@ -169,14 +153,9 @@ impl<'t> Renderer<'t> {
             .collect();
         out.push(Line::styled(header_border, header_border_style));
 
-        // Data rows, each followed by an inter-row separator except the
-        // last.  When `row_striping` is off, the separator is a thin
-        // box-drawing rule (`├─┼─┤`).  When striping is on, the rule
-        // would clash with the alternating background fill — so we
-        // emit a *blank* separator whose background matches the row
-        // immediately above it.  Visual effect: each data row appears
-        // as a 2-row band of its own color, with no horizontal rule
-        // breaking up the stripe.
+        // Inter-row separator: a thin `├─┼─┤` rule, or — under `row_striping`, where the
+        // rule would clash with the alternating fill — a blank line carrying the row
+        // above's background, so each data row reads as a 2-row band.
         let thin: String = std::iter::once("├".to_string())
             .chain(widths.iter().enumerate().map(|(i, &w)| {
                 let corner = if i + 1 < col_count { "┼" } else { "┤" };
@@ -203,7 +182,6 @@ impl<'t> Renderer<'t> {
             }
         }
 
-        // Bottom border: └─────┴─────┘
         let bottom: String = std::iter::once("└".to_string())
             .chain(widths.iter().enumerate().map(|(i, &w)| {
                 let corner = if i + 1 < col_count { "┴" } else { "┘" };
@@ -213,22 +191,12 @@ impl<'t> Renderer<'t> {
         out.push(Line::styled(bottom, border_style));
     }
 
-    /// Build a stripe-aware blank-separator line — a `│ … │ … │` row
-    /// where every cell is filled with NBSP (U+00A0) under the supplied
-    /// style.  The leading `│`s remain at the table-border style so the
-    /// side edges of the table stay continuous; the cell-padding NBSPs
-    /// in between pick up the row-above's bg fill (or no bg for plain
-    /// rows).  Replaces the `├─┼─┤` thin rule when `row_striping` is on
-    /// so the alternating-band visual rhythm isn't broken by horizontal
-    /// rules.
+    /// Stripe-aware blank separator: a `│ … │ … │` row whose cells carry `cell_style`'s
+    /// background while the outer `│`s stay at the border style.
     ///
-    /// NBSP rather than regular spaces is the marker that lets
-    /// `ui::table_view::classify_table_sub_lines` distinguish a stripe
-    /// separator from the empty wrap-continuation line that
-    /// `render_table_row` emits for short cells in a multi-row data
-    /// row — those use ASCII spaces.  NBSP is visually identical to a
-    /// regular space in every terminal we target, so the user never
-    /// sees a difference.
+    /// The fill is NBSP (U+00A0), not a space, so
+    /// `ui::table_view::classify_table_sub_lines` can tell a stripe separator from the
+    /// ASCII-space wrap-continuation line `render_table_row` emits.  Visually identical.
     fn blank_table_separator(
         &self,
         widths: &[usize],
@@ -254,16 +222,11 @@ impl<'t> Renderer<'t> {
         Line::from(spans)
     }
 
-    /// Render one logical table row into `out`.  When any cell needs more
-    /// than one wrap line, all cells in the row align onto the same number
-    /// of rendered lines (shorter cells emit blank-padded continuation
-    /// lines so the surrounding `│` borders stay vertically aligned).
+    /// Render one logical table row.  All cells align onto the same number of rendered
+    /// lines, shorter ones blank-padded, so the `│` borders stay vertically aligned.
     ///
-    /// Wrap is *inline-aware* — each cell's `Vec<Inline>` is
-    /// flattened to a per-char `(char, style)` sequence, wrapped on
-    /// whitespace boundaries, then re-grouped into styled spans for
-    /// each rendered sub-line.  Bold / italic / code spans preserved
-    /// across line breaks.
+    /// Wrap is inline-aware: cells flatten to per-char `(char, style)` pairs and re-group
+    /// into spans per sub-line, so bold / italic / code survive a line break.
     fn render_table_row(
         &self,
         cells: &[Vec<Inline>],
@@ -278,9 +241,7 @@ impl<'t> Renderer<'t> {
             None => self.theme.table_border,
         };
 
-        // Flatten each cell into a per-char (char, style) sequence and
-        // wrap to its column width.  `cell_rows[c]` is `Vec<row>`; each
-        // `row` is `Vec<StyledChar>`.  Always returns ≥1 row.
+        // `cell_rows[c]` is that cell's wrapped rows; always at least one.
         let mut cell_rows: Vec<Vec<Vec<StyledChar>>> = Vec::with_capacity(col_count);
         for i in 0..col_count {
             let cell_inlines: &[Inline] = cells.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -295,19 +256,14 @@ impl<'t> Renderer<'t> {
         for sub in 0..row_height {
             let mut spans: Vec<Span<'static>> = Vec::with_capacity(col_count * 4 + 1);
             spans.push(Span::styled("│", outer_border));
-            // The body indexes both `widths` and `cell_rows` per `i`, so
-            // `enumerate()` doesn't simplify it.
+            // Indexes both `widths` and `cell_rows`, so `enumerate()` doesn't help.
             #[allow(clippy::needless_range_loop)]
             for i in 0..col_count {
                 let width = widths.get(i).copied().unwrap_or(MIN_COL_WIDTH);
                 let row: &[StyledChar] = cell_rows[i].get(sub).map(|v| v.as_slice()).unwrap_or(&[]);
                 let row_w: usize = row.iter().map(|c| c.ch.to_string().chars().count()).sum();
-                // Cells whose rendered width exceeds the allocated column
-                // width truncate with `…` (rare — only fires when a cell
-                // is a single un-breakable token that overflows even the
-                // hard-split fallback).  Use plain-text fallback for the
-                // truncation path so we don't try to paint a partial
-                // styled run.
+                // Overflow truncates with `…` — rare, and only for a single unbreakable
+                // token.  Plain text there, to avoid painting a partial styled run.
                 spans.push(Span::styled(" ", default_style));
                 if row_w <= width {
                     extend_with_styled_chars(&mut spans, row);
@@ -329,11 +285,8 @@ impl<'t> Renderer<'t> {
         }
     }
 
-    /// Flatten a cell's `Vec<Inline>` into a per-char styled sequence.
-    /// Drives the inline-aware wrap pipeline — each emitted character
-    /// remembers the style its source span carried (bold / italic / code
-    /// span / link / etc.) so the wrapped output preserves formatting
-    /// across line breaks.
+    /// Flatten a cell into per-char styled pairs, each remembering its source span's
+    /// style, so the inline-aware wrap preserves formatting across line breaks.
     fn cell_styled_chars(&self, cell_inlines: &[Inline], default_style: Style) -> Vec<StyledChar> {
         let mut out: Vec<StyledChar> = Vec::new();
         for span in self.render_inlines(cell_inlines, default_style) {
@@ -370,15 +323,12 @@ mod tests {
 
     #[test]
     fn cell_min_width_short_code_span_counts_content_only() {
-        // Rendered form is `ok` — 2 cells, below the breakable floor.
         let cell = vec![Inline::Code("ok".to_owned())];
         assert_eq!(cell_min_width(&cell), 2);
     }
 
     #[test]
     fn cell_min_width_prose_word_beside_code_token_wins() {
-        // The prose word is its own token and longer than the breakable
-        // floor — it stays the column's min.
         let cell = vec![
             text("unbreakableprose "),
             Inline::Code("very_long_identifier_here".to_owned()),
@@ -388,8 +338,7 @@ mod tests {
 
     #[test]
     fn cell_min_width_mixed_token_keeps_prose_run_intact() {
-        // Prose glued to a code span forms one token; the floor must not
-        // drop below the prose run so a hard split can't shred the word.
+        // One token; the floor must not drop below the prose run or a split shreds it.
         let cell = vec![text("unbreakableprose"), Inline::Code("x".to_owned())];
         assert_eq!(cell_min_width(&cell), "unbreakableprose".chars().count());
     }
@@ -406,8 +355,6 @@ mod tests {
 
     #[test]
     fn cell_min_width_empty_link_text_measures_url_fallback() {
-        // Empty bracket text renders as the URL fallback — long, so capped
-        // at the breakable floor.
         let cell = vec![Inline::Link {
             text: vec![],
             url: "https://example.com/some/long/path".to_owned(),

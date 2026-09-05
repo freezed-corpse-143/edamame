@@ -2,22 +2,10 @@
 
 use crate::config::Action;
 
-/// Categories the overlay surfaces, in display order.  Each entry is
-/// `(category_label, &[(action, action_label)])`.
-///
-/// Order is curated to put the most-used categories first.  Within a
-/// category the order is also curated — broadly: file ops, then
-/// editing, then mode/state.
-///
-/// * `PgUp` / `PgDown` (`ScrollPageUp` / `ScrollPageDown`) are
-///   intentionally absent — they're discovered by trying the obvious
-///   keys and don't need a row in the overlay.
-/// * `Toggle raw/render` lives under Editor (not a separate `View`
-///   section) because the user thinks of mode-switching as part of
-///   the editing surface.
-/// * Table cell-navigation actions (Tab / Shift-Tab / Enter / etc.)
-///   appear in the Table section so the row/column reorder chords
-///   sit alongside the navigation chords that complement them.
+/// Categories the overlay surfaces, as `(category_label, &[(action, action_label)])`.
+/// Both levels are in curated display order (most-used first).
+/// `ScrollPageUp` / `ScrollPageDown` are intentionally absent: the obvious keys
+/// find them without a row.
 pub(super) const CATEGORIES: &[(&str, &[(Action, &str)])] = &[
     (
         "Editor",

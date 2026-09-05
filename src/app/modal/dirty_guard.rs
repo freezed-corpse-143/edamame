@@ -1,8 +1,5 @@
-//! Dirty-buffer guard shown before navigating away from an unsaved
-//! document.  Two buttons: Save / Discard.  Escape (or the `esc`
-//! close hint) abandons the navigation entirely.  Carries the pending
-//! navigation target across the modal's lifetime so the App can
-//! resume it once the user picks a button.
+//! Save / Discard guard shown before navigating away from an unsaved document; Esc abandons
+//! the navigation.  Carries the pending target so the App can resume it.
 
 use std::any::Any;
 
@@ -21,17 +18,9 @@ pub struct DirtyGuardModal {
     body: Vec<Line<'static>>,
     buttons: Vec<ModalButton>,
     chrome: ModalChrome,
-    /// The destination that was about to be followed when the guard
-    /// fired.  Restored to the App via the close callback after Save
-    /// or Discard.
-    ///
-    /// An `Option` purely so the close callback can take ownership of
-    /// it; a resolved guard is dropped immediately afterwards.
+    /// `Option` only so the close callback can take ownership.
     pending: Option<NavPending>,
-    /// The deep link's `#fragment`, when the link carried one.  It
-    /// rides along with `pending` so answering the guard resumes the
-    /// *whole* link — dropping it here would land the reader at the top
-    /// of the target document instead of the section they clicked.
+    /// The deep link's `#fragment`; rides along so the guard resumes the *whole* link.
     fragment: Option<String>,
 }
 
@@ -60,22 +49,12 @@ impl DirtyGuardModal {
         }
     }
 
-    /// Map a resolved response to an outcome.  Shared by the key and
-    /// click paths so a mouse click on a button behaves exactly like
-    /// pressing it.
+    /// Shared by the key and click paths; doc dimensions come from `App`'s cache because
+    /// `handle_click` has none to thread in.
     ///
-    /// The cursor-visibility calls read the cached doc dimensions from
-    /// `App` (`last_doc_height` / `last_doc_width`) rather than taking
-    /// them as parameters: `Modal::handle_click` has no live `DocDims`
-    /// to thread in, so both paths share the same App-sourced values.
-    ///
-    /// They are a correction for the document the modal was covering,
-    /// and so are skipped on every branch where the navigation actually
-    /// happened: [`App::navigate_to_pending`] owns the new document's
-    /// viewport, and a deep link's fragment jump moves `scroll` without
-    /// moving the cursor (a freshly loaded editor starts in
-    /// `Mode::Preview`), so re-asserting visibility on top of it scrolls
-    /// the reader back to line 0 and throws the jump away.
+    /// `ensure_cursor_visible` corrects the document the modal was covering, so it is
+    /// skipped on every branch where navigation happened: a fragment jump moves `scroll`
+    /// without the cursor, and re-asserting visibility would throw the jump away.
     fn resolve(&mut self, response: ModalResponse) -> ModalOutcome {
         match response {
             ModalResponse::Continue => ModalOutcome::Continue,
@@ -103,11 +82,8 @@ impl DirtyGuardModal {
                                 }
                             }
                         } else {
-                            // No path yet — prompt for one, then follow
-                            // the pending navigation once it's written.
-                            // The correction below still applies to *this*
-                            // document, which is what stays on screen
-                            // while the Save-as modal is open.
+                            // Pathless: prompt, then navigate once written.  This document
+                            // stays on screen meanwhile, so the correction below applies.
                             app.open_save_as_modal(Some(Box::new(move |app| {
                                 let (h, w) = (app.last_doc_height, app.last_doc_width);
                                 let _ = app.navigate_to_pending(pending, fragment, h, w);

@@ -1,9 +1,7 @@
-//! Fuzzy-searchable command palette.  Adapter that drives a
-//! [`SearchableList<PaletteEntry>`](crate::ui::searchable_list::SearchableList)
-//! so it can ride on the App's [`super::ModalStack`].  Selecting a row
-//! dispatches the chosen [`crate::config::Action`] back through
-//! [`crate::app::App::dispatch_action`] — the unified dispatcher shared with
-//! the run-loop keystroke path.
+//! Fuzzy-searchable command palette: an adapter putting a
+//! [`SearchableList<PaletteEntry>`](crate::ui::searchable_list::SearchableList) on the App's
+//! [`super::ModalStack`].  Selecting a row dispatches its [`crate::config::Action`] through
+//! [`crate::app::App::dispatch_action`], the same dispatcher the keystroke path uses.
 
 use std::any::Any;
 
@@ -25,8 +23,7 @@ pub struct CommandPaletteModal {
 }
 
 impl CommandPaletteModal {
-    /// `vim_enabled` hides `Exit to preview` — see
-    /// [`build_palette_list`].
+    /// `vim_enabled` hides `Exit to preview`; see [`build_palette_list`].
     pub fn new(keymap: &KeyMap, vim_enabled: bool) -> Self {
         Self {
             list: build_palette_list(keymap, vim_enabled),
@@ -34,7 +31,7 @@ impl CommandPaletteModal {
         }
     }
 
-    /// Build the close+dispatch outcome for a selected action.
+    /// The close+dispatch outcome for a selected action.
     fn dispatch(action: Action, doc_height: usize, doc_width: usize) -> ModalOutcome {
         ModalOutcome::CloseAnd(Box::new(move |app| {
             app.dispatch_action(action, doc_height, doc_width);
@@ -66,7 +63,7 @@ impl Modal for CommandPaletteModal {
                 let action = self.list.items()[i].action.clone();
                 Self::dispatch(action, doc_height, doc_width)
             }
-            // FocusChanged has no live-preview behaviour in the palette.
+            // The palette has no live preview, so focus changes are inert.
             ListEvent::Continue | ListEvent::FocusChanged(_) => ModalOutcome::Continue,
         }
     }
@@ -122,9 +119,7 @@ mod tests {
 
     #[test]
     fn paste_routes_into_the_open_palette_query() {
-        // End-to-end: a bracketed paste while the palette is open must
-        // reach the list's query through `dispatch_modal_paste`,
-        // flattened and length-capped by `sanitize_paste`.
+        // End-to-end through `dispatch_modal_paste`, flattened by `sanitize_paste`.
         let mut app = make_app();
         app.open_command_palette();
         app.dispatch_modal_paste("sa\nve");
@@ -137,9 +132,6 @@ mod tests {
 
     #[test]
     fn dispatch_action_save_on_clean_buffer_is_silent() {
-        // Driving `Action::Save` via the unified dispatcher with a
-        // clean buffer is a no-op: nothing on disk, no flash, no
-        // notice modal.
         let mut app = make_app();
         app.editor.dirty = false; // no-op save
         app.dispatch_action(Action::Save, 40, 80);
@@ -148,17 +140,12 @@ mod tests {
 
     #[test]
     fn dispatch_action_save_writes_to_disk_and_clears_dirty() {
-        // Single source of truth for the unified save flow: the
-        // keystroke arm (`dispatch_single_key`) and the palette modal
-        // both funnel through `App::dispatch_action`, which routes
-        // `Action::Save` to `handle_app_action` → `save_buffer` →
-        // `Buffer::save_file`.  Verify the disk write happens, the
-        // dirty flag clears, and the "Saved" flash fires exactly once.
+        // The keystroke arm and the palette both funnel through `App::dispatch_action` →
+        // `handle_app_action` → `save_buffer`, so this covers the whole unified save flow.
         let mut app = make_app();
         let tmp = tempfile::NamedTempFile::new().expect("temp file");
         app.editor.buffer = Buffer::for_new_file(tmp.path());
-        // Force a dirty edit so the save has something to flush and
-        // the flash logic treats it as a meaningful save.
+        // A real edit, so the flash logic treats this as a meaningful save.
         let len = app.editor.buffer.len_chars();
         app.editor.buffer.insert_char(len, 'x');
         app.editor.dirty = true;
@@ -175,9 +162,7 @@ mod tests {
 
     #[test]
     fn dispatch_action_save_prompts_for_path_when_buffer_has_no_path() {
-        // A never-saved buffer has no destination, so `Save` opens the
-        // Save As path-entry modal instead of failing into a sticky
-        // error.  The buffer stays dirty until the user supplies a path.
+        // `Save` opens the Save As modal rather than failing into a sticky error.
         use crate::app::modal::SaveAsModal;
         let mut app = make_app();
         assert!(app.editor.buffer.path().is_none());

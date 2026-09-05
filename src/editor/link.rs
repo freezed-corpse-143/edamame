@@ -1,87 +1,38 @@
-//! Link target classification for clickable-link navigation.
-//!
-//! `LinkTarget` divides the raw `url` string on an `Inline::Link` into one
-//! of three categories so the App can pick the right dispatch path:
-//!   * `Anchor(slug)` — `#heading` fragment, resolved against the current
-//!     document's heading table.
-//!   * `Url(string)`  — any absolute URL with an RFC-3986 scheme
-//!     (including `mailto:`), handed off to `open::that` so the OS picks
-//!     the handler.
-//!   * `LocalFile { path, fragment }` — everything else is treated as a
-//!     filesystem path, resolved relative to the current document's
-//!     directory, with any trailing `#fragment` split off.  The `.md`
-//!     extension then triggers in-editor navigation (scrolling to the
-//!     fragment's heading once the file is loaded — a deep link); other
-//!     extensions get handed off to `open::that`.
-//!
-//! This module is deliberately pure — no I/O, no `App` state — so the
-//! classification is trivial to test and can be invoked identically from
-//! the mouse dispatch path and the keyboard `FollowLinkUnderCursor`
-//! handler.
+//! Link target classification for link following (see `docs/dev/link-following.md`).
+//! Deliberately pure — no I/O, no `App` state — so mouse and keyboard dispatch share it.
 
 use std::path::{Path, PathBuf};
 
 /// A classified link destination ready for App-level dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkTarget {
-    /// Absolute URL (`https://…`, `mailto:…`, etc.).  Opened via the OS
-    /// default handler.
+    /// Absolute URL with a scheme (`https:`, `mailto:`, …); opened by the OS handler.
     Url(String),
-    /// Local filesystem path, resolved against the document's base
-    /// directory when the source URL was relative.  `.md` extensions
-    /// are loaded into the editor; others hand off to `open::that`.
-    ///
-    /// `fragment` carries the `#section` part of `other.md#section`
-    /// when the link had one — a *deep link*.  It is split off the
-    /// path before resolution, because it is not part of any file
-    /// name: leaving it attached is what made the OS handler receive
-    /// `docs/editing.md#some-heading` and fail (issue #38).  `None`
-    /// when the link named no fragment, and also when it named an
-    /// empty one (`other.md#`), which has no heading to resolve.
+    /// Local path, resolved against the document's directory when relative.  `.md` opens
+    /// in-editor, anything else goes to `open::that`.  `fragment` is the `#section` of a
+    /// deep link, split off before resolution — left attached it reached the OS handler as
+    /// `editing.md#heading` and failed (issue #38).  `None` for no or an empty fragment.
     LocalFile {
         path: PathBuf,
         fragment: Option<String>,
     },
-    /// In-document anchor (the text after `#` in `#heading`).  Empty
-    /// fragments (`url = "#"`) are still classified as `Anchor("")` —
-    /// the caller decides whether to treat them as no-ops.
+    /// In-document `#heading` anchor; `"#"` yields `Anchor("")` and the caller decides.
     Anchor(String),
-    /// A footnote reference `[^label]` — follow jumps to the matching
-    /// definition.  The inner string is the raw label (`"1"`, `"note"`).
-    /// Not produced by [`LinkTarget::parse`]; constructed by the footnote
-    /// source scanner.
+    /// Footnote reference `[^label]` (raw label); built by the footnote scanner, not `parse`.
     Footnote(String),
-    /// A footnote definition's back-link — follow returns to the
-    /// reference the reader came from (or, if they scrolled here
-    /// directly, the footnote's first reference).  The inner string is
-    /// the raw label.
+    /// A footnote definition's back-link to the reference the reader came from.
     FootnoteBack(String),
 }
 
 impl LinkTarget {
-    /// Classify `url` against an optional `base_dir` (the directory of
-    /// the current document, used to resolve relative paths).
-    ///
-    /// Rules:
-    /// - `"#foo"` → `Anchor("foo")`
-    /// - Scheme-prefixed URLs (`http:`, `https:`, `mailto:`, `ftp:`, …)
-    ///   → `Url(url.to_owned())`.  A single-character "scheme" (Windows
-    ///   drive letters like `C:/path`) is NOT a scheme for this purpose
-    ///   so absolute Windows paths still classify as `LocalFile`.
-    /// - `file:///abs/path` → `LocalFile { path: /abs/path, .. }` (the
-    ///   `file:` scheme is treated as a local-path hint, mirroring
-    ///   `image::loader::resolve_local_path`).
-    /// - Anything else → `LocalFile`, resolved relative to `base_dir`
-    ///   when the path is relative and `base_dir` is `Some`.
-    /// - A trailing `#fragment` on either of the two local forms is
-    ///   split off into `LocalFile::fragment` before the path is
-    ///   resolved.
+    /// Classify `url`, resolving relative local paths against `base_dir`.  `file://` is a
+    /// local-path hint (mirroring `image::loader::resolve_local_path`), and a one-letter
+    /// "scheme" is a Windows drive letter, not a URL.
     pub fn parse(url: &str, base_dir: Option<&Path>) -> Self {
         if let Some(fragment) = url.strip_prefix('#') {
             return LinkTarget::Anchor(fragment.to_owned());
         }
 
-        // `file://` is a local-path hint, not a remote URL.
         if let Some(stripped) = url.strip_prefix("file://") {
             let (path, fragment) = split_fragment(stripped);
             return LinkTarget::LocalFile {
@@ -109,9 +60,7 @@ impl LinkTarget {
         }
     }
 
-    /// True when this target points at a Markdown file that edamame can
-    /// open in-editor.  Case-insensitive check on `.md`/`.markdown`.
-    /// Used by tests in this module.
+    /// Case-insensitive `.md` / `.markdown` check on a `LocalFile` (test helper).
     #[allow(dead_code)]
     pub fn is_markdown_file(&self) -> bool {
         match self {
@@ -128,15 +77,8 @@ impl LinkTarget {
     }
 }
 
-/// Split a local link's `path#fragment` at the first `#`, returning
-/// the path text and the fragment (`None` when there is no `#`, and
-/// also when the fragment is empty — `foo.md#` names no heading).
-///
-/// The split is unconditional on the first `#`, which is what every
-/// other Markdown tool does; the cost is that a file whose *name*
-/// contains a `#` can only be linked with the character
-/// percent-encoded.  Callers reach here only after the `#`-leading
-/// (pure anchor) case has been handled, so `path` is never empty.
+/// Split `path#fragment` at the first `#` (as every Markdown tool does; a `#` in a file name
+/// must be percent-encoded).  An empty fragment becomes `None`.
 fn split_fragment(url: &str) -> (&str, Option<String>) {
     match url.split_once('#') {
         Some((path, fragment)) if !fragment.is_empty() => (path, Some(fragment.to_owned())),
@@ -145,10 +87,7 @@ fn split_fragment(url: &str) -> (&str, Option<String>) {
     }
 }
 
-/// True when `url` begins with a multi-character URL scheme
-/// (`scheme:rest`).  A single-character prefix (e.g. Windows `C:/…`) is
-/// rejected so absolute Windows paths keep their `LocalFile`
-/// classification.
+/// True when `url` starts with a multi-character RFC-3986 scheme (one char is a drive letter).
 fn has_url_scheme(url: &str) -> bool {
     let Some((scheme, _rest)) = url.split_once(':') else {
         return false;
@@ -174,8 +113,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// A fragment-less `LocalFile` target, the shape most assertions
-    /// here want.
     fn local(path: &str) -> LinkTarget {
         LinkTarget::LocalFile {
             path: PathBuf::from(path),
@@ -270,8 +207,6 @@ mod tests {
 
     #[test]
     fn windows_drive_letter_is_not_a_url_scheme() {
-        // Single-char "scheme" is a Windows drive letter — classify as a
-        // local path, not a URL.
         let classified = LinkTarget::parse("C:/Users/name/doc.md", None);
         assert!(matches!(classified, LinkTarget::LocalFile { .. }));
     }
@@ -306,9 +241,7 @@ mod tests {
 
     #[test]
     fn fragment_bearing_link_still_reads_as_markdown() {
-        // The whole point of the split: with the fragment attached the
-        // extension was `md#when-the-file-changes`, so the link was
-        // handed to the OS opener instead of the editor (issue #38).
+        // Regression for issue #38.
         assert!(LinkTarget::parse("editing.md#section", None).is_markdown_file());
     }
 
@@ -325,7 +258,6 @@ mod tests {
 
     #[test]
     fn remote_url_keeps_its_fragment_inline() {
-        // The OS handler wants the whole URL, fragment included.
         assert_eq!(
             LinkTarget::parse("https://example.com/p#frag", None),
             LinkTarget::Url("https://example.com/p#frag".to_owned())

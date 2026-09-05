@@ -1,12 +1,6 @@
-//! Destructive-confirmation step gating `DirtyConflictModal`'s
-//! `[Discard & reload]` button.  Two buttons: `[Discard & reload]`
-//! (destructive, secondary focus) and `[Cancel]` (default focus).
-//! Esc or Cancel returns the user to the underlying
-//! [`super::DirtyConflictModal`].
-//!
-//! Carries the on-disk contents already read by the watcher worker
-//! so the reload is byte-identical to the change that triggered the
-//! conflict, without a re-read race.
+//! Destructive confirmation gating [`super::DirtyConflictModal`]'s `[Discard & reload]`.
+//! Carries the on-disk contents already read by the watcher so the reload is byte-identical
+//! to the triggering change, without a re-read race.
 
 use std::any::Any;
 
@@ -25,21 +19,14 @@ pub struct DirtyConflictDiscardConfirmModal {
     body: Vec<Line<'static>>,
     buttons: Vec<ModalButton>,
     chrome: ModalChrome,
-    /// `pub(crate)` so the sibling `file_changed.rs` test module can
-    /// inspect what bytes the modal would reload with — see the
-    /// `second_external_change_refreshes_open_discard_confirm_modal`
-    /// test.  Mutated through [`Self::set_on_disk_contents`] in
-    /// production code.
+    /// `pub(crate)` for the `file_changed.rs` tests; production code goes through
+    /// [`Self::set_on_disk_contents`].
     pub(crate) on_disk_contents: String,
 }
 
 impl DirtyConflictDiscardConfirmModal {
-    /// Replace the carried on-disk contents with the bytes from a
-    /// freshly-arrived external write.  Called from
-    /// `App::handle_file_changed` when a new change is observed while
-    /// this modal is open, so the user's eventual `Discard & reload`
-    /// confirmation reloads against the *current* disk state rather
-    /// than the stale snapshot that originally opened the modal.
+    /// Refresh the carried contents when another external write lands while the modal is
+    /// open, so the eventual reload uses the current disk state.
     pub fn set_on_disk_contents(&mut self, contents: String) {
         self.on_disk_contents = contents;
     }
@@ -50,9 +37,7 @@ impl DirtyConflictDiscardConfirmModal {
             Line::raw(""),
             Line::raw("They cannot be recovered."),
         ];
-        // Cancel first (default focus) so a confused user can back
-        // out with a single Enter press — destructive button is
-        // intentionally one Tab away.
+        // Cancel takes default focus; the destructive button is deliberately one Tab away.
         Self {
             body,
             buttons: vec![
@@ -64,22 +49,15 @@ impl DirtyConflictDiscardConfirmModal {
         }
     }
 
-    /// Map a resolved response to an outcome.  Shared by the key and
-    /// click paths so a mouse click on a button behaves exactly like
-    /// pressing it.
+    /// Map a chrome response to an outcome; shared by the key and click paths.
     fn resolve(&mut self, response: ModalResponse) -> ModalOutcome {
         match response {
             ModalResponse::Continue => ModalOutcome::Continue,
-            // Esc returns to the DirtyConflictModal underneath — no
-            // state change here.
             ModalResponse::Cancelled => ModalOutcome::Close,
             ModalResponse::ButtonPressed(0) => ModalOutcome::Close,
             ModalResponse::ButtonPressed(1) => {
                 let contents = std::mem::take(&mut self.on_disk_contents);
                 ModalOutcome::CloseAnd(Box::new(move |app| {
-                    // Close the parent DirtyConflictModal underneath
-                    // before reloading so the modal stack is empty
-                    // when the reload's flash appears.
                     app.modal_stack.remove_first::<DirtyConflictModal>();
                     app.reload_buffer_from_disk(contents);
                 }))

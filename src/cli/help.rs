@@ -4,8 +4,7 @@
 //! documentation in `docs/` is the reference, and a help text that
 //! restates it is a second copy to keep in sync.
 
-/// The version edamame was compiled at — the single read of
-/// `CARGO_PKG_VERSION` on the CLI path.
+/// The single read of `CARGO_PKG_VERSION` on the CLI path.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Where `--help` and the unknown-argument error point the reader.
@@ -16,11 +15,8 @@ const ISSUES_URL: &str = "https://github.com/mijowi/edamame/issues";
 pub const USAGE: &str =
     "USAGE:\n    edamame [OPTIONS] [FILE[#SECTION]]\n    edamame --diff <OLD> <NEW>\n\nTry 'edamame --help'.";
 
-/// `--version` output: `edamame 0.1.0`.
-///
-/// The bare `name version` form is the convention every tool that ships
-/// in a bug report follows, and it is what `cargo --version`-style
-/// scrapers expect.
+/// `--version` output: `edamame 0.1.0`.  The bare `name version` form is what
+/// bug reports and `cargo --version`-style scrapers expect.
 pub fn version_line() -> String {
     format!("edamame {VERSION}")
 }
@@ -69,8 +65,7 @@ mod tests {
         assert_eq!(version_line(), format!("edamame {VERSION}"));
     }
 
-    /// Every flag the parser accepts must be discoverable from `--help`;
-    /// a flag documented nowhere else is a flag nobody finds.
+    /// Every flag the parser accepts must be discoverable from `--help`.
     #[test]
     fn help_lists_every_supported_flag() {
         let help = help_text();

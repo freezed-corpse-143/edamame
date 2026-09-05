@@ -1,8 +1,4 @@
 //! Cursor-block tracking and the jitter-suppression reveal timer.
-//!
-//! Methods extracted from `EditorState`'s big `impl` block.  Lives on the
-//! same struct via Rust's ability to have multiple `impl` blocks across
-//! files in the same crate.
 
 use std::time::Instant;
 
@@ -10,25 +6,17 @@ use crate::editor::state::ImageReveal;
 use crate::editor::{EditorState, Mode, RAW_REVEAL_DELAY};
 
 impl EditorState {
-    /// Call after any cursor movement in Rendered mode. Tracks which block the
-    /// cursor is in and which buffer line it is on. `RenderedView` uses
-    /// `cursor_block_entered_at` to delay revealing the raw cursor-block view.
-    /// The timer resets whenever the cursor moves to a **different buffer line**
-    /// (not just a different block), so that the delay is consistent regardless
-    /// of whether the block is a single-line paragraph or a fifty-line table.
+    /// Call after any cursor movement in Rendered mode: refreshes the cursor block, its
+    /// buffer line range, and the raw-reveal timer.  The timer resets on every change of
+    /// **buffer line** (not block), so a fifty-line table reveals row by row with the same
+    /// delay as a one-line paragraph.
     pub fn update_cursor_block(&mut self) {
         let cursor_byte = self.buffer.rope().char_to_byte(self.cursor.offset);
         let previous_block_idx = self.cursor_block_idx;
-        // Always keep cursor_block_idx up-to-date (used by rendered_view for
-        // extracting the raw source of the current block).
         self.cursor_block_idx = self.parsed.source_map.block_for_byte(cursor_byte);
 
-        // Cache the cursor block's buffer line range.  Used by rendered_view
-        // to extract the raw block source during a typing burst without
-        // consulting the (then-stale) source_map.  In-line edits keep line
-        // indices stable — no newlines added or removed — so this range
-        // stays correct until the cursor moves or a cross-line edit fires
-        // refresh_parsed.
+        // Lets rendered_view extract the raw block source during a typing burst without
+        // consulting the stale source_map; in-line edits never move line indices.
         self.cursor_block_line_range = self.cursor_block_idx.and_then(|idx| {
             let byte_range = self.parsed.source_map.original_range_for_block(idx)?;
             let rope = self.buffer.rope();
@@ -36,23 +24,15 @@ impl EditorState {
             let start_byte = byte_range.start.min(total_bytes);
             let end_byte = byte_range.end.min(total_bytes);
             let start_char = rope.byte_to_char(start_byte);
-            // Use `end_byte.saturating_sub(1)` so a range that ends on a `\n`
-            // doesn't claim the next line.
+            // `end_byte - 1` so a range ending on `\n` doesn't claim the next line.
             let end_char = rope.byte_to_char(end_byte.saturating_sub(1).max(start_byte));
             let start_line = rope.char_to_line(start_char);
             let end_line = rope.char_to_line(end_char).max(start_line);
             Some(start_line..end_line + 1)
         });
 
-        // Reset the reveal timer only when the cursor moves to a different
-        // logical buffer line — this makes scrolling through a large table feel
-        // uniform: each row gets the same delay, not the whole table at once.
-        //
-        // Exception: a mermaid diagram block reveals as a single unit (every
-        // rendered row swaps to raw source), so re-arming the timer on every
-        // intra-block line move would flash the image placeholder back in
-        // between line moves.  Keep the existing reveal time once the cursor
-        // is inside a mermaid block until it leaves.
+        // A mermaid block reveals as one unit, so re-arming the timer on intra-block line
+        // moves would flash the image placeholder back in between them.
         let (current_line, _) = self.cursor.line_col(&self.buffer);
         if Some(current_line) != self.cursor_line_idx {
             let staying_in_mermaid = previous_block_idx == self.cursor_block_idx
@@ -67,35 +47,23 @@ impl EditorState {
         self.cursor_blink.reset();
     }
 
-    /// Whether the cursor should be painted this frame.  Combines the
-    /// blink state with the current mode — Preview never shows a cursor.
+    /// Whether the cursor should be painted this frame.
     pub fn cursor_visible(&self) -> bool {
         self.terminal_focused
             && self.mode != Mode::Preview
             && (self.modal_open || self.cursor_blink.is_visible())
     }
 
-    /// Returns true when the raw view for the cursor block should be shown.
-    /// False during the `RAW_REVEAL_DELAY` window after the cursor entered a
-    /// new block (so rapidly-traversed blocks stay rendered), and false
-    /// while a mouse drag is in progress (so the user's visible click
-    /// anchor doesn't shift under the drag).
+    /// Whether the cursor block should show raw source.  False during the `RAW_REVEAL_DELAY`
+    /// window, during a mouse drag (the click anchor must not shift), and while a search or
+    /// `:s` preview is active (blocks must not flip to raw under the highlights).
     pub fn cursor_block_revealed(&self) -> bool {
         if self.drag_in_progress {
             return false;
         }
-        // An active search flow keeps the document fully rendered:
-        // tabbing through matches must not flip blocks between rendered
-        // and raw under the highlights.  This holds even for a
-        // non-capturing navigate flow, where editing is allowed — the
-        // highlights stay stable until the user dismisses the search.
         if self.search.is_some() {
             return false;
         }
-        // Likewise during a live `:s` preview: the preview parks the
-        // cursor on the first affected line while the user types, and
-        // the reveal delay would elapse mid-typing, flipping that block
-        // to raw source under the preview highlights.
         if self.substitute_preview.is_some() {
             return false;
         }
@@ -105,22 +73,11 @@ impl EditorState {
         }
     }
 
-    /// Bring [`EditorState::image_reveal`] in line with where the cursor
-    /// is right now, re-parsing when it changed.  Returns `true` when the
-    /// document was re-laid-out, so the caller can force a redraw.
-    ///
-    /// Called once per frame from `App::prepare_viewport` because the
-    /// reveal is time-driven (the `RAW_REVEAL_DELAY` window elapses without
-    /// any event of its own), so there is no single action site that could
-    /// own the transition.  It is a no-op on every frame where the target
-    /// hasn't moved — the re-parse only fires as the cursor enters or
-    /// leaves an image block.
+    /// Bring [`EditorState::image_reveal`] in line with the cursor, re-parsing when it
+    /// changed; returns `true` when it did.  Called every event-loop pass from
+    /// `App::prepare_viewport` because the reveal is time-driven and has no action site of
+    /// its own, so the no-op path must not allocate.
     pub fn sync_image_reveal(&mut self) -> bool {
-        // The target borrows out of `parsed`, so nothing is allocated on
-        // the overwhelmingly common no-op path — this runs on every pass of
-        // the event loop (every keystroke and every idle tick), not just on
-        // the frames that draw.  Only a real transition pays for the
-        // `String`.
         let target = self.image_reveal_target();
         let unchanged = match (target, self.image_reveal.as_ref()) {
             (Some((ordinal, url, rows)), Some(cur)) => {
@@ -137,35 +94,21 @@ impl EditorState {
             url: url.to_owned(),
             rows,
         });
-        // Only the block's *rendered* row count changed — the source is
-        // untouched, so every byte range (and with it the cached cursor
-        // block and its line range) survives the re-parse unchanged.
+        // Source is untouched, so every byte range survives the re-parse.
         self.refresh_parsed();
         true
     }
 
-    /// The reservation the image reveal wants for the current cursor
-    /// position: `(image-block ordinal, image URL, one row per raw source
-    /// line)`, or `None` when the cursor isn't resting inside a revealed
-    /// image block.  The ordinal is the block's index into
-    /// `ParsedDoc::image_blocks`, which is the index space the renderer's
-    /// row override counts in — see [`ImageReveal`] for why the URL alone
-    /// is not enough to name a block.
-    ///
-    /// The URL is borrowed out of `self.parsed` rather than cloned: the
-    /// caller runs this per event-loop pass purely to compare against the
-    /// stashed reservation, and owns the result only when they differ.
+    /// The reservation the reveal wants for the cursor position: `(ordinal into
+    /// `ParsedDoc::image_blocks`, URL, one row per raw source line)`, or `None` outside a
+    /// revealed image block.  See [`ImageReveal`] for why the URL alone can't name a block.
+    /// The URL is borrowed, not cloned, because this runs every event-loop pass.
     fn image_reveal_target(&self) -> Option<(usize, &str, usize)> {
-        // Preview is browse-only and Raw already shows the source, so the
-        // reveal — and its reflow — belongs to Rendered mode alone.
         if self.mode != Mode::Rendered {
             return None;
         }
-        // Mid-typing the parse is stale, and with it the block's URL (a
-        // diagram's hashes its source; an ordinary image's *is* source
-        // text).  An in-line edit can't change the block's line count, so
-        // hold the current reservation rather than recomputing one against
-        // a URL that no longer exists.
+        // Mid-typing the parse (and a diagram's source-hashed URL) is stale; an in-line edit
+        // can't change the line count, so hold the current reservation.
         if self.parsed_dirty {
             return self
                 .image_reveal
@@ -177,16 +120,9 @@ impl EditorState {
         }
         let cursor_byte = self.buffer.rope().char_to_byte(self.cursor.offset);
         let block_idx = self.parsed.source_map.block_for_byte(cursor_byte)?;
-        // Every `Block::ImageBlock` qualifies, diagram or not: the row
-        // reservation tracks the rendered image in both cases, and the raw
-        // source it hides is a mermaid fence in one and a single
-        // `![alt](url)` line in the other.
         if !self.parsed.is_image_block(block_idx) {
             return None;
         }
-        // `position` rather than `find`: the index *is* the ordinal the
-        // renderer's row override counts to, so the same walk answers both
-        // halves of the block's identity.
         let ordinal = self
             .parsed
             .image_blocks
@@ -194,18 +130,11 @@ impl EditorState {
             .position(|info| info.block_idx == block_idx)?;
         let url = self.parsed.image_blocks[ordinal].url.as_str();
         let range = self.parsed.source_map.original_range_for_block(block_idx)?;
-        // Read the document out of `ParsedDoc`, not the live `Buffer`: the
-        // range is a *parse-time* byte range, and this runs on every frame
-        // the cursor rests in an image block — `Buffer::contents()` would
-        // allocate the whole document as a `String` each time.
+        // Parse-time range, so read the parse-time source (also avoids `Buffer::contents()`
+        // allocating the whole document every frame).
         let contents = self.parsed.source();
         let source = contents.get(range.start..range.end.min(contents.len()))?;
-        // Counts the lines `RenderedView` reveals through — minus a
-        // trailing blank the extended block range absorbed, which owns a
-        // rendered row of its own as a virtual block.  Derived from the
-        // same split the painter uses, so the reserved rows and the raw
-        // lines painted onto them can't disagree, and without allocating
-        // the `Vec` of slices just to read its length.
+        // Same split the painter uses, so reserved rows and painted lines can't disagree.
         let rows = crate::ui::rendered_view::revealed_source_line_count(source);
         Some((ordinal, url, rows))
     }

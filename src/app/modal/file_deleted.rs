@@ -1,18 +1,7 @@
-//! Warning modal shown when the watched file is deleted on disk while
-//! a buffer for it is open.  The in-memory buffer is now the only copy
-//! of its contents, so the modal offers to write it back out:
-//!
-//! - `[Save]` re-creates the file at its original path via
-//!   [`App::save_buffer`].
-//! - `[Save as…]` opens a [`super::SaveAsModal`] to write the buffer to
-//!   a new path and re-point at it (useful when the original directory
-//!   is also gone).
-//! - `Esc` / `[Dismiss]` closes and keeps the buffer in memory,
-//!   unchanged — the user can save later by any normal means.
-//!
-//! Unlike an external *change*, a deletion never enters diff review:
-//! there is nothing on disk to diff against.  The watcher arm in
-//! `file_changed.rs` collapses any open diff before pushing this modal.
+//! Shown when the watched file is deleted on disk: the buffer is now the only copy, so
+//! offer `[Save]` (original path), `[Save as…]` ([`super::SaveAsModal`], for when the
+//! directory is gone too), or `[Dismiss]`.  A deletion never enters diff review — there is
+//! nothing to diff against — and `file_changed.rs` collapses any open diff first.
 
 use std::any::Any;
 use std::path::PathBuf;
@@ -33,8 +22,7 @@ pub struct FileDeletedModal {
     body: Vec<Line<'static>>,
     buttons: Vec<ModalButton>,
     chrome: ModalChrome,
-    /// The path that was deleted — used as the default location when
-    /// the user picks `[Save as…]`.
+    /// Default location for `[Save as…]`.
     path: PathBuf,
 }
 
@@ -58,23 +46,17 @@ impl FileDeletedModal {
         }
     }
 
-    /// Map a resolved response to an outcome.  Shared by the key and
-    /// click paths so a mouse click on a button behaves exactly like
-    /// pressing it.
+    /// Map a chrome response to an outcome; shared by the key and click paths.
     fn resolve(&mut self, response: ModalResponse) -> ModalOutcome {
         match response {
             ModalResponse::Continue => ModalOutcome::Continue,
-            // Esc / [Dismiss] — keep the buffer in memory, do nothing.
             ModalResponse::Cancelled => ModalOutcome::Close,
-            // [Save] — re-create the file at its original path.
             ModalResponse::ButtonPressed(0) => {
                 ModalOutcome::CloseAnd(Box::new(|app| match app.save_buffer() {
                     Ok(()) => app.flash("Saved", MessageKind::Success),
                     Err(e) => app.notify(format!("Save failed: {e}"), ModalKind::Error),
                 }))
             }
-            // [Save as…] — open the path-entry modal to write elsewhere
-            // and re-point the buffer.
             ModalResponse::ButtonPressed(1) => {
                 let default = self.path.display().to_string();
                 ModalOutcome::CloseAnd(Box::new(move |app| {
@@ -82,7 +64,6 @@ impl FileDeletedModal {
                         .push(Box::new(SaveAsModal::for_deleted_file(default)));
                 }))
             }
-            // [Dismiss].
             ModalResponse::ButtonPressed(_) => ModalOutcome::Close,
         }
     }
@@ -156,7 +137,6 @@ mod tests {
             .push(Box::new(FileDeletedModal::new("/tmp/gone.md".into())));
         app.dispatch_modal_key(key(KeyCode::Esc), 40, 80);
         assert!(!app.modal_stack.contains::<FileDeletedModal>());
-        // Dismiss leaves the buffer exactly as it was.
         assert!(app.editor.dirty, "dismiss must not clear the dirty flag");
         assert!(app.transient.is_none());
     }
@@ -166,7 +146,6 @@ mod tests {
         let mut app = make_app();
         app.modal_stack
             .push(Box::new(FileDeletedModal::new("/tmp/gone.md".into())));
-        // Tab once to focus [Save as…] (index 1), then activate it.
         app.dispatch_modal_key(key(KeyCode::Tab), 40, 80);
         app.dispatch_modal_key(key(KeyCode::Enter), 40, 80);
         assert!(!app.modal_stack.contains::<FileDeletedModal>());

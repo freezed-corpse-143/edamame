@@ -1,7 +1,5 @@
-//! Shared rendering for the centred button row at the bottom of every
-//! modal/overlay (`[ Save ]  [ Cancel ]`).  Keeps the bracket
-//! formatting, focus styling, and 2-space gap consistent across
-//! `modal`, `save_copy_modal`, and `insert_table_modal`.
+//! Shared rendering for the centered `[ Save ]  [ Cancel ]` button row at the bottom of every
+//! modal/overlay: bracket formatting, focus styling, gap, and wrap packing in one place.
 
 use std::ops::Range;
 
@@ -26,8 +24,6 @@ impl<'a> Button<'a> {
         Self { label }
     }
 
-    /// Column width of the rendered button: the label plus 4 (one space
-    /// + two brackets + one space).
     fn width(&self) -> u16 {
         self.label.chars().count() as u16 + 4
     }
@@ -37,29 +33,19 @@ impl<'a> Button<'a> {
     }
 }
 
-/// Width in columns of a row of [`Button`]s — each button is `label + 4`
-/// columns, and adjacent buttons are separated by a 2-column gap.
+/// Width in columns of a row of [`Button`]s including the gaps between them.
 pub fn buttons_row_width(buttons: &[Button]) -> u16 {
     let labels_w: usize = buttons.iter().map(|b| b.width() as usize).sum();
     let gaps = buttons.len().saturating_sub(1) * 2;
     (labels_w + gaps) as u16
 }
 
-/// Column gap between two buttons on the same row.
 const BUTTON_GAP: u16 = 2;
 
-/// Split `buttons` into the rows they occupy at `width` columns, greedily
-/// filling each row before starting the next.
-///
-/// A row that would overflow wraps rather than clipping, because a
-/// clipped footer is a button the user cannot see *or* reach: the
-/// keyboard still cycles focus onto it and the click rect still points
-/// off the modal.  A single button wider than `width` gets a row of its
-/// own and is clipped there — nothing else can be done with it, and the
-/// alternative (dropping it) hides an action entirely.
-///
-/// Returns one index range per row, so callers can render and hit-test
-/// in button order without re-deriving the packing.
+/// Greedily pack `buttons` into rows of at most `width` columns, returning one index range per
+/// row.  Overflow wraps rather than clips (a clipped button is still focusable and clickable but
+/// invisible); a single button wider than `width` gets its own row and is clipped there rather
+/// than dropped.
 pub fn button_rows(buttons: &[Button], width: u16) -> Vec<Range<usize>> {
     let mut rows: Vec<Range<usize>> = Vec::new();
     let mut start = 0;
@@ -80,40 +66,25 @@ pub fn button_rows(buttons: &[Button], width: u16) -> Vec<Range<usize>> {
     rows
 }
 
-/// Blank rows between two wrapped footer rows.  A wrapped footer reads
-/// as one block of buttons stacked tight otherwise, which is exactly the
-/// thing a footer must not look like — the rows are alternatives, not a
-/// list.
+/// Blank rows between wrapped footer rows, so the rows read as alternatives rather than a list.
 const ROW_SPACING: u16 = 1;
 
-/// Rows [`render_buttons`] paints for `buttons` at `width` columns,
-/// including the [`ROW_SPACING`] blanks between wrapped rows.  The
-/// sizing pass asks this before the modal rect exists, so it must be
-/// derived from the same packing the render uses.
+/// Rows [`render_buttons`] paints for `buttons` at `width`, including [`ROW_SPACING`] blanks.
+/// Must derive from the same packing the render uses, since sizing runs before the rect exists.
 pub fn button_rows_height(buttons: &[Button], width: u16) -> u16 {
     let rows = button_rows(buttons, width).len() as u16;
     rows.saturating_mul(1 + ROW_SPACING)
         .saturating_sub(ROW_SPACING)
 }
 
-/// Rows a footer of `labels` needs inside a modal whose content is
-/// `content_w` columns wide and whose padding caps at `max_pad_h`, laid
-/// out in a terminal of `area_w`.
+/// Rows a footer of `labels` needs inside a modal of `content_w` columns with padding capped at
+/// `max_pad_h`, in a terminal `area_w` wide.
 ///
-/// The caller is in the same bind [`crate::ui::ModalView`] is: the
-/// footer's width is only known once the frame exists, and the frame's
-/// height depends on the footer.  Both resolve it by running the real
-/// sizing arithmetic — `modal_dimensions_for`'s width clamp followed by
-/// [`compute_pad_h`] — so the reservation and the packing in
-/// [`render_buttons`] can never disagree.  Reproducing it by hand with a
-/// flat [`crate::ui::MIN_PAD_H`] instead overestimates the inner width
-/// by up to `2 * (max_pad_h - MIN_PAD_H)` columns, which reserves one
-/// row for a footer that then wraps onto two.
-///
-/// `max_pad_h` is the caller's own
-/// [`crate::ui::scroll_container::ContentSize::max_pad_h`] — the
-/// keybinds overlay raises it, so a hardcoded [`crate::ui::MAX_PAD_H`]
-/// would be wrong there.
+/// Runs the frame's real sizing arithmetic (width clamp then [`compute_pad_h`]) so the
+/// reservation can never disagree with the packing in [`render_buttons`]; a flat
+/// [`crate::ui::MIN_PAD_H`] shortcut overestimates the inner width and reserves one row for a
+/// footer that wraps onto two.  `max_pad_h` must be the caller's own
+/// [`crate::ui::scroll_container::ContentSize::max_pad_h`] (the keybinds overlay raises it).
 pub fn footer_row_count(labels: &[&str], content_w: u16, area_w: u16, max_pad_h: u16) -> u16 {
     let buttons: Vec<Button> = labels.iter().map(|l| Button::bracketed(l)).collect();
     let modal_w = content_w.saturating_add(2 * max_pad_h).min(area_w);
@@ -122,22 +93,13 @@ pub fn footer_row_count(labels: &[&str], content_w: u16, area_w: u16, max_pad_h:
     button_rows_height(&buttons, inner_w).max(1)
 }
 
-/// Width in columns of a row of all-bracketed buttons rendered as
-/// `[ label ]  [ label ]`.  Convenience wrapper over
-/// [`buttons_row_width`] for the common case.
+/// [`buttons_row_width`] for a row of bracketed `labels`.
 pub fn button_row_width(labels: &[&str]) -> u16 {
     let buttons: Vec<Button> = labels.iter().map(|l| Button::bracketed(l)).collect();
     buttons_row_width(&buttons)
 }
 
-/// Render the button row, horizontally centred in `area`, with the
-/// button at `focused_idx` drawn focused (`primary` chip) and
-/// the rest as a neutral `text_muted` chip (see `controls::button_style`).
-///
-/// Returns the absolute terminal rect of each rendered button, in the
-/// same order as `labels`, so callers that need to hit-test mouse
-/// clicks can do so without duplicating the centring / bracket-padding
-/// arithmetic.  Single source of truth for button layout.
+/// [`render_buttons`] for a row of bracketed `labels`.
 pub fn render_button_row(
     area: Rect,
     buf: &mut Buffer,
@@ -149,15 +111,9 @@ pub fn render_button_row(
     render_buttons(area, buf, &buttons, focused_idx, theme)
 }
 
-/// Render a row of [`Button`]s, horizontally centred in `area`, with the
-/// button at `focused_idx` drawn focused (`primary` chip) and the
-/// rest in `theme.modal_item`.  Bare buttons render their label without
-/// the `[ … ]` wrapper.
-///
-/// Returns the absolute terminal rect of each rendered button, in the
-/// same order as `buttons`, so callers that need to hit-test mouse
-/// clicks can do so without duplicating the centring arithmetic.  Single
-/// source of truth for button layout.
+/// Render [`Button`]s centered in `area`, wrapping per [`button_rows`], with `focused_idx`
+/// drawn focused (see `controls::button_style`).  Returns each button's absolute rect, in
+/// order, for hit-testing.
 pub fn render_buttons(
     area: Rect,
     buf: &mut Buffer,
@@ -168,11 +124,8 @@ pub fn render_buttons(
     let mut rects = Vec::with_capacity(buttons.len());
     for (row_idx, row) in button_rows(buttons, area.width).into_iter().enumerate() {
         let y = area.y + row_idx as u16 * (1 + ROW_SPACING);
-        // A row past the bottom of `area` is not painted, but its rects
-        // are still produced: the return value is indexed by button, and
-        // a caller that reserved only one row (the bespoke overlays,
-        // whose footers fit at any width worth using) must not find its
-        // vector short of the index it knows a button by.
+        // A row past the bottom of `area` is not painted, but its rects are still produced:
+        // callers index the result by button.
         let visible = y < area.y + area.height;
         let row_buttons = &buttons[row.clone()];
         let mut spans: Vec<Span<'_>> = Vec::with_capacity(row_buttons.len() * 2);
@@ -195,10 +148,7 @@ pub fn render_buttons(
                 .render(row_area, buf);
         }
 
-        // Mirror Paragraph's centred layout: the row's own width,
-        // starting at the centred offset inside `area`.  Each button
-        // occupies its own width, with a `BUTTON_GAP` gap between
-        // neighbours.
+        // Mirror Paragraph's centered layout.
         let mut x = area.x + area.width.saturating_sub(buttons_row_width(row_buttons)) / 2;
         for button in row_buttons {
             let w = button.width();
@@ -214,19 +164,10 @@ pub fn render_buttons(
     rects
 }
 
-/// Render a single [`Button`] left-aligned at the start of `area` (rather
-/// than centred like [`render_buttons`]), filling the row with the modal
-/// background.  Returns the button's absolute rect for hit-testing.
-///
-/// Used where a button reads as an inline affordance pinned to the body's
-/// left edge rather than a centred footer row — e.g. the welcome modal's
-/// "Switch theme" button.  Shares the bracket formatting, width math, and
-/// `controls::button_style` focus styling with the rest of this module so
-/// callers never hand-roll a button.
-///
-/// A `disabled` button renders in the shared disabled style
-/// (`controls::control_label_style`, so it reads the same as a disabled
-/// control row); the caller is responsible for ignoring its rect.
+/// Render one [`Button`] left-aligned at the start of `area` (an inline affordance, e.g. the
+/// welcome modal's "Switch theme"), filling the row with the modal background.  Returns its
+/// absolute rect.  A `disabled` button uses the shared disabled control style; the caller is
+/// responsible for ignoring its rect.
 pub fn render_button_at(
     area: Rect,
     buf: &mut Buffer,
@@ -259,7 +200,6 @@ mod tests {
 
     #[test]
     fn width_two_buttons_with_gap() {
-        // "[ Save ]"   = 8 chars, "[ Cancel ]" = 10 chars, gap = 2.
         assert_eq!(button_row_width(&["Save", "Cancel"]), 8 + 10 + 2);
     }
 
@@ -286,11 +226,8 @@ mod tests {
 
     #[test]
     fn buttons_wrap_instead_of_clipping() {
-        // "[ Save ]" is 8 and "[ Cancel ]" is 10, so 2 columns short of
-        // the 20 the pair needs.
         let b = buttons(&["Save", "Cancel"]);
         assert_eq!(button_rows(&b, 18), vec![0..1, 1..2]);
-        // Two button rows and the blank between them.
         assert_eq!(button_rows_height(&b, 18), 3);
     }
 
@@ -307,17 +244,13 @@ mod tests {
 
     #[test]
     fn a_button_wider_than_the_row_still_gets_one() {
-        // Clipped, but present: dropping it would hide the action
-        // outright, and its focus / click rect must stay in step with
-        // the index the caller knows it by.
         let b = buttons(&["Check for updates"]);
         assert_eq!(button_rows(&b, 4), vec![0..1]);
     }
 
     #[test]
     fn a_row_that_does_not_fit_still_reports_its_rects() {
-        // Callers index the result by button; a short vector would panic
-        // on a modal that reserved one row for a footer that wrapped.
+        // A short vector would panic on a modal that reserved one row for a footer that wrapped.
         let theme = Theme::default();
         let area = Rect::new(0, 0, 12, 1);
         let mut buf = Buffer::empty(Rect::new(0, 0, 12, 4));
@@ -329,16 +262,11 @@ mod tests {
 
     #[test]
     fn footer_row_count_asks_at_the_width_the_frame_really_gives() {
-        // The reservation has to run the frame's own arithmetic, not a
-        // flat MIN_PAD_H shortcut: with `content_w` 30 in 34 columns the
-        // modal keeps 2 columns of padding a side, so the footer packs
-        // against 30 — not the 32 a MIN_PAD_H subtraction would claim.
-        // Reserving against 32 puts a 31-column footer on one row while
-        // the render wraps it onto two, leaving the second unpainted.
+        // With `content_w` 30 in 34 columns the modal keeps 2 columns of padding a side, so a
+        // 31-column footer packs against 30 and wraps; a MIN_PAD_H shortcut would claim 32.
         let labels: &[&str] = &["aaaaaaaaaaa", "bbbbbbbbbb"];
         assert_eq!(button_row_width(labels), 31);
         assert_eq!(footer_row_count(labels, 30, 34, MAX_PAD_H), 3);
-        // Cross-check against the real sizing path at the same numbers.
         let modal_w = 30u16.saturating_add(2 * MAX_PAD_H).min(34);
         let inner_w = modal_w - 2 * compute_pad_h(modal_w, 30, MAX_PAD_H);
         assert_eq!(inner_w, 30);
@@ -350,22 +278,16 @@ mod tests {
 
     #[test]
     fn footer_row_count_honours_a_raised_padding_cap() {
-        // The keybinds overlay raises `max_pad_h` to 8, which takes 16
-        // columns out of the footer's width — a hardcoded MAX_PAD_H
-        // would reserve one row for a footer that wraps onto two.
         let labels: &[&str] = &["Cancel", "Save"];
         assert_eq!(button_row_width(labels), 20);
         assert_eq!(footer_row_count(labels, 20, 36, 4), 1);
         assert_eq!(footer_row_count(labels, 20, 36, 8), 1);
-        // In a terminal that cannot afford the raised padding *and* the
-        // row, both agree it wraps.
         assert_eq!(footer_row_count(labels, 20, 20, 8), 3);
     }
 
     #[test]
     fn packing_is_greedy_so_a_wrapped_row_refills() {
         let b = buttons(&["Ok", "Ok", "Ok"]);
-        // Each is 6 wide; 14 columns fit two with the gap, not three.
         assert_eq!(button_rows(&b, 14), vec![0..2, 2..3]);
     }
 }

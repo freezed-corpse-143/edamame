@@ -1,9 +1,6 @@
-//! Bottom status region.
-//!
-//! Composes the contextual [`HintLine`] on top of the persistent
-//! [`StatusBar`].  The hint line adapts to the cursor's context
-//! (default / table / list) and can be overlaid by a transient message
-//! or preempted by a modal prompt.
+//! Bottom status region: the contextual [`HintLine`] over the persistent [`StatusBar`].  The hint
+//! line adapts to the cursor's context and can be overlaid by a transient message or a modal
+//! prompt.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -21,11 +18,7 @@ use crate::editor::{EditorState, Mode};
 
 use super::status_bar::{StatusBar, StatusBarState};
 
-/// A single keybind chord + label pair (e.g. `^C` + `Copy`).  The
-/// chord glyph alone renders in the contrasting `hint_chord` theme
-/// slot (no surrounding padding inside the badge), followed by a
-/// single space, the label in `hint_label`, and a two-space separator
-/// between successive hints.
+/// A keybind chord + label pair (e.g. `^C` + `Copy`).  See [`lay_out_chords`] for the rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HintChord {
     pub chord: String,
@@ -41,13 +34,8 @@ impl HintChord {
     }
 }
 
-/// A default-hint payload: an optional leading plaintext hint (e.g.
-/// `Press any key to edit` in Preview mode) followed by a chord row.
-///
-/// `search_match` carries the `(current, total)` match counter of an
-/// active search flow.  It renders as an accent badge (`theme.status_mode_search`)
-/// at the very front of the hint line — ahead of the prelude and chords
-/// — mirroring the appearance it had when it lived on the status bar.
+/// A default-hint payload: an optional plaintext prelude followed by a chord row.  `search_match`
+/// is an active search's `(current, total)` counter, rendered as an accent badge ahead of both.
 #[derive(Debug, Clone, Default)]
 pub struct HintSet {
     pub prelude: Option<String>,
@@ -55,17 +43,11 @@ pub struct HintSet {
     pub search_match: Option<(usize, usize)>,
 }
 
-/// What the hint line currently displays.  The three variants are
-/// mutually exclusive — a transient message replaces the default
-/// chords, and a modal prompt replaces both.
-///
-/// All variants own their strings so the hint can be built up-front
-/// and then passed by value into [`EditorView`](crate::ui::editor_view::EditorView) without entangling its
-/// borrow of `&mut self.editor`.
+/// What the hint line displays; the variants are mutually exclusive, each replacing the ones
+/// above it.  All own their strings so the hint can be built up front and passed by value into
+/// [`EditorView`](crate::ui::editor_view::EditorView) without entangling its `&mut self.editor`.
 #[derive(Debug, Clone)]
 pub enum HintContent {
-    /// Default: contextual keybind chords, with an optional leading
-    /// plaintext prelude.
     Chords(HintSet),
     /// Transient overlay (e.g. `Copied`, `Saved`).
     Transient {
@@ -77,9 +59,8 @@ pub enum HintContent {
         prompt: String,
         chords: Vec<HintChord>,
     },
-    /// Vim command line (`/` `?` `:`): a prefix glyph plus the typed text
-    /// with a block cursor at char index `cursor`.  `cursor_visible`
-    /// carries the blink phase so the cursor pulses like other inputs.
+    /// Vim command line (`/` `?` `:`): a prefix glyph plus the typed text with a block cursor at
+    /// char index `cursor`.  `cursor_visible` is the blink phase.
     CommandLine {
         prefix: char,
         text: String,
@@ -88,72 +69,38 @@ pub enum HintContent {
     },
 }
 
-/// The UI-layer facts [`hint_line_for`] needs that aren't readable off
-/// `EditorState`.  Passed as one named struct rather than a run of
-/// positional `bool`s so a call site can't silently transpose them; build
-/// it with `..Default::default()` and set only the fields that apply.
+/// The UI-layer facts [`hint_line_for`] needs that aren't readable off `EditorState`.  A named
+/// struct rather than positional `bool`s so a call site can't transpose them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HintCtx {
-    /// True when the file / in-document history stack holds at least one
-    /// back- or forward-entry.  Lives on the `App` (`nav_back` /
-    /// `nav_forward`), not in document state.
+    /// True when the `App`'s nav history holds a back or forward entry.
     pub nav_available: bool,
-    /// True while the vim handler is in the VisualLine sub-mode.  A V-LINE
-    /// selection covering a single line is charwise-empty (`anchor ==
-    /// active`) even though the whole line paints as highlighted, so the
-    /// selection row can't be inferred from `state.selection_size()` alone.
+    /// True in vim's VisualLine sub-mode.  A single-line V-LINE selection is charwise-empty
+    /// (`anchor == active`) yet paints the whole line, so `selection_size()` can't detect it.
     pub visual_line: bool,
-    /// True while the vim handler is active.  Vim never rests in Preview
-    /// (Normal is its resting mode) and consumes `Esc` in every sub-mode,
-    /// so `ExitToPreview` can never fire and its chord is dropped from the
-    /// baseline row — the same rule the keybinds overlay applies to its
-    /// `Preview mode` row.
+    /// True while the vim handler is active.  Vim consumes `Esc` in every sub-mode and never rests
+    /// in Preview, so the `ExitToPreview` chord is dropped from the baseline row.
     pub vim_enabled: bool,
 }
 
-/// Pick the default hint set for `state`, adapting to the cursor's
-/// Markdown context.  Pure function so it can be unit-tested without
-/// spinning up a terminal.
+/// Pick the default hint set for `state`, adapting to the cursor's Markdown context.  Pure, so it
+/// is unit-testable without a terminal.
 ///
-/// Chord glyphs are looked up dynamically from `keymap` so that
-/// rebinds applied through the keybinds overlay (or via
-/// `keybindings.toml`) appear in the hint line on the very next
-/// frame — no chord text is hardcoded.  Chords for actions that the
-/// user has unbound are silently dropped from the row.
+/// Chord glyphs are always looked up from `keymap` — never hardcoded — so a rebind shows on the
+/// next frame, and an unbound action's chord silently drops from the row.
 ///
-/// Priority: active search > table (Rendered only) > task-list item >
-/// mode-default.
-/// Tables don't appear in Raw mode because the table-editing chords
-/// don't work against the raw source — the user is editing the plain
-/// Markdown and `Tab` / `⌥↑↓` insert characters or do nothing.
+/// Priority: active search > table (Rendered only) > task-list item > mode-default.  Tables are
+/// absent in Raw because the table-editing chords don't act on the raw source.
 ///
-/// `ctx` carries the UI-layer facts that aren't readable off `state` — see
-/// [`HintCtx`].  They're threaded in from the `App` rather than read off
-/// `state` because the nav stacks and the vim sub-mode are UI-layer facts,
-/// not document state.
-///
-/// The vim handler reuses this same row unchanged: vim's modal keys
-/// (`i` / `v` / `:` / `/`, the Visual operators, …) are vim-internal and
-/// the status bar already advertises the active sub-mode, so the hint line
-/// shows edamame's own contextual + baseline chords in every vim sub-mode
-/// rather than re-advertising vim's keys.  A Visual selection lands on the
-/// shared selection row (Cut / Copy / Paste / …) because vim Visual sets
-/// the editor `selection` just like a mouse drag does; VisualLine gets its
-/// own shorter row (see [`visual_line_chords`]).  The one baseline chord
-/// vim does drop is `Esc Preview`: under vim `Esc` returns to Normal and
-/// Preview is never entered, so advertising it would be a lie.
+/// Vim reuses this row unchanged: its modal keys are vim-internal and the status bar already shows
+/// the sub-mode.  A vim Visual selection sets the editor `selection` like a mouse drag and so
+/// lands on the shared selection row; VisualLine gets [`visual_line_chords`].
 pub fn hint_line_for(state: &EditorState, keymap: &KeyMap, ctx: HintCtx) -> HintSet {
-    // An active search flow replaces the row wholesale, whatever the
-    // view mode — only the flow keys work while it's active.  The
-    // Replace / Replace-all chords appear only in the replace flow
-    // (non-empty replace field).
+    // An active search replaces the row wholesale in every view mode: only the flow keys work.
     if let Some(search) = state.search.as_ref() {
         let mut chords = search_flow_chords(search.is_replace_flow());
-        // In the replace flow, surface the undo/redo chords (looked up
-        // from the live keymap, like every non-hard-bound hint) right
-        // before the trailing `Esc Exit` so a mis-replace is visibly
-        // recoverable without leaving the flow.  Redo is gated on
-        // `can_redo`, mirroring the baseline edit row.
+        // Undo/redo ride just ahead of `Esc Exit` so a mis-replace is visibly recoverable without
+        // leaving the flow.  Redo is `can_redo`-gated, as on the baseline row.
         if search.is_replace_flow() {
             let exit_idx = chords.len().saturating_sub(1);
             if state.history.can_redo() {
@@ -168,9 +115,7 @@ pub fn hint_line_for(state: &EditorState, keymap: &KeyMap, ctx: HintCtx) -> Hint
         return HintSet {
             prelude: None,
             chords,
-            // The match counter leads the search-flow hint line; absent
-            // when the result set is empty (e.g. after a replace-all
-            // consumes every match).
+            // Absent when the result set is empty, e.g. after a replace-all consumed every match.
             search_match: (!search.matches.is_empty())
                 .then(|| (search.focused_idx + 1, search.matches.len())),
         };
@@ -187,37 +132,24 @@ pub fn hint_line_for(state: &EditorState, keymap: &KeyMap, ctx: HintCtx) -> Hint
                     (Action::Quit, "Quit"),
                 ],
             );
-            // History navigation leads the row when there's somewhere to
-            // go — Preview is browse mode, so back/forward is its most
-            // relevant context.  Suppressed when the cursor sits in a
-            // table: `Alt+Left/Right` reorder columns there (the nav
-            // redirect in `app::actions` only fires outside a table), and
-            // the cursor offset persists into Preview, so a table cell is
-            // reachable here too.  A read-only document needs no arm of
-            // its own here: `cursor_in_table` already answers `false`
-            // while `readonly`, so the chord is unconditional there.
+            // Preview is browse mode, so history navigation leads the row.  Suppressed inside a
+            // table, where `Alt+Left/Right` reorder columns instead (the nav redirect in
+            // `app::actions` fires only outside one) — reachable here because the cursor offset
+            // persists into Preview.
             if ctx.nav_available && !cursor_in_table(state) {
                 chords.insert(0, nav_chord());
             }
             HintSet {
-                // The one thing a read-only document changes about this
-                // row: it rests in Preview permanently, so opening with
-                // an invitation to edit would advertise the single
-                // transition the mode is defined by refusing.  The
-                // chords are identical — everything a reader can do
-                // here, an ordinary Preview can do too.
+                // A read-only document rests in Preview permanently, so the invitation to edit
+                // would advertise the one transition the mode refuses.  The chords are identical.
                 prelude: (!state.readonly).then(|| "Press any key to edit".to_owned()),
                 chords,
                 search_match: None,
             }
         }
-        // A vim VisualLine selection covering a single line is charwise-empty
-        // (anchor == active) yet paints the whole line as highlighted, so it
-        // can't be inferred from `selection_size` — the `ctx.visual_line` flag
-        // carries it.  The `selection.is_some()` conjunct keeps the row
-        // self-consistent rather than trusting the App-layer invariant that
-        // V-LINE always has one: an advertised Cut with nothing selected
-        // would be a dead chord.
+        // `selection_size` can't see a single-line V-LINE selection (see [`HintCtx::visual_line`]).
+        // The `is_some` conjunct keeps the row self-consistent rather than trusting the App-layer
+        // invariant: an advertised Cut with nothing selected would be a dead chord.
         Mode::Rendered | Mode::Raw if ctx.visual_line && state.selection.is_some() => HintSet {
             prelude: None,
             chords: visual_line_chords(keymap),
@@ -230,17 +162,8 @@ pub fn hint_line_for(state: &EditorState, keymap: &KeyMap, ctx: HintCtx) -> Hint
                 &[
                     (Action::Cut, "Cut"),
                     (Action::Copy, "Copy"),
-                    // Paste is included so the user can replace the
-                    // selection with the clipboard contents in one
-                    // chord.  The whole baseline row is suppressed
-                    // for the duration of the selection — mirroring
-                    // how the table-context row replaces the row
-                    // wholesale rather than prepending to it.
                     (Action::Paste, "Paste"),
-                    // Bold / italic wrap the selection; they only make
-                    // sense with one active, so they ride this row
-                    // rather than the baseline.  Dropped automatically
-                    // if the user has unbound them.
+                    // Bold / italic wrap a selection, so they ride this row rather than baseline.
                     (Action::BoldSelection, "Bold"),
                     (Action::ItalicizeSelection, "Italic"),
                 ],
@@ -266,30 +189,9 @@ pub fn hint_line_for(state: &EditorState, keymap: &KeyMap, ctx: HintCtx) -> Hint
             }
         }
         Mode::Rendered | Mode::Raw => {
-            // Baseline edit-mode hints — Menu anchors the row so
-            // the command-palette chord is always the discovery
-            // entry; then Paste / Undo / [Redo] / Open / Save /
-            // Preview / view-mode toggle / Quit.  Redo is gated on
-            // `state.history.can_redo()` so it only appears when
-            // there's actually something to redo; the row shifts
-            // by one slot when it pops in or out.  Cut / Copy are
-            // absent from the baseline because they're only useful
-            // with an active selection, which is handled by the
-            // selection-override arm above.  The view-mode chord
-            // label flips with the current mode (Rendered → "Raw",
-            // Raw → "Render") and "Preview" / "Raw" / "Render" are
-            // all destination labels — never the current state.  The
-            // Preview chord is gated on `!ctx.vim_enabled`: vim consumes
-            // `Esc` itself and never rests in Preview, so the action is
-            // unreachable there and the keybinds overlay already hides
-            // its row for the same reason.
-            //
-            // Contextual chords (those that only make sense in a
-            // specific state) are prepended to the front of the row
-            // so the user sees them immediately.  Final order when
-            // both are active: Link, Toggle, Menu, ...  Link leads
-            // because its trigger is the narrowest (a specific
-            // `[text](url)` span); Toggle follows.
+            // Baseline edit-mode row, anchored by Menu as the discovery entry.  Cut / Copy are
+            // absent: they need a selection, which the arm above handles.  "Preview" / "Raw" /
+            // "Render" are destination labels, never the current state.
             let view_toggle_label = match state.mode {
                 Mode::Raw => "Render",
                 _ => "Raw",
@@ -311,21 +213,10 @@ pub fn hint_line_for(state: &EditorState, keymap: &KeyMap, ctx: HintCtx) -> Hint
             ];
             let entries: Vec<(Action, &str)> = baseline.into_iter().flatten().collect();
             let mut chords = chords_from(keymap, &entries);
-            // Insertion order here matters for the final layout:
-            // each `insert(0, ..)` pushes the previous head back by
-            // one slot, so the LAST insert ends up leftmost.  Order
-            // of inserts below is the REVERSE of the desired visual
-            // order: Back/fwd → Toggle → Link.  History navigation
-            // goes in first so it lands rightmost of the contextual
-            // block (just left of `Menu`) — its trigger (a non-empty
-            // history stack) is the broadest, so it trails the narrower
-            // Link / Toggle hints.  The `!cursor_in_table` guard keeps
-            // the ⌥←→ chord hidden whenever the cursor sits in a table —
-            // there `Alt+Left/Right` reorder columns instead of
-            // navigating history (the redirect in `app::actions` only
-            // fires outside a table).  The Rendered table arm above
-            // returns before this point, but Raw mode has no such arm, so
-            // the explicit check is what covers the Raw-in-table case.
+            // Each `insert(0, ..)` pushes the previous head back, so these run in REVERSE of the
+            // desired visual order: Link, Toggle, Back/fwd — narrowest trigger leftmost.  The
+            // `!cursor_in_table` guard matters for Raw, which has no early-returning table arm
+            // above; there `Alt+Left/Right` reorder columns rather than navigating history.
             if ctx.nav_available && !cursor_in_table(state) {
                 chords.insert(0, nav_chord());
             }
@@ -348,30 +239,20 @@ pub fn hint_line_for(state: &EditorState, keymap: &KeyMap, ctx: HintCtx) -> Hint
     }
 }
 
-/// The combined back/forward history-navigation hint (`⌥←→ Back/fwd`).
-///
-/// The chord glyph is fixed rather than looked up from `keymap` because
-/// `NavigateBack` / `NavigateForward` carry no default binding — the keys
-/// that actually fire them are `Alt+Left` / `Alt+Right`, which the `App`
-/// redirects from `TableMoveColumnLeft` / `TableMoveColumnRight` when the
-/// cursor is outside any table (see `App::normalize_context_action`, which
-/// resolves that redirect ahead of every action gate).
-/// One badge stands in for both directions, mirroring the table arm's
-/// bundled `⌥↑↓←→` glyph.
+/// The combined back/forward hint.  The glyph is fixed rather than keymap-derived because
+/// `NavigateBack` / `NavigateForward` have no binding of their own: `App::normalize_context_action`
+/// redirects `Alt+Left/Right` from the table column actions when outside a table.
 fn nav_chord() -> HintChord {
     HintChord::new("⌥←→", "Back/fwd")
 }
 
-/// Look up the first key bound to `action` in `keymap` and pair it
-/// with `label`.  Returns `None` when the action is unbound — the
-/// caller drops unbound entries from the hint row entirely.
+/// Pair `action`'s first bound key with `label`; `None` when unbound, so the row drops it.
 fn chord_for(keymap: &KeyMap, action: &Action, label: &str) -> Option<HintChord> {
     let ev = keymap.first_key_event_for(action)?;
     Some(HintChord::new(format_key_compact(&ev), label.to_owned()))
 }
 
-/// Convenience — apply [`chord_for`] over a slice and collect the
-/// successful lookups in order.
+/// [`chord_for`] over a slice, collecting the successful lookups in order.
 fn chords_from(keymap: &KeyMap, entries: &[(Action, &str)]) -> Vec<HintChord> {
     entries
         .iter()
@@ -379,23 +260,15 @@ fn chords_from(keymap: &KeyMap, entries: &[(Action, &str)]) -> Vec<HintChord> {
         .collect()
 }
 
-/// Diff Review hint row.  The key glyphs come from the shared
-/// `diff_keys` table (via [`crate::input::diff_hint`]) — the same source
-/// the input handler, keybinds overlay, decision divider, and
-/// diff-intro modal read — so the advertised chord can never disagree
-/// with the key that actually fires.  The labels are this row's own
-/// (terse, to fit the bar).
+/// Diff Review hint row.  Glyphs come from the shared `diff_keys` table (via
+/// [`crate::input::diff_hint`]), the same source the input handler and overlays read, so the
+/// advertised chord can never disagree with the key that fires.
 ///
-/// `Quit` is the one entry that comes from the `keymap` instead: it is
-/// not a review binding — it is the global quit chord, honored in diff
-/// mode via `diff_safe_action` — so it is rebindable and has no glyph
-/// in the diff table.  Only the read-only row lists it, which is why
-/// the `keymap` is threaded in.
+/// `Quit` alone comes from `keymap`: it is the rebindable global chord (honored in diff mode via
+/// `diff_safe_action`), not a review binding, so it has no glyph in the diff table.
 ///
-/// `Esc Exit` trails the row, and only once every hunk is resolved:
-/// diff mode can't be exited via `Esc` while hunks are still pending
-/// (see `Action::DiffExit`), so advertising the chord before then
-/// would be misleading.
+/// `Esc Exit` trails the row and appears only once every hunk is resolved, because `Esc` can't
+/// exit diff mode before then.
 fn diff_review_chords(
     keymap: &KeyMap,
     all_resolved: bool,
@@ -405,27 +278,16 @@ fn diff_review_chords(
     let mk = |action: &Action, label: &str| {
         HintChord::new(crate::input::diff_hint(action), label.to_owned())
     };
-    // A read-only review (`--diff`) refuses every decision action, so
-    // the row carries navigation and exit only — advertising `y Accept`
-    // beside a key that answers "This review is read-only" is worse than
-    // a short row.  `Esc Exit` is unconditional here: there is nothing
-    // to resolve, so the gate below would hide the one way out.
-    //
-    // `Quit` rides this row and no other, because in a difftool session
-    // the two exits mean different things: `Esc` finishes this file and
-    // lets `git difftool` move to the next, while `Quit` ends the whole
-    // walk (`app::difftool::stop_walk`).  A key that stops a multi-file
-    // review has to be discoverable from the review itself, not only
-    // from the docs.  Elsewhere in diff mode `Esc` is the intended exit
-    // and `Quit` stays off the row.
+    // A read-only review (`--diff`) refuses every decision action, so the row is navigation and
+    // exit only, and `Esc` is unconditional — nothing can resolve, so the gate below would hide
+    // the one way out.  `Quit` rides this row alone because in a difftool walk the two exits
+    // differ: `Esc` finishes this file, `Quit` ends the whole walk (`app::difftool::stop_walk`).
     if read_only {
         let mut chords = vec![
             mk(&Action::DiffNext, "Next"),
             mk(&Action::DiffPrev, "Prev"),
             mk(&Action::DiffExit, "Close file"),
         ];
-        // Dropped silently when the user has unbound `Quit`, as
-        // everywhere else the row resolves a keymap chord.
         chords.extend(chords_from(keymap, &[(Action::Quit, "Quit diff")]));
         return chords;
     }
@@ -437,26 +299,18 @@ fn diff_review_chords(
         mk(&Action::DiffAcceptAll, "Accept all"),
         mk(&Action::DiffRejectAll, "Reject all"),
     ];
-    // `⌫ Reset` only makes sense once the focused hunk carries a
-    // decision — it's a no-op on a still-`Pending` hunk, so advertising
-    // it then would be misleading.
+    // Reset is a no-op on a still-`Pending` hunk.
     if focused_resolved {
         chords.push(mk(&Action::DiffResetHunk, "Reset"));
     }
-    // `Esc Exit` trails the row so the primary review actions lead; it
-    // appears only once the whole diff is resolved.
     if all_resolved {
         chords.push(mk(&Action::DiffExit, "Exit"));
     }
     chords
 }
 
-/// Search-flow hint row.  Key glyphs come from the shared
-/// `search::search_keys` table (via [`crate::search::search_hint`]) —
-/// the same source the input handler reads — so the advertised chord
-/// can never disagree with the key that actually fires.  `r Replace`
-/// and `a Replace all` ride the row only in the replace flow; `Esc
-/// Exit` trails so the navigation chords lead.
+/// Search-flow hint row.  Glyphs come from the shared `search::search_keys` table (via
+/// [`crate::search::search_hint`]), so the advertised chord always matches the one that fires.
 fn search_flow_chords(is_replace: bool) -> Vec<HintChord> {
     let mk = |action: &Action, label: &str| {
         HintChord::new(crate::search::search_hint(action), label.to_owned())
@@ -473,16 +327,12 @@ fn search_flow_chords(is_replace: bool) -> Vec<HintChord> {
     chords
 }
 
-/// Build the vim VisualLine hint row: the three clipboard chords that the
-/// App widens to whole lines before dispatching
-/// (`App::dispatch_visual_line_clipboard`), so each one acts on exactly the
-/// highlighted rows.
+/// The vim VisualLine hint row: the three clipboard chords the App widens to whole lines
+/// (`App::dispatch_visual_line_clipboard`).
 ///
-/// Deliberately shorter than the charwise selection row — `Bold` / `Italic`
-/// are omitted because `edit_ops::toggle_wrap` bails on both shapes a V-LINE
-/// selection can take: an empty charwise span (a single-line V-LINE, where
-/// `anchor == active`) and a span containing a newline (any multi-line one).
-/// Advertising them here would be advertising two no-ops.
+/// Shorter than the charwise row on purpose: `toggle_wrap` bails on both shapes a V-LINE selection
+/// takes — an empty charwise span, or one containing a newline — so Bold / Italic would be
+/// advertised no-ops.
 fn visual_line_chords(keymap: &KeyMap) -> Vec<HintChord> {
     chords_from(
         keymap,
@@ -494,20 +344,11 @@ fn visual_line_chords(keymap: &KeyMap) -> Vec<HintChord> {
     )
 }
 
-/// Build the table-context hint row.  When the four arrow-driven
-/// actions of a bundle (`Move row/col`, `Insert row/col`) all share
-/// modifiers and arrow key codes, we collapse them into a single
-/// glyph (`⌥↑↓←→`) — the visually compact shape the user already
-/// learns from the default keymap.  When the user has rebound any of
-/// the four to a non-arrow chord, we fall back to listing the four
-/// chords joined by `/` so the badge still reflects what's actually
-/// bound.
+/// The table-context hint row; see [`arrow_bundle_chord`] for the collapsed arrow badges.
 fn table_chords(keymap: &KeyMap) -> Vec<HintChord> {
     let mut out: Vec<HintChord> = Vec::new();
-    // "Next cell" reuses InsertTab's chord because table next-cell is
-    // a context dispatch from InsertTab in `edit_ops`.  Looking up
-    // InsertTab keeps the displayed chord truthful even if the user
-    // rebinds Tab to something exotic.
+    // Next-cell is a context dispatch from `InsertTab` in `edit_ops`, so look up that action to
+    // stay truthful if the user rebinds Tab.
     if let Some(c) = chord_for(keymap, &Action::InsertTab, "Next cell") {
         out.push(c);
     }
@@ -541,13 +382,9 @@ fn table_chords(keymap: &KeyMap) -> Vec<HintChord> {
     out
 }
 
-/// Compose a single chord glyph for an arrow-driven bundle (e.g.
-/// `⌥↑↓←→` for the four `TableMoveRow*` / `TableMoveColumn*`
-/// actions).  Returns the bundled glyph when all four chords share
-/// modifiers AND each maps to its expected arrow direction; falls
-/// back to a slash-joined list of compact chords otherwise.  Returns
-/// `None` only when none of the four actions is bound — there's
-/// nothing to display in that case.
+/// One chord glyph for an arrow-driven bundle (`⌥↑↓←→`).  Collapses only when all four chords
+/// share modifiers *and* each maps to its expected arrow; otherwise slash-joins the compact
+/// chords.  `None` when none of the four is bound.
 fn arrow_bundle_chord(
     keymap: &KeyMap,
     up: &Action,
@@ -590,29 +427,14 @@ fn arrow_bundle_chord(
     )
 }
 
-/// Lay out a chord list into spans.  Always renders every chord with
-/// its label — if the row is too narrow, the trailing chords are
-/// truncated by ratatui's non-wrapping `Paragraph`.  A bare chord
-/// badge with no label isn't useful, so we don't bother dropping
-/// labels under width pressure.
+/// Lay out a chord list into spans: `{chord}` in `hint_chord`, ` {label}` in `hint_label`, then a
+/// two-space `bar_style` separator.  Labels are never dropped under width pressure — a bare badge
+/// isn't useful — so a narrow row simply truncates in the non-wrapping `Paragraph`.
 ///
-/// Layout per hint: `{chord}` in `hint_chord` (the badge is exactly
-/// the chord glyph — no surrounding padding gets the badge bg), then
-/// ` {label}` in `hint_label` (a single leading space separates label
-/// from chord), then `  ` (two spaces) in `bar_style` as the separator
-/// before the next hint.
-///
-/// `bar_style` is the hint-bar background for the active mode — normally
-/// [`Theme::hint_bar`], but [`Theme::hint_bar_diff`] while in diff mode
-/// so the inter-chord separators match the recolored bar instead of
-/// punching the default hue through every gap.
+/// `bar_style` is the active mode's hint-bar background, [`Theme::hint_bar_diff`] in diff mode.
 pub fn lay_out_chords(chords: &[HintChord], theme: &Theme, bar_style: Style) -> Vec<Span<'static>> {
-    // Wash the chord-badge and label backgrounds with the active bar's
-    // bg so the whole hint row reads as one bar.  In every mode except
-    // diff this is a no-op (`hint_bar`, `hint_chord` and `hint_label`
-    // all share `surface_elevated`); in diff mode it extends the
-    // recolored `hint_bar_diff` wash across the badges instead of
-    // leaving them on the default surface.
+    // Wash the badge and label backgrounds with the bar's bg so the row reads as one bar.  A no-op
+    // outside diff mode, where all three slots already share `surface_elevated`.
     let chord_style = match bar_style.bg {
         Some(bg) => theme.hint_chord.bg(bg),
         None => theme.hint_chord,
@@ -630,12 +452,9 @@ pub fn lay_out_chords(chords: &[HintChord], theme: &Theme, bar_style: Style) -> 
     spans
 }
 
-/// Build the spans for a vim command line: a leading ` {prefix}` glyph, then
-/// the typed text with a block cursor (the unified modal `theme.cursor`) at
-/// char index `cursor`.  The cursor is a single, blink-stable cell — the
-/// character under it recolored when `cursor_visible`, shown plainly when not
-/// (a space past end-of-line) — so an empty `/` still reserves the cursor cell
-/// and the row never jitters on blink.
+/// Spans for a vim command line: a leading ` {prefix}` glyph then the typed text with the unified
+/// block cursor at char index `cursor`.  The cursor is one blink-stable cell (a space past
+/// end-of-line), so an empty `/` still reserves it and the row never jitters on blink.
 fn command_line_spans(
     prefix: char,
     text: &str,
@@ -648,8 +467,6 @@ fn command_line_spans(
         Some(bg) => theme.hint_label.bg(bg),
         None => theme.hint_label,
     };
-    // The cursor is the unified block — the same blink-stable one-cell slot
-    // every other modal input uses, recoloring the character it sits on.
     let mut spans = vec![Span::styled(format!(" {prefix}"), base)];
     spans.extend(crate::ui::cursor::text_field_spans(
         text,
@@ -661,15 +478,11 @@ fn command_line_spans(
     spans
 }
 
-/// The hint-line widget.  Renders chords / transient / prompt onto a
-/// single row, with a trailing fill using `bar_style`.
+/// The hint-line widget: one row of chords / transient / prompt with a trailing `bar_style` fill.
 pub struct HintLine<'a> {
     pub content: HintContent,
     pub theme: &'a Theme,
-    /// Background style for the bar fill and inter-chord separators.
-    /// [`Theme::hint_bar`] in every mode except diff, which uses
-    /// [`Theme::hint_bar_diff`] so the recolored bar signals the mode
-    /// change.
+    /// Bar fill and inter-chord separator background; [`Theme::hint_bar_diff`] in diff mode.
     pub bar_style: Style,
 }
 
@@ -683,11 +496,8 @@ impl<'a> Widget for HintLine<'a> {
         let spans: Vec<Span<'_>> = match &self.content {
             HintContent::Chords(set) => {
                 let mut v: Vec<Span<'_>> = Vec::new();
-                // Search match counter — an accent badge (` n/N `) that
-                // leads the hint line ahead of every other item.  Same
-                // `status_mode_search` styling it carried on the status
-                // bar; a trailing bar-styled space pads it off from the
-                // first chord so the gap matches the inter-chord one.
+                // The ` n/N ` badge leads the line; a trailing bar-styled space makes its gap
+                // match the inter-chord one.
                 if let Some((current, total)) = set.search_match {
                     v.push(Span::styled(
                         format!(" {}/{} ", current, total),
@@ -695,10 +505,7 @@ impl<'a> Widget for HintLine<'a> {
                     ));
                     v.push(Span::styled(" ".to_string(), self.bar_style));
                 }
-                // Prelude — plain text on the hint bar, followed by a
-                // two-space gap that acts as a separator before the
-                // chord row.  Rendered as hint_bar bg + hint_label fg
-                // so it reads as a sentence, not another chord.
+                // `hint_label` fg on the bar bg, so the prelude reads as a sentence, not a chord.
                 if let Some(prelude) = &set.prelude {
                     let text = format!(" {}  ", prelude);
                     let prelude_style = match self.bar_style.bg {
@@ -736,9 +543,7 @@ impl<'a> Widget for HintLine<'a> {
             ),
         };
 
-        // Sum what we've rendered so we can pad the trailing fill with
-        // the hint_bar background — otherwise the terminal shows its
-        // own default background in the gap.
+        // Pad the trailing fill with the bar background, else the terminal's own shows through.
         let used: usize = spans
             .iter()
             .map(|s| s.content.chars().count())
@@ -754,8 +559,7 @@ impl<'a> Widget for HintLine<'a> {
     }
 }
 
-/// Composite widget owning the bottom region layout.  Renders a
-/// [`HintLine`] above a persistent [`StatusBar`].
+/// Composite widget: a [`HintLine`] above a persistent [`StatusBar`].
 pub struct BottomRegion<'a> {
     pub status: StatusBarState<'a>,
     pub hint: HintContent,
@@ -763,8 +567,7 @@ pub struct BottomRegion<'a> {
 }
 
 impl<'a> BottomRegion<'a> {
-    /// Height in rows that [`BottomRegion`] requires.  Consulted by
-    /// `EditorView` to partition the terminal area.
+    /// Rows this region needs; `EditorView` partitions the terminal area with it.
     pub fn height() -> u16 {
         2
     }
@@ -779,8 +582,7 @@ impl<'a> Widget for BottomRegion<'a> {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Length(1)])
             .split(area);
-        // Diff mode recolors the whole hint bar to match the
-        // status bar's mode shift (§7).
+        // Diff mode recolors the hint bar to match the status bar's mode shift.
         let bar_style = if matches!(self.status.mode, Mode::Diff) {
             self.theme.hint_bar_diff
         } else {
@@ -800,16 +602,12 @@ impl<'a> Widget for BottomRegion<'a> {
     }
 }
 
-/// True when the editor's cursor sits inside a Markdown table.  Mirror
-/// of the App-internal helper so pure hint-line code doesn't depend on
-/// private app state.
+/// True when the cursor sits inside a Markdown table.  Mirrors the App-internal helper so pure
+/// hint-line code needn't reach into app state.
 fn cursor_in_table(state: &EditorState) -> bool {
-    // A read-only document has no column to reorder — every table
-    // command is denied by `readonly_safe_action` — so `Alt+Left` /
-    // `Alt+Right` must stay the Back / Forward chord the hint row
-    // advertises, even when a `GoToSection` jump has parked the cursor
-    // inside one of `keybindings.md`'s many tables.  Without this the
-    // reader gets a dead chord for the one navigation they use most.
+    // A read-only document has no column to reorder (`readonly_safe_action` denies every table
+    // command), so `Alt+Left/Right` must stay the Back/Forward chord even when a section jump
+    // parks the cursor in one of `keybindings.md`'s many tables.
     if state.readonly {
         return false;
     }
@@ -818,10 +616,7 @@ fn cursor_in_table(state: &EditorState) -> bool {
     crate::editor::table_edit::find_table_at(&source, cursor_byte).is_some()
 }
 
-/// True when the cursor sits on a Markdown *task* list item (i.e. a
-/// list item whose marker is followed by `[ ]` / `[x]`).  Regular
-/// bullet / ordered items return false — they have no checkbox to
-/// toggle, so offering `^Space Toggle` would just confuse the user.
+/// True when the cursor is on a *task* list item; plain bullets have no checkbox to toggle.
 fn cursor_on_task_item(state: &EditorState) -> bool {
     let cursor_byte = state.buffer.rope().char_to_byte(state.cursor.offset);
     let source = state.buffer.contents();
@@ -834,11 +629,8 @@ fn cursor_on_task_item(state: &EditorState) -> bool {
         .is_some_and(|it| it.task.is_some())
 }
 
-/// True when the cursor sits inside a `[text](url)` link on the
-/// current line.  Reuses the `link_at_offset` scan that
-/// `mouse_ops` and `App::resolve_link_at_cursor` use, so hint
-/// visibility and the actual `FollowLinkUnderCursor` dispatch agree
-/// on what counts as a link.
+/// True when the cursor sits inside a `[text](url)` link.  Uses the same `link_at_offset` scan as
+/// `mouse_ops` and `App::resolve_link_at_cursor`, so the hint and the dispatch agree.
 fn cursor_on_link(state: &EditorState) -> bool {
     let cursor_byte = state.buffer.rope().char_to_byte(state.cursor.offset);
     let source = state.buffer.contents();
@@ -877,10 +669,7 @@ mod tests {
         assert!(set.chords.iter().any(|c| c.label == "Quit"));
     }
 
-    /// A read-only document differs from an ordinary Preview in exactly
-    /// one way: no "Press any key to edit", because that is the one
-    /// transition the mode refuses.  The chords are the same row —
-    /// there is no reading-specific vocabulary to advertise.
+    /// A read-only document differs from Preview in one way: no "Press any key to edit".
     #[test]
     fn the_read_only_row_drops_only_the_edit_invitation() {
         let mut st = state("hello");
@@ -902,9 +691,8 @@ mod tests {
         }
     }
 
-    /// `keybindings.md` is mostly tables, and the Back chord used to
-    /// vanish from the row whenever a section jump parked the cursor in
-    /// one — matching a redirect that had itself stopped firing.
+    /// Regression: the Back chord used to vanish whenever a section jump parked the cursor in one
+    /// of `keybindings.md`'s many tables.
     #[test]
     fn the_back_chord_survives_a_table_in_a_read_only_document() {
         let mut st = state("| a | b |\n|---|---|\n| 1 | 2 |\n");
@@ -921,10 +709,7 @@ mod tests {
         );
     }
 
-    /// A read-only (`--diff`) review advertises navigation and exit
-    /// only: every decision key answers "This review is read-only", and
-    /// `Esc Close file` must appear even though nothing is resolved,
-    /// because it is the one way out of the session.
+    /// `Esc Close file` must appear even with nothing resolved: it is the one way out.
     #[test]
     fn a_read_only_diff_row_offers_only_navigation_and_the_two_exits() {
         let labels: Vec<String> = diff_review_chords(&keymap(), false, false, true)
@@ -934,9 +719,8 @@ mod tests {
         assert_eq!(labels, vec!["Next", "Prev", "Close file", "Quit diff"]);
     }
 
-    /// The two exits differ in a difftool walk — `Esc` advances to the
-    /// next file, `Quit` stops it — so both must be on the row, with
-    /// distinct chords.
+    /// In a difftool walk `Esc` advances to the next file and `Quit` stops it, so the two exits
+    /// need distinct chords.
     #[test]
     fn a_read_only_diff_row_names_a_distinct_chord_for_each_exit() {
         let row = diff_review_chords(&keymap(), false, false, true);
@@ -954,8 +738,6 @@ mod tests {
 
     #[test]
     fn diff_hint_gates_exit_on_full_resolution() {
-        // Pending hunks: no `Esc Exit` hint (diff can't be exited yet),
-        // and the navigation/decision chords lead the row.
         let pending = diff_review_chords(&keymap(), false, false, false);
         assert!(
             !pending.iter().any(|c| c.label == "Exit"),
@@ -963,8 +745,6 @@ mod tests {
         );
         assert_eq!(pending[0].label, "Next", "Tab/Next leads when pending");
 
-        // All resolved: the review actions still lead, and `Esc Exit`
-        // appears at the very end of the row.
         let resolved = diff_review_chords(&keymap(), true, true, false);
         assert_eq!(resolved[0].label, "Next", "review actions lead the row");
         let last = resolved.last().expect("non-empty row");
@@ -974,14 +754,11 @@ mod tests {
 
     #[test]
     fn diff_reset_hint_only_when_focused_hunk_resolved() {
-        // Focused hunk still pending → no `Reset` chord (it'd be a
-        // no-op there).
         let pending = diff_review_chords(&keymap(), false, false, false);
         assert!(
             !pending.iter().any(|c| c.label == "Reset"),
             "Reset hint must be hidden while the focused hunk is pending",
         );
-        // Focused hunk decided → `⌫ Reset` is offered.
         let decided = diff_review_chords(&keymap(), false, true, false);
         let reset = decided
             .iter()
@@ -1004,7 +781,6 @@ mod tests {
             "Rendered-mode chord toggles TO Raw"
         );
         assert!(labels.contains(&"Quit"));
-        // Cut / Copy are selection-gated — no selection here.
         assert!(
             !labels.contains(&"Cut"),
             "Cut must stay hidden without an active selection"
@@ -1013,17 +789,14 @@ mod tests {
             !labels.contains(&"Copy"),
             "Copy must stay hidden without an active selection"
         );
-        // Bold / Italic are selection-gated too.
         assert!(
             !labels.contains(&"Bold") && !labels.contains(&"Italic"),
             "Bold/Italic must stay hidden without an active selection"
         );
-        // Plain paragraph has no link, so "Open link" must not appear.
         assert!(
             !labels.contains(&"Open link"),
             "link hint must stay hidden when the cursor isn't on a link"
         );
-        // No prelude in edit mode.
         assert!(set.prelude.is_none());
     }
 
@@ -1034,7 +807,6 @@ mod tests {
         let mut st = state("hello");
         st.mode = Mode::Rendered;
 
-        // Fresh history → no redo entry yet.
         let labels: Vec<_> = hint_line_for(&st, &keymap(), HintCtx::default())
             .chords
             .iter()
@@ -1101,14 +873,12 @@ mod tests {
     fn link_hint_appears_only_when_cursor_on_link() {
         let mut st = state("a [site](https://example.com) rest");
         st.mode = Mode::Rendered;
-        // Cursor in the "site" link text → on a link.
         st.cursor.offset = 5;
         let on_link = hint_line_for(&st, &keymap(), HintCtx::default());
         assert_eq!(
             on_link.chords[0].label, "Open link",
             "contextual link hint must lead the row"
         );
-        // Cursor in the trailing plain-text tail → not on a link.
         st.cursor.offset = 32;
         let off_link = hint_line_for(&st, &keymap(), HintCtx::default());
         assert!(
@@ -1119,9 +889,6 @@ mod tests {
 
     #[test]
     fn contextual_hints_lead_with_link_before_toggle() {
-        // Task item that also contains a link — both contextual
-        // chords should be at the front, with Open link first and
-        // Toggle second, ahead of every baseline chord.
         let mut st = state("- [ ] see [docs](https://example.com)\n");
         st.mode = Mode::Rendered;
         st.cursor.offset = 14; // inside "docs"
@@ -1155,10 +922,7 @@ mod tests {
     #[test]
     fn visual_line_shows_selection_hints_despite_empty_charwise_span() {
         use crate::document::Selection;
-        // V-LINE on a single line paints the whole line but leaves the
-        // charwise selection empty (anchor == active), so `selection_size`
-        // is None.  The `visual_line` flag must still surface the
-        // selection row.
+        // A single-line V-LINE leaves the charwise selection empty, so only the flag surfaces it.
         let mut st = state("hello world");
         st.mode = Mode::Rendered;
         st.selection = Some(Selection {
@@ -1194,9 +958,7 @@ mod tests {
     #[test]
     fn visual_line_row_omits_bold_and_italic() {
         use crate::document::Selection;
-        // `toggle_wrap` bails on an empty span *and* on one containing a
-        // newline, so Bold / Italic are no-ops under either V-LINE shape.
-        // The charwise row still carries them.
+        // `toggle_wrap` bails on both V-LINE shapes, so Bold / Italic would be no-ops there.
         let mut st = state("alpha\nbeta\n");
         st.mode = Mode::Rendered;
         st.selection = Some(Selection {
@@ -1227,9 +989,7 @@ mod tests {
 
     #[test]
     fn visual_line_flag_without_a_selection_falls_through() {
-        // The V-LINE row is gated on an actual selection as well as the
-        // flag, so a desynced sub-mode can't advertise a Cut with nothing
-        // to cut.
+        // A desynced sub-mode must not advertise a Cut with nothing to cut.
         let mut st = state("hello world");
         st.mode = Mode::Rendered;
         assert!(st.selection.is_none(), "test premise");
@@ -1264,8 +1024,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Cut", "Copy", "Paste", "Bold", "Italic"]
         );
-        // Clearing the selection must drop the row back to the
-        // baseline edit-mode chords with Menu leading.
         st.selection = None;
         let set = hint_line_for(&st, &keymap(), HintCtx::default());
         assert_eq!(set.chords[0].label, "Menu");
@@ -1276,7 +1034,6 @@ mod tests {
 
     #[test]
     fn plain_list_item_does_not_show_toggle_chord() {
-        // Cursor at byte 2 — inside `- a` (a regular bullet, NOT a task).
         let mut st = state("- a\n- b\n");
         st.mode = Mode::Rendered;
         st.cursor.offset = 2;
@@ -1289,7 +1046,6 @@ mod tests {
 
     #[test]
     fn task_list_item_shows_toggle_chord_first() {
-        // Cursor inside a task-list item: `- [ ] todo`.
         let mut st = state("- [ ] todo\n");
         st.mode = Mode::Rendered;
         st.cursor.offset = 8;
@@ -1315,10 +1071,8 @@ mod tests {
 
     #[test]
     fn rebinding_action_updates_chord_in_hint_line() {
-        // Move ShowCommandPalette off Ctrl-P onto F1 via the same
-        // `KeyMap::rebind` call the keybinds overlay uses — which
-        // (unlike the load-time merge in `KeyMap::build`) drops the
-        // prior key for the action.  The Menu chord must follow.
+        // `KeyMap::rebind` (the overlay's path) drops the action's prior key, unlike the load-time
+        // merge in `KeyMap::build`.
         let mut km = keymap();
         let mut overrides = KeyBindingOverrides::default();
         km.rebind(&Action::ShowCommandPalette, "f1", &mut overrides)
@@ -1344,10 +1098,7 @@ mod tests {
 
     #[test]
     fn unbinding_an_action_drops_its_chord_from_the_row() {
-        // Steal Save's `Ctrl-S` slot by rebinding Quit onto it; the
-        // override hands Ctrl-S to Quit and leaves Save without a
-        // binding.  The Save chord must vanish from the hint row
-        // entirely (not render as a blank chord).
+        // Rebinding Quit onto Ctrl-S orphans Save, whose chord must vanish rather than blank out.
         let mut overrides = KeyBindingOverrides::default();
         overrides.0.insert("Quit".into(), "ctrl+s".into());
         let km = KeyMap::build(&overrides).unwrap();
@@ -1367,11 +1118,7 @@ mod tests {
 
     #[test]
     fn arrow_bundle_falls_back_to_slash_list_when_modifiers_diverge() {
-        // Rebind one of the four `Move row/col` arrow actions through
-        // the in-app rebind path so the prior arrow binding is
-        // dropped — the bundle can no longer collapse to `⌥↑↓←→`,
-        // and the badge must list the four bound chords joined by
-        // `/`.
+        // Rebinding one of the four drops its arrow binding, so the bundle can no longer collapse.
         let mut km = keymap();
         let mut overrides = KeyBindingOverrides::default();
         km.rebind(&Action::TableMoveRowUp, "ctrl+shift+u", &mut overrides)
@@ -1400,14 +1147,11 @@ mod tests {
     fn nav_hint_appears_only_when_history_available() {
         let mut st = state("hello");
         st.mode = Mode::Rendered;
-        // No history → no Back/fwd chord.
         let off = hint_line_for(&st, &keymap(), HintCtx::default());
         assert!(
             !off.chords.iter().any(|c| c.label == "Back/fwd"),
             "Back/fwd must stay hidden with an empty history stack"
         );
-        // History present → the ⌥←→ chord rides the contextual block,
-        // sitting just before the baseline `Menu` chord.
         let on = hint_line_for(
             &st,
             &keymap(),
@@ -1432,8 +1176,6 @@ mod tests {
 
     #[test]
     fn nav_hint_suppressed_in_table() {
-        // Alt+Left/Right reorder columns inside a table, so the history
-        // chord must not be advertised there even when history exists.
         let source = "| a | b |\n| - | - |\n| c | d |\n";
         let mut st = state(source);
         st.mode = Mode::Rendered;
@@ -1454,11 +1196,8 @@ mod tests {
 
     #[test]
     fn nav_hint_suppressed_in_table_raw_mode() {
-        // Raw mode has no early-returning table arm, so the suppression
-        // rests entirely on the explicit `!cursor_in_table` guard.  Without
-        // it the row would advertise ⌥←→ while Alt+Left/Right actually
-        // reorder the table column (the nav redirect fires only outside a
-        // table, regardless of view mode).
+        // Raw has no early-returning table arm, so suppression rests entirely on the explicit
+        // `!cursor_in_table` guard.
         let source = "| a | b |\n| - | - |\n| c | d |\n";
         let mut st = state(source);
         st.mode = Mode::Raw;
@@ -1479,10 +1218,6 @@ mod tests {
 
     #[test]
     fn preview_chord_hidden_under_vim() {
-        // Vim consumes `Esc` in every sub-mode and never rests in Preview,
-        // so `ExitToPreview` is unreachable there: the chord must vanish
-        // from the baseline row (Rendered and Raw alike) while every other
-        // baseline entry stays put.
         for mode in [Mode::Rendered, Mode::Raw] {
             let mut st = state("hello");
             st.mode = mode;
@@ -1519,7 +1254,6 @@ mod tests {
 
     #[test]
     fn nav_hint_leads_preview_row() {
-        // Preview is browse mode — history navigation leads the row.
         let st = state("hello");
         let set = hint_line_for(
             &st,
@@ -1539,9 +1273,6 @@ mod tests {
 
     #[test]
     fn nav_hint_trails_link_and_toggle() {
-        // On a task line that also holds a link, the narrower Link /
-        // Toggle hints lead and Back/fwd trails them, still ahead of the
-        // baseline row.
         let mut st = state("- [ ] see [docs](https://example.com)\n");
         st.mode = Mode::Rendered;
         st.cursor.offset = 14; // inside "docs"
@@ -1580,10 +1311,6 @@ mod tests {
         st.mode = Mode::Rendered;
         let search = SearchState::new("foo".to_owned(), None).unwrap();
         st.enter_search(search);
-        // An active search replaces the whole row with the flow chords +
-        // match counter — under vim too, since `hint_line_for` no longer
-        // branches on the sub-mode (the App passes the same editor state
-        // either way).
         let set = hint_line_for(&st, &keymap(), HintCtx::default());
         assert!(set.search_match.is_some(), "match counter must lead");
         assert!(set.chords.iter().any(|c| c.label == "Next"));
@@ -1679,7 +1406,6 @@ mod tests {
             },
         );
         assert!(out.contains("Copied"), "out: {out}");
-        // Chords shouldn't bleed through.
         assert!(!out.contains("Save"), "out: {out}");
     }
 

@@ -1,25 +1,16 @@
-//! Static row table for the settings overlay.
-//!
-//! Each row carries a label, an optional description, and a [`RowKind`]
-//! whose function-pointer fields tell the overlay how to read, write, and
-//! cycle the underlying config field.  Pulling the table out of
-//! `settings_overlay.rs` keeps the parent file focused on widget
-//! plumbing — adding a new setting only touches this file.
+//! Static row table for the settings overlay.  Each row carries a label, an optional description,
+//! and a [`RowKind`] whose function pointers tell the overlay how to read, write, and cycle the
+//! underlying config field.  Adding a setting should only touch this file.
 
 use crate::config::sections::{DEFAULT_HANDLER, MAX_WIDTH_COLS_MIN, VIM_HANDLER};
 use crate::config::{Config, DiagramsEnabled, ImagesEnabled, RemoteImagePolicy};
 use crate::ui::controls;
 
-/// Row labels for the settings overlay, exported as constants so the
-/// App-level live-update wiring in `app/modal/settings.rs` and the
-/// row table here can't drift out of sync on a copy change.  Only
-/// labels that are referenced from outside this module need a
-/// constant; the rest stay as inline string literals.
+/// Labels referenced from outside this module are constants so the App-level live-update wiring in
+/// `app/modal/settings.rs` can't drift from the row table on a copy change.
 ///
-/// Explanatory header rendered as a styled note above the rows.
-/// Non-focusable; identified in `build_row_lines` by string equality
-/// against this constant so it can be rendered without the usual
-/// label/value formatting.
+/// This one is the non-focusable header note, matched by string equality in `build_row_lines` so it
+/// renders without the usual label/value formatting.
 pub(crate) const HEADER_NOTE: &str = "Common options shown below — all others in config.toml";
 
 pub(crate) const LABEL_BIG_H1: &str = "Big H1 headings";
@@ -38,19 +29,15 @@ pub(crate) const LABEL_DIFF_ON_CHANGE: &str = "Diff when file changes";
 pub(crate) const LABEL_TABLE_BUTTONS: &str = "Show table buttons";
 pub(crate) const LABEL_CHECK_UPDATES: &str = "Check for updates";
 
-/// Minimum accepted value for [`LABEL_SCROLL_SPEED`].  The
-/// dispatcher additionally clamps zero to one as a safety net, but
-/// rejecting at the input boundary keeps the persisted value and
-/// the live wheel_step in agreement.
+/// Minimum accepted value for [`LABEL_SCROLL_SPEED`].  Rejecting at the input boundary (rather
+/// than relying on the dispatcher's clamp) keeps the persisted value and the live wheel step equal.
 const MOUSE_SCROLL_LINES_MIN: usize = 1;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum RowAction {
     /// "Open config.toml in editor" sentinel.
     OpenExternalEditor,
-    /// "Open Config folder" sentinel — fires the `OpenConfigFolder`
-    /// action via the OS file manager (`xdg-open` on Linux,
-    /// `open` on macOS, `explorer` on Windows).
+    /// "Open config folder" sentinel — hands the path to the OS file manager.
     OpenConfigFolder,
     /// Enter cycles the value (boolean toggle / enum advance).
     Cycle,
@@ -58,13 +45,10 @@ pub(super) enum RowAction {
     Edit,
 }
 
-/// `(config) -> ControlValue`: read an option row's current value as a
-/// normalized [`controls::ControlValue`] for the shared transition layer.
-/// Aliased so the `Option<…>` fields below stay under clippy's
-/// type-complexity threshold.
+/// Read an option row's current value as a normalized [`controls::ControlValue`].  Aliased to keep
+/// the `Option<…>` fields below under clippy's type-complexity threshold.
 pub(super) type ReadValueFn = fn(&Config) -> controls::ControlValue;
-/// `(config, ControlValue)`: write back the value produced by
-/// [`controls::Control::apply`] on an option row.
+/// Write back the value [`controls::Control::apply`] produced for an option row.
 pub(super) type WriteValueFn = fn(&mut Config, controls::ControlValue);
 
 pub(super) struct RowKind {
@@ -72,32 +56,20 @@ pub(super) struct RowKind {
     pub(super) action: RowAction,
     pub(super) read: fn(&Config, &[String]) -> String,
     pub(super) write_string: fn(&mut Config, &str) -> Result<(), String>,
-    /// Read the focused row's current value / write a new value as a
-    /// normalized [`controls::ControlValue`].  `Some` on option rows
-    /// (toggle / pill); `None` on numeric (edit), button, and display-only
-    /// rows.  The overlay's input path reads the current value, runs it
-    /// through [`controls::Control::apply`], and writes back the result —
-    /// so the toggle-flip / pill-cycle math lives in `controls`, not here.
+    /// Read / write the row's value as a [`controls::ControlValue`].  `Some` on option rows
+    /// (toggle / pill), `None` on numeric, button, and display-only rows.  The input path routes
+    /// the value through [`controls::Control::apply`], so the cycle math lives in `controls`.
     pub(super) read_value: Option<ReadValueFn>,
     pub(super) write_value: Option<WriteValueFn>,
-    /// Control spec for option-style rows: booleans use
-    /// [`controls::Control::Toggle`] (the on/off slider) and tri-states use
-    /// [`controls::Control::Pill`] over [`controls::ASK_ALWAYS_NEVER`].
-    /// When `Some`, the overlay renders the *current* value as that control
-    /// (a toggle reads `on`/`off`; a pill matches `read(..)` against its
-    /// labels).  When `None`, the row is a single-value display instead
-    /// (numeric / path / external-action rows).
+    /// Control spec for option-style rows: booleans use [`controls::Control::Toggle`], tri-states
+    /// [`controls::Control::Pill`].  `None` renders the row as a single-value display.
     pub(super) options: Option<controls::Control>,
-    /// When `Some` and the fn returns true for the current config, the
-    /// row is rendered inert (dimmed label + pills) and skipped by focus
-    /// navigation / cycling.  Used by the remote-images row, which the
-    /// images-`Never` cascade locks to `Never` (mirrors the welcome
-    /// modal's cascade — see `ui::welcome`).
+    /// When it returns true, the row renders inert and focus navigation skips it.  Used by the
+    /// remote-images row, which the images-`Never` cascade locks (mirroring `ui::welcome`).
     pub(super) disabled: Option<fn(&Config) -> bool>,
 }
 
-/// Display string for a boolean setting.  `"on"` is the enabled state, so
-/// the [`controls::Control::Toggle`] slider reads it as on.
+/// Display string for a boolean setting; the [`controls::Control::Toggle`] slider reads `"on"`.
 fn bool_label(value: bool) -> &'static str {
     if value {
         "on"
@@ -106,24 +78,19 @@ fn bool_label(value: bool) -> &'static str {
     }
 }
 
-/// Static table of rows.  `read` formats the field's current value
-/// for display; `cycle` is `Some` for fields whose value cycles on
-/// Left/Right or Enter (booleans, enum-valued fields, theme name);
-/// `write_string` handles the inline-editor confirm path.
+/// One settings row.  `read` formats the current value for display; `write_string` handles the
+/// inline-editor confirm path.
 pub(super) struct RowDef {
     pub(super) label: &'static str,
     pub(super) description: Option<&'static str>,
-    /// Dynamic description override.  When `Some`, it is formatted from
-    /// live config and takes precedence over `description` — used to
-    /// embed a file-only numeric value (e.g. the blink cadence) in the
-    /// pinned footer copy.  Most rows leave this `None`.
+    /// Dynamic description, formatted from live config and taking precedence over `description` —
+    /// used to embed a file-only numeric value (e.g. the blink cadence) in the footer copy.
     pub(super) describe: Option<fn(&Config) -> String>,
     pub(super) kind: RowKind,
 }
 
 impl RowDef {
-    /// Resolve the row's footer description for the given config —
-    /// dynamic (`describe`) when present, else the static string.
+    /// Footer description for `config`: dynamic when present, else the static string.
     pub(super) fn resolved_description(&self, config: &Config) -> Option<String> {
         match self.describe {
             Some(f) => Some(f(config)),
@@ -136,8 +103,7 @@ impl RowDef {
         self.kind.disabled.map(|f| f(config)).unwrap_or(false)
     }
 
-    /// Whether focus may land on this row right now: focusable in
-    /// principle and not currently disabled.
+    /// Whether focus may land on this row right now.
     pub(super) fn focus_eligible(&self, config: &Config) -> bool {
         self.kind.focusable && !self.is_disabled(config)
     }
@@ -147,9 +113,7 @@ fn no_write(_: &mut Config, _: &str) -> Result<(), String> {
     Err("row is not editable in place".to_owned())
 }
 
-/// Build a non-focusable display-only row.  Used for the explanatory
-/// header note and blank dividers — anything that participates in the
-/// row list for layout but never takes focus or fires an action.
+/// A non-focusable display-only row: the header note and blank dividers.
 fn display_only_row(label: &'static str) -> RowDef {
     RowDef {
         label,
@@ -192,16 +156,12 @@ const REMOTE_POLICY_ORDER: &[RemoteImagePolicy] = &[
     RemoteImagePolicy::Never,
 ];
 
-/// Index of `value` within its ordered enum table — the
-/// [`controls::ControlValue::Choice`] index fed through
-/// [`controls::Control::apply`].  Falls back to 0 for an absent value
-/// (unreachable for the tri-states, which list every variant).
+/// Index of `value` in its ordered enum table — the [`controls::ControlValue::Choice`] index.
 fn order_index<T: PartialEq>(order: &[T], value: T) -> usize {
     order.iter().position(|v| *v == value).unwrap_or(0)
 }
 
-/// Inverse of [`order_index`]: the value at `i`, clamped to the last entry
-/// for an out-of-range index (the pill only ever yields `0..len`).
+/// Inverse of [`order_index`], clamped to the last entry for an out-of-range index.
 fn order_value<T: Copy>(order: &[T], i: usize) -> T {
     order[i.min(order.len().saturating_sub(1))]
 }
@@ -257,9 +217,7 @@ fn parse_remote_policy(s: &str) -> Result<RemoteImagePolicy, String> {
     }
 }
 
-/// Build the static row table.  Order is the user-facing display
-/// order; nothing else depends on it.  See [`crate::config::Config`]
-/// for each field's persistence semantics.
+/// Build the static row table.  Order is the user-facing display order; nothing else depends on it.
 pub(super) fn build_rows() -> Vec<RowDef> {
     vec![
         display_only_row(HEADER_NOTE),
@@ -271,8 +229,7 @@ pub(super) fn build_rows() -> Vec<RowDef> {
             kind: RowKind {
                 focusable: true,
                 action: RowAction::OpenConfigFolder,
-                // The folder path is not shown (it can be long); the
-                // `[ Open ]` button is the affordance.
+                // The path can be long, so the `[ Open ]` button is the only affordance.
                 read: |_, _| String::new(),
                 write_string: no_write,
                 read_value: None,
@@ -296,14 +253,10 @@ pub(super) fn build_rows() -> Vec<RowDef> {
                 disabled: None,
             },
         },
-        // Blank divider — sets the "open externally" pair apart
-        // from the editable settings beneath.  Non-focusable so
-        // arrow-key navigation skips it; the View renders an empty
-        // line for any non-focusable row with an empty label.
+        // Blank divider setting the "open externally" pair apart from the editable settings.
         display_only_row(""),
-        // ── Editable settings, alphabetical by label, except
-        //    `Show line numbers` sits below the two image-visibility
-        //    rows so the image group stays contiguous ──
+        // ── Editable settings, alphabetical by label, except `Show line numbers`, which sits
+        //    below the image-visibility rows so the image group stays contiguous ──
         RowDef {
             label: LABEL_AUTOSAVE,
             description: Some("\nAutomatically save changes when idle"),
@@ -446,8 +399,7 @@ pub(super) fn build_rows() -> Vec<RowDef> {
         },
         RowDef {
             label: LABEL_DIFF_ON_CHANGE,
-            // Two-line footer description: the on/off meanings differ enough
-            // to spell out separately.  Split on `\n` by the footer renderer.
+            // Two-line footer: the on/off meanings differ enough to spell out separately.
             description: Some(
                 "On: Review external changes hunk by hunk\n\
                  Off: Silently reload a clean buffer",
@@ -546,8 +498,7 @@ pub(super) fn build_rows() -> Vec<RowDef> {
                     }
                 }),
                 options: Some(controls::Control::Pill(controls::ASK_ALWAYS_NEVER)),
-                // Locked to Never (and skipped by focus) while images are
-                // off — mirrors the welcome modal's images→remote cascade.
+                // Locked while images are off — mirrors the welcome modal's cascade.
                 disabled: Some(|c| matches!(c.images.enabled, ImagesEnabled::Never)),
             },
         },
@@ -634,11 +585,8 @@ pub(super) fn build_rows() -> Vec<RowDef> {
             kind: RowKind {
                 focusable: true,
                 action: RowAction::Cycle,
-                // Vim mode is stored as the modal handler name, not a
-                // bool — `read`/`cycle` translate between the
-                // `true`/`false` pills and `config.modal.handler`.  The
-                // App-level live-update arm rebuilds the VimState so the
-                // toggle takes effect without a restart.
+                // Vim mode is stored as the modal handler name, not a bool, so these translate
+                // between the pills and `config.modal.handler`.
                 read: |c, _| bool_label(c.modal.handler == VIM_HANDLER).to_owned(),
                 write_string: no_write,
                 read_value: Some(|c| {

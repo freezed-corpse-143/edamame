@@ -1,12 +1,9 @@
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 
-/// Deserializes a color from TOML.  Accepts either:
-///   * a string (`"magenta"`, `"#ff00aa"`, `"236"`)  — via ratatui's `Color`
-///   * a bare integer (`236`)                        — as `Color::Indexed`
-///
-/// Both shapes exist because TOML distinguishes strings and integers, and
-/// forcing users to quote `236` when they mean "palette index 236" is awkward.
+/// A color read from TOML: either a string (`"magenta"`, `"#ff00aa"`, `"236"`) parsed by
+/// ratatui's `Color`, or a bare integer treated as a palette index — TOML distinguishes the
+/// two, and quoting `236` to mean "palette index 236" would be awkward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ColorField {

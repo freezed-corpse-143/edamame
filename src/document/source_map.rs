@@ -1,62 +1,31 @@
 use std::ops::Range;
 
-/// Maps rendered visual lines to their source byte ranges, enabling the hybrid
-/// rendered/raw editing view.
+/// Maps rendered lines to the source blocks that produced them and back, for the hybrid
+/// rendered/raw editing view (see `docs/dev/editing-model.md`).
 ///
-/// # How it is built
-///
-/// The renderer produces one rendered line per block element (headings,
-/// paragraphs, etc.). The [`crate::markdown::parse_offsets`] module provides
-/// the byte range of each top-level block. Pairing these gives: for rendered
-/// line `i`, the source byte range `entries[i]`.
-///
-/// Gaps between blocks (blank lines in the source) are absorbed into the
-/// adjacent block's *extended* range by `ParsedDoc`'s `build_extended_ranges`
-/// pass, so every source byte is covered by exactly one rendered line.
-/// (This used to live in a `parse_offsets::covering_ranges` helper; that
-/// function is gone and must not come back for the cursor mapping — see
-/// the "Hybrid editing model" notes in AGENTS.md.)
-///
-/// # Key operations
-///
-/// - Given a cursor char offset → byte offset → find which rendered line(s)
-///   correspond to the same source block.
-/// - Given a source block → find all rendered lines it produced.
+/// Block byte ranges come from [`crate::markdown::parse_offsets`]; `ParsedDoc` extends them so
+/// blank-line gaps are absorbed and every source byte belongs to exactly one block.
 #[derive(Debug, Clone, Default)]
 pub struct SourceMap {
-    /// For each rendered line: the block index that produced it.
-    /// `rendered_to_block[i]` = which block (0-indexed) generated rendered line i.
+    /// Per rendered line, the block index that produced it.
     rendered_to_block: Vec<usize>,
 
-    /// For each block: the *extended* byte range (covering gaps) that this
-    /// block "owns". Used for cursor-to-block lookup.
+    /// Per block, the gap-covering byte range used for cursor → block lookup.
     extended_ranges: Vec<Range<usize>>,
 
-    /// For each block: the *original* byte range from pulldown-cmark (used to
-    /// extract raw source text for editing).
+    /// Per block, the exact pulldown-cmark byte range, used to extract raw source for editing.
     original_ranges: Vec<Range<usize>>,
 
-    /// Precomputed `block_idx → rendered-line Range` lookup.  Mirrors the
-    /// answer `rendered_lines_for_block` used to compute via two
-    /// O(n) scans of `rendered_to_block`; storing the ranges once at
-    /// construction turns the query into O(1).  Blocks that produced
-    /// no rendered lines (empty list items, collapsed blanks) inherit
-    /// the nearest neighbour's range — same fallback semantics the
-    /// uncached version used.
+    /// Per block, its rendered-line range, precomputed so the query is O(1). Blocks that produced
+    /// no rendered lines inherit the nearest neighbor's range so the result is never empty.
     block_to_rendered_range: Vec<Range<usize>>,
 
-    /// Total source bytes (for proptest assertions in `tests/source_map.rs`).
+    /// Total source bytes, for proptest assertions in `tests/source_map.rs`.
     #[allow(dead_code)]
     pub total_bytes: usize,
 }
 
 impl SourceMap {
-    /// Construct a SourceMap.
-    ///
-    /// - `rendered_to_block`: per rendered line, which block produced it.
-    /// - `extended_ranges`: per block, the extended range (covering gaps).
-    /// - `original_ranges`: per block, the exact pulldown-cmark byte range.
-    /// - `total_bytes`: length of the source string in bytes.
     pub fn new(
         rendered_to_block: Vec<usize>,
         extended_ranges: Vec<Range<usize>>,
@@ -74,14 +43,12 @@ impl SourceMap {
         }
     }
 
-    /// Find the block index that "owns" `byte_offset` (using extended ranges).
-    ///
-    /// Returns `None` only for empty documents (no blocks).
+    /// Block whose extended range owns `byte_offset`; the last block for an offset at or past
+    /// the end. `None` only for an empty document.
     pub fn block_for_byte(&self, byte_offset: usize) -> Option<usize> {
         self.extended_ranges
             .iter()
             .position(|r| r.start <= byte_offset && byte_offset < r.end)
-            // If not found (e.g. byte == total_bytes at exact end), return the last block.
             .or_else(|| {
                 if !self.extended_ranges.is_empty() {
                     Some(self.extended_ranges.len() - 1)
@@ -91,12 +58,8 @@ impl SourceMap {
             })
     }
 
-    /// Return the range of rendered line indices produced by `block_idx`.
-    ///
-    /// The range is `start..end` (exclusive end). If the block produced no
-    /// rendered lines (e.g. an empty list item before the renderer fix), the
-    /// precomputed table returns the nearest adjacent block's lines to
-    /// guarantee a non-empty range. O(1) — the work happens once in `new`.
+    /// Rendered-line range produced by `block_idx`; never empty for a known block (see
+    /// `block_to_rendered_range`).
     pub fn rendered_lines_for_block(&self, block_idx: usize) -> Range<usize> {
         self.block_to_rendered_range
             .get(block_idx)
@@ -104,8 +67,7 @@ impl SourceMap {
             .unwrap_or(0..0)
     }
 
-    /// Return all rendered line indices produced by the block that contains
-    /// `byte_offset`, as a contiguous `Range`. Returns `0..0` for empty maps.
+    /// Rendered-line range of the block containing `byte_offset`; `0..0` for an empty map.
     pub fn rendered_lines_for_byte(&self, byte_offset: usize) -> Range<usize> {
         match self.block_for_byte(byte_offset) {
             Some(block_idx) => self.rendered_lines_for_block(block_idx),
@@ -113,46 +75,36 @@ impl SourceMap {
         }
     }
 
-    /// Return the **original** (not extended) byte range of the block that
-    /// contains `byte_offset`. Used to extract raw source text for editing.
+    /// Original (not extended) byte range of the block containing `byte_offset`.
     pub fn original_range_for_byte(&self, byte_offset: usize) -> Option<Range<usize>> {
         let block = self.block_for_byte(byte_offset)?;
         self.original_ranges.get(block).cloned()
     }
 
-    /// Total number of rendered lines tracked by this map.
     pub fn rendered_line_count(&self) -> usize {
         self.rendered_to_block.len()
     }
 
-    /// Total number of blocks — including the virtual one synthesised per
-    /// blank line, so this index space is the source map's own and never
-    /// `ParsedDoc::blocks`'.  Bounds the block walk in
-    /// `editor::state_source_lines`.
+    /// Block count *including* the virtual block per blank line — this index space is the source
+    /// map's own, never `ParsedDoc::blocks`'.
     pub fn block_count(&self) -> usize {
         self.extended_ranges.len()
     }
 
-    /// Return the original byte range start for the block that contains
-    /// `rendered_line`. Used to sync the cursor to the scroll position when
-    /// entering edit mode from preview mode.
+    /// Original byte-range start of the block that produced `rendered_line`.
     pub fn original_byte_for_rendered_line(&self, rendered_line: usize) -> Option<usize> {
         let block_idx = *self.rendered_to_block.get(rendered_line)?;
         self.original_ranges.get(block_idx).map(|r| r.start)
     }
 
-    /// Return the original byte range for `block_idx`, or `None` if the
-    /// index is out of range.  Symmetric with `rendered_lines_for_block`.
+    /// Original byte range of `block_idx`, `None` when out of range.
     pub fn original_range_for_block(&self, block_idx: usize) -> Option<Range<usize>> {
         self.original_ranges.get(block_idx).cloned()
     }
 }
 
-/// Precompute the per-block rendered-line range table.  Single pass
-/// over `rendered_to_block` records start / end per block; a second
-/// pass fills empty-range slots from the nearest neighbour so the
-/// fallback semantics of the old O(n) scan (always return a
-/// non-empty range when at least one line exists) are preserved.
+/// Build the per-block rendered-line table; blocks with no rendered lines borrow one line from
+/// the nearest following (else preceding) block so every range is non-empty when any line exists.
 fn build_block_to_rendered_range(
     rendered_to_block: &[usize],
     block_count: usize,
@@ -174,10 +126,6 @@ fn build_block_to_rendered_range(
     if n == 0 {
         return ranges;
     }
-    // Fallback: blocks that produced no rendered lines inherit the
-    // nearest subsequent-then-preceding neighbour's range.  Matches
-    // the old uncached fallback so callers observe no behavioural
-    // change.
     for i in 0..block_count {
         if !seen[i] {
             let mut fallback: Option<Range<usize>> = None;
@@ -211,7 +159,6 @@ fn build_block_to_rendered_range(
 mod tests {
     use super::*;
 
-    /// Build a simple SourceMap with one block owning rendered lines 0..n_lines.
     fn single_block_map(n_lines: usize, byte_len: usize) -> SourceMap {
         SourceMap::new(
             vec![0usize; n_lines],
@@ -269,23 +216,18 @@ mod tests {
             vec![0..10, 10..20],
             20,
         );
-        assert_eq!(map.rendered_lines_for_byte(5), 0..2); // in block 0
-        assert_eq!(map.rendered_lines_for_byte(12), 2..5); // in block 1
+        assert_eq!(map.rendered_lines_for_byte(5), 0..2);
+        assert_eq!(map.rendered_lines_for_byte(12), 2..5);
     }
 
     #[test]
     fn original_range_for_byte() {
-        let map = SourceMap::new(
-            vec![0, 1],
-            vec![0..10, 10..20], // extended (no gaps here)
-            vec![2..9, 11..19],  // original ranges (smaller)
-            20,
-        );
+        let map = SourceMap::new(vec![0, 1], vec![0..10, 10..20], vec![2..9, 11..19], 20);
         assert_eq!(map.original_range_for_byte(5), Some(2..9));
         assert_eq!(map.original_range_for_byte(15), Some(11..19));
     }
 
-    // ── Proptest-style invariant checks (deterministic) ───────────────────────
+    // ── Coverage invariants ───────────────────────────────────────────────────
 
     #[test]
     fn every_byte_maps_to_some_line_single_block() {

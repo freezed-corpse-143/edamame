@@ -1,10 +1,6 @@
-//! Command-line buffer editing for the `:` / `/` / `?` prompts.
-//!
-//! A small, view-agnostic text field: it owns only the editing of a
-//! [`CmdLineState`] (insert, backspace, cursor moves) and reports a
-//! [`CmdLineStep`] back to `vim_feed`, which decides what a submitted
-//! line means (a search query, an ex command, …).  First needed by CP8's
-//! `/` / `?` search; CP9 reuses it for `:`.
+//! Command-line buffer editing for the `:` / `/` / `?` prompts: a view-agnostic text field
+//! over [`CmdLineState`] that reports a [`CmdLineStep`] to `vim_feed`, which decides what a
+//! submitted line means.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -13,9 +9,8 @@ use super::state::CmdLineState;
 /// What feeding one key to the command line decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CmdLineStep {
-    /// Still editing — redraw the prompt, keep capturing keys.
     Editing,
-    /// `Enter`: submit the typed text (which may be empty).
+    /// `Enter`; the text may be empty.
     Submit(String),
     /// `Esc`, or `Backspace` past the start — close the prompt with no action.
     Cancel,
@@ -28,9 +23,7 @@ pub fn feed_key(cl: &mut CmdLineState, key: KeyEvent) -> CmdLineStep {
         KeyCode::Esc => CmdLineStep::Cancel,
         KeyCode::Backspace => {
             if cl.cursor == 0 {
-                // Backspace with nothing before the cursor closes the prompt
-                // when the line is empty (vim closes the `/` on the last
-                // backspace); otherwise it is a no-op.
+                // vim closes the prompt on backspace over an empty line.
                 if cl.input.is_empty() {
                     return CmdLineStep::Cancel;
                 }
@@ -57,8 +50,6 @@ pub fn feed_key(cl: &mut CmdLineState, key: KeyEvent) -> CmdLineStep {
             cl.cursor = cl.input.chars().count();
             CmdLineStep::Editing
         }
-        // A printable char (no `Ctrl`/`Alt`/`Super` chord) is inserted at the
-        // cursor.  `Shift` is fine — it just gives an uppercase letter.
         KeyCode::Char(c)
             if !key
                 .modifiers
@@ -69,17 +60,13 @@ pub fn feed_key(cl: &mut CmdLineState, key: KeyEvent) -> CmdLineStep {
             cl.cursor += 1;
             CmdLineStep::Editing
         }
-        // Anything else (a `Ctrl-*` chord, a function key, …) is ignored so
-        // the prompt keeps capturing until an explicit submit/cancel.
+        // Chords and function keys are swallowed so the prompt keeps capturing.
         _ => CmdLineStep::Editing,
     }
 }
 
-/// Recall the previous (older) entry of `history` into the prompt. The first
-/// step back stashes the live draft (so [`history_next`] can restore it) and
-/// jumps to the newest entry; further steps walk toward older entries and stop
-/// at the oldest. A no-op when `history` is empty. The cursor lands at the end
-/// of the recalled line, as in vim.
+/// Recall the next-older `history` entry. The first step stashes the live draft (restored
+/// by [`history_next`]) and jumps to the newest entry; walking stops at the oldest.
 pub fn history_prev(cl: &mut CmdLineState, history: &[String]) {
     if history.is_empty() {
         return;
@@ -96,9 +83,7 @@ pub fn history_prev(cl: &mut CmdLineState, history: &[String]) {
     set_input(cl, history[idx].clone());
 }
 
-/// Step toward newer entries of `history`. Stepping past the newest entry ends
-/// the recall and restores the stashed draft. A no-op when not currently
-/// browsing history.
+/// Step toward newer entries; past the newest, end the recall and restore the draft.
 pub fn history_next(cl: &mut CmdLineState, history: &[String]) {
     let Some(idx) = cl.history_idx else {
         return;
@@ -113,23 +98,14 @@ pub fn history_next(cl: &mut CmdLineState, history: &[String]) {
     }
 }
 
-/// Replace the prompt text and park the cursor at its end.
 fn set_input(cl: &mut CmdLineState, text: String) {
     cl.cursor = text.chars().count();
     cl.input = text;
 }
 
-/// Insert pasted `text` at the cursor (a bracketed paste into an open
-/// `/` `?` `:` prompt).  The command line is a single line, so a
-/// multi-line paste would otherwise corrupt it (this is also what
-/// triggered the buffer-paste panic before paste was routed here).
-///
-/// On a **search** prompt the payload is escaped first, so a pasted
-/// multi-line snippet becomes a working `\n`-joined query rather than
-/// silently losing its breaks — search queries are written in escape
-/// syntax (`search::escape`).  An `:` prompt is an ex command, not a
-/// search term, so it keeps the plain strip.  Either way the loop below
-/// drops any break the transform didn't consume.
+/// Insert a bracketed paste at the cursor. On a search prompt the payload is escaped first
+/// (`search::escape`) so a multi-line snippet becomes a `\n`-joined query; on `:` it is an
+/// ex command and keeps the plain strip. Any surviving line break is dropped.
 pub fn paste_str(cl: &mut CmdLineState, text: &str) {
     let escaped;
     let text = if cl.kind.is_search() {
@@ -194,7 +170,6 @@ mod tests {
         let bs = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
         assert_eq!(feed_key(&mut s, bs), CmdLineStep::Editing);
         assert_eq!(s.input, "");
-        // Backspace on the now-empty line closes the prompt.
         assert_eq!(feed_key(&mut s, bs), CmdLineStep::Cancel);
     }
 
@@ -215,30 +190,25 @@ mod tests {
         let history = vec!["w".to_owned(), "q".to_owned(), "wq".to_owned()];
         let mut s = cl();
         feed_key(&mut s, ch('a'));
-        // First Up stashes the half-typed draft and jumps to the newest entry.
         history_prev(&mut s, &history);
         assert_eq!(s.draft, "a");
         assert_eq!(s.input, "wq");
         assert_eq!(s.cursor, 2);
         assert_eq!(s.history_idx, Some(2));
-        // Walk to the oldest, then stay put at the boundary.
         history_prev(&mut s, &history);
         history_prev(&mut s, &history);
         assert_eq!(s.input, "w");
         assert_eq!(s.history_idx, Some(0));
-        history_prev(&mut s, &history); // already oldest — no-op
+        history_prev(&mut s, &history);
         assert_eq!(s.input, "w");
-        // Down steps back toward newer entries…
         history_next(&mut s, &history);
         assert_eq!(s.input, "q");
         history_next(&mut s, &history);
         assert_eq!(s.input, "wq");
-        // …and Down past the newest restores the original draft.
         history_next(&mut s, &history);
         assert_eq!(s.input, "a");
         assert_eq!(s.cursor, 1);
         assert_eq!(s.history_idx, None);
-        // Down with no recall active is a no-op.
         history_next(&mut s, &history);
         assert_eq!(s.input, "a");
     }

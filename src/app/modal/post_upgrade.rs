@@ -1,19 +1,13 @@
 //! Post-upgrade notice: edamame was updated, here is what changed.
 //!
-//! Two entry points, one body.  [`PostUpgradeModal::for_upgrade`] is
-//! the once-per-upgrade startup notice `App::new` builds, and returns
-//! `None` when the installed version has no changelog section — the
-//! startup path stays silent rather than raising a modal with nothing
-//! in it.  [`PostUpgradeModal::on_demand`] is the About page's
-//! `[ Release notes ]` button, and always builds: an explicit request
-//! is answered even when the answer is "there aren't any", the same
-//! split [`super::update`] draws between the silent startup check and
-//! the explicit one.
+//! Two entry points, one body.  [`PostUpgradeModal::for_upgrade`] is the startup notice and returns
+//! `None` when the installed version has no changelog section, so the startup path stays silent
+//! rather than raising an empty modal.  [`PostUpgradeModal::on_demand`] is the About page's button
+//! and always builds — an explicit request is answered even when the answer is "there aren't any",
+//! the same split [`super::update`] draws.
 //!
-//! Simpler than that modal in every other respect: the content is a
-//! compiled-in string, so nothing animates, nothing arrives later, and
-//! there is no button to press — hence no `next_deadline`, no
-//! `set_status`, and an empty button slice.
+//! The content is a compiled-in string, so nothing animates and nothing arrives later: no
+//! `next_deadline`, no `set_status`, no buttons.
 
 use std::any::Any;
 
@@ -31,20 +25,17 @@ use crate::ui::{ModalResponse, PROSE_CONTENT_WIDTH};
 
 pub struct PostUpgradeModal {
     chrome: ModalChrome,
-    /// `None` means the installed version has no changelog section —
-    /// distinct from `Some(vec![])`, a section that exists but says
-    /// nothing.  Only the first is worth reporting as an absence.
+    /// `None` means no changelog section for this version, distinct from `Some(vec![])`, a section
+    /// that exists and says nothing.  Only the first is reported as an absence.
     notes: Option<Vec<String>>,
-    /// Which entry point built this one.  The body's opening line is
-    /// the only thing it decides — see [`PostUpgradeOccasion`] — but it
-    /// has to be carried on the modal, because `render` is the first
-    /// place the two paths meet again.
+    /// Which entry point built this.  It decides only the body's opening line, but must live on the
+    /// modal because `render` is where the two paths meet again.
     occasion: PostUpgradeOccasion,
 }
 
 impl PostUpgradeModal {
-    /// The startup notice.  `None` when there is nothing to show, so
-    /// the caller has no "should I?" test of its own to get wrong.
+    /// The startup notice; `None` when there is nothing to show, so the caller needs no test of
+    /// its own.
     pub(crate) fn for_upgrade() -> Option<Self> {
         Some(Self::new(
             Some(changelog::notes_for_version(INSTALLED_VERSION)?),
@@ -52,8 +43,7 @@ impl PostUpgradeModal {
         ))
     }
 
-    /// The About page's on-demand opening, which always has something
-    /// to say even if that something is "no notes are bundled".
+    /// The About page's opening, which always has something to say.
     pub(crate) fn on_demand() -> Self {
         Self::new(
             changelog::notes_for_version(INSTALLED_VERSION),
@@ -63,9 +53,8 @@ impl PostUpgradeModal {
 
     fn new(notes: Option<Vec<String>>, occasion: PostUpgradeOccasion) -> Self {
         Self {
-            // Prose body, so the content width is capped — an
-            // unwrapped-longest-line sizing would stretch the modal
-            // across the terminal.  Same reasoning as `UpdateModal`.
+            // Prose, so the width is capped: longest-line sizing would stretch it across the
+            // terminal.  Same as `UpdateModal`.
             chrome: ModalChrome::new(ModalKind::Normal, true)
                 .with_max_content_width(PROSE_CONTENT_WIDTH),
             notes,
@@ -73,8 +62,7 @@ impl PostUpgradeModal {
         }
     }
 
-    /// Map onto the `ui` layer's own vocabulary — the translation that
-    /// keeps `ui::update_check` free of any `app` import.
+    /// Translate into the `ui` layer's vocabulary, keeping `ui::update_check` free of `app`.
     fn report(&self) -> PostUpgradeReport<'_> {
         match &self.notes {
             Some(notes) => PostUpgradeReport::Found { notes },
@@ -82,9 +70,7 @@ impl PostUpgradeModal {
         }
     }
 
-    /// Shared by the key and click paths so mouse and keyboard can't
-    /// diverge.  There are no buttons, so every response that isn't a
-    /// scroll closes.
+    /// Shared by the key and click paths.  With no buttons, everything but a scroll closes.
     fn resolve(response: ModalResponse) -> ModalOutcome {
         match response {
             ModalResponse::Continue => ModalOutcome::Continue,
@@ -170,8 +156,7 @@ mod tests {
 
     #[test]
     fn enter_does_nothing_since_there_is_nothing_to_press() {
-        // The button-less shape `NoticeModal` established: with no
-        // footer row, Enter has no target and Esc is the way out.
+        // `NoticeModal`'s button-less shape: no footer row, so Esc is the way out.
         let mut app = make_app();
         let mut modal = with_notes();
         assert!(matches!(
@@ -182,9 +167,6 @@ mod tests {
 
     #[test]
     fn a_missing_section_and_an_empty_one_are_different_states() {
-        // `None` is "this version has no entry"; `Some(vec![])` is "it
-        // has one and it is empty".  Only the first is reported as an
-        // absence, so the two must not be collapsed.
         assert!(matches!(
             PostUpgradeModal::new(None, PostUpgradeOccasion::OnDemand).report(),
             PostUpgradeReport::NotFound
@@ -197,9 +179,7 @@ mod tests {
 
     #[test]
     fn the_on_demand_opening_always_builds_a_modal() {
-        // Whatever the bundled changelog happens to say about the
-        // version under test — including nothing at all, which is the
-        // normal state between releases.
+        // Including when the bundled changelog says nothing, the normal state between releases.
         let modal = PostUpgradeModal::on_demand();
         assert!(modal.dismissable());
         assert_eq!(modal.kind(), ModalKind::Normal);
@@ -207,9 +187,7 @@ mod tests {
 
     #[test]
     fn each_entry_point_carries_its_own_occasion() {
-        // The About page's opening must not announce an upgrade, and
-        // the startup notice must; the body is otherwise identical, so
-        // this field is the whole difference between them.
+        // The About page's opening must not announce an upgrade; the startup notice must.
         assert_eq!(
             PostUpgradeModal::on_demand().occasion,
             PostUpgradeOccasion::OnDemand

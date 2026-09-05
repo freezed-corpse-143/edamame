@@ -1,24 +1,11 @@
 //! Raw-source hit-testing for footnote references and definitions.
 //!
-//! A click or keyboard-follow lands on a rope byte; this module scans the
-//! enclosing source line for `[^label]` syntax and classifies the hit:
-//!   * `[^label]` (not followed by `:`) → [`LinkTarget::Footnote`] — jump
-//!     to the matching definition.
-//!   * `[^label]:` (a definition leader) → [`LinkTarget::FootnoteBack`] —
-//!     return to the reference.
-//!
-//! The classification is deliberately a raw scan (no AST), mirroring
-//! [`super::links::link_at_offset`].  It serves both input paths: the
-//! keyboard `FollowLinkUnderCursor` handler and the mouse click path.  A
-//! click on the rendered definition's `  N.  ` leader maps, via the 1:1
-//! raw-column coordinate translation, back onto the `[^label]:` source
-//! bytes — so the definition arm doubles as the back-link hit-test without
-//! any rendered-column bookkeeping.
-//!
-//! The definition also renders a trailing `↩` glyph (the visible back-link
-//! affordance, see `markdown::renderer`).  That glyph is appended chrome
-//! with no raw source byte, so the raw scan can't see it;
-//! [`back_link_glyph_at_click`] hit-tests it on the rendered line directly.
+//! A raw scan of the enclosing line (no AST, mirroring [`super::links::link_at_offset`]),
+//! shared by keyboard follow and mouse click: `[^label]` → [`LinkTarget::Footnote`],
+//! `[^label]:` → [`LinkTarget::FootnoteBack`].  The rendered definition's `  N.  ` leader
+//! maps 1:1 onto the `[^label]:` bytes, so the definition arm doubles as the back-link
+//! hit-test.  The trailing `↩` glyph is appended chrome with no raw byte, so
+//! [`back_link_glyph_at_click`] hit-tests it on the rendered line instead.
 
 use crate::editor::footnote_edit;
 use crate::editor::link::LinkTarget;
@@ -26,17 +13,11 @@ use crate::editor::EditorState;
 
 use super::coord::rendered_line_at_row;
 
-/// The back-link glyph appended to the end of a rendered footnote
-/// definition.  Kept in sync with `markdown::renderer`'s
-/// `render_footnote_definition`.
+/// Kept in sync with `markdown::renderer`'s `render_footnote_definition`.
 const BACK_LINK_GLYPH: char = '↩';
 
-/// Classify the footnote (if any) at `byte` in `source`.  Returns the
-/// follow target, or `None` when the byte isn't on footnote syntax.
-///
-/// Delegates the `[^label]` scan to [`footnote_edit::scan`] (run over the
-/// enclosing line) so the hit-test and the edit primitives share one
-/// implementation.
+/// Classify the footnote syntax (if any) at `byte` in `source`.  Delegates to
+/// [`footnote_edit::scan`] so the hit-test and the edit primitives share one implementation.
 pub fn footnote_at_offset(source: &str, byte: usize) -> Option<LinkTarget> {
     let byte = byte.min(source.len());
     let line_start = source[..byte].rfind('\n').map(|i| i + 1).unwrap_or(0);
@@ -48,9 +29,7 @@ pub fn footnote_at_offset(source: &str, byte: usize) -> Option<LinkTarget> {
     let col = byte - line_start;
 
     footnote_edit::scan(line).into_iter().find_map(|s| {
-        // Reference hit span is `[^label]`; a definition also covers its
-        // trailing `:` so a click on the leader's colon still counts.
-        // `s.end` is one past the `]`.
+        // A definition's hit span also covers its trailing `:` (`s.end` is one past the `]`).
         let span_end = if s.is_definition { s.end } else { s.end - 1 };
         if col >= s.start && col <= span_end {
             Some(if s.is_definition {
@@ -64,17 +43,9 @@ pub fn footnote_at_offset(source: &str, byte: usize) -> Option<LinkTarget> {
     })
 }
 
-/// If the click at rendered `(col, row)` lands on a footnote definition's
-/// trailing back-link glyph, return the [`LinkTarget::FootnoteBack`]
-/// target.
-///
-/// The glyph is appended chrome with no raw source byte, so
-/// [`footnote_at_offset`]'s raw scan can't resolve it (that path handles
-/// the `  N.  ` leader, which IS column-matched to the `[^N]:` source).
-/// This rendered-line check covers the trailing glyph as a second
-/// affordance.  The hit zone is exactly the glyph and the single space we
-/// render before it (`" ↩"`); a click *past* the glyph (in the blank area
-/// beyond the line) places the cursor at line end instead of following.
+/// The [`LinkTarget::FootnoteBack`] target when a rendered `(col, row)` lands on a definition's
+/// trailing `↩` glyph.  The hit zone is exactly `" ↩"`; a click past the glyph places the
+/// cursor at line end instead.
 pub(super) fn back_link_glyph_at_click(
     state: &EditorState,
     col: u16,
@@ -87,12 +58,9 @@ pub(super) fn back_link_glyph_at_click(
     if col != glyph_col && col != glyph_col.saturating_sub(1) {
         return None;
     }
-    // Cheap guard before the source lookup: the last rendered char must be
-    // the glyph.
     if line.spans.iter().flat_map(|s| s.content.chars()).last() != Some(BACK_LINK_GLYPH) {
         return None;
     }
-    // Resolve the label from the definition block that produced this row.
     let (line_idx, _) = state.rendered_line_at_visual_row(
         state.scroll.saturating_add(row as usize),
         state.viewport_width,
@@ -121,7 +89,7 @@ mod tests {
     #[test]
     fn reference_classifies_as_footnote() {
         let src = "See note.[^1] end\n";
-        let byte = src.find("[^1]").unwrap() + 1; // inside the marker
+        let byte = src.find("[^1]").unwrap() + 1;
         assert_eq!(
             footnote_at_offset(src, byte),
             Some(LinkTarget::Footnote("1".into()))
@@ -131,8 +99,6 @@ mod tests {
     #[test]
     fn definition_marker_classifies_as_back_link() {
         let src = "[^1]: the note text\n";
-        // Click on the leading `[` (where the rendered `  N.  ` leader maps
-        // 1:1 — the leader is the back-link's column-matched hit zone).
         assert_eq!(
             footnote_at_offset(src, 0),
             Some(LinkTarget::FootnoteBack("1".into()))

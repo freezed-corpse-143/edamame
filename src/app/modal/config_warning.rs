@@ -1,8 +1,5 @@
-//! Surfaces non-fatal problems detected while reading `config.toml`,
-//! `keybindings.toml`, or the active theme file.  Shown at startup
-//! when [`crate::config::Config::load`] reports any [`ConfigWarning`]s,
-//! and re-shown after the post-external-editor reload when those
-//! reloads surface fresh warnings.
+//! Surfaces non-fatal problems from reading `config.toml`, `keybindings.toml`, or the
+//! active theme file — whenever [`crate::config::Config::load`] reports [`ConfigWarning`]s.
 
 use std::any::Any;
 
@@ -23,23 +20,14 @@ use crate::ui::{ModalButton, ModalLink, ModalLinkTarget, ModalResponse};
 pub struct ConfigWarningModal {
     pub(crate) body: Vec<Line<'static>>,
     pub(crate) buttons: Vec<ModalButton>,
-    /// Rebuilt each render — the warning list above it varies in
-    /// length, so the footnote's line index is only known once the
-    /// body is assembled.
+    /// Rebuilt each render: the footnote's line index depends on the warning list length.
     links: Vec<ModalLink>,
     chrome: ModalChrome,
 }
 
 impl ConfigWarningModal {
-    /// Build a warning modal from a list of warnings.  Returns `None`
-    /// when the list is empty — callers can `if let Some(m) = ...`
-    /// without an extra emptiness check.
-    ///
-    /// Body lines are grouped by file: each group leads with the file
-    /// path (header style), followed by indented detail lines describing
-    /// what went wrong.  Multiple warnings against the same file get
-    /// separate groups in load order so the user can scroll through
-    /// them.
+    /// Build a warning modal, one body group per warning (path then indented detail).
+    /// `None` for an empty list, so callers need no separate emptiness check.
     pub fn from_warnings(warnings: &[ConfigWarning]) -> Option<Self> {
         if warnings.is_empty() {
             return None;
@@ -95,8 +83,7 @@ impl ConfigWarningModal {
             chrome: ModalChrome::new(ModalKind::Warning, true),
         })
     }
-    /// Map a resolved response to an outcome.  Shared by the key and
-    /// click paths so mouse and keyboard behave identically.
+    /// Map a resolved response to an outcome; shared by the key and click paths.
     fn resolve(&self, response: LinkableResponse) -> ModalOutcome {
         match response {
             LinkableResponse::Modal(ModalResponse::Continue) => ModalOutcome::Continue,
@@ -111,8 +98,7 @@ impl ConfigWarningModal {
     }
 }
 
-/// The manual section explaining what edamame does with a config it
-/// could not fully read, and where that config lives.
+/// The manual section on configs that could not be fully read.
 const DOCS_FOOTNOTE: DocsFootnote = DocsFootnote {
     label: "When something is wrong with your config",
     target: ModalLinkTarget {
@@ -178,19 +164,14 @@ impl Modal for ConfigWarningModal {
 
 #[cfg(test)]
 mod tests {
-    //! `ConfigWarningModal::from_warnings` composes the body of the
-    //! warning popup from a slice of [`ConfigWarning`].  These tests
-    //! exercise the body shape directly so a regression in the
-    //! formatting shows up without rendering through ratatui.
+    //! Body shape is asserted directly, without rendering through ratatui.
 
     use super::*;
     use crate::config::Theme;
     use crate::document::ParsedDoc;
     use std::path::PathBuf;
 
-    /// Fragments are matched exactly, so renaming that heading in
-    /// `docs/configuration.md` dead-ends this link silently, and only
-    /// for the reader who followed it.
+    /// Fragments match exactly, so renaming the heading dead-ends this link silently.
     #[test]
     fn the_docs_link_names_a_heading_that_exists() {
         let ModalLinkTarget { id, fragment } = DOCS_FOOTNOTE.target;
@@ -333,11 +314,6 @@ mod tests {
     }
 
     // ── App-level wiring ─────────────────────────────────────────────
-    //
-    // A warning that flows through `App::new` (or is pushed onto the
-    // stack later) ends up on the modal stack, and dispatching Enter or
-    // Escape pops it.  The body-content invariants are owned by the
-    // builder tests above.
 
     use crate::app::test_utils::make_app;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

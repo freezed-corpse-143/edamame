@@ -1,45 +1,14 @@
-//! Settings overlay.
+//! Settings overlay: a curated subset of `config.toml` editable in place.  Esoteric
+//! options (developer logging, modal handler name, image cell ceilings) stay file-only so
+//! the overlay remains simpler than the TOML.
 //!
-//! Friendly, curated subset of `config.toml` editable in-place.  The
-//! overlay is intentionally narrower than the file: anything that's
-//! truly esoteric (developer logging, modal handler name, image cell
-//! ceilings) stays in the file where users who care can edit it
-//! directly.  The in-app overlay should always be simpler than
-//! reading the TOML.
-//!
-//! Layout:
-//!
-//! ```text
-//! Open Config folder              [ Open ]
-//! Open config.toml in editor      [ Open ]
-//!
-//! Autosave                        |   off
-//!   Automatically save changes when idle
-//!
-//!   Char limit                     100
-//! Maximum content width in characters when limit is on
-//! ...
-//! ```
-//!
-//! Editable rows are listed alphabetically by label, except `Show line
-//! numbers`, which sits below the two image-visibility rows so the image
-//! group stays contiguous.  The remote-images row is locked (greyed +
-//! skipped, in the muted hint color) while `Show images` is `Never`,
-//! mirroring the welcome modal's cascade.
-//!
-//! The first two rows are "open externally" actions — the folder row
-//! shells `xdg-open` (or the OS equivalent) on the config directory;
-//! the file row suspends the TUI and runs `$VISUAL`/`$EDITOR` on
-//! `config.toml`.  A blank divider separates them from the editable
-//! settings beneath.
-//!
-//! Each row's description appears beneath it only when the row is
-//! focused, conserving vertical space.  Booleans render as on/off toggle
-//! sliders and enum-valued fields as cycle pills — both change on
-//! Left/Right (or Enter).  Numeric fields are text inputs that are
-//! editable the moment the row has focus (no "press Enter to begin"); the
-//! draft commits on Enter or when focus leaves the row, and an invalid
-//! draft reverts on leave.
+//! Rows: two "open externally" actions, a blank divider, then editable settings in
+//! alphabetical order by label — except `Show line numbers`, kept below the image rows so
+//! that group stays contiguous.  The remote-images row is locked while `Show images` is
+//! `Never`, mirroring the welcome modal's cascade.  The focused row's description is
+//! pinned into the footer.  Booleans are toggles and enums are pills (Left/Right/Enter);
+//! numeric fields are text inputs editable the moment the row has focus, committing on
+//! Enter or focus-leave and reverting an invalid draft on leave.
 
 mod rows;
 
@@ -56,15 +25,10 @@ use crate::ui::content_width::{max_row_width, optional_text_width};
 use crate::ui::controls::{self, Control, ControlEvent, ControlInput};
 use crate::ui::overlay_nav::next_focusable;
 
-/// Width of the label column in the settings overlay (column count of the
-/// padded `{label:<LABEL_PAD$}` slot before the value column begins).
-/// Wide enough to fit the longest setting label without clipping; narrow
-/// enough to leave room for the value on terminals around 80 columns.
+/// Width of the padded label column; sized to fit the longest label while leaving room
+/// for the value on an 80-column terminal.
 const LABEL_PAD: usize = 28;
-/// Width of the focus-marker column (`› ` / two spaces) rendered before
-/// every row's label.  The control's value column starts after the marker
-/// and the padded label — shared by the content-width sizing pass and the
-/// click hit-rect capture.
+/// Width of the focus-marker column (`› ` / two spaces) before every label.
 const FOCUS_MARKER_WIDTH: usize = 2;
 use crate::ui::scroll_container::{
     centered_rect_for_content, draw_frame, ContentSize, FrameOpts, ModalKind, ScrollContainerState,
@@ -73,9 +37,8 @@ use crate::ui::scroll_container::{
 
 use self::rows::{build_rows, RowAction, RowDef};
 
-// Re-exports for the bin-only `app::modal::settings` live-update wiring.
-// The lib itself never reads them, so allow(dead_code) on the helper
-// suppresses the otherwise-spurious `cargo clippy --lib` warning.
+// Re-exports for the bin-only `app::modal::settings` live-update wiring; the lib never
+// reads them, hence the allows.
 #[allow(unused_imports)]
 pub(crate) use self::rows::{
     HEADER_NOTE, LABEL_AUTOSAVE, LABEL_BIG_H1, LABEL_BLINK_CURSOR, LABEL_DIFF_ON_CHANGE,
@@ -84,10 +47,8 @@ pub(crate) use self::rows::{
     LABEL_VIM_MODE, LABEL_VISUAL_LINE_NAV,
 };
 
-/// All row labels in display order, including non-focusable dividers.
-/// Used by the App-level live-update wiring tests in
-/// `app/modal/settings.rs` so that adding a new row to `build_rows`
-/// becomes an explicit, reviewable change at the App layer too.
+/// All row labels in display order, dividers included; pinned by the App-level
+/// live-update wiring tests so a new row is a reviewable change there too.
 #[allow(dead_code)]
 pub(crate) fn all_row_labels() -> Vec<&'static str> {
     build_rows().into_iter().map(|r| r.label).collect()
@@ -98,64 +59,38 @@ pub(crate) fn all_row_labels() -> Vec<&'static str> {
 pub enum SettingsResponse {
     Continue,
     Cancelled,
-    /// User chose `Open config.toml in editor` — caller
-    /// should suspend the TUI and run `$VISUAL`/`$EDITOR`, falling
-    /// back to `open::that(&config_path)`.
+    /// Caller should suspend the TUI and run `$VISUAL`/`$EDITOR` on `config.toml`.
     OpenInExternalEditor,
-    /// User chose the new top-row "Open Config folder" entry —
-    /// caller should `open::that(&config_dir)` so the OS file
-    /// manager surfaces the folder.  Distinct from
-    /// `OpenInExternalEditor` because this path doesn't need to
-    /// suspend the TUI: `xdg-open` returns immediately and edamame
-    /// stays in the foreground.
+    /// Caller should `open::that(&config_dir)`; no TUI suspension needed since the opener
+    /// returns immediately.
     OpenConfigFolder,
-    /// A field changed.  The overlay's [`Config`] reference has
-    /// already been mutated; the caller is expected to call
-    /// `Config::save` and flash a `Configuration updated`
-    /// notification.  Carries the human-readable label of the
-    /// changed field.
+    /// A field changed (label carried).  `config` is already mutated; the caller saves it
+    /// and flashes a notice.
     FieldChanged(&'static str),
 }
 
 /// Mutable state for an open settings overlay.
 pub struct SettingsState {
-    /// Index into [`Self::rows`].  Never rests on a divider or another
-    /// non-focusable row: it is seeded to the first Cycle/Edit row by
-    /// [`Self::new`], stepped by [`Self::move_focus`] (which skips
-    /// ineligible rows), and the one other assignment site —
-    /// [`Self::focus_clicked_row`], via [`Self::handle_click`] — checks
-    /// `focus_eligible` against the live config before calling it.  A new
-    /// assignment site owes the same guard; `rows` is built once in `new`
-    /// and never rebuilt, so nothing re-snaps a stale index.
+    /// Index into [`Self::rows`].  Invariant: never rests on a non-focusable or
+    /// cascade-locked row.  Every assignment site must check `focus_eligible` against the
+    /// live config; `rows` is never rebuilt, so nothing re-snaps a stale index.
     pub focused: usize,
-    /// Editable draft for the focused text-input (numeric) row.  Seeded
-    /// by [`Self::open_draft_for_focused`] whenever focus lands on such a
-    /// row (so it's editable on focus) and committed at a boundary (Enter
-    /// or focus-leave); `None` on toggle / pill / action rows.
+    /// Editable draft for the focused text-input row; `None` on toggle / pill / action rows.
     pub editing: Option<String>,
-    /// Last error from a rejected edit.  Cleared on the next
-    /// successful edit / cancel.
+    /// Last error from a rejected edit; cleared on the next successful edit / cancel.
     pub last_error: Option<String>,
-    /// Empty placeholder — kept so the row table's `read` / `cycle`
-    /// function pointers can continue to take `&[String]`.  Theme
-    /// selection moved out of the settings overlay into a dedicated
-    /// `Action::SwitchTheme` modal, so no live row needs this list
-    /// anymore.
+    /// Empty placeholder kept so the row table's `read` / `cycle` function pointers can keep
+    /// taking `&[String]`; theme selection moved to its own modal.
     pub theme_names: Vec<String>,
-    /// Vertical scroll bookkeeping for the row table.  Up/Down move
-    /// `focused` and pull the viewport via `ensure_visible`; PgUp/PgDn
-    /// and the mouse wheel drive `scroll_state.scroll` directly without
+    /// Up/Down move `focused` and pull the viewport; PgUp/PgDn and the wheel scroll without
     /// touching focus.
     pub scroll_state: ScrollContainerState,
     /// Absolute terminal rect of the rendered `esc` close hint.
     pub esc_button_rect: Option<Rect>,
-    /// Cached "remote policy before the images→Never cascade" so that
-    /// flipping `Show images` back out of `Never` restores the user's
-    /// prior `Show remote images` choice.  Mirrors the welcome modal's
-    /// `pre_cascade_remote` (see `ui::welcome`).
+    /// Remote policy before the images→Never cascade, restored on leaving `Never`.  Mirrors
+    /// the welcome modal.
     pre_cascade_remote: Option<RemoteImagePolicy>,
-    /// `(row index, control rect)` for each focusable row visible in the
-    /// last render, in absolute terminal coords.  Drives click dispatch;
+    /// `(row index, rect)` per focusable row visible in the last render, absolute coords;
     /// rebuilt every frame so scrolling can't leave stale geometry.
     row_hit_rects: Vec<(usize, Rect)>,
     rows: Vec<RowDef>,
@@ -174,11 +109,7 @@ impl SettingsState {
             row_hit_rects: Vec::new(),
             rows: build_rows(),
         };
-        // Default focus to the first editable setting rather than the
-        // "open externally" pair at the top.  Most users open the
-        // overlay to tweak a setting; the externals are still one Up
-        // arrow away.  Picking the first Cycle/Edit row keeps this
-        // correct as the (alphabetized) row order changes.
+        // Default focus lands on the first editable setting, not the "open externally" pair.
         state.focused = state
             .rows
             .iter()
@@ -192,26 +123,16 @@ impl SettingsState {
 
     /// Apply a key event, possibly mutating `config`.
     ///
-    /// A numeric (text-input) row is *editable as soon as it has focus* —
-    /// there is no "press Enter to begin": [`Self::open_draft_for_focused`]
-    /// seeds an editable draft whenever focus lands on such a row, and
-    /// typing edits the draft in place.  The draft is **committed** (parsed,
-    /// validated, written to `config`) only at a boundary — Enter, or when
-    /// focus leaves the row — so a multi-keystroke value still produces a
-    /// single config write / flash.  An invalid draft is reverted when
-    /// focus leaves; Esc closes the overlay and abandons any uncommitted
-    /// draft.  Toggle / pill rows change immediately on Left/Right (or
-    /// Enter), like before.
+    /// A text-input draft is committed only at a boundary (Enter or focus-leave) so a
+    /// multi-keystroke value produces a single config write / flash; Esc closes the overlay
+    /// and abandons any uncommitted draft.
     pub fn handle_key(&mut self, key: &KeyEvent, config: &mut Config) -> SettingsResponse {
-        // PgUp/PgDn/Home/End move the viewport without touching focus or
-        // the open draft.
         if self.scroll_state.handle_paging_key(key) {
             return SettingsResponse::Continue;
         }
 
         match key.code {
             KeyCode::Esc => {
-                // Abandon any uncommitted text draft and close.
                 self.editing = None;
                 self.last_error = None;
                 SettingsResponse::Cancelled
@@ -245,11 +166,8 @@ impl SettingsState {
         }
     }
 
-    /// Insert a bracketed paste into the focused row's editable draft, if
-    /// one is open.  No-op on toggle / pill rows (cycled, not typed into).
-    /// The paste is flattened to one line and length-capped by
-    /// [`crate::ui::sanitize_paste`]; the value is still validated when the
-    /// draft commits via the row's `write_string`.
+    /// Insert a bracketed paste into the open draft, if any.  Sanitized by
+    /// [`crate::ui::sanitize_paste`]; still validated at commit.
     pub fn paste(&mut self, text: &str) {
         if let Some(buf) = self.editing.as_mut() {
             buf.push_str(&crate::ui::sanitize_paste(text));
@@ -270,12 +188,9 @@ impl SettingsState {
         }
     }
 
-    /// Commit the focused text-input row's draft to `config`.  Returns
-    /// [`SettingsResponse::FieldChanged`] when a *changed* draft validates
-    /// and is written (the draft is refreshed to the normalized value, so
-    /// the row stays editable); on a validation error the draft is kept and
-    /// `last_error` set; an unchanged draft is a no-op.  No-op on non-edit
-    /// rows.
+    /// Commit the focused text-input row's draft to `config`.  A changed, valid draft is
+    /// written (and refreshed to the normalized value) and yields `FieldChanged`; an invalid
+    /// one keeps the draft and sets `last_error`; unchanged or non-edit rows are no-ops.
     fn commit_draft(&mut self, config: &mut Config) -> SettingsResponse {
         let draft = match self.editing.as_deref() {
             Some(d) => d.to_owned(),
@@ -306,11 +221,8 @@ impl SettingsState {
         }
     }
 
-    /// Seed (or clear) the editable draft for the currently-focused row:
-    /// a text-input row gets its current value as an editable draft, every
-    /// other row clears the draft.  Called whenever focus settles on a new
-    /// row so text inputs are editable on focus without an explicit "begin
-    /// edit" step.
+    /// Seed the draft for a focused text-input row (or clear it for any other row).  Called
+    /// whenever focus settles so text inputs are editable on focus.
     pub(super) fn open_draft_for_focused(&mut self, config: &Config) {
         self.editing = match self.rows.get(self.focused) {
             Some(r) if matches!(r.kind.action, RowAction::Edit) => {
@@ -320,22 +232,14 @@ impl SettingsState {
         };
     }
 
-    /// Apply a [`ControlInput`] to the focused option row through the shared
-    /// transition layer ([`Control::apply`]), writing the result back into
-    /// `config`.  Only applies to toggle / pill rows; no-op on numeric /
-    /// edit-only and button rows (their `read_value` / `write_value` are
-    /// `None`) so an accidental Left arrow doesn't surprise the user.  A
-    /// disabled row (e.g. the cascade-locked remote-images row) never
-    /// changes.  Changing `Show images` cascades the remote-images policy
-    /// to / from `Never`, matching the welcome modal.
+    /// Apply a [`ControlInput`] to the focused toggle / pill row via [`Control::apply`] and
+    /// write the result into `config`.  No-op on numeric, button, and disabled rows.
+    /// Changing `Show images` cascades the remote-images policy, matching the welcome modal.
     fn apply_control_input(
         &mut self,
         config: &mut Config,
         input: ControlInput,
     ) -> SettingsResponse {
-        // Copy the bits we need (all `Copy`: a `&'static str`, two `fn`
-        // pointers, a `Control`) before mutating `config` / `self` so the
-        // borrow of `self.rows` doesn't outlive the apply call.
         let (label, control, read_value, write_value, disabled) = match self.rows.get(self.focused)
         {
             Some(r) => (
@@ -350,7 +254,6 @@ impl SettingsState {
         if disabled {
             return SettingsResponse::Continue;
         }
-        // Only option rows carry all three; numeric / button rows opt out.
         let (Some(control), Some(read_value), Some(write_value)) =
             (control, read_value, write_value)
         else {
@@ -369,9 +272,8 @@ impl SettingsState {
         }
     }
 
-    /// Apply the images→remote cascade after `Show images` changed.
-    /// Delegates to the shared [`controls::apply_images_cascade`] so
-    /// the welcome modal and the settings overlay can't drift.
+    /// Images→remote cascade after `Show images` changed; shared with the welcome modal via
+    /// [`controls::apply_images_cascade`].
     fn apply_images_cascade(&mut self, config: &mut Config, was_never: bool) {
         config.images.remote_policy = controls::apply_images_cascade(
             config.images.enabled,
@@ -381,15 +283,10 @@ impl SettingsState {
         );
     }
 
-    /// Move focus by `delta`, committing the row being left.  The current
-    /// text-input draft (if any) is committed first — a valid change is
-    /// written and surfaces as [`SettingsResponse::FieldChanged`]; an
-    /// invalid or unchanged draft is silently dropped (revert-on-leave).
-    /// Focus then moves and the new row's draft is opened.
+    /// Move focus by `delta`, committing the row being left (an invalid or unchanged draft
+    /// is dropped) and opening the new row's draft.
     fn move_focus_committing(&mut self, delta: i32, config: &mut Config) -> SettingsResponse {
         let committed = self.commit_draft(config);
-        // Leaving the row abandons any still-uncommitted (invalid) draft
-        // and its error.
         self.editing = None;
         self.last_error = None;
         self.move_focus(delta, config);
@@ -410,14 +307,9 @@ impl SettingsState {
         self.rows.iter().position(|r| r.kind.focusable)
     }
 
-    /// Route a click at terminal `(col, row)` to the focusable row whose
-    /// control rect (cached by the last render) it lands in.  Focuses the
-    /// clicked row — committing any open draft on the row being left, exactly
-    /// as an arrow move would — then acts on it: an option row cycles via the
-    /// shared [`Control::apply`] (`Activate`); an external-action row fires
-    /// its [`SettingsResponse`]; an edit row just takes focus (its draft is
-    /// now open).  A click that misses every row, or lands on a disabled
-    /// (cascade-locked) one, is a no-op.
+    /// Route a click to the row whose cached hit-rect contains it: focus it (committing the
+    /// row being left, as an arrow move would), then activate an option / action row.  A
+    /// miss or a disabled row is a no-op.
     pub fn handle_click(&mut self, col: u16, row: u16, config: &mut Config) -> SettingsResponse {
         let Some(&(idx, _)) = self
             .row_hit_rects
@@ -426,9 +318,7 @@ impl SettingsState {
         else {
             return SettingsResponse::Continue;
         };
-        // Re-check eligibility against the live config: a row locked since
-        // the last render (e.g. the cascade-locked remote-images row)
-        // absorbs the click without moving focus.
+        // Eligibility may have changed since the last render (cascade lock).
         if !self
             .rows
             .get(idx)
@@ -442,17 +332,12 @@ impl SettingsState {
             Some(RowAction::OpenExternalEditor) => SettingsResponse::OpenInExternalEditor,
             Some(RowAction::OpenConfigFolder) => SettingsResponse::OpenConfigFolder,
             Some(RowAction::Cycle) => self.apply_control_input(config, ControlInput::Activate),
-            // An edit row only takes focus (its draft opens); surface the
-            // commit of whatever row we left so its live-update still fires.
+            // Surface the commit of the row we left so its live-update still fires.
             Some(RowAction::Edit) | None => committed,
         }
     }
 
-    /// Move focus to an explicit row index — the click counterpart of
-    /// [`Self::move_focus_committing`].  Commits the row being left (a valid
-    /// change surfaces as [`SettingsResponse::FieldChanged`]; an invalid or
-    /// unchanged draft is dropped), moves focus, and opens the new row's
-    /// draft.
+    /// Click counterpart of [`Self::move_focus_committing`] for an explicit row index.
     fn focus_clicked_row(&mut self, idx: usize, config: &mut Config) -> SettingsResponse {
         let committed = self.commit_draft(config);
         self.editing = None;
@@ -482,14 +367,10 @@ impl<'a> StatefulWidget for SettingsView<'a> {
     type State = SettingsState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        // Build per-row spans (without the inline description) so we
-        // can size the modal and figure out which rows fit on screen.
         let row_lines = build_row_lines(state, self.config, self.theme, self.cursor_visible);
         let content_width = settings_content_width(state, self.config);
 
-        // Pinned-bottom region: one row per description line (a
-        // description may be multi-line, `\n`-separated) when the focused
-        // row has one, plus 2 rows for the error footer (blank + ✗ msg).
+        // Pinned footer: one row per description line, plus blank + error row when set.
         let focused_row = state.rows.get(state.focused);
         let focused_desc = focused_row.and_then(|r| r.resolved_description(self.config));
         let desc_rows = focused_desc
@@ -507,10 +388,7 @@ impl<'a> StatefulWidget for SettingsView<'a> {
         };
         let rect = centered_rect_for_content(content, area);
 
-        // Pre-compute layout so the title's arrow indicator reflects
-        // the post-observe scroll bounds.  Vertical chrome is fixed by
-        // `draw_frame`; the body area below it holds the scroll list +
-        // pinned footer.
+        // Observe before draw_frame so the title's arrow indicator sees the new scroll bounds.
         let inner_h = rect.height.saturating_sub(VERTICAL_CHROME_ROWS);
         let table_height = inner_h.saturating_sub(pinned_bottom);
         state
@@ -553,13 +431,8 @@ impl<'a> StatefulWidget for SettingsView<'a> {
             .style(self.theme.modal_bg)
             .render(table_area, buf);
 
-        // Capture per-visible-row hit-rects for click dispatch.  A click
-        // anywhere on the row — focus marker, label, or control — focuses and
-        // operates it, so the rect spans the whole `marker + label + value`
-        // run from the body's left edge.  The label column is the wider of
-        // `LABEL_PAD` and the actual label, since a label longer than the pad
-        // is not truncated (the control shifts right with it).  Indices align
-        // 1:1 with the `skip(scroll).take(visible_rows)` draw above.
+        // Hit-rects span the whole `marker + label + value` run.  A label longer than
+        // `LABEL_PAD` is not truncated, so the control shifts right with it.
         let end = (scroll + visible_rows).min(state.rows.len());
         let mut hit_rects: Vec<(usize, Rect)> = Vec::new();
         for idx in scroll..end {
@@ -597,13 +470,9 @@ impl<'a> StatefulWidget for SettingsView<'a> {
             );
         }
 
-        // Pinned footer: description (when present) followed by error.
         let mut footer_y = inner.y + table_height;
         if let Some(desc) = focused_desc.as_deref() {
-            // No leading indent: the description left-aligns with the
-            // header note ("Common options shown below …") at the body
-            // edge rather than under the row labels.  A multi-line
-            // description renders one row per `\n`-separated line.
+            // No indent: the description left-aligns with the header note, not the labels.
             for line in desc.lines() {
                 let desc_area = Rect {
                     x: inner.x,
@@ -621,7 +490,6 @@ impl<'a> StatefulWidget for SettingsView<'a> {
             }
         }
         if let Some(err) = state.last_error.as_ref() {
-            // Blank spacer row, then the error.
             let err_area = Rect {
                 x: inner.x,
                 y: footer_y + 1,
@@ -638,8 +506,8 @@ impl<'a> StatefulWidget for SettingsView<'a> {
     }
 }
 
-/// Build one display line per row.  The focused row's description is
-/// *not* included here — it's pinned into the modal's footer instead.
+/// One display line per row; the focused row's description is pinned into the footer, not
+/// included here.
 fn build_row_lines<'a>(
     state: &SettingsState,
     config: &Config,
@@ -663,18 +531,14 @@ fn build_row_lines<'a>(
         let editing = focused && state.editing.is_some();
         let disabled = row.is_disabled(config);
 
-        // The label column (marker + padding) is one unit per the control
-        // scheme: when the row is focused the whole column takes the focus
-        // fill — for a toggle that's the only place focus shows, since the
-        // toggle widget keeps its value color.
+        // The focused label column takes the focus fill — for a toggle that's the only place
+        // focus shows, since the toggle keeps its value color.
         let marker = if focused { "› " } else { "  " };
         let label_padded = format!("{marker}{:<pad$}", row.label, pad = LABEL_PAD);
         let label_style = controls::control_label_style(focused, disabled, theme);
         let mut spans: Vec<Span<'static>> = vec![Span::styled(label_padded, label_style)];
 
         if let Some(control) = row.kind.options {
-            // Option rows render the current value as a toggle (on/off
-            // slider) or a multi-value pill, chosen by the control kind.
             let current = (row.kind.read)(config, &state.theme_names);
             match control {
                 Control::Toggle => spans.extend(controls::toggle_spans(
@@ -701,10 +565,8 @@ fn build_row_lines<'a>(
                 }
             }
         } else if editing {
-            // Focused text-input row: render the live, editable draft with
-            // a distinctly-colored (accent `theme.cursor`) blink-stable
-            // block cursor at the append-only end, so the cursor itself is
-            // the "type here" signal and never blends into the focus fill.
+            // Accent-colored block cursor at the append-only end is the "type here" signal;
+            // it must not blend into the focus fill.
             let draft = state.editing.as_deref().unwrap_or("");
             let cursor = draft.chars().count();
             spans.extend(crate::ui::cursor::text_field_spans(
@@ -715,9 +577,6 @@ fn build_row_lines<'a>(
                 theme.cursor,
             ));
         } else {
-            // Unfocused text input or an external-action row: the value
-            // styled as a text-input control (focus fill when focused,
-            // `secondary` foreground at rest).
             let value = (row.kind.read)(config, &state.theme_names);
             spans.push(Span::styled(
                 value,
@@ -729,10 +588,8 @@ fn build_row_lines<'a>(
     lines
 }
 
-/// Content-aware width: max over rows of `marker(2) + label_pad +
-/// value_w`, plus the longest description so the pinned-footer copy
-/// doesn't get clipped.  Sizes against the *whole* row set so the
-/// modal width doesn't jiggle as focus moves.
+/// Content width: the widest row, description line, or error.  Sized against the *whole*
+/// row set (descriptions resolved) so the modal doesn't jiggle as focus moves.
 fn settings_content_width(state: &SettingsState, config: &Config) -> u16 {
     let row_max = max_row_width(&state.rows, |r| {
         if !r.kind.focusable && r.label == HEADER_NOTE {
@@ -740,12 +597,7 @@ fn settings_content_width(state: &SettingsState, config: &Config) -> u16 {
         }
         FOCUS_MARKER_WIDTH + LABEL_PAD + row_value_width(r, config, &state.theme_names)
     });
-    // The description is left-aligned at the body edge (no indent), so
-    // size against its raw length.  Resolve it so a dynamic description
-    // (e.g. the blink cadence) can't clip.
     let desc_max = max_row_width(&state.rows, |r| {
-        // A description may be multi-line (`\n`-separated); size against
-        // its widest line, not the whole string.
         r.resolved_description(config)
             .map(|d| d.lines().map(|l| l.chars().count()).max().unwrap_or(0))
             .unwrap_or(0)
@@ -754,10 +606,8 @@ fn settings_content_width(state: &SettingsState, config: &Config) -> u16 {
     row_max.max(desc_max).max(err_max)
 }
 
-/// Rendered width (in cells) of a row's value column: the control's fixed
-/// width for an option/button row, or the displayed string length for a
-/// numeric / external-action row.  Shared by the content-width sizing pass
-/// and the click hit-rect capture so the two can't disagree.
+/// Rendered width of a row's value column; shared by the sizing pass and the hit-rect
+/// capture so the two can't disagree.
 fn row_value_width(row: &RowDef, config: &Config, theme_names: &[String]) -> usize {
     match row.kind.options {
         Some(Control::Toggle) => controls::toggle_width(),
@@ -767,7 +617,6 @@ fn row_value_width(row: &RowDef, config: &Config, theme_names: &[String]) -> usi
     }
 }
 
-/// True when `(col, row)` falls inside `rect`.
 fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
@@ -789,34 +638,25 @@ mod tests {
             .position(|r| r.label == label)
             .unwrap_or_else(|| panic!("missing row {label}"));
         state.focused = idx;
-        // Mirror real navigation: landing on a row opens its draft so a
-        // text-input row is editable on focus.
         state.open_draft_for_focused(config);
     }
 
     #[test]
     fn toggle_arrows_are_direction_bound() {
-        // Phase 3 routed settings option rows through `Control::apply`, so
-        // toggle arrows became direction-bound everywhere: Left = off,
-        // Right = on (Enter/Space still flip).  Previously a settings toggle
-        // flipped on either arrow; no test exercised that, so this locks in
-        // the new behavior.
+        // Left = off, Right = on (Enter still flips); a toggle used to flip on either arrow.
         let mut config = Config::default();
         config.editor.autosave_enabled = false;
         let mut state = SettingsState::new();
         focus_row(&mut state, &config, "Autosave");
-        // Left on an already-off toggle is a no-op (not a flip-on).
         let resp = state.handle_key(&key(KeyCode::Left), &mut config);
         assert_eq!(resp, SettingsResponse::Continue);
         assert!(!config.editor.autosave_enabled, "Left means off");
-        // Right turns it on; a second Right is a no-op.
         let resp = state.handle_key(&key(KeyCode::Right), &mut config);
         assert!(matches!(resp, SettingsResponse::FieldChanged(_)));
         assert!(config.editor.autosave_enabled, "Right means on");
         let resp = state.handle_key(&key(KeyCode::Right), &mut config);
         assert_eq!(resp, SettingsResponse::Continue);
         assert!(config.editor.autosave_enabled, "Right when on is a no-op");
-        // Left turns it back off.
         let resp = state.handle_key(&key(KeyCode::Left), &mut config);
         assert!(matches!(resp, SettingsResponse::FieldChanged(_)));
         assert!(!config.editor.autosave_enabled, "Left means off");
@@ -864,7 +704,6 @@ mod tests {
     fn editor_max_width_is_editable_on_focus_and_round_trips() {
         let mut config = Config::default();
         let mut state = SettingsState::new();
-        // No "Enter to begin": focusing the row opens its draft.
         focus_row(&mut state, &config, "  Char limit");
         assert_eq!(state.editing.as_deref(), Some("100"));
         for _ in 0..3 {
@@ -873,7 +712,6 @@ mod tests {
         for c in "200".chars() {
             state.handle_key(&key(KeyCode::Char(c)), &mut config);
         }
-        // Enter commits in place and the row stays editable.
         let resp = state.handle_key(&key(KeyCode::Enter), &mut config);
         assert!(matches!(resp, SettingsResponse::FieldChanged(_)));
         assert_eq!(config.editor.max_width_cols, 200);
@@ -891,7 +729,6 @@ mod tests {
         for c in "200".chars() {
             state.handle_key(&key(KeyCode::Char(c)), &mut config);
         }
-        // Leaving the row (without Enter) commits the valid draft.
         let resp = state.handle_key(&key(KeyCode::Up), &mut config);
         assert!(matches!(resp, SettingsResponse::FieldChanged(_)));
         assert_eq!(config.editor.max_width_cols, 200);
@@ -909,8 +746,6 @@ mod tests {
         for c in "abc".chars() {
             state.handle_key(&key(KeyCode::Char(c)), &mut config);
         }
-        // Leaving with an invalid draft silently reverts — no write, no
-        // lingering error.
         let resp = state.handle_key(&key(KeyCode::Up), &mut config);
         assert_eq!(resp, SettingsResponse::Continue);
         assert_eq!(config.editor.max_width_cols, 100);
@@ -937,10 +772,6 @@ mod tests {
 
     #[test]
     fn default_focus_is_first_editable_row() {
-        // Most users open Settings to adjust a setting, not the
-        // externals.  Default focus skips past the open-externally
-        // pair (and the divider) and lands on the first editable row
-        // (alphabetically, "Autosave").
         let state = SettingsState::new();
         assert_eq!(state.rows[state.focused].label, "Autosave");
     }
@@ -949,8 +780,6 @@ mod tests {
     fn arrow_navigation_skips_divider_row() {
         let mut config = Config::default();
         let mut state = SettingsState::new();
-        // Default focus is the first editable row — Up must skip the
-        // blank divider and land on "Open config.toml in editor".
         state.handle_key(&key(KeyCode::Up), &mut config);
         assert_eq!(state.rows[state.focused].label, "Open config.toml");
         state.handle_key(&key(KeyCode::Up), &mut config);
@@ -974,15 +803,12 @@ mod tests {
         let mut config = Config::default();
         let mut state = SettingsState::new();
         focus_row(&mut state, &config, "  Char limit");
-        // Replace `100` with garbage (draft is already open on focus).
         for _ in 0..3 {
             state.handle_key(&key(KeyCode::Backspace), &mut config);
         }
         for c in "abc".chars() {
             state.handle_key(&key(KeyCode::Char(c)), &mut config);
         }
-        // Enter on an invalid draft flags the error and keeps the draft
-        // (the row stays editable so the user can fix it).
         let resp = state.handle_key(&key(KeyCode::Enter), &mut config);
         assert!(matches!(resp, SettingsResponse::Continue));
         assert!(state.last_error.is_some());
@@ -1003,14 +829,11 @@ mod tests {
         let mut config = Config::default();
         let mut state = SettingsState::new();
         focus_row(&mut state, &config, "  Char limit");
-        // Type an uncommitted change, then Esc.
         for c in "9".chars() {
             state.handle_key(&key(KeyCode::Char(c)), &mut config);
         }
         assert!(state.editing.is_some());
         let resp = state.handle_key(&key(KeyCode::Esc), &mut config);
-        // Esc closes the overlay (it no longer just cancels an edit) and
-        // the uncommitted draft is dropped — config is untouched.
         assert_eq!(resp, SettingsResponse::Cancelled);
         assert!(state.editing.is_none());
         assert_eq!(config.editor.max_width_cols, 100);
@@ -1018,11 +841,7 @@ mod tests {
 
     #[test]
     fn rows_match_curated_list() {
-        // The phase 10 review pinned the exact set of rows.  Lock it
-        // in here so adding a new row to `build_rows` becomes an
-        // explicit, reviewable change.  The empty entry between the
-        // "open externally" pair and the editable settings is the
-        // non-focusable divider row.
+        // Pins the row set so a new row is an explicit, reviewable change.
         let labels: Vec<&str> = build_rows().iter().map(|r| r.label).collect();
         assert_eq!(
             labels,
@@ -1032,8 +851,6 @@ mod tests {
                 "Open config folder",
                 "Open config.toml",
                 "",
-                // Editable settings, alphabetized by label — except
-                // "Show line numbers", grouped below the image rows.
                 "Autosave",
                 "Big H1 headings",
                 "Blink cursor",
@@ -1056,11 +873,7 @@ mod tests {
 
     #[test]
     fn dropped_legacy_rows_are_absent() {
-        // The review removed several rows: tab_width, line_wrap,
-        // code_block_wrap, preserve_blank_lines,
-        // suppress_capability_warnings, images.max_width/max_height,
-        // dev.logging.  Confirm none accidentally come back via a
-        // future schema rebase.
+        // Rows deliberately removed from the overlay must not come back via a schema rebase.
         let labels: Vec<&str> = build_rows().iter().map(|r| r.label).collect();
         for stale in [
             "editor.tab_width",
@@ -1071,9 +884,6 @@ mod tests {
             "images.max_width",
             "images.max_height",
             "dev.logging",
-            // Removed from the overlay: hint duration and diff intro are
-            // file-only now, and the export toggles moved to the
-            // export-flow modal.
             "Hint duration",
             "Diff intro",
             "Export inlined images",
@@ -1123,8 +933,6 @@ mod tests {
     fn settings_renders_scrollbar_when_more_rows_than_visible_height() {
         let config = Config::default();
         let mut state = SettingsState::new();
-        // 80 cols × 8 rows: only ~5 row slots after frame + footer.
-        // Settings has 13 rows.
         let contents = render(&mut state, &config, 80, 12);
         assert!(
             contents.contains('█'),
@@ -1173,7 +981,6 @@ mod tests {
             .max()
             .unwrap_or(0);
         let modal_width = max_border + 2;
-        // 80% of 200 would be 160; content is much narrower.
         assert!(
             modal_width < 130,
             "expected content-aware width well below 80% of 200, got modal width {modal_width}"
@@ -1207,8 +1014,6 @@ mod tests {
     fn settings_description_appears_in_pinned_footer() {
         let config = Config::default();
         let mut state = SettingsState::new();
-        // Default focus is on the first editable row ("Autosave"),
-        // which has a description.
         let contents = render(&mut state, &config, 100, 25);
         assert!(
             contents.contains("Automatically save"),
@@ -1218,9 +1023,6 @@ mod tests {
 
     #[test]
     fn blink_cursor_description_embeds_config_cadence() {
-        // The "Blink cursor" row's description is dynamic: it reads the
-        // file-only `cursor_blink_ms` so the hint reflects the user's
-        // configured cadence rather than a hardcoded value.
         let mut config = Config::default();
         config.editor.cursor_blink_ms = 777;
         let mut state = SettingsState::new();
@@ -1298,10 +1100,7 @@ mod tests {
 
     #[test]
     fn click_on_a_long_label_row_operates_its_shifted_control() {
-        // A label longer than `LABEL_PAD` is not truncated, so the control
-        // renders further right than the padded column.  The hit-rect must
-        // stretch to cover it: a click on the control cell still toggles, and
-        // a click on the label cell does too (the whole row is one target).
+        // A label longer than `LABEL_PAD` shifts the control right; the hit-rect must cover it.
         const LONG: &str = "Autosave with an unusually long label";
         assert!(
             LONG.chars().count() > LABEL_PAD,
@@ -1309,7 +1108,6 @@ mod tests {
         );
         let mut config = Config::default();
         let mut state = SettingsState::new();
-        // Repoint an existing toggle row at the long label.
         let idx = state
             .rows
             .iter()
@@ -1319,8 +1117,6 @@ mod tests {
         render(&mut state, &config, 120, 40);
 
         let r = rect_for(&state, LONG);
-        // The control sits past the `marker + label` run — beyond where the
-        // old fixed `LABEL_PAD`-based rect would have ended.
         let control_col = r.x + (FOCUS_MARKER_WIDTH + LONG.chars().count()) as u16;
         assert!(
             control_col < r.x + r.width,
@@ -1331,7 +1127,6 @@ mod tests {
         assert!(matches!(resp, SettingsResponse::FieldChanged(_)));
         assert_eq!(config.editor.autosave_enabled, !before);
 
-        // A click on the label cell operates the same control.
         state.handle_click(r.x, r.y, &mut config);
         assert_eq!(config.editor.autosave_enabled, before);
     }
@@ -1350,8 +1145,6 @@ mod tests {
 
     #[test]
     fn click_on_a_locked_row_is_a_noop() {
-        // Images Never locks the remote-images row; a click on it must not
-        // move focus or change config.
         let mut config = Config::default();
         config.images.enabled = ImagesEnabled::Never;
         config.images.remote_policy = RemoteImagePolicy::Never;
@@ -1374,7 +1167,6 @@ mod tests {
         let mut state = SettingsState::new();
         render(&mut state, &config, 120, 40);
         let focused_before = state.focused;
-        // Column 0 is the focus-marker gutter, left of every control rect.
         let resp = state.handle_click(0, 0, &mut config);
         assert_eq!(resp, SettingsResponse::Continue);
         assert_eq!(state.focused, focused_before);
@@ -1382,20 +1174,15 @@ mod tests {
 
     #[test]
     fn show_images_never_cascades_remote_to_never_and_locks_row() {
-        // Mirrors the welcome modal: cycling Show images to Never forces
-        // remote to Never, disables the remote row, and skips it on
-        // navigation; leaving Never restores the prior remote choice.
         let mut config = Config::default();
         config.images.remote_policy = RemoteImagePolicy::Always;
         let mut state = SettingsState::new();
         focus_row(&mut state, &config, "Show images");
-        // Ask → Always → Never.
         state.handle_key(&key(KeyCode::Enter), &mut config);
         state.handle_key(&key(KeyCode::Enter), &mut config);
         assert_eq!(config.images.enabled, ImagesEnabled::Never);
         assert_eq!(config.images.remote_policy, RemoteImagePolicy::Never);
 
-        // The remote row is now disabled and skipped by Down navigation.
         let remote_idx = state
             .rows
             .iter()
@@ -1406,7 +1193,6 @@ mod tests {
         state.handle_key(&key(KeyCode::Down), &mut config);
         assert_ne!(state.focused, remote_idx, "Down must skip the locked row");
 
-        // Leave Never (Never → Ask) — prior remote choice is restored.
         focus_row(&mut state, &config, "Show images");
         state.handle_key(&key(KeyCode::Enter), &mut config);
         assert_eq!(config.images.enabled, ImagesEnabled::Ask);

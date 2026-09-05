@@ -1,19 +1,12 @@
-//! Action-routing layer extracted from `app.rs` in Step 2 of
-//! `refactor-app.md`.
+//! Action routing.
 //!
-//! Owns:
-//! - [`App::handle_app_action`] — App-level actions intercepted before
-//!   the generic `edit_ops::apply` fallthrough (link follow, palette,
-//!   overlays, table buttons toggle, insert table, save copy, …).
-//! - [`App::dispatch_action`] — the single unified dispatcher used by
-//!   both the run-loop keystroke arm and the palette-pick re-entry
-//!   path.  Resolves `handle_app_action` → dirty-quit guard →
-//!   `edit_ops::apply` → scroll / flash / link-follow side effects.
-//! - The thin `open_X` modal-push helpers + [`App::ensure_keymap_clone`].
-//! - Modal-key dispatch and the quit-confirm / column-widths flows.
-//! - The [`HandleEvent`] adapter trait used by the run loop.
-//! - Live-theme reapply.
-//! - Pure helpers `cursor_in_table` and `modal_wheel_delta`.
+//! [`App::handle_app_action`] intercepts App-level actions before the generic `edit_ops::apply`
+//! fallthrough; [`App::dispatch_action`] is the single dispatcher shared by the run-loop
+//! keystroke arm and the palette-pick re-entry path, resolving `handle_app_action` → dirty-quit
+//! guard → `edit_ops::apply` → scroll / flash / link-follow side effects.
+//!
+//! Also holds the `open_X` modal-push helpers, modal-key dispatch, the quit-confirm and
+//! column-widths flows, the [`HandleEvent`] run-loop adapter, and live-theme reapply.
 
 use crossterm::event::{Event, KeyEventKind, MouseEvent, MouseEventKind};
 
@@ -30,87 +23,49 @@ use super::flash::MessageKind;
 use super::modal::ModalOutcome;
 use super::App;
 
-/// Actions whose handlers are stubs.  When one of these fires (from a
-/// keybinding, palette pick, or other surface) the App pops a generic
-/// "not implemented" notice.  This is the single source of truth for
-/// unfinished features — grep `NOT_YET_IMPLEMENTED` to enumerate them.
+/// Actions whose handlers are stubs; firing one pops a generic "not implemented" notice.  The
+/// single source of truth for unfinished features.
 ///
-/// When you implement one of these for real: add an explicit
-/// `Action::Foo => …` arm above the catch-all guard AND remove the
-/// variant from this list.  The two are not enforced to stay in
-/// sync — an entry left here after a real handler lands will never
-/// fire (the explicit arm wins), but the stale entry is misleading
-/// to future readers of this list.
+/// Implementing one means adding an explicit `Action::Foo => …` arm above the catch-all guard
+/// *and* removing it here — nothing enforces that, and a stale entry is merely misleading (the
+/// explicit arm wins).
 pub(super) const NOT_YET_IMPLEMENTED: &[Action] = &[Action::Open];
 
 /// What an [`Action`] can *do*, tagged once per variant.
 ///
-/// The three default-deny gates in this module — diff review, a
-/// capturing search flow, a read-only document — used to be three
-/// hand-maintained allowlists of 25, 45 and 51 variants, seventeen of
-/// them identical across all three.  Every new `Action` therefore
-/// defaulted to *denied* in three places at once, silently, and the
-/// only way to notice was to try the chord in each context.
+/// The three default-deny gates below — diff review, a capturing search flow, a read-only
+/// document — are rules over these tags rather than hand-maintained allowlists, which used to
+/// silently default every new `Action` to denied in three places at once.  The tag match is
+/// exhaustive with **no wildcard arm**, so a new variant is a compile error until tagged.
 ///
-/// Inverting it fixes both halves of that.  The tag is a single
-/// exhaustive match with **no wildcard arm**, so a new variant is a
-/// compile error until somebody says what it does; and each gate
-/// becomes a rule over the tags rather than a list, so the seventeen
-/// shared entries collapse into [`ActionCaps::always_safe`].
-///
-/// The flags are deliberately about *capability*, not about any one
-/// gate's policy: "writes to the text", not "denied in diff".  A gate
-/// that wants an exception spells that exception out at its own site,
-/// where the reason for it is readable.
+/// The flags describe *capability*, not any gate's policy: "writes to the text", not "denied in
+/// diff".  A gate wanting an exception spells it out at its own site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ActionCaps {
-    /// Writes to the document's text — anything that could dirty the
-    /// buffer.  Conservative: a variant that mutates only in some
-    /// states (`TableNextCell` appends a row at the end of a table)
-    /// still carries the flag, because a gate asks "could this write?".
+    /// Writes to the document's text.  Conservative: a variant that mutates only in some states
+    /// (`TableNextCell` appends a row at a table's end) still carries the flag.
     pub mutates_buffer: bool,
-    /// Replaces the live document, or leaves the current position for
-    /// another.
+    /// Replaces the live document, or leaves the current position for another.
     ///
-    /// **No gate reads this today, and that is the point of writing it
-    /// down.**  A capturing search flow does leave these out — going
-    /// somewhere else mid-replace abandons a task in progress — but it
-    /// does so by *not* listing them in its allowlist, which is the
-    /// default-deny behavior every unlisted variant already gets.
-    /// Denying on the flag as well would say the same thing twice.  The
-    /// read-only gate is the one that has an opinion worth stating, and
-    /// its opinion is the opposite: cross-linking and section jumping
-    /// are what a manual is *for*, so it allows these emphatically
-    /// (`a_read_only_document_denies_every_write_and_allows_every_navigation`
-    /// asserts that, which is what keeps the tag honest).  Tagging is
-    /// cheap and a wrong tag is loud; a future gate that needs the
-    /// distinction finds it already made rather than having to
-    /// re-derive it over eighty variants.
+    /// **No gate denies on this today.**  The capturing search flow excludes these by simply not
+    /// listing them (default-deny already covers it), and the read-only gate takes the opposite
+    /// view — cross-linking and section jumping are what a manual is *for*.  Tagged anyway so a
+    /// future gate finds the distinction already made rather than re-deriving it.
     pub navigates_away: bool,
-    /// Writes the document out, or needs it to have a path on disk.
-    /// A pathless document (a page of the embedded manual) must refuse
-    /// these outright rather than detour into a Save-as prompt for a
-    /// document nobody can own.
+    /// Writes the document out, or needs it to have a path on disk.  A pathless document (an
+    /// embedded manual page) refuses these rather than detour into a Save-as prompt.
     pub needs_path: bool,
-    /// Reads the buffer without writing it: cursor motion, selection,
-    /// copy.  Distinct from "not `mutates_buffer`", which is also true
-    /// of every config toggle and every mode transition.
+    /// Reads the buffer without writing it: cursor motion, selection, copy.  Distinct from "not
+    /// `mutates_buffer`", which also covers config toggles and mode transitions.
     pub read_only_nav: bool,
-    /// Safe in every gated context: the six scroll actions, the ten
-    /// overlay openers, and `Quit`.  These are the seventeen that were
-    /// triplicated across the three old allowlists.
+    /// Safe in every gated context: the scroll actions, the overlay openers, and `Quit`.
     pub always_safe: bool,
 }
 
-/// Tag `action` with what it can do.  Exhaustive by construction —
-/// **do not add a wildcard arm**; the compile error a new variant
-/// produces here is the whole point.
+/// Tag `action` with what it can do.  **Do not add a wildcard arm** — the compile error a new
+/// variant produces here is the whole point.
 pub(super) fn action_caps(action: &Action) -> ActionCaps {
     use Action::*;
-    // Start from "does nothing dangerous, but is not blanket-safe" and
-    // let each group turn on what it needs.  Written as five booleans
-    // over one match rather than five matches so a variant's whole
-    // answer is readable in one place.
     let mutates_buffer = matches!(
         action,
         InsertChar(_)
@@ -131,10 +86,8 @@ pub(super) fn action_caps(action: &Action) -> ActionCaps {
             | Undo
             | Redo
             | ToggleCheckbox
-            // Every table command may rewrite the grid.  The four
-            // "motion" ones are included on purpose: Tab off the last
-            // cell appends a row, and Shift-Tab outside a table
-            // outdents a list item.
+            // The "motion" table commands are included on purpose: Tab off the last cell
+            // appends a row, and Shift-Tab outside a table outdents a list item.
             | TableNextCell
             | TablePrevCell
             | TableNextRow
@@ -204,10 +157,8 @@ pub(super) fn action_caps(action: &Action) -> ActionCaps {
             | CreateCustomTheme
             | OpenConfigFolder
     );
-    // The exhaustiveness check.  Every variant must appear here, so a
-    // new one cannot be added without an author deciding which group it
-    // joins — including "none of them", which is a real answer for the
-    // mode transitions and the config toggles.
+    // The exhaustiveness check: a new variant can't be added without deciding which group it
+    // joins — including "none of them", the real answer for mode transitions and config toggles.
     match action {
         ScrollUp | ScrollDown | ScrollPageUp | ScrollPageDown | ScrollToTop | ScrollToBottom
         | Quit | ShowCommandPalette | ShowMarkdownCheatSheet | ShowAbout | CheckForUpdates
@@ -226,14 +177,12 @@ pub(super) fn action_caps(action: &Action) -> ActionCaps {
         | SearchReplaceAll | FollowLinkUnderCursor | NavigateBack | NavigateForward
         | GoToSection | OpenDoc(_) | Open | Save | SaveAs | ExportHtml
         | OpenInExternalEditor
-        // Neither reads nor writes the document: the mode transitions
-        // and the persisted-setting flips.
+        // Neither reads nor writes the document: mode transitions and persisted-setting flips.
         | EnterEditMode | ExitToPreview | ToggleRawMode | ToggleTableButtons | ToggleBigH1
         | ToggleLineNumbers | ToggleBlinkCursor | ToggleAutosave | ToggleVisualLineNav
         | ToggleVimMode | ToggleLimitWidth | ToggleDiffOnChange
-        // The two bespoke command vocabularies.  Each gate names its
-        // own set explicitly, because "is a diff command" is a fact
-        // about one context rather than a capability.
+        // The two bespoke command vocabularies, which each gate names explicitly: "is a diff
+        // command" is a fact about one context, not a capability.
         | OpenSearch | SearchNext | SearchPrev | SearchExit | DiffNext | DiffPrev
         | DiffAcceptHunk | DiffRejectHunk | DiffAcceptAll | DiffRejectAll | DiffResetHunk
         | DiffExit => {}
@@ -247,16 +196,12 @@ pub(super) fn action_caps(action: &Action) -> ActionCaps {
     }
 }
 
-/// Default-deny gate over [`Action`]s in diff mode.  Returns
-/// `Some(action)` when the action is allowed in Review sub-mode (the
-/// only sub-mode today); `None` for everything else.  When an in-diff
-/// Edit mode lands, this can grow a `(action, sub_mode)` signature so
-/// Edit-only and Review-only actions refine the gate.
+/// Default-deny gate over [`Action`]s in diff mode: `Some(action)` when allowed in Review
+/// sub-mode, the only one today.
 ///
-/// The narrowest of the three gates: the review has no text-editing UI
-/// wired up at all, so nothing beyond the always-safe set and diff's
-/// own vocabulary is allowed — not even cursor motion, which in diff
-/// mode would move a cursor the stacked view does not draw.
+/// The narrowest of the three gates — the review has no text-editing UI at all, so nothing beyond
+/// the always-safe set and diff's own vocabulary passes, not even cursor motion, which would move
+/// a cursor the stacked view does not draw.
 pub(super) fn diff_safe_action(action: &Action) -> Option<Action> {
     use Action::*;
     let allowed = action_caps(action).always_safe
@@ -274,16 +219,11 @@ pub(super) fn diff_safe_action(action: &Action) -> Option<Action> {
     allowed.then(|| action.clone())
 }
 
-/// Default-deny gate over [`Action`]s while a *capturing* search flow
-/// (a replace flow) is active.  Navigate-only flows don't capture, so
-/// they never reach this gate.
+/// Default-deny gate over [`Action`]s while a *capturing* (replace) search flow is active;
+/// navigate-only flows never reach it.
 ///
-/// The rule: the flow's own commands, read-only navigation (the user
-/// can move, select and copy while the flow holds the `Tab`/`r`/`a`
-/// keys), and the always-safe set.  Everything that mutates the buffer
-/// stays unavailable for the duration, mirroring diff mode — and so
-/// does everything that navigates away, because leaving the document
-/// mid-replace abandons a task in progress.
+/// Allowed: the flow's own commands, read-only navigation, and the always-safe set.  Buffer
+/// mutation stays unavailable, as does navigating away — that abandons a task in progress.
 pub(super) fn search_safe_action(action: &Action) -> Option<Action> {
     use Action::*;
     let caps = action_caps(action);
@@ -297,56 +237,34 @@ pub(super) fn search_safe_action(action: &Action) -> Option<Action> {
                 | SearchReplace
                 | SearchReplaceAll
                 | SearchExit
-                // Undo / redo mutate, and are allowed anyway: they are
-                // how the user takes back a replace they just made,
-                // which is part of the flow rather than an escape from
-                // it.
+                // Undo / redo mutate but are allowed: taking back a replace is part of the flow.
                 | Undo
                 | Redo
-                // Saving mid-flow is the ordinary "commit what I have
-                // so far" reflex, and writes the document the flow is
-                // already editing — no detour, since the flow can only
-                // run on a document that is open.
+                // Saving mid-flow writes the document the flow is already editing — no detour.
                 | Save
                 | SaveAs
         );
     allowed.then(|| action.clone())
 }
 
-/// Default-deny gate over [`Action`]s while the live document is
-/// read-only (today: a page of the embedded manual, `crate::docs`).
+/// Default-deny gate over [`Action`]s while the live document is read-only (today: a page of the
+/// embedded manual).  Refuses exactly `mutates_buffer` and `needs_path`; everything else is
+/// allowed, `navigates_away` emphatically included, since cross-linking is what a manual is for.
 ///
-/// **Five denials, expressed as a rule rather than a list.**  A
-/// read-only document refuses exactly what writes its text
-/// (`mutates_buffer`) and what writes it out or needs it to have a path
-/// (`needs_path`) — which resolves to `InsertTable`, `Save`, `SaveAs`,
-/// `ExportHtml` and `OpenInExternalEditor` plus the editing actions a
-/// reader has no way to reach anyway.  Everything else is allowed,
-/// `navigates_away` emphatically included: cross-linking and jumping to
-/// a section is the entire point of a manual.
-///
-/// This gate is a *courtesy*, not the guarantee.  The guarantee is made
-/// two layers down, where it cannot be forgotten: `enter_edit_if_preview`
-/// refuses the transition out of `Mode::Preview` (all twenty-six call
-/// sites at once) and `EditorState::apply_delta` refuses the write.
-/// This exists so a palette pick of `Save` doesn't open a Save-as
-/// prompt for a document nobody can own, and so the refusal can be
-/// silent rather than half-performed.
+/// A *courtesy*, not the guarantee: that is made two layers down by `enter_edit_if_preview` and
+/// `EditorState::apply_delta`.  This exists so a palette pick of `Save` doesn't open a Save-as
+/// prompt for a document nobody can own, and so the refusal is silent rather than
+/// half-performed.
 pub(super) fn readonly_safe_action(action: &Action) -> bool {
     let caps = action_caps(action);
     !caps.mutates_buffer && !caps.needs_path
 }
 
-/// True when the editor's cursor sits inside a table block.  Mirrors
-/// the check used by `edit_ops::cursor_in_table`; re-implemented here
-/// to keep the App free of a cross-module private dep.
+/// True when the editor's cursor sits inside a table block.  Mirrors `edit_ops::cursor_in_table`,
+/// re-implemented to keep the App free of a cross-module private dep.
 pub(super) fn cursor_in_table(state: &EditorState) -> bool {
-    // A read-only document has no column to reorder — every table
-    // command is denied by `readonly_safe_action` — so `Alt+Left` /
-    // `Alt+Right` must stay the Back / Forward chord the hint row
-    // advertises, even when a `GoToSection` jump has parked the cursor
-    // inside one of `keybindings.md`'s many tables.  Without this the
-    // reader gets a dead chord for the one navigation they use most.
+    // A read-only document has no column to reorder, so `Alt+Left` / `Alt+Right` must stay the
+    // Back / Forward chord the hint row advertises even when the cursor sits inside a table.
     if state.readonly {
         return false;
     }
@@ -355,26 +273,18 @@ pub(super) fn cursor_in_table(state: &EditorState) -> bool {
     crate::editor::table_edit::find_table_at(&source, cursor_byte).is_some()
 }
 
-/// Reshape `clipboard` into the payload that replaces a vim VisualLine
-/// selection whose widened char range is `range`: the text, made *linewise*
-/// — guaranteed to end with a newline whenever the span it replaces does.
+/// Reshape `clipboard` into the payload replacing a vim VisualLine selection over `range`: made
+/// *linewise*, ending with a newline whenever the span it replaces does.
 ///
-/// `visual_line_char_range` includes the trailing newline of the last
-/// highlighted line, so pasting charwise text (`"foo"`) over it would
-/// otherwise weld the following line onto the paste (`alpha\nbeta\ngamma` →
-/// `foogamma`).  Appending the newline puts the payload on its own line(s),
-/// matching vim's `Vp` with a charwise register.  Text that already ends in a
-/// newline — the common V-LINE copy → V-LINE paste round trip — is returned
-/// unchanged, so no blank line creeps in.  A selection on a final line with
-/// no trailing newline replaces a span that doesn't end in one either, so
-/// nothing is appended there.
+/// `visual_line_char_range` includes the last line's trailing newline, so charwise text pasted
+/// over it would weld the following line onto the paste.  Text already ending in a newline is
+/// returned unchanged so no blank line creeps in, and a final line without one gets nothing
+/// appended.
 ///
-/// Returns `None` when there is nothing to paste (empty clipboard *and* empty
-/// kill-ring); the caller treats that as "do nothing" rather than replacing
-/// the lines with a bare newline.
+/// `None` when there is nothing to paste (empty clipboard *and* kill-ring), which the caller
+/// treats as a no-op rather than replacing the lines with a bare newline.
 ///
-/// Pure in `clipboard` — the OS clipboard read stays at the call site so this
-/// decision can be unit-tested without a live clipboard.
+/// Pure in `clipboard`; the OS read stays at the call site so this is unit-testable.
 fn linewise_paste_payload(
     buffer: &crate::document::Buffer,
     range: &std::ops::Range<usize>,
@@ -391,11 +301,8 @@ fn linewise_paste_payload(
     Some(clipboard)
 }
 
-/// Translate a wheel event into a `ModalState::scroll_by` delta.
-/// Honours the user's configured `mouse_scroll_lines` so a coarser
-/// wheel feel applies inside modals as well as the editor.  Returns
-/// `0` for non-wheel mouse events so callers can blindly forward
-/// every `Event::Mouse` without filtering.
+/// Translate a wheel event into a `ModalState::scroll_by` delta, honoring the configured
+/// `mouse_scroll_lines`.  `0` for non-wheel events, so callers can forward every `Event::Mouse`.
 pub(super) fn modal_wheel_delta(event: &MouseEvent, wheel_step: usize) -> i32 {
     let step = wheel_step.max(1) as i32;
     match event.kind {
@@ -405,9 +312,8 @@ pub(super) fn modal_wheel_delta(event: &MouseEvent, wheel_step: usize) -> i32 {
     }
 }
 
-/// Private extension trait so `DefaultHandler` can process raw crossterm events
-/// (filtering for KeyPress) without exposing this logic in the `ModeHandler`
-/// trait (which operates on already-filtered `KeyEvent`s).
+/// Private extension trait letting `DefaultHandler` process raw crossterm events (filtering for
+/// KeyPress) without putting that in `ModeHandler`, which takes already-filtered `KeyEvent`s.
 pub(super) trait HandleEvent {
     fn handle_event(&mut self, event: Event, state: &EditorState) -> Option<crate::config::Action>;
 }
@@ -427,20 +333,15 @@ impl App {
         !self.modal_stack.is_empty()
     }
 
-    /// Resolve an [`Action`] whose meaning depends on where the cursor
-    /// is, so every gate downstream judges what will actually run.
+    /// Resolve an [`Action`] whose meaning depends on the cursor position, so every downstream
+    /// gate judges what will actually run.
     ///
-    /// One case today: the default `Alt+Left` / `Alt+Right` bindings
-    /// land on `TableMoveColumnLeft` / `TableMoveColumnRight`, which
-    /// mean "reorder a column" inside a table and "navigate back /
-    /// forward" outside one.  `cursor_in_table` answers `false` for a
-    /// read-only document, so there the redirect always fires — which
-    /// is what the hint row's `⌥←→ Back/fwd` chord promises.
+    /// One case today: `Alt+Left` / `Alt+Right` bind to `TableMoveColumnLeft` /
+    /// `TableMoveColumnRight`, which mean "reorder a column" inside a table and "navigate back /
+    /// forward" outside one.
     ///
-    /// Deliberately ahead of the gates rather than inside
-    /// `handle_app_action`: a gate that judges the pre-redirect action
-    /// denies a navigation because of what a *different* action would
-    /// have done.
+    /// Deliberately ahead of the gates: a gate judging the pre-redirect action would deny a
+    /// navigation because of what a *different* action would have done.
     fn normalize_context_action(&self, action: Action) -> Action {
         match action {
             Action::TableMoveColumnLeft if !cursor_in_table(&self.editor) => Action::NavigateBack,
@@ -451,11 +352,8 @@ impl App {
         }
     }
 
-    /// Intercept App-level actions (`FollowLinkUnderCursor`,
-    /// `NavigateBack`, `NavigateForward`) before they hit `edit_ops::apply`.
-    ///
-    /// Returns `true` when the action was fully handled here; `false`
-    /// means the caller should fall through to `edit_ops::apply`.
+    /// Intercept App-level actions before they reach `edit_ops::apply`.  `true` when fully
+    /// handled here; `false` means fall through.
     pub(super) fn handle_app_action(
         &mut self,
         action: &Action,
@@ -503,8 +401,8 @@ impl App {
                 true
             }
             Action::OpenDoc(id) => {
-                // Opening a page replaces the document, so an unsaved
-                // buffer gets the same guard a cross-file link gets.
+                // Opening a page replaces the document, so an unsaved buffer needs the same
+                // guard a cross-file link gets.
                 if self.editor.dirty {
                     self.open_dirty_guard(crate::app::nav::NavPending::Doc(*id), None);
                 } else {
@@ -544,9 +442,7 @@ impl App {
                 }
                 true
             }
-            // Stub actions — every entry in `NOT_YET_IMPLEMENTED` lands
-            // here and surfaces the generic notice.  Wire a real handler
-            // above and drop the entry from the list to implement.
+            // Every `NOT_YET_IMPLEMENTED` entry lands here and surfaces the generic notice.
             a if NOT_YET_IMPLEMENTED.contains(a) => {
                 self.notify_not_implemented();
                 true
@@ -555,20 +451,15 @@ impl App {
                 if self.editor.buffer.path().is_none() {
                     self.notify("No file path for buffer", ModalKind::Error);
                 } else {
-                    // The actual editor invocation needs the live
-                    // `Terminal` handle, owned by the run loop.
-                    // Mirrors the settings-overlay "Open config.toml"
-                    // flow.
+                    // The invocation itself needs the live `Terminal` handle, owned by the run
+                    // loop.
                     self.pending_open_file_in_editor = true;
                     self.needs_draw = true;
                 }
                 true
             }
             Action::ToggleTableButtons => {
-                // Skip the toggle on terminals where mouse reporting is
-                // unavailable: the gutter glyphs would be inert and
-                // confusing.  Otherwise flip and persist, matching the
-                // settings-overlay row.
+                // Inert on terminals without mouse reporting, where the glyphs would confuse.
                 if self.capabilities.mouse {
                     self.config.table.show_buttons = !self.config.table.show_buttons;
                     self.toggle_persisted_setting(
@@ -622,9 +513,8 @@ impl App {
                 true
             }
             Action::ToggleVimMode => {
-                // Vim mode is stored as the modal handler name, not a
-                // bool — flip the handler, then let `apply_live_update`
-                // rebuild the live `VimState`.
+                // Vim mode is stored as the modal handler name, not a bool; `apply_live_update`
+                // then rebuilds the live `VimState`.
                 let enabling = self.config.modal.handler != VIM_HANDLER;
                 self.config.modal.handler = if enabling {
                     VIM_HANDLER
@@ -652,11 +542,8 @@ impl App {
                 true
             }
             Action::InsertTable => {
-                // Pre-flight the blank-line guard before
-                // opening the modal so a non-blank cursor surfaces an
-                // immediate warning notice.  The same guard subsumes
-                // mid-paragraph, heading, list, code-block, and
-                // existing-table cases without classifying the block.
+                // The blank-line guard runs before the modal opens, so a non-blank cursor gets
+                // an immediate warning.  It subsumes every block-kind case without classifying.
                 let source = self.editor.buffer.contents();
                 let cursor_byte = self
                     .editor
@@ -671,12 +558,8 @@ impl App {
                 self.needs_draw = true;
                 true
             }
-            // Image / link snippets share one pre-flight: the target
-            // block must be able to host inline Markdown (code, HTML,
-            // and image blocks hold literal content).  The insert
-            // functions run it themselves — against the actual insert
-            // offset, after the Preview cursor→scroll sync — and
-            // return `false` when it fails.
+            // Image / link snippets share one pre-flight — the target block must host inline
+            // Markdown — run inside the insert functions, against the post-sync insert offset.
             Action::InsertImage | Action::InsertLink => {
                 let is_image = matches!(action, Action::InsertImage);
                 let inserted = if is_image {
@@ -756,21 +639,16 @@ impl App {
                 self.needs_draw = true;
                 true
             }
-            // Hoisted out of `edit_ops::apply` so all save paths
-            // (keystroke, palette, autosave, post-merge resolution
-            // in later checkpoints) route through `App::save_buffer`
-            // — the single call site for `Buffer::save_file`.
-            // `flash_for_action` is invoked here because the
-            // post-dispatch flash in `dispatch_action` only fires
-            // when `handle_app_action` returns `false`.
+            // Hoisted out of `edit_ops::apply` so every save path routes through
+            // `App::save_buffer`, the single call site for `Buffer::save_file`.  The flash fires
+            // here because `dispatch_action`'s only runs when this returns `false`.
             Action::Save => {
                 if self.editor.mode == crate::editor::Mode::Diff {
                     self.flash("Resolve diff before saving", MessageKind::Info);
                     return true;
                 }
-                // A new, never-saved buffer has no destination yet.
-                // Prompt for one via the Save As modal instead of
-                // letting `save_file` fail into a generic "Save failed".
+                // A never-saved buffer has no destination: prompt rather than let `save_file`
+                // fail into a generic "Save failed".
                 if self.editor.buffer.path().is_none() {
                     self.open_save_as_modal(None);
                     self.needs_draw = true;
@@ -787,20 +665,14 @@ impl App {
         }
     }
 
-    /// Flip-and-persist path shared by the command-palette setting
-    /// toggles.  The caller has already mutated the `config` field;
-    /// this writes `config.toml`, pushes the change into any App-side
-    /// live cache (reusing the settings-overlay
-    /// [`apply_live_update`](crate::app::modal::settings::apply_live_update)
-    /// so the two surfaces can't diverge), and flashes the new state.
-    /// Unlike the overlay — which flashes the generic "Configuration
-    /// updated" — the palette names the setting and its new value.
+    /// Flip-and-persist path for the command-palette setting toggles.  The caller has already
+    /// mutated `config`; this writes `config.toml`, pushes the change through the settings
+    /// overlay's
+    /// [`apply_live_update`](crate::app::modal::settings::apply_live_update) so the two surfaces
+    /// can't diverge, and flashes the setting's new value by name.
     ///
-    /// The live update runs even when the save fails: the `config`
-    /// field is already flipped, so we push it into the live cache
-    /// regardless to keep the two in sync (the setting takes effect
-    /// for the session, just unpersisted).  This mirrors the overlay,
-    /// whose `apply_live_update` also runs unconditionally after save.
+    /// The live update runs even when the save fails: `config` is already flipped, so the setting
+    /// takes effect for the session, just unpersisted.
     fn toggle_persisted_setting(&mut self, label: &str, new_state: bool) {
         let saved = self.config.save();
         modal::settings::apply_live_update(label, self);
@@ -822,12 +694,8 @@ impl App {
         self.needs_draw = true;
     }
 
-    /// Pop the topmost modal off the stack, dispatch the key to it,
-    /// and apply the resulting [`ModalOutcome`].  Pop-then-dispatch
-    /// lets the modal handler take `&mut App` without borrow conflicts
-    /// — the popped modal owns itself.  `Continue` re-pushes it,
-    /// `Close` drops it, `CloseAnd` drops it then runs the supplied
-    /// callback against the now-unborrowed `App`.
+    /// Pop the topmost modal, dispatch the key to it, and apply the [`ModalOutcome`].
+    /// Pop-then-dispatch is what lets the handler take `&mut App` without a borrow conflict.
     pub(super) fn dispatch_modal_key(
         &mut self,
         key: crossterm::event::KeyEvent,
@@ -849,10 +717,8 @@ impl App {
         }
     }
 
-    /// Route a bracketed paste to the topmost modal.  Mirrors
-    /// [`Self::dispatch_modal_key`]'s pop-dispatch-push pattern; only the
-    /// text-input modals act on it (the rest inherit the `Modal`
-    /// trait's no-op `handle_paste`).
+    /// Route a bracketed paste to the topmost modal, as [`Self::dispatch_modal_key`] does.  Only
+    /// the text-input modals act on it.
     pub(super) fn dispatch_modal_paste(&mut self, text: &str) {
         let Some(mut top) = self.modal_stack.pop() else {
             return;
@@ -869,9 +735,8 @@ impl App {
         }
     }
 
-    /// Route a left-button click at terminal coords `(col, row)` to the
-    /// topmost modal.  Mirrors [`Self::dispatch_modal_key`]'s
-    /// pop-dispatch-push pattern so handlers can take `&mut App`.
+    /// Route a left-button click at `(col, row)` to the topmost modal, as
+    /// [`Self::dispatch_modal_key`] does.
     pub(super) fn dispatch_modal_click(&mut self, col: u16, row: u16) {
         let Some(mut top) = self.modal_stack.pop() else {
             return;
@@ -888,15 +753,13 @@ impl App {
         }
     }
 
-    /// Push the generic "feature not implemented yet" notice.  Called
-    /// from the [`NOT_YET_IMPLEMENTED`] dispatch arm; kept as its own
-    /// method so any future change to the wording lives in one place.
+    /// Push the generic "feature not implemented yet" notice, for the [`NOT_YET_IMPLEMENTED`]
+    /// dispatch arm.
     pub(super) fn notify_not_implemented(&mut self) {
         self.notify("This feature is not implemented yet.", ModalKind::Normal);
     }
 
-    /// Open the three-button `Save / Discard / Cancel` modal.  Called
-    /// when the user requests `Quit` on a dirty buffer.
+    /// Open the `Save / Discard / Cancel` modal, for `Quit` on a dirty buffer.
     pub(super) fn open_quit_confirm(&mut self) {
         let display = self
             .file_path
@@ -908,18 +771,14 @@ impl App {
             .push(Box::new(modal::QuitConfirmModal::new(&display)));
     }
 
-    /// Open the Markdown syntax cheat-sheet popover.  Pushes a
-    /// trait-based modal onto the stack; dispatch is handled by the
-    /// generic [`Self::dispatch_modal_key`] / wheel routes.
+    /// Open the Markdown syntax cheat-sheet popover.
     pub fn open_markdown_cheat_sheet(&mut self) {
         self.modal_stack
             .push(Box::new(modal::CheatSheetModal::new()));
     }
 
-    /// Open the About page.  Deliberately touches no network: the page
-    /// no longer reports release information, and its
-    /// `[ Check for updates ]` button is the only thing here that
-    /// reaches GitHub (see [`App::open_update_modal`]).
+    /// Open the About page.  Touches no network — its `[ Check for updates ]` button is the only
+    /// thing that reaches GitHub (see [`App::open_update_modal`]).
     pub fn open_about_modal(&mut self) {
         if self.modal_stack.contains::<modal::AboutModal>() {
             return;
@@ -939,9 +798,7 @@ impl App {
             )));
     }
 
-    /// Build a fresh copy of the keymap, populating `self.keymap` if
-    /// it has not been built yet.  Returns a clone so callers can use
-    /// it without holding a borrow on `self`.
+    /// Build `self.keymap` if needed and return a clone, so callers need no borrow on `self`.
     pub(super) fn ensure_keymap_clone(&mut self) -> KeyMap {
         if self.keymap.is_none() {
             match KeyMap::build(&self.keybindings) {
@@ -956,52 +813,27 @@ impl App {
         self.keymap.as_ref().unwrap().clone()
     }
 
-    /// Dispatch a resolved [`Action`] through the unified pipeline.
-    /// Both the run-loop keystroke arm
-    /// ([`super::App::dispatch_single_key`]) and the command palette
-    /// (`CommandPaletteModal`) funnel through here so there is exactly
-    /// one place where `handle_app_action`, the dirty-buffer quit
-    /// guard, `edit_ops::apply`, scroll tracking, post-action flashes,
-    /// and pending link-follow draining are sequenced.
+    /// Dispatch a resolved [`Action`] through the unified pipeline.  The run-loop keystroke arm
+    /// and the command palette both funnel through here, so `handle_app_action`, the dirty-quit
+    /// guard, `edit_ops::apply`, scroll tracking, flashes, and link-follow draining are sequenced
+    /// in exactly one place.
     pub fn dispatch_action(&mut self, action: Action, doc_height: usize, doc_width: usize) {
-        // Resolve the context-dependent meaning of an action *before*
-        // any gate judges it, so each gate judges the action that will
-        // actually run.
-        //
-        // This is what makes `Alt+Left` work in a read-only document.
-        // The redirect used to live inside `handle_app_action`, behind
-        // the gates — so the read-only gate saw the pre-redirect
-        // `TableMoveColumnLeft`, denied it as a buffer mutation, and
-        // the reader got a dead chord for the one navigation the hint
-        // row tells them is Back.
+        // Resolve the context-dependent meaning *before* any gate judges it — otherwise the
+        // read-only gate sees `TableMoveColumnLeft` and denies what is really a Back navigation.
         let action = self.normalize_context_action(action);
-        // A read-only document refuses the five actions that would
-        // write it or write it out.  Outermost on purpose:
-        // `search_safe_action` allows `SearchReplace` /
-        // `SearchReplaceAll`, so a replace flow started while reading
-        // would otherwise rewrite the in-memory page through an
-        // allowlist that never heard of it.  The gates compose by
+        // Outermost on purpose: `search_safe_action` allows `SearchReplace`, so a replace flow
+        // started while reading would otherwise rewrite the in-memory page.  The gates compose by
         // narrowing.
         //
-        // Silent, and keyed on `editor.readonly` rather than on
-        // `open_doc`: nothing here depends on the document being the
-        // manual, which is what leaves the door open for a `--readonly`
-        // flag or a file opened without write permission.  The refusal
-        // says nothing because in reading mode there is nothing left to
-        // refuse out loud — the hint row advertises none of these, and
-        // `Mode::Preview` draws no editing surface to be confused by.
+        // Silent, and keyed on `editor.readonly` rather than on `open_doc`, which leaves the door
+        // open for a `--readonly` flag or a file opened without write permission.
         if self.editor.readonly && !readonly_safe_action(&action) {
             return;
         }
-        // Search flow owns its own dispatch — gated *before*
-        // `handle_app_action` (unlike diff) so app-level actions that
-        // mutate the buffer or navigate away (insert table, footnotes,
-        // link follow, …) can't fire mid-flow.  `search_safe_action`
-        // default-denies everything off the allowlist; allowed
-        // app-level openers are re-routed inside
-        // `dispatch_search_action`.
-        // A navigate-only flow does *not* capture, in vim or default mode —
-        // see `search_flow_captures`.
+        // Gated *before* `handle_app_action` (unlike diff) so app-level actions that mutate or
+        // navigate away can't fire mid-flow; allowed openers are re-routed inside
+        // `dispatch_search_action`.  A navigate-only flow does not capture — see
+        // `search_flow_captures`.
         if self.search_flow_captures() {
             let Some(safe) = search_safe_action(&action) else {
                 self.flash_action_unavailable("search");
@@ -1010,10 +842,8 @@ impl App {
             self.dispatch_search_action(safe, doc_height, doc_width);
             return;
         }
-        // Non-capturing navigate flow: its own navigation actions (intercepted
-        // ahead of the keymap by `search_action_for`) still route to the
-        // search dispatcher; everything else falls through to normal editing
-        // with the match highlights left in place.
+        // Non-capturing navigate flow: its own navigation actions still route to the search
+        // dispatcher; everything else falls through to normal editing, highlights intact.
         if self.editor.search.is_some()
             && matches!(
                 action,
@@ -1023,47 +853,31 @@ impl App {
             self.dispatch_search_action(action, doc_height, doc_width);
             return;
         }
-        // Visual `Ctrl-C` / `Ctrl-X` / `Ctrl-V`: copy, cut, or replace the
-        // *widened* range so the clipboard matches the highlight (§2.6) —
-        // inclusive of the char under the cursor charwise, whole rows in
-        // VisualLine.  The widening goes through the one shared
-        // `vim_ops::visual_span` helper that the render and operator paths
-        // use, so the three can never disagree.  `selection` itself is never
-        // snapped — Copy restores the stored span so a continued Visual
-        // session keeps its true anchor; Cut and Paste consume the span and
-        // leave Visual.
+        // Visual `Ctrl-C` / `Ctrl-X` / `Ctrl-V` act on the *widened* range so the clipboard
+        // matches the highlight, widened through the shared `vim_ops::visual_span` the render and
+        // operator paths also use.  `selection` itself is never snapped: Copy restores the stored
+        // span so a continued Visual session keeps its anchor.
         if matches!(action, Action::Copy | Action::Cut | Action::Paste) {
             if let Some(kind) = self.vim.as_ref().and_then(|v| v.visual_kind()) {
                 self.dispatch_visual_clipboard(action, kind, doc_height, doc_width);
                 return;
             }
         }
-        // Diff mode default-denies *before* `handle_app_action`, for the
-        // same reason the search flow does: `handle_app_action` answers
-        // `true` for everything it handles, so a gate placed behind it
-        // never sees those actions at all.  `InsertTable`, the footnote
-        // fix-ups and `FollowLinkUnderCursor` are all off the diff
-        // allowlist and all handled there — and all reachable mid-review
-        // from the command palette, which *is* on the allowlist.  Gated
-        // here, the insert-table modal opened over a diff review and its
-        // edit landed on the pre-merge buffer.
+        // Denied *before* `handle_app_action`, like the search flow: that function answers
+        // `true` for everything it handles, so a gate behind it never sees `InsertTable`, the
+        // footnote fix-ups or `FollowLinkUnderCursor` — all off the diff allowlist, and all
+        // reachable mid-review from the palette, which is on it.
         //
-        // Only the refusal moves.  Dispatch stays below, so an allowed
-        // action still reaches `handle_app_action` first (that is what
-        // opens the palette and the overlays) and falls through to
-        // `dispatch_diff_action` only when nothing there claimed it.
+        // Only the refusal moves; dispatch stays below, so an allowed action still reaches
+        // `handle_app_action` first and falls through to `dispatch_diff_action`.
         if self.editor.mode == crate::editor::Mode::Diff && diff_safe_action(&action).is_none() {
             self.flash_action_unavailable("diff review");
             return;
         }
         let handled = self.handle_app_action(&action, doc_height, doc_width);
         if !handled {
-            // Diff mode owns its own dispatch — checked *before* the
-            // generic dirty-buffer quit guard, because in diff mode the
-            // buffer still holds the pre-merge text, so that guard's
-            // "Save" path would persist the wrong contents.  `Quit` in
-            // diff mode routes to `dispatch_diff_action`, which opens the
-            // diff-specific `DiffQuitConfirmModal`.
+            // Before the generic dirty-quit guard: in diff mode the buffer still holds the
+            // pre-merge text, so that guard's "Save" would persist the wrong contents.
             if self.editor.mode == crate::editor::Mode::Diff {
                 self.dispatch_diff_action(action, doc_height, doc_width);
                 return;
@@ -1088,14 +902,10 @@ impl App {
         }
     }
 
-    /// Copy, cut, or paste over a vim Visual selection: widen it first to the
-    /// span actually on screen (`vim_ops::visual_span` — inclusive of the char
-    /// under the cursor charwise, whole lines in VisualLine), without ever
-    /// snapping the persistent half-open `selection`.  `Copy` restores the
-    /// stored span afterwards (the user may keep extending in Visual); `Cut`
-    /// and `Paste` consume the span and exit Visual, since the selected
-    /// content is gone.  `EditorState` / `edit_ops` stay vim-agnostic — the
-    /// widening lives entirely here.
+    /// Copy, cut, or paste over a vim Visual selection, widening it to the span actually on
+    /// screen (`vim_ops::visual_span`) without snapping the persistent half-open `selection`.
+    /// `Copy` restores the stored span so the user can keep extending; `Cut` and `Paste` consume
+    /// it and exit Visual.  The widening lives here so `edit_ops` stays vim-agnostic.
     fn dispatch_visual_clipboard(
         &mut self,
         action: Action,
@@ -1107,11 +917,9 @@ impl App {
             return;
         };
         let range = crate::editor::vim_ops::visual_span(&sel, &self.editor.buffer, Some(kind));
-        // A VisualLine paste needs its payload newline-terminated so it can't
-        // weld onto the following line; nothing to paste must not consume the
-        // lines, so bail before the widening and leave the session untouched.
-        // Charwise paste is an ordinary span replacement — `edit_ops` handles
-        // it (and no-ops on an empty clipboard) against the widened selection.
+        // A VisualLine paste needs a newline-terminated payload so it can't weld onto the
+        // following line, and an empty one must bail before the widening rather than consume the
+        // lines.  Charwise paste is an ordinary span replacement `edit_ops` handles.
         let payload = match action {
             Action::Paste if kind == crate::editor::vim_ops::VisualKind::Line => {
                 let clipboard = edit_ops::clipboard_text(&self.editor);
@@ -1122,9 +930,7 @@ impl App {
                 Some(text)
             }
             Action::Paste => {
-                // Same promise as the linewise arm: nothing to paste must not
-                // consume the span, so bail while the session is intact rather
-                // than letting `edit_ops` no-op and exiting Visual anyway.
+                // As above: nothing to paste must not consume the span or exit Visual.
                 if edit_ops::clipboard_text(&self.editor).is_empty() {
                     return;
                 }
@@ -1139,40 +945,29 @@ impl App {
         self.editor.selection = Some(widened);
         let dirty_before = self.editor.dirty;
         match &payload {
-            // `paste_text` replaces the (now widened) selection with the
-            // linewise payload, so the highlighted rows are what gets
-            // overwritten — not the charwise anchor..active span.
             Some(text) => edit_ops::paste_text(&mut self.editor, text, doc_height, doc_width),
             None => {
                 edit_ops::apply(&mut self.editor, action.clone(), doc_height, doc_width);
             }
         }
-        // Mirror the non-vim clipboard path's feedback — the shared dispatch's
-        // `flash_for_action` is skipped by our early return, so run it here
-        // (flashing "Copied" for Copy / Cut; Paste is silent there, exactly as
-        // it is off this path).
+        // The shared dispatch's `flash_for_action` is skipped by our early return.
         self.flash_for_action(&action, dirty_before);
         if matches!(action, Action::Cut | Action::Paste) {
-            // The span is gone (deleted, or overwritten by the paste);
-            // drop back to Normal.
+            // The span is gone, so drop back to Normal.
             if let Some(vim) = self.vim.as_mut() {
                 vim.sub_mode = crate::input::VimSubMode::Normal;
                 vim.visual_anchor = None;
             }
             self.editor.selection = None;
         } else {
-            // Copy left the buffer untouched — restore the stored span so
-            // the highlight and a continued Visual session stay correct.
+            // Copy left the buffer untouched, so restore the stored span.
             self.editor.selection = Some(sel);
         }
         self.needs_draw = true;
     }
 
-    /// Shared free-scroll arms for the diff and search flow
-    /// dispatchers: the viewport moves without dragging the cursor
-    /// along (unlike `edit_ops` scrolling, which keeps the cursor
-    /// visible).  Returns `true` when `action` was a scroll action and
-    /// was handled here.
+    /// Shared free-scroll arms for the diff and search-flow dispatchers: the viewport moves
+    /// without dragging the cursor along, unlike `edit_ops` scrolling.  `true` when handled.
     pub(super) fn dispatch_flow_scroll(
         &mut self,
         action: &Action,
@@ -1224,9 +1019,8 @@ impl App {
         true
     }
 
-    /// Dispatch a single action while `Mode::Diff` is active.  The
-    /// caller has already passed `action` through
-    /// [`diff_safe_action`] so unsupported actions never arrive here.
+    /// Dispatch a single action while `Mode::Diff` is active; the caller has already filtered it
+    /// through [`diff_safe_action`].
     pub(super) fn dispatch_diff_action(
         &mut self,
         action: Action,
@@ -1237,14 +1031,10 @@ impl App {
         if self.dispatch_flow_scroll(&action, doc_height, doc_width) {
             return;
         }
-        // A read-only review (`--diff`) has no decision vocabulary: the
-        // sides are paths git chose, so a decision has nowhere to go.
-        // Denied here rather than in `diff_safe_action` because that
-        // gate answers "is this action legal in diff mode at all", a
-        // question with the same answer for both presentations — and it
-        // has no `DiffState` in hand to ask.  The command palette can
-        // reach these actions too, so a key-table omission would not be
-        // enough on its own.
+        // A read-only review (`--diff`) has no decision vocabulary — the sides are paths git
+        // chose.  Denied here rather than in `diff_safe_action`, which answers the
+        // presentation-independent question and holds no `DiffState`; and not merely by omission
+        // from the key table, since the palette reaches these too.
         if self.editor.diff.as_ref().is_some_and(|d| d.read_only)
             && matches!(
                 action,
@@ -1260,13 +1050,9 @@ impl App {
         }
         match action {
             Action::DiffNext => {
-                // Manual navigation supersedes any deferred auto-advance,
-                // and never triggers the resolve-confirm flow.  That flow
-                // has exactly two entry points (see `check_diff_resolution`):
-                // resolving the final hunk (a decision action, via the
-                // deferred advance) and pressing Esc once everything is
-                // resolved.  Tabbing among already-decided hunks must not
-                // pop the modal.
+                // Manual navigation supersedes a deferred auto-advance and never triggers the
+                // resolve-confirm flow — tabbing among decided hunks must not pop the modal.
+                // See `check_diff_resolution` for the flow's two entry points.
                 self.cancel_diff_advance();
                 if let Some(d) = self.editor.diff.as_mut() {
                     d.advance_focus();
@@ -1286,19 +1072,12 @@ impl App {
             }
             Action::DiffAcceptHunk => self.decide_focused_hunk(Decision::Accepted),
             Action::DiffRejectHunk => self.decide_focused_hunk(Decision::Rejected),
-            // Accept-all / reject-all override *every* hunk in one
-            // keystroke, so an accidental press would wipe out a mix of
-            // careful per-hunk decisions with no way to undo it
-            // (decisions aren't on an undo stack).  Gate the bulk flip
-            // behind a confirm modal; the actual `bulk_decide` happens
-            // on confirmation via `apply_diff_bulk_decision`.
+            // Decisions are not on an undo stack, so a one-keystroke override of every hunk
+            // goes behind a confirm modal; `apply_diff_bulk_decision` does the work.
             Action::DiffAcceptAll => self.open_diff_bulk_confirm(Decision::Accepted),
             Action::DiffRejectAll => self.open_diff_bulk_confirm(Decision::Rejected),
             Action::DiffResetHunk => {
-                // Undecide the focused hunk.  Cancel any in-flight
-                // post-decision advance first so a freshly-reset hunk
-                // keeps focus instead of being skipped past.  A no-op
-                // (hunk already `Pending`) leaves everything untouched.
+                // Cancel any in-flight advance first, so a freshly-reset hunk keeps focus.
                 self.cancel_diff_advance();
                 let reset = self.editor.diff.as_mut().is_some_and(|d| d.reset_focused());
                 if reset {
@@ -1306,20 +1085,12 @@ impl App {
                 }
             }
             Action::DiffExit => {
-                // Esc is gated on full resolution — diff mode cannot be
-                // exited while any hunk is still pending:
-                //  - every hunk resolved → open the apply-confirm modal
-                //    (entry point 2 of the resolve flow), so a fully
-                //    reviewed diff is applied via an explicit choice.
-                //  - anything still pending → no-op + a hint; the user
-                //    must decide every hunk before leaving (Apply on the
-                //    confirm modal is the exit, or Quit to abandon).
+                // Esc cannot exit while any hunk is pending: fully resolved opens the
+                // apply-confirm modal (resolve-flow entry point 2), anything pending no-ops with
+                // a hint.  Apply or Quit are the two exits.
                 self.cancel_diff_advance();
-                // A read-only review is the whole session — there is no
-                // editor behind it to return to, and nothing to resolve
-                // — so Esc leaves the process.  git difftool runs one
-                // file per invocation, so this is what advances the loop
-                // to the next file.
+                // A read-only review has no editor behind it and nothing to resolve, so Esc
+                // leaves the process — which is what advances a `git difftool` walk.
                 if self.editor.diff.as_ref().is_some_and(|d| d.read_only) {
                     self.should_quit = true;
                 } else if self.editor.diff.as_ref().is_some_and(|d| d.all_resolved()) {
@@ -1331,27 +1102,18 @@ impl App {
                     );
                 }
             }
-            // Note: `SaveAs` is deliberately excluded from
-            // `diff_safe_action` (and so never reaches here) — it
-            // re-points the buffer path and watcher, which would desync
-            // the live diff.
+            // `SaveAs` never reaches here: `diff_safe_action` excludes it, since re-pointing the
+            // buffer path and watcher would desync the live diff.
             Action::Quit => {
-                // Nothing is at stake in a read-only review — no
-                // decisions, no unapplied merge — so the confirmation
-                // would be a prompt with one sensible answer.  The flag
-                // is what tells `main` to end the whole `git difftool`
-                // walk and not just this file.
+                // Nothing is at stake in a read-only review, so no confirmation.  The flag tells
+                // `main` to end the whole `git difftool` walk, not just this file.
                 if self.editor.diff.as_ref().is_some_and(|d| d.read_only) {
                     self.diff_stop_walk = true;
                     self.should_quit = true;
                     return;
                 }
-                // An active diff review is unapplied work — quitting
-                // would discard the pending external change and every
-                // decision.  Warn first, mirroring the dirty-buffer
-                // quit guard; `DiffQuitConfirmModal` handles the actual
-                // discard-and-quit on confirm.  Don't stack a second
-                // copy if one is already up.
+                // An active review is unapplied work, so warn first, as the dirty-buffer quit
+                // guard does — without stacking a second copy of the modal.
                 if !self
                     .modal_stack
                     .contains::<crate::app::modal::DiffQuitConfirmModal>()
@@ -1361,9 +1123,6 @@ impl App {
                     self.needs_draw = true;
                 }
             }
-            // Read-only overlay openers route through their
-            // standard App-level helpers, which push the modal atop
-            // the diff view.
             Action::ShowCommandPalette => {
                 self.open_command_palette();
             }
@@ -1396,21 +1155,16 @@ impl App {
                     self.spawn_open_worker(dir.display().to_string());
                 }
             }
-            // Everything else passed `diff_safe_action` but doesn't
-            // need a specific arm (e.g. NavigateBack/Forward, which
-            // are app-level and handled by `handle_app_action`).
+            // Everything else passed `diff_safe_action` but needs no specific arm here.
             _ => {}
         }
     }
 
-    /// Record an accept/reject on the focused hunk and arm the deferred
-    /// advance so the user sees the decision land before focus moves on
-    /// (§ diff-mode UX).  A prior pending advance is flushed first so
-    /// rapid taps walk through hunks rather than re-deciding one.  When
-    /// this decision resolves the final hunk, the deferred advance's
-    /// `check_diff_resolution` is what opens the confirm modal — so the
-    /// resolve flow is triggered by the *act* of deciding, not by merely
-    /// landing in a resolved state.
+    /// Record an accept/reject on the focused hunk and arm the deferred advance, so the user sees
+    /// the decision land before focus moves.  A prior pending advance is flushed first, so rapid
+    /// taps walk through hunks rather than re-deciding one.  On the final hunk, the deferred
+    /// advance's `check_diff_resolution` opens the confirm modal — the flow is triggered by the
+    /// *act* of deciding, not by landing in a resolved state.
     fn decide_focused_hunk(&mut self, decision: crate::diff::Decision) {
         if self.diff_advance_pending_since.is_some() {
             self.apply_diff_advance();
@@ -1426,11 +1180,8 @@ impl App {
         }
     }
 
-    /// Open the bulk-decision confirm modal for `DiffAcceptAll` /
-    /// `DiffRejectAll`.  No-op when no diff is active or a copy of the
-    /// modal is already on the stack (so a held / repeated key can't
-    /// stack duplicates).  The decision is *not* applied here — that
-    /// waits for the user's `[Yes]` (see `apply_diff_bulk_decision`).
+    /// Open the bulk-decision confirm modal.  No-op without a diff, or when one is already
+    /// stacked (a held key must not stack duplicates).  The decision waits for `[Yes]`.
     fn open_diff_bulk_confirm(&mut self, decision: crate::diff::Decision) {
         self.cancel_diff_advance();
         if self.editor.diff.is_none() {
@@ -1449,10 +1200,8 @@ impl App {
         self.needs_draw = true;
     }
 
-    /// Apply a confirmed bulk decision to every hunk, then route through
-    /// the normal resolution check (which opens the apply-confirm modal
-    /// once everything is decided).  Invoked from the bulk-confirm
-    /// modal's `[Yes]` callback.
+    /// Apply a confirmed bulk decision to every hunk, then run the normal resolution check.
+    /// Invoked from the bulk-confirm modal's `[Yes]` callback.
     pub(crate) fn apply_diff_bulk_decision(&mut self, decision: crate::diff::Decision) {
         self.cancel_diff_advance();
         if let Some(d) = self.editor.diff.as_mut() {
@@ -1462,14 +1211,10 @@ impl App {
         self.check_diff_resolution();
     }
 
-    /// Push the apply-confirm modal iff every hunk has been decided.
-    /// This is the *single* place the modal is opened, and it has only
-    /// two callers so the resolve flow has exactly two entry points:
-    /// (1) `apply_diff_advance` after a decision resolves the final hunk
-    /// (including bulk accept-all / reject-all), and (2) `Action::DiffExit`
-    /// (Esc) when the diff is already fully resolved.  Hunk navigation
-    /// deliberately does *not* call this — tabbing through resolved hunks
-    /// must not re-open the modal.
+    /// Push the apply-confirm modal iff every hunk has been decided.  The *single* place it is
+    /// opened, with exactly two callers: `apply_diff_advance` once a decision resolves the final
+    /// hunk, and `Action::DiffExit` on an already-resolved diff.  Hunk navigation deliberately
+    /// does not call it — tabbing through resolved hunks must not re-open the modal.
     pub(crate) fn check_diff_resolution(&mut self) {
         let Some(diff) = self.editor.diff.as_ref() else {
             return;
@@ -1477,7 +1222,6 @@ impl App {
         if !diff.all_resolved() {
             return;
         }
-        // Already showing the confirm modal?  Don't push a second one.
         if self
             .modal_stack
             .contains::<crate::app::modal::DiffResolveConfirmModal>()
@@ -1497,22 +1241,14 @@ impl App {
         self.needs_draw = true;
     }
 
-    /// Enter diff-review mode against the on-disk contents the user's
-    /// `DirtyConflictModal` was carrying.  Push the intro modal first
-    /// when the user hasn't opted out (§8).
+    /// Enter diff-review mode against the on-disk contents the `DirtyConflictModal` was carrying,
+    /// pushing the intro modal first unless the user opted out.
     pub(crate) fn enter_diff_mode(&mut self, on_disk: String) {
-        // A half-typed vim command line (`:`/`/`/`?`) can't survive
-        // into diff review: vim key handling is deferred while in diff
-        // mode (so the prompt could never be completed), and a stale
-        // `cmdline` outranks the diff hint row in `hint_content`,
-        // masking the diff-review chords.  Drop it — along with any
-        // in-progress multi-key parse — so the hint line reads diff.
-        // End the prompt's live sessions first, as Esc would: the
-        // incsearch session must not dangle on `VimState` (the next `/`
-        // would reuse its stale saved view), and a live `:s` preview
-        // must revert its transient buffer edit before the `old`
-        // snapshot below — otherwise the diff is taken against preview
-        // text and the preview's app-level gates hold forever.
+        // A half-typed vim command line can't survive into diff review: the prompt could never
+        // be completed there, and a stale `cmdline` masks the diff hint row.  End its live
+        // sessions first, as Esc would — a dangling incsearch session would be reused by the next
+        // `/`, and a live `:s` preview must revert its transient edit before the `old` snapshot
+        // below, or the diff is taken against preview text and its gates hold forever.
         if let Some(vim) = self.vim.as_mut() {
             crate::editor::vim_ops::end_incsearch(&mut self.editor, &mut vim.incsearch);
             vim.cmdline = None;
@@ -1522,28 +1258,19 @@ impl App {
             &mut self.editor,
             /*restore_view=*/ true,
         );
-        // A search flow can't survive into diff review either — the
-        // diff view replaces the document and its resolution will swap
-        // the buffer out from under the match list.  Runs after
-        // `end_incsearch` so a restored prior hlsearch session is torn
-        // down along with the advance timer.
+        // A search flow can't survive either: resolution swaps the buffer out from under the
+        // match list.  After `end_incsearch`, so a restored prior hlsearch session goes too.
         self.exit_search_flow();
         let old = self.editor.buffer.contents();
         let Some(diff_state) = crate::diff::DiffState::new(&old, &on_disk) else {
-            // Edge case: the dirty-conflict modal was opened against
-            // bytes that happen to match the buffer now (perhaps the
-            // user reverted manually before clicking Merge).  Flash
-            // a hint and return to the main editor.
+            // The on-disk bytes match the buffer after all (a manual revert before Merge).
             self.flash("No differences to review", MessageKind::Info);
             return;
         };
         let uneven_table_fallback = diff_state.uneven_table_fallback;
         self.editor.enter_diff_mode(diff_state);
-        // Only ever show one intro modal at a time.  A clean buffer stays
-        // clean while in diff review, so a second (or third) external
-        // overwrite re-enters this path and would otherwise stack another
-        // identical modal on top — the user then has to dismiss each one
-        // in turn.  Skip the push when one is already on the stack.
+        // A clean buffer stays clean during review, so a second external overwrite re-enters
+        // this path; without the check the user dismisses one intro modal per overwrite.
         if self.config.editor.show_diff_intro
             && !self
                 .modal_stack
@@ -1561,29 +1288,20 @@ impl App {
         self.needs_draw = true;
     }
 
-    /// Install a **read-only** review of `old` vs `new` and enter diff
-    /// mode — the `--diff` difftool presentation.
+    /// Install a **read-only** review of `old` vs `new` and enter diff mode — the `--diff`
+    /// difftool presentation.
     ///
-    /// Distinct from [`Self::enter_diff_mode`] rather than a flag on it,
-    /// because almost none of that method's work applies: there is no
-    /// vim command line to tear down, no search flow to end, and no
-    /// intro modal to push (it teaches the accept/reject vocabulary this
-    /// review does not have). What it shares is the one thing that
-    /// matters — `DiffState::new` refusing an empty hunk list, and
-    /// `EditorState::enter_diff_mode` as the single door into
-    /// `Mode::Diff`.
+    /// Separate from [`Self::enter_diff_mode`] rather than a flag on it: there is no vim command
+    /// line to tear down, no search flow to end, and no intro modal (it teaches an accept/reject
+    /// vocabulary this review lacks).  What it shares is `DiffState::new` refusing an empty hunk
+    /// list and `EditorState::enter_diff_mode` as the single door into `Mode::Diff`.
     ///
-    /// The buffer is seeded with the *old* side so the review reads the
-    /// way every other one does (buffer = before, `new_buffer` = after)
-    /// and so `resolved_rope`'s coordinate space stays meaningful should
-    /// a later write-back mode want it. `dirty` is left false by
-    /// `replace_buffer`, and `file_path` stays `None`, so nothing in the
-    /// process has a path to save over.
+    /// The buffer is seeded with the *old* side so the review reads like every other one (buffer =
+    /// before, `new_buffer` = after).  `dirty` stays false and `file_path` stays `None`, so
+    /// nothing has a path to save over.
     ///
-    /// Returns `false` when the two files are byte-identical — git only
-    /// invokes a difftool for paths it believes differ, but a
-    /// whitespace- or mode-only change can still reach us, and opening
-    /// an empty review would be worse than saying so on stderr.
+    /// `false` when the two files are byte-identical: git invokes a difftool only for paths it
+    /// believes differ, but a whitespace- or mode-only change can still reach us.
     pub fn enter_read_only_diff(&mut self, old: String, new: String) -> bool {
         let Some(mut diff_state) = crate::diff::DiffState::new(&old, &new) else {
             return false;
@@ -1593,17 +1311,10 @@ impl App {
         self.editor
             .replace_buffer(crate::document::Buffer::from_str(&old));
         self.editor.enter_diff_mode(diff_state);
-        // `App::new` built the three media prompts from the editor it
-        // was handed, which for a `--diff` session is the empty startup
-        // buffer — so this is the call that asks them against the
-        // document actually under review.  Without it a mermaid diagram
-        // or a remote image in a clean region shows a placeholder for
-        // the whole session under the default `ask` policy, because
-        // nothing else ever sets `session_diagrams_enabled` /
-        // `session_images_enabled` and `effective_*_enabled` is false
-        // until something does (issue #30's shape, one path further on).
-        // After `enter_diff_mode`, since the prompts read
-        // `editor.parsed`, which `replace_buffer` has just rebuilt.
+        // `App::new` built the media prompts from the empty startup buffer, so this is the call
+        // that asks them against the document actually under review — otherwise nothing ever
+        // sets `session_*_enabled` and every diagram / remote image stays a placeholder for the
+        // session.  After `enter_diff_mode`, since the prompts read the rebuilt `editor.parsed`.
         self.on_document_contents_swapped();
         if uneven_table_fallback {
             self.flash(
@@ -1615,18 +1326,14 @@ impl App {
         true
     }
 
-    /// Set the status-bar label for a difftool session (see
-    /// [`App::diff_label`]).
+    /// Set the status-bar label for a difftool session (see [`App::diff_label`]).
     pub fn set_diff_label(&mut self, label: Option<String>) {
         self.diff_label = label;
     }
 
-    /// Apply the merged result to the editor buffer and exit diff
-    /// mode.  Called from the `[Apply]` button of
-    /// [`crate::app::modal::DiffResolveConfirmModal`].  Records a single
-    /// coarse "merge-revert" history entry (§6) so one `Ctrl-Z` from
-    /// normal mode reverts the whole merge and one `Ctrl-Y` re-applies
-    /// it; any new edit afterwards clears the redo path as usual.
+    /// Apply the merged result and exit diff mode, from the `[Apply]` button of
+    /// [`crate::app::modal::DiffResolveConfirmModal`].  Records one coarse history entry, so a
+    /// single `Ctrl-Z` reverts the whole merge.
     pub(crate) fn apply_diff_resolution(&mut self) {
         self.cancel_diff_advance();
         let Some(diff) = self.editor.diff.as_ref() else {
@@ -1636,15 +1343,12 @@ impl App {
             self.flash("Diff is not fully resolved", MessageKind::Info);
             return;
         };
-        // Compare resolved bytes against the disk contents so we
-        // only set dirty when the merge actually diverges from disk.
+        // Only dirty when the merge actually diverges from disk.
         let new_text = diff.new_buffer.contents();
         let resolved_text = resolved.to_string();
         let differs_from_disk = resolved_text != new_text;
-        // The pre-merge buffer is the diff's `old_rope` (entering diff
-        // mode never mutates `editor.buffer`).  Build the single
-        // synthetic delta that, on undo, restores it and, on redo,
-        // re-applies the merged text.
+        // The pre-merge buffer is the diff's `old_rope` — entering diff mode never mutates
+        // `editor.buffer` — so one synthetic delta covers both directions.
         let merge_delta = crate::document::EditDelta {
             offset: 0,
             removed: diff.old_rope.to_string(),
@@ -1658,28 +1362,20 @@ impl App {
         self.editor.refresh_parsed();
         self.editor.update_cursor_block();
         self.editor.exit_diff_mode();
-        // The merge replaced the document's contents wholesale, so it
-        // owes the same bookkeeping a file load does — including the
-        // media prompts, since the external change may have introduced
-        // this session's first image / diagram / remote URL.  Must
-        // follow `refresh_parsed`: the prompts are built from
-        // `editor.parsed`.
+        // A wholesale content replacement owes the same bookkeeping a file load does, media
+        // prompts included.  After `refresh_parsed`, which the prompts are built from.
         self.on_document_contents_swapped();
         self.flash("Diff resolved", MessageKind::Success);
         self.needs_draw = true;
     }
 
-    /// Exit diff mode without applying the merge.  Restores the
-    /// pre-diff buffer state (the diff's `old_rope` already equals
-    /// the editor's current buffer, so this is just a clean-up).
+    /// Exit diff mode without applying the merge.  Just clean-up: the diff's `old_rope` already
+    /// equals the editor's buffer.
     pub(crate) fn exit_diff_mode_discarding(&mut self) {
         self.cancel_diff_advance();
         self.editor.exit_diff_mode();
-        // Tear down every diff-specific modal: the diff they refer to
-        // is gone, so leaving one buried (e.g. behind the file-deleted
-        // modal when the file vanishes mid-review) would let a stale
-        // confirmation fire against no diff.  `remove_first` is a no-op
-        // for any not present, so this is safe from every caller.
+        // The diff these refer to is gone, so a buried one (e.g. behind the file-deleted modal)
+        // would later fire against no diff.  `remove_first` no-ops when absent.
         self.modal_stack
             .remove_first::<crate::app::modal::DiffResolveConfirmModal>();
         self.modal_stack
@@ -1691,54 +1387,29 @@ impl App {
         self.needs_draw = true;
     }
 
-    /// The single call site for [`crate::document::Buffer::save_file`]
-    /// across the application.  Every save path funnels through
-    /// here so that follow-up state — clearing the dirty flag today,
-    /// and the watcher's own-write hash stamp in a later checkpoint —
-    /// has a single place to live.  Routed callers today:
+    /// The single call site for [`crate::document::Buffer::save_file`].  Every save path funnels
+    /// through here — keystroke / palette `Save`, autosave, the dirty-link and dirty-quit guards,
+    /// the external-editor flow — so follow-up state (the dirty flag, the watcher's own-write
+    /// hash) has one home.
     ///
-    /// - keystroke / palette-invoked `Action::Save`
-    ///   ([`App::handle_app_action`])
-    /// - idle autosave ([`App::tick_autosave`])
-    /// - save-before-navigate from the dirty-link guard
-    ///   ([`super::modal::DirtyGuardModal`])
-    /// - save-and-quit from the dirty-quit confirm modal
-    ///   ([`super::modal::QuitConfirmModal`])
-    /// - save-before-launch in the external-editor flow
-    ///   ([`App::open_current_file_in_editor`])
-    /// - future post-merge diff resolution
-    ///
-    /// Callers are responsible for their own success / failure UX
-    /// (toast vs. error modal vs. silent autosave flash); this helper
-    /// only returns the underlying `Result` so each caller can shape
-    /// the message it wants.
+    /// Returns the raw `Result`; each caller shapes its own success / failure UX.
     pub(super) fn save_buffer(&mut self) -> anyhow::Result<()> {
         self.editor.buffer.save_file()?;
         self.editor.dirty = false;
-        // Stamp the just-written contents so the watcher's own-write
-        // filter drops the inotify echo that our own save is about to
-        // generate.  Hashed from the in-memory rope (its `\n`-only form)
-        // rather than re-reading disk: for a CRLF buffer the on-disk
-        // bytes are *not* identical — `save_file` widens each `\n` to
-        // `\r\n` — but `handle_file_changed` normalizes the echoed read
-        // back to `\n` before hashing, so both sides meet in `\n` space
-        // and the memory read stays dramatically cheaper.
+        // Stamp the written contents so the watcher's own-write filter drops our save's own
+        // echo.  Hashed from the in-memory rope's `\n`-only form rather than re-reading disk:
+        // `handle_file_changed` normalizes CRLF back to `\n` before hashing, so both sides meet
+        // in `\n` space and the memory read is far cheaper.
         let bytes = self.editor.buffer.contents();
         self.set_disk_hash(bytes.as_bytes());
         Ok(())
     }
 
-    /// Save the buffer to a new path and adopt it as the buffer's
-    /// home.  Backs every "Save As" path: the [`modal::SaveAsModal`]
-    /// (palette `SaveAs`, a path-less `Save`, vim `:w <path>` /
-    /// `:saveas`) and the file-deleted recovery flow.  Writing the rope
-    /// elsewhere re-points the buffer, the App's `file_path`, and the
-    /// filesystem watcher at the new location rather than leaving them
-    /// bound to the old path.
+    /// Save the buffer to a new path and adopt it: the buffer, the App's `file_path`, and the
+    /// filesystem watcher are all re-pointed there.  Backs every "Save As" path.
     ///
-    /// Mirrors [`Self::save_buffer`]'s post-write bookkeeping (clear
-    /// dirty, stamp the own-write hash) and additionally re-points the
-    /// watcher — best-effort, matching [`Self::load_file_into_editor`].
+    /// Mirrors [`Self::save_buffer`]'s post-write bookkeeping, plus a best-effort watcher
+    /// re-point.
     pub(super) fn save_buffer_as(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
         self.editor.buffer.save_as(path)?;
         self.editor.dirty = false;
@@ -1758,12 +1429,9 @@ impl App {
         Ok(())
     }
 
-    /// Stamp the watcher's own-write filter from raw bytes.  Used by
-    /// callers that do not already have an `incoming_hash` computed
-    /// — the initial file load and the manual / autosave save paths.
-    /// The accepted-`FileChanged` arm in `file_changed.rs` writes
-    /// `last_disk_hash` directly to avoid hashing the same bytes
-    /// twice.
+    /// Stamp the watcher's own-write filter from raw bytes, for callers without an
+    /// `incoming_hash` already in hand.  The accepted-`FileChanged` arm writes `last_disk_hash`
+    /// directly instead, to avoid hashing the same bytes twice.
     pub(crate) fn set_disk_hash(&mut self, bytes: &[u8]) {
         self.last_disk_hash = Some(seahash::hash(bytes));
     }
@@ -1774,13 +1442,9 @@ impl App {
             .push(Box::new(modal::SettingsOverlayModal::new()));
     }
 
-    /// Open the welcome modal on demand — the capability-aware settings
-    /// surface.  Unlike the startup path this ignores
-    /// `config.editor.show_welcome`, and it rebuilds the state from the
-    /// live `capabilities`, so it doubles as the "my terminal changed"
-    /// entry point: images / diagrams / theme are re-gated against what
-    /// *this* terminal can actually do.  Guarded against stacking two
-    /// copies, like the About modal.
+    /// Open the welcome modal on demand, ignoring `config.editor.show_welcome` and rebuilding
+    /// from the live `capabilities` — so it doubles as the "my terminal changed" entry point.
+    /// Guarded against stacking two copies.
     pub fn open_welcome_modal(&mut self) {
         if self.modal_stack.contains::<modal::WelcomeModal>() {
             return;
@@ -1791,16 +1455,12 @@ impl App {
         )));
     }
 
-    /// Open the fuzzy-searchable theme picker.  Replaces the Theme
-    /// row that the settings overlay used to carry — selecting a row
-    /// writes `config.theme`, saves, and reapplies the palette live.
+    /// Open the fuzzy-searchable theme picker; selecting a row writes `config.theme`, saves, and
+    /// reapplies the palette live.
     pub fn open_theme_picker(&mut self) {
         let current = self.config.theme.clone();
-        // If the configured appearance doesn't match the current theme's
-        // appearance (e.g. config.toml was hand-edited), open the picker
-        // in the mode that actually contains the current theme — otherwise
-        // it would be filtered out of the list and the "(current)" marker
-        // would never render.
+        // Open in the mode that actually contains the current theme (they can disagree after a
+        // hand-edited config.toml), or it is filtered out and "(current)" never renders.
         let mode =
             crate::config::theme::theme_appearance(&current).unwrap_or(self.config.appearance);
         let themes = crate::config::theme::list_theme_names_for_mode(mode);
@@ -1809,8 +1469,7 @@ impl App {
         )));
     }
 
-    /// Open the keybinds overlay.  Builds a live `KeyMap` if one
-    /// hasn't been kept around yet.
+    /// Open the keybinds overlay, building a live `KeyMap` if there isn't one yet.
     pub fn open_keybinds_overlay(&mut self) {
         let keymap = self.ensure_keymap_clone();
         let overrides = self.keybindings.clone();
@@ -1823,37 +1482,27 @@ impl App {
             )));
     }
 
-    /// Open the rows/columns prompt.  Caller is expected to have
-    /// already verified the cursor sits on a blank line via
-    /// [`crate::editor::table_edit::cursor_line_is_blank`]; this method just
-    /// seeds the modal state.
+    /// Open the rows/columns prompt.  The caller must have verified the blank-line precondition
+    /// via [`crate::editor::table_edit::cursor_line_is_blank`].
     pub fn open_insert_table_modal(&mut self) {
         self.modal_stack
             .push(Box::new(modal::InsertTableModal::new()));
     }
 
-    /// Open the "Save As" path-entry modal, seeded from the buffer's
-    /// current path (or a default for an unnamed buffer).  On submit the
-    /// buffer is written and *re-pointed* at the new path via
-    /// [`Self::save_buffer_as`].  `after_save` runs once the write
-    /// succeeds — used by the save-then-quit / save-then-navigate flows
-    /// so a path-less buffer can finish a deferred action after the user
-    /// supplies a path.
+    /// Open the "Save As" path-entry modal, seeded from the buffer's current path.  On submit
+    /// the buffer is written and re-pointed via [`Self::save_buffer_as`]; `after_save` then runs,
+    /// which is how the save-then-quit / save-then-navigate flows finish a deferred action.
     pub fn open_save_as_modal(&mut self, after_save: Option<modal::save_as::AfterSave>) {
         let m = modal::SaveAsModal::for_buffer_path(self.editor.buffer.path(), after_save);
         self.modal_stack.push(Box::new(m));
     }
 
-    /// Write the buffer to a named `path`, adopting it — but first prompt
-    /// for confirmation when the write would clobber a *different*
-    /// existing file (see [`crate::document::Buffer::would_overwrite`]).
-    /// `force` skips that prompt (vim `:w!` / `:saveas!`).  `after` runs
-    /// once the write succeeds (e.g. quit for `:wq <path>`).
+    /// Write the buffer to a named `path` and adopt it, confirming first when the write would
+    /// clobber a *different* existing file (see [`crate::document::Buffer::would_overwrite`]).
+    /// `force` skips that prompt (vim `:w!` / `:saveas!`); `after` runs once the write succeeds.
     ///
-    /// Used by the vim direct-save path, where the destination is named
-    /// on the command line so no path-entry modal is involved.  The Save
-    /// As modal does its own overwrite check inline (it owns the path
-    /// field) and pushes the same [`modal::OverwriteConfirmModal`].
+    /// For the vim direct-save path, where the destination is named on the command line.  The
+    /// Save As modal owns the path field, so it does its own check and pushes the same modal.
     pub(super) fn save_buffer_as_confirmed(
         &mut self,
         path: std::path::PathBuf,
@@ -1876,12 +1525,8 @@ impl App {
         }
     }
 
-    /// Write a snapshot of the buffer to a named `path` *without* changing
-    /// the buffer's own path (vim `:w <path>` — the user keeps editing the
-    /// current file).  Like [`Self::save_buffer_as_confirmed`] it confirms
-    /// before clobbering a *different* existing file; `force` (`:w!`) skips
-    /// that prompt.  `after` runs once the write succeeds (e.g. quit for
-    /// `:wq <path>`).
+    /// Write a snapshot to `path` *without* re-pointing the buffer (vim `:w <path>`).  Confirms
+    /// before clobbering a different existing file, as [`Self::save_buffer_as_confirmed`] does.
     pub(super) fn save_copy_confirmed(
         &mut self,
         path: std::path::PathBuf,
@@ -1909,15 +1554,10 @@ impl App {
         }
     }
 
-    /// Drain `EditorState::pending_column_widths_commit` (set by a
-    /// column-border drag's Release) and decide what happens next:
-    ///   * No pending commit → no-op.
-    ///   * Table already has a `<!-- tui-columns: ... -->` comment, OR
-    ///     `config.table.warn_on_width_injection` is false → commit
-    ///     immediately.
-    ///   * Otherwise → open the warning modal carrying the table's
-    ///     `table_byte_start` so its handler can call back to commit /
-    ///     cancel via `EditorState`.
+    /// Drain `EditorState::pending_column_widths_commit`, set by a column-border drag's Release.
+    /// Commits immediately when the table already carries a `<!-- tui-columns: … -->` comment or
+    /// `config.table.warn_on_width_injection` is off; otherwise opens the warning modal carrying
+    /// the table's `table_byte_start` so its handler can commit or cancel.
     pub(super) fn handle_pending_column_widths(&mut self) {
         let Some(table_byte_start) = self.editor.pending_column_widths_commit else {
             return;
@@ -1931,31 +1571,15 @@ impl App {
             .push(Box::new(modal::WidthInjectionWarning::new()));
     }
 
-    /// Reload the theme named by `self.config.theme` from disk, build
-    /// a fresh `Theme`, leak it into `'static`, and swap it onto
-    /// `self.theme` and the editor.  Any non-fatal warnings raised by
-    /// the theme loader (parse error, unknown keys) are surfaced via
-    /// the existing `ConfigWarningModal`, which renders above the
-    /// settings overlay so a malformed theme is the first thing the
-    /// user sees.
+    /// Reload the theme named by `self.config.theme`, leak it into `'static`, and swap it onto
+    /// `self.theme` and the editor.  Loader warnings surface via `ConfigWarningModal`, which
+    /// renders above the settings overlay.
     ///
     /// # Leak by design
     ///
-    /// `Theme` is held everywhere as `&'static Theme` — see the
-    /// constructor for the rationale (every widget and `EditorState`
-    /// reads it on the hot render path, and threading a lifetime or
-    /// wrapping in `Arc` would touch dozens of call sites for no
-    /// observable benefit).  `'static` is obtained by `Box::leak`-ing
-    /// the heap allocation.
-    ///
-    /// Each theme change leaks one fresh `Theme` allocation: the
-    /// previous one is unreachable but never freed, since `'static`
-    /// references can't be invalidated.  The cost per leak is bounded
-    /// — a `Theme` is a fixed-size struct of ~100 `Style` values, on
-    /// the order of a few KB — and theme changes are user-initiated
-    /// (Enter / Left / Right on the settings overlay's Theme row, or
-    /// post-editor reload).  Even an aggressive cycler would
-    /// accumulate at most a few MB across the editor's session.
+    /// `Theme` is held everywhere as `&'static Theme` (see the constructor), obtained by
+    /// `Box::leak`.  Each theme change leaks one fresh allocation — a few KB, user-initiated — so
+    /// even aggressive cycling accumulates at most a few MB per session.
     pub(super) fn apply_active_theme(&mut self) {
         let truecolor = self.capabilities.color_depth == ColorDepth::TrueColor;
         let (theme_file, warnings) = Config::load_theme(&self.config.theme, truecolor);
@@ -1977,10 +1601,9 @@ mod tests {
 
     // ── The diff-mode gate sits ahead of `handle_app_action` ───────
 
-    /// `handle_app_action` answers `true` for everything it handles, so
-    /// a gate placed behind it never sees those actions.  `InsertTable`
-    /// is off the diff allowlist *and* handled there, and the command
-    /// palette — which is on the allowlist — can reach it mid-review.
+    /// `handle_app_action` answers `true` for everything it handles, so a gate behind it never
+    /// sees `InsertTable` — off the diff allowlist, handled there, and reachable mid-review from
+    /// the palette, which is on the allowlist.
     #[test]
     fn an_app_level_action_off_the_allowlist_is_refused_in_diff_review() {
         let mut app = app_with_buffer("alpha\n", 0);
@@ -2015,9 +1638,8 @@ mod tests {
         );
     }
 
-    /// Only the *refusal* moved: an allowed app-level action still
-    /// reaches `handle_app_action`, which is what opens the palette and
-    /// the overlays during a review.
+    /// Only the *refusal* moved: an allowed app-level action still reaches `handle_app_action`,
+    /// which is what opens the palette and the overlays during a review.
     #[test]
     fn an_allowed_app_level_action_still_runs_in_diff_review() {
         let mut app = app_with_buffer("alpha\n", 0);
@@ -2058,10 +1680,8 @@ mod tests {
 
     #[test]
     fn reentering_diff_mode_does_not_stack_a_second_intro_modal() {
-        // A clean buffer stays clean during diff review, so a second
-        // external overwrite re-enters `enter_diff_mode`.  Only one
-        // intro modal must ever be on the stack — otherwise the user
-        // has to dismiss one per overwrite.
+        // A clean buffer stays clean during review, so a second external overwrite re-enters
+        // `enter_diff_mode` and must not stack a second intro modal.
         use crate::app::modal::DiffIntroModal;
         let mut app = make_app();
         app.editor.buffer.insert(0, "alpha\nbeta\n");
@@ -2083,8 +1703,7 @@ mod tests {
         app.editor.buffer.insert(0, "alpha\nbeta\n");
         app.editor.mode = crate::editor::Mode::Rendered;
         app.editor.refresh_parsed();
-        // V-LINE on the first line: the charwise span is empty (anchor ==
-        // active) but the whole line is the effective selection.
+        // V-LINE on the first line: the charwise span is empty, but the whole line is selected.
         app.editor.selection = Some(Selection {
             anchor: 0,
             active: 0,
@@ -2103,13 +1722,11 @@ mod tests {
         );
     }
 
-    /// The linewise-paste payload rules, exercised directly so no live
-    /// clipboard is involved (the OS clipboard is global and would race
-    /// parallel tests).
+    /// The linewise-paste payload rules, exercised directly: the OS clipboard is global and
+    /// would race parallel tests.
     #[test]
     fn linewise_paste_payload_keeps_the_line_structure() {
         let buf = Buffer::from_str("alpha\nbeta\ngamma\n");
-        // Lines 0..=1 → "alpha\nbeta\n", a span ending in a newline.
         let range = 0..11;
         assert_eq!(
             linewise_paste_payload(&buf, &range, "foo".to_owned()),
@@ -2130,8 +1747,7 @@ mod tests {
 
     #[test]
     fn linewise_paste_payload_leaves_a_final_line_without_a_newline() {
-        // No trailing newline on the last line, so the replaced span
-        // doesn't end in one either and nothing should be appended.
+        // The replaced span has no trailing newline either, so nothing is appended.
         let buf = Buffer::from_str("alpha\nbeta");
         let range = 6..10;
         assert_eq!(
@@ -2140,10 +1756,9 @@ mod tests {
         );
     }
 
-    /// The widening + payload composition that `dispatch_visual_line_clipboard`
-    /// performs, run against a *charwise* payload — the case the end-to-end
-    /// wiring test in `app.rs` can't reach (it must Copy first, which yields a
-    /// linewise payload, to be independent of the live OS clipboard).
+    /// `dispatch_visual_line_clipboard`'s widening and payload composition against a *charwise*
+    /// payload — the case the end-to-end test in `app.rs` can't reach, since it must Copy first
+    /// (yielding a linewise payload) to stay independent of the live OS clipboard.
     #[test]
     fn visual_line_paste_of_charwise_text_keeps_the_line_intact() {
         use crate::document::Selection;
@@ -2151,8 +1766,7 @@ mod tests {
         app.editor.buffer.insert(0, "alpha\nbeta\ngamma\n");
         app.editor.mode = crate::editor::Mode::Rendered;
         app.editor.refresh_parsed();
-        // V-LINE parked mid-line-1: the charwise span is empty, the widened
-        // one is the whole line including its newline.
+        // V-LINE parked mid-line: the widened span is the whole line, newline included.
         let sel = Selection {
             anchor: 8,
             active: 8,
@@ -2188,8 +1802,6 @@ mod tests {
         let vim = app.vim.as_ref().unwrap();
         assert!(vim.cmdline.is_none(), "command line must be cleared");
         assert_eq!(vim.count, None, "pending parse must be reset");
-        // The hint line now reads the diff-review chords, not a stale
-        // command line.
         assert!(matches!(app.hint_content(), HintContent::Chords(_)));
     }
 
@@ -2260,13 +1872,11 @@ mod tests {
         assert_eq!(app.editor.mode, crate::editor::Mode::Diff);
         let diff = app.editor.diff.as_ref().expect("review installed");
         assert!(diff.read_only);
-        // Buffer holds the *before* side, as in every other review.
         assert_eq!(app.editor.buffer.contents(), "alpha\nbeta\n");
         assert!(!app.editor.dirty);
     }
 
-    /// The intro modal teaches accept/reject, which this review does not
-    /// have — pushing it would document keys that answer "read-only".
+    /// The intro modal teaches accept/reject, which this review does not have.
     #[test]
     fn a_read_only_review_pushes_no_intro_modal() {
         use crate::app::modal::DiffIntroModal;
@@ -2284,8 +1894,8 @@ mod tests {
         assert_ne!(app.editor.mode, crate::editor::Mode::Diff);
     }
 
-    /// Every decision action is refused, including via the command
-    /// palette — the key table is not the only way to reach them.
+    /// Every decision action is refused, including via the palette: the key table is not the only
+    /// way to reach them.
     #[test]
     fn a_read_only_review_refuses_every_decision_action() {
         use crate::config::Action;
@@ -2309,8 +1919,8 @@ mod tests {
         }
     }
 
-    /// Esc ends the process: there is no editor behind the review to
-    /// return to, and git difftool runs one file per invocation.
+    /// Esc ends the process: there is no editor behind the review, and git difftool runs one file
+    /// per invocation.
     #[test]
     fn esc_quits_a_read_only_review_without_resolving() {
         use crate::config::Action;
@@ -2320,8 +1930,7 @@ mod tests {
         assert!(!app.diff_stop_walk(), "Esc moves on to the next file");
     }
 
-    /// Quit skips the discard-confirm modal (nothing is at stake) and
-    /// flags the abort so `main` can exit non-zero.
+    /// Quit skips the discard-confirm modal and flags the abort so `main` exits non-zero.
     #[test]
     fn quit_aborts_a_read_only_review_without_confirmation() {
         use crate::app::modal::DiffQuitConfirmModal;
@@ -2333,12 +1942,9 @@ mod tests {
         assert!(!app.modal_stack.contains::<DiffQuitConfirmModal>());
     }
 
-    /// The review *is* the document for a `--diff` session, so the media
-    /// prompts have to be asked against it: `App::new` built them from
-    /// the empty startup buffer, and under the default `ask` policy
-    /// nothing else would ever set `session_diagrams_enabled` — the
-    /// diagram would render as a placeholder for the whole review with
-    /// no question asked.
+    /// The review *is* the document for a `--diff` session, so the media prompts must be asked
+    /// against it: `App::new` built them from the empty startup buffer, and nothing else would
+    /// ever set `session_diagrams_enabled`.
     #[test]
     fn a_read_only_review_asks_the_media_prompts_for_its_document() {
         use crate::app::modal::DiagramsEnabledPromptModal;
@@ -2375,11 +1981,9 @@ mod tests {
         let mut app = make_app();
         app.editor.buffer.insert(0, "alpha\nbeta\ngamma\n");
         app.enter_diff_mode("alpha\nBETA\ngamma\n".to_owned());
-        // Dismiss the intro modal if it stacked.
         app.modal_stack
             .remove_first::<crate::app::modal::DiffIntroModal>();
-        // Accept-all now opens the bulk-confirm modal rather than
-        // deciding immediately; confirm it, then apply.
+        // Accept-all opens the bulk-confirm modal rather than deciding immediately.
         app.dispatch_diff_action(crate::config::Action::DiffAcceptAll, 24, 80);
         assert!(app.modal_stack.contains::<DiffBulkConfirmModal>());
         app.apply_diff_bulk_decision(crate::diff::Decision::Accepted);
@@ -2397,19 +2001,16 @@ mod tests {
         app.apply_diff_resolution();
         assert!(app.editor.diff.is_none());
         assert_eq!(app.editor.buffer.contents(), "alpha\nBETA\ngamma\n");
-        // Exactly one coarse undo step: the merge-revert entry.
         assert_eq!(app.editor.history.undo_depth(), 1);
 
-        // One Undo reverts the whole merge back to the pre-merge buffer.
         crate::editor::edit_ops::apply(&mut app.editor, Action::Undo, 24, 80);
         assert_eq!(app.editor.buffer.contents(), "alpha\nbeta\ngamma\n");
-        // One Redo re-applies the merged result.
         crate::editor::edit_ops::apply(&mut app.editor, Action::Redo, 24, 80);
         assert_eq!(app.editor.buffer.contents(), "alpha\nBETA\ngamma\n");
     }
 
-    /// Helper: enter diff mode against `disk`, dropping the intro modal
-    /// so it doesn't interfere with stack assertions.
+    /// Enter diff mode against `disk`, dropping the intro modal so it doesn't interfere with
+    /// stack assertions.
     fn app_in_diff(buffer: &str, disk: &str) -> crate::app::App {
         let mut app = make_app();
         app.editor.buffer.insert(0, buffer);
@@ -2419,8 +2020,7 @@ mod tests {
         app
     }
 
-    /// Resolve every hunk directly (no action), so a subsequent action
-    /// is the only thing under test.
+    /// Resolve every hunk directly, so a subsequent action is the only thing under test.
     fn resolve_all(app: &mut crate::app::App, decision: crate::diff::Decision) {
         for d in app.editor.diff.as_mut().unwrap().decisions.iter_mut() {
             *d = decision;
@@ -2429,12 +2029,9 @@ mod tests {
 
     #[test]
     fn resolving_a_diff_that_adds_an_image_queues_the_images_prompt() {
-        // A clean buffer's external change goes to diff review by
-        // default (`diff_on_change`), so this — not
-        // `reload_buffer_from_disk` — is the usual way a document picks
-        // up its first image mid-session.  Without the prompt,
-        // `effective_images_enabled` stays false and the merged image
-        // never decodes (issue #30).
+        // A clean buffer's external change goes to diff review by default, so this — not
+        // `reload_buffer_from_disk` — is the usual way a document gains its first image
+        // mid-session.  Without the prompt the merged image never decodes (issue #30).
         use crate::app::modal::ImagesEnabledPromptModal;
         let mut app = app_in_diff("Just prose.\n", "Just prose.\n\n![a](img.png)\n");
         assert!(!app.modal_stack.contains::<ImagesEnabledPromptModal>());
@@ -2476,8 +2073,7 @@ mod tests {
         use crate::diff::Decision;
         let mut app = app_in_diff("a\nb\nc\nd\ne\n", "A\nb\nC\nd\nE\n");
         resolve_all(&mut app, Decision::Accepted);
-        // Tab / Shift-Tab among already-resolved hunks must not pop the
-        // apply-confirm modal — navigation is not a resolve trigger.
+        // Navigation is not a resolve trigger, even among already-resolved hunks.
         app.dispatch_diff_action(Action::DiffNext, 24, 80);
         assert!(!app.modal_stack.contains::<DiffResolveConfirmModal>());
         app.dispatch_diff_action(Action::DiffPrev, 24, 80);
@@ -2494,11 +2090,8 @@ mod tests {
         use crate::config::Action;
         use crate::diff::Decision;
         let mut app = app_in_diff("a\nb\nc\n", "A\nb\nC\n");
-        // Pre-resolve everything as accepted, so nothing is `Pending`.
         resolve_all(&mut app, Decision::Accepted);
-        // Reject-all opens the bulk-confirm modal *without* yet changing
-        // any decision — the prior accepts must stay intact until the
-        // user confirms.
+        // The bulk-confirm modal must not change any decision before the user confirms.
         app.dispatch_diff_action(Action::DiffRejectAll, 24, 80);
         assert!(app.modal_stack.contains::<DiffBulkConfirmModal>());
         assert!(
@@ -2511,11 +2104,9 @@ mod tests {
                 .all(|d| *d == Decision::Accepted),
             "bulk-confirm must not flip decisions before the user confirms",
         );
-        // A second press must not stack a duplicate modal.
         app.dispatch_diff_action(Action::DiffRejectAll, 24, 80);
         assert_eq!(app.modal_stack.count::<DiffBulkConfirmModal>(), 1);
 
-        // Confirming applies the override and opens the resolve-confirm.
         app.apply_diff_bulk_decision(Decision::Rejected);
         assert!(
             app.editor
@@ -2536,15 +2127,13 @@ mod tests {
         use crate::config::Action;
         use crate::diff::Decision;
         let mut app = app_in_diff("a\nb\nc\n", "A\nb\nC\n");
-        // Make a deliberate mix of per-hunk decisions.
         {
             let d = app.editor.diff.as_mut().unwrap();
             d.decisions[0] = Decision::Accepted;
             d.decisions[1] = Decision::Rejected;
         }
         let before = app.editor.diff.as_ref().unwrap().decisions.clone();
-        // Accept-all opens the gate; dismissing it (without the [Yes]
-        // callback) must leave every prior decision untouched.
+        // Dismissing the gate without the [Yes] callback must leave every decision untouched.
         app.dispatch_diff_action(Action::DiffAcceptAll, 24, 80);
         assert!(app.modal_stack.contains::<DiffBulkConfirmModal>());
         app.modal_stack.remove_first::<DiffBulkConfirmModal>();
@@ -2559,8 +2148,6 @@ mod tests {
     fn diff_quit_warns_instead_of_discarding_immediately() {
         use crate::app::modal::DiffQuitConfirmModal;
         use crate::config::Action;
-        // Quit mid-review must not silently discard + quit: it pushes
-        // the diff-quit confirm modal and leaves the review intact.
         let mut app = app_in_diff("a\nb\nc\n", "A\nb\nC\n");
         app.dispatch_action(Action::Quit, 24, 80);
         assert!(
@@ -2570,7 +2157,6 @@ mod tests {
         assert!(!app.should_quit, "Quit must not fire before confirmation");
         assert!(app.editor.diff.is_some(), "the review must stay active");
 
-        // A second Quit while the modal is up must not stack a duplicate.
         app.dispatch_action(Action::Quit, 24, 80);
         assert_eq!(app.modal_stack.count::<DiffQuitConfirmModal>(), 1);
     }
@@ -2581,8 +2167,7 @@ mod tests {
         use crate::config::Action;
         use crate::diff::Decision;
 
-        // Pending hunks: Esc must NOT exit or discard — the diff stays
-        // active and no confirm modal opens.
+        // With hunks pending, Esc must neither exit nor open the confirm modal.
         let mut app = app_in_diff("a\nb\nc\n", "A\nb\nC\n");
         app.dispatch_diff_action(Action::DiffExit, 24, 80);
         assert!(
@@ -2591,7 +2176,6 @@ mod tests {
         );
         assert!(!app.modal_stack.contains::<DiffResolveConfirmModal>());
 
-        // All resolved: Esc opens the confirm modal (the only exit path).
         resolve_all(&mut app, Decision::Accepted);
         app.dispatch_diff_action(Action::DiffExit, 24, 80);
         assert!(
@@ -2629,8 +2213,6 @@ mod tests {
 
     #[test]
     fn modal_wheel_delta_translates_scroll_direction() {
-        // Build minimal `MouseEvent`s with the kinds we care about;
-        // crossterm requires explicit modifier + column/row fields.
         let scroll_up = MouseEvent {
             kind: MouseEventKind::ScrollUp,
             column: 0,
@@ -2647,20 +2229,15 @@ mod tests {
         };
         assert_eq!(modal_wheel_delta(&scroll_up, 1), -1);
         assert_eq!(modal_wheel_delta(&scroll_down, 1), 1);
-        // Coarser wheel honoured.
         assert_eq!(modal_wheel_delta(&scroll_down, 4), 4);
-        // Wheel-step floor is 1, even when config asks for 0.
+        // The wheel-step floor is 1, even when config asks for 0.
         assert_eq!(modal_wheel_delta(&scroll_up, 0), -1);
-        // Non-wheel events return 0 so callers can blindly forward.
         assert_eq!(modal_wheel_delta(&click, 1), 0);
     }
 
-    /// Every `Action` variant, for the gate sweeps below.
-    ///
-    /// `EVERY_UNIT_ACTION` is derived from the `action_variants!` list
-    /// that drives `Display` / `FromStr`, so it cannot fall behind the
-    /// enum; the two payload-bearing variants are appended by hand
-    /// because they need a value.
+    /// Every `Action` variant, for the gate sweeps below.  `EVERY_UNIT_ACTION` derives from the
+    /// `action_variants!` list, so it cannot fall behind the enum; the two payload-bearing
+    /// variants are appended by hand.
     fn every_action() -> Vec<Action> {
         let mut all = crate::config::keymap::EVERY_UNIT_ACTION.to_vec();
         all.push(Action::InsertChar('a'));
@@ -2668,8 +2245,7 @@ mod tests {
         all
     }
 
-    /// The seventeen that were triplicated across the three old
-    /// allowlists, pinned as one set.
+    /// The always-safe set, pinned.
     #[test]
     fn always_safe_is_exactly_the_scroll_openers_and_quit() {
         use Action::*;
@@ -2694,17 +2270,13 @@ mod tests {
         ];
         for action in &expected {
             assert!(action_caps(action).always_safe, "{action} should be safe");
-            // The always-safe set is what every gate shares, so it must
-            // clear all three.
             assert!(diff_safe_action(action).is_some(), "{action} in diff");
             assert!(search_safe_action(action).is_some(), "{action} in search");
             assert!(readonly_safe_action(action), "{action} while read-only");
         }
     }
 
-    /// A capability tag is about what the action *does*, so the three
-    /// flags that gate policy must not overlap in ways that make a
-    /// rule ambiguous.
+    /// The three policy-gating flags must not overlap in ways that make a rule ambiguous.
     #[test]
     fn read_only_navigation_never_mutates_or_needs_a_path() {
         for action in every_action() {
@@ -2720,9 +2292,8 @@ mod tests {
         }
     }
 
-    /// Diff review is the narrowest gate: its own vocabulary plus the
-    /// always-safe set, and nothing else — not even cursor motion,
-    /// which would move a cursor the stacked view does not draw.
+    /// Diff review is the narrowest gate: its own vocabulary plus the always-safe set, and
+    /// nothing else — not even cursor motion.
     #[test]
     fn diff_allows_only_its_own_commands_and_the_always_safe_set() {
         for action in every_action() {
@@ -2743,9 +2314,8 @@ mod tests {
         }
     }
 
-    /// Nothing that writes the buffer may run in a capturing replace
-    /// flow except the flow's own replace commands and the undo/redo
-    /// that takes one back.
+    /// Nothing that writes the buffer may run in a capturing replace flow, except the flow's own
+    /// commands and the undo/redo that takes one back.
     #[test]
     fn a_capturing_search_flow_admits_no_other_buffer_mutation() {
         for action in every_action() {
@@ -2761,8 +2331,7 @@ mod tests {
         }
     }
 
-    /// The read-only rule, stated as the property it is meant to have
-    /// rather than as the five names it happens to resolve to today.
+    /// The read-only rule as a property, rather than the five names it resolves to today.
     #[test]
     fn a_read_only_document_denies_every_write_and_allows_every_navigation() {
         for action in every_action() {
@@ -2773,8 +2342,7 @@ mod tests {
             } else {
                 assert!(allowed, "{action} must be allowed while read-only");
             }
-            // Cross-linking and section jumping are the whole point of
-            // a manual, so `navigates_away` is never a reason to deny.
+            // Cross-linking is the whole point of a manual, so `navigates_away` never denies.
             if caps.navigates_away {
                 assert!(allowed, "{action} navigates and must stay available");
             }

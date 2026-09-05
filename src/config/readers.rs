@@ -17,18 +17,12 @@ use super::theme::Theme;
 use super::theme_file::ThemeFile;
 use super::warnings::{ConfigWarning, WarningKind};
 
-/// Discover user-droppable export stylesheets in `<config_dir>/export/`.
+/// Every `.css` file in `<config_dir>/export/`, sorted by path.  The scaffolded
+/// `default.css.example` is deliberately excluded by the extension filter — it's a
+/// fork-able template, not a selectable stylesheet.
 ///
-/// Returns every `.css` file in that folder, sorted by path.  The
-/// `default.css.example` reference scaffolded on first run is deliberately
-/// excluded by the `.css` extension filter — it's a fork-able template, not
-/// a selectable stylesheet.  A missing or unreadable directory yields an
-/// empty vector — callers fall back to the compiled-in `Builtin` stylesheet.
-///
-/// A `--no-config` run always yields the empty vector: the export folder
-/// is part of the config directory this run has taken out of play, and
-/// the compiled-in stylesheet is exactly the built-in default that flag
-/// asks for.  See [`crate::config::persistence`].
+/// Empty for a missing directory or a `--no-config` run (see
+/// [`crate::config::persistence`]); callers then use the compiled-in stylesheet.
 pub fn list_export_stylesheets(config_dir: &Path) -> Vec<PathBuf> {
     if !super::persistence::config_reads_allowed() {
         return Vec::new();
@@ -51,11 +45,9 @@ pub fn list_export_stylesheets(config_dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Parse a TOML payload into `T`, recording unknown keys via
-/// `serde_ignored`.  Returns the parsed struct and the list of
-/// dotted-path keys that no field on `T` consumed.  Unlike
-/// `toml::from_str`, success here doesn't imply a clean file — the
-/// caller checks the returned `Vec` and pushes a warning if non-empty.
+/// Parse TOML into `T`, also returning the dotted-path keys no field on `T` consumed.
+/// Unlike `toml::from_str`, success here doesn't imply a clean file — the caller checks
+/// the returned `Vec` and warns if it is non-empty.
 fn deserialize_with_unknown_keys<'de, T>(
     raw: &'de str,
 ) -> std::result::Result<(T, Vec<String>), toml::de::Error>
@@ -63,21 +55,17 @@ where
     T: serde::de::Deserialize<'de>,
 {
     let mut unknown: Vec<String> = Vec::new();
-    // toml 1.x parses eagerly in `Deserializer::parse`, returning a
-    // `Result`; a malformed document surfaces here rather than during
-    // the `serde_ignored::deserialize` walk below.
+    // toml 1.x parses eagerly here, so a malformed document surfaces before the
+    // `serde_ignored` walk below.
     let de = toml::Deserializer::parse(raw)?;
     let value = serde_ignored::deserialize(de, |path| unknown.push(path.to_string()))?;
     Ok((value, unknown))
 }
 
-/// Read `path`, deserialize into `T`, and emit any warnings into
-/// `warnings`.  Missing → `on_missing()` (no warning); IO failure →
-/// `on_parse_failure()` + `ParseError` warning; toml parse error →
-/// `on_parse_failure()` + `ParseError` warning; unknown keys →
-/// parsed value + `UnknownKeys` warning.  The two fallbacks are
-/// separate so callers like [`read_theme_named`] can attach a
-/// `tracing::warn!` to the missing-file path only.
+/// Read `path`, deserialize into `T`, and push any warnings.  Missing → `on_missing()`
+/// with no warning; IO or parse failure → `on_parse_failure()` + `ParseError`; unknown
+/// keys → the parsed value + `UnknownKeys`.  The two fallbacks are separate so callers
+/// can treat the missing-file path differently.
 fn read_and_warn<T, M, F>(
     path: &Path,
     warnings: &mut Vec<ConfigWarning>,
@@ -120,24 +108,17 @@ where
     }
 }
 
-/// Read `config.toml`.  Missing → defaults; parse error → defaults +
-/// `ParseError` warning; unknown keys → parsed value + `UnknownKeys`
-/// warning.  IO errors other than NotFound also produce a `ParseError`
-/// warning so the user always sees the failure path.
+/// Read `config.toml` via [`read_and_warn`], then apply [`validate_main_config`].
 pub(super) fn read_main_config(path: &Path, warnings: &mut Vec<ConfigWarning>) -> Config {
     let mut config: Config = read_and_warn(path, warnings, Config::default, Config::default);
     validate_main_config(path, &mut config, warnings);
     config
 }
 
-/// Post-deserialization sanity checks for `config.toml`.  Each rule
-/// resets the offending field to its default and pushes a
-/// [`WarningKind::InvalidValue`] so the user sees that their requested
-/// value didn't take effect.  Keep this list short — runtime-clamp at
-/// the use site (see e.g. `MAX_WIDTH_COLS_MIN`) is preferred for fields
-/// where any value still produces a sensible UI; this path is for
-/// fields where an out-of-range value would be actively confusing
-/// (autosave firing on every keystroke at `idle_ms = 0`, etc.).
+/// Post-deserialization sanity checks: reset the offending field and push a
+/// [`WarningKind::InvalidValue`].  Keep this list short — prefer a runtime clamp at the
+/// use site (e.g. `MAX_WIDTH_COLS_MIN`); this path is only for values that would be
+/// actively confusing (autosave firing on every keystroke at `idle_ms = 0`).
 fn validate_main_config(path: &Path, config: &mut Config, warnings: &mut Vec<ConfigWarning>) {
     let idle = config.editor.autosave_idle_ms;
     if idle <= AUTOSAVE_IDLE_MS_MIN_EXCLUSIVE || idle >= AUTOSAVE_IDLE_MS_MAX_EXCLUSIVE {
@@ -158,18 +139,12 @@ fn validate_main_config(path: &Path, config: &mut Config, warnings: &mut Vec<Con
     validate_custom_exports(path, config, warnings);
 }
 
-/// Warn once for every `[[export.custom]]` entry that could not produce a
-/// working palette command.
+/// Warn once per unusable `[[export.custom]]` entry.
 ///
-/// **Reports, but does not remove.**  Unlike the range checks above there
-/// is no default to fall back on, but *deleting* the entry from `config`
-/// would be worse than the problem: the loader's result is written back on
-/// the next `Config::save`, so a `retain` here erases the user's block from
-/// their `config.toml` — the very lines the warning is asking them to fix.
-/// The entry stays put and is instead excluded from the palette at the
-/// point rows are built ([`crate::config::CustomExportEntry::config_problem`]
-/// is the shared predicate), so a row that cannot run is never offered
-/// while the config on disk is left intact.
+/// **Reports, but does not remove.**  The loader's result is written back on the next
+/// `Config::save`, so a `retain` here would erase the very lines the warning asks the user
+/// to fix.  The palette instead filters rows on
+/// [`crate::config::CustomExportEntry::config_problem`].
 fn validate_custom_exports(path: &Path, config: &mut Config, warnings: &mut Vec<ConfigWarning>) {
     for (index, entry) in config.export.custom.iter().enumerate() {
         if let Some(message) = entry.config_problem() {
@@ -184,11 +159,9 @@ fn validate_custom_exports(path: &Path, config: &mut Config, warnings: &mut Vec<
     }
 }
 
-/// Read `keybindings.toml`.  In addition to the usual parse-error /
-/// unknown-key paths, every entry is validated against the `Action`
-/// enum and `parse_key`; bad entries are stripped and reported under a
-/// single `InvalidKeybindings` warning so the live keymap only contains
-/// usable bindings.
+/// Read `keybindings.toml`.  Beyond the usual parse paths, every entry is validated
+/// against `Action` and `parse_key`; bad entries are stripped and reported under one
+/// `InvalidKeybindings` warning, so the live keymap holds only usable bindings.
 pub(super) fn read_keybindings(
     path: &Path,
     warnings: &mut Vec<ConfigWarning>,
@@ -220,59 +193,35 @@ pub(super) fn read_keybindings(
     overrides
 }
 
-/// Built-in theme name substituted when the active theme is missing
-/// and `truecolor` is `true`.  Picked because Edamame is the project's
-/// canonical truecolor palette.
+/// Substituted when the active theme is missing and `truecolor` is `true`.
 pub const TRUECOLOR_FALLBACK_THEME: &str = "Edamame";
-/// Built-in theme name substituted when the active theme is missing
-/// and `truecolor` is `false`.  Indexed-color built-in that renders
+/// Substituted when the active theme is missing and `truecolor` is `false`; renders
 /// faithfully on 256-color and even 16-color terminals.
 pub const INDEXED_FALLBACK_THEME: &str = "256 Dark";
 
 /// Read the active theme file.
 ///
-/// Returns the parsed [`ThemeFile`] alongside an optional fallback
-/// name: `Some(name)` means the requested theme was missing on disk
-/// (and wasn't a built-in), so `name` was substituted in its place.
-/// The caller is responsible for persisting the rename back to
-/// `config.toml` so the substitution doesn't recur on next launch.
-///
-/// Semantics by case:
-///   - name resolves to a built-in: return that built-in, `None`.
-///   - file present, parses cleanly: return parsed file, `None`.
-///   - file present, parse error: compiled default, `None`
-///     (existing `ParseError` warning still fires).
-///   - file present, blank: empty file, `None`
-///     (user opt-out of styling).
-///   - file absent: built-in fallback, `Some(name)`
-///     + [`WarningKind::MissingTheme`].
-///
-/// `truecolor` selects between [`TRUECOLOR_FALLBACK_THEME`] and
-/// [`INDEXED_FALLBACK_THEME`] for the missing-file case.
+/// `Some(name)` in the second slot means the requested theme was missing on disk (and
+/// wasn't a built-in) and `name` was substituted; the caller must persist that rename to
+/// `config.toml` so the substitution doesn't recur.  Every other case yields `None`,
+/// including a parse error (compiled default) and a blank file (a valid opt-out of
+/// styling).  `truecolor` picks between the two fallback constants.
 pub(super) fn read_theme_named(
     config_dir: &Path,
     name: &str,
     truecolor: bool,
     warnings: &mut Vec<ConfigWarning>,
 ) -> (ThemeFile, Option<String>) {
-    // Built-in themes always win on name collision: a user file
-    // `themes/default.toml` is ignored if `default` is a built-in.
-    // Custom user themes go through the disk path below.
+    // Built-ins win on name collision: `themes/default.toml` is ignored if `default` is one.
     if let Some(theme) = Theme::builtin(name) {
         return ((&theme).into(), None);
     }
 
-    // Past this point every branch reads `themes/<name>.toml`, which a
-    // `--no-config` run must not do.  Defense in depth: `list_theme_names`
-    // offers built-ins only under the same gate, so a custom name should
-    // never reach here — but if one does (a stale `config.theme` from a
-    // caller that didn't come through the picker), fall back to the
-    // capability-appropriate built-in rather than reading the file.
-    //
-    // `None`, not `Some(fallback)`: the second element asks the caller to
-    // persist the rename, and this run neither wrote nor read that file.
-    // No `MissingTheme` warning either — nothing is missing, it is
-    // excluded, and a modal about it would be noise on every launch.
+    // Past this point every branch reads `themes/<name>.toml`, which a `--no-config` run
+    // must not do.  Defense in depth behind `list_theme_names`, for a stale `config.theme`
+    // that didn't come through the picker.  `None`, not `Some(fallback)`: nothing was read,
+    // so there is no rename to persist — and no `MissingTheme` warning, since the file is
+    // excluded rather than missing.
     if !super::persistence::config_reads_allowed() {
         let fallback = if truecolor {
             TRUECOLOR_FALLBACK_THEME
@@ -289,12 +238,8 @@ pub(super) fn read_theme_named(
     }
 
     let path = config_dir.join("themes").join(format!("{name}.toml"));
-    // Detect "missing" up-front so we can apply a capability-aware
-    // built-in fallback and surface a `MissingTheme` warning, rather
-    // than silently degrading to the compiled `Theme::default()`.
-    // The blank-file and parse-error cases still flow through
-    // `read_and_warn` below — those are deliberate user states, not
-    // missing-file states.
+    // Detect "missing" up front so it gets a capability-aware built-in and a
+    // `MissingTheme` warning rather than silently degrading to `Theme::default()`.
     if !path.exists() {
         let fallback = if truecolor {
             TRUECOLOR_FALLBACK_THEME
@@ -318,12 +263,8 @@ pub(super) fn read_theme_named(
         return ((&theme).into(), Some(fallback.to_string()));
     }
 
-    // File exists — read it directly.  We bypass `read_and_warn`
-    // here because its `on_missing` branch is unreachable after the
-    // existence check above, and unread + reparse on parse failure
-    // both fall back to the compiled `Theme::default()` (a blank
-    // file is a valid opt-out of styling and still parses cleanly
-    // into an empty `ThemeFile`).
+    // Bypasses `read_and_warn`: its `on_missing` branch is unreachable after the
+    // existence check above.
     let theme_default = || ((&Theme::default()).into(), None);
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -360,8 +301,7 @@ mod tests {
     use super::*;
     use crate::config::CustomExportEntry;
 
-    /// Build a `Config` with the given custom-export entries, run it
-    /// through validation, and report what survived plus the warnings.
+    /// Validate the given custom-export entries; report what survived plus the warnings.
     fn validated(entries: Vec<CustomExportEntry>) -> (Vec<CustomExportEntry>, Vec<ConfigWarning>) {
         let mut config = Config::default();
         config.export.custom = entries;
@@ -378,8 +318,6 @@ mod tests {
         }
     }
 
-    /// A well-formed entry warns about nothing and is left exactly as
-    /// written.
     #[test]
     fn a_usable_custom_export_survives_untouched() {
         let good = entry("PDF", &["pandoc", "{html}", "-o", "{out}"], "pdf");
@@ -391,11 +329,7 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
-    /// Each unusable shape warns once, naming its index — but the entry is
-    /// **kept**, not removed.  Deleting it would erase the user's block on
-    /// the next `Config::save`; the palette excludes it instead
-    /// (`CustomExportEntry::config_problem`), so the config on disk is left
-    /// intact for the user to fix.
+    /// Kept, not removed: deleting would erase the user's block on the next `Config::save`.
     #[test]
     fn every_unusable_custom_export_is_reported_but_kept() {
         for (label, bad) in [
@@ -419,11 +353,8 @@ mod tests {
         }
     }
 
-    /// One bad entry must not cost the user a warning against the wrong
-    /// line: the index the message carries is the offender's *own*
-    /// position, which is what the palette builds its rows from, so an
-    /// off-by-one would point the user at working config.  All three are
-    /// kept — only the palette-offering is filtered.
+    /// The index in the message is the offender's own position — the palette builds rows
+    /// from it, so an off-by-one would point the user at working config.
     #[test]
     fn a_bad_entry_is_reported_at_its_own_index_without_taking_its_neighbours() {
         let (kept, warnings) = validated(vec![
@@ -439,9 +370,6 @@ mod tests {
         }
     }
 
-    /// A tolerated-but-nonempty extension is not a problem, and the value
-    /// actually used for the filename is normalized: whitespace and a
-    /// single leading dot are stripped.
     #[test]
     fn output_extension_normalizes_dot_and_whitespace() {
         assert!(entry("PDF", &["pandoc"], " pdf ")
@@ -449,15 +377,11 @@ mod tests {
             .is_none());
         assert_eq!(entry("PDF", &["pandoc"], " pdf ").output_extension(), "pdf");
         assert_eq!(entry("PDF", &["pandoc"], ".pdf").output_extension(), "pdf");
-        // Trims to empty → a real problem, caught before it can unname the file.
         assert!(entry("PDF", &["pandoc"], ".").config_problem().is_some());
     }
 
-    /// The shipped `config/config.toml` is copied verbatim into every new
-    /// user's config directory, so a typo in it greets a first-time user
-    /// with a warning modal.  It must deserialize cleanly *and* leave no
-    /// unknown keys — the same two checks `read_and_warn` performs at
-    /// startup.
+    /// The shipped `config/config.toml` is copied verbatim into every new user's config
+    /// directory, so a typo in it greets a first-time user with a warning modal.
     #[test]
     fn shipped_reference_config_loads_without_warnings() {
         let raw = super::super::init::REFERENCE_CONFIG_TOML;
@@ -469,16 +393,9 @@ mod tests {
         );
     }
 
-    /// Most of `config/config.toml` is *commented* examples, and the test
-    /// above can't see any of them — it parses the file as shipped, where
-    /// a key renamed out from under its `# key = value` line is just a
-    /// comment.  The user who uncomments it is the one who finds out.
-    ///
-    /// So uncomment each example in turn and put it through the same
-    /// deserialize-and-report-unknown-keys check, scoped to whichever
-    /// table it sits under (tracking commented `# [section]` headers as
-    /// well as live ones).  This is the config-side counterpart to
-    /// `shipped_reference_keybindings_are_all_uncommentable`.
+    /// The test above parses the file as shipped, where a key renamed out from under its
+    /// `# key = value` line is just a comment — the user who uncomments it finds out.  So
+    /// uncomment each example in turn and check it against the live schema.
     #[test]
     fn shipped_reference_config_examples_are_all_uncommentable() {
         let checked = check_commented_examples(super::super::init::REFERENCE_CONFIG_TOML)
@@ -490,10 +407,7 @@ mod tests {
         );
     }
 
-    /// The scanner above is only worth having if it fails on a stale
-    /// example, so pin that directly: a key that no longer exists must be
-    /// reported, and the live/commented section tracking must attribute it
-    /// to the right table.
+    /// The scanner is only worth having if it fails on a stale example; pin that directly.
     #[test]
     fn commented_example_scanner_rejects_a_key_that_no_longer_exists() {
         let good = "[editor]\n# line_wrap = true\n# [dev]\n# logging = false\n";
@@ -506,22 +420,16 @@ mod tests {
             "unhelpful failure message: {err}"
         );
 
-        // A real key, but filed under the wrong table — the same failure.
         let misplaced = "# [dev]\n# line_wrap = true\n";
         assert!(check_commented_examples(misplaced).is_err());
 
-        // Prose and trailing-comment continuations must not be mistaken
-        // for examples.
         let prose = "[editor]\n# Wrap long lines. Default: true.\n#     # a .css file.\n";
         assert_eq!(check_commented_examples(prose), Ok(0));
 
-        // Bracketed *prose* must not be adopted as a section header — doing
-        // so would check every example after it against a table that does
-        // not exist.  `# [ ] a task` looks like one to a naive scan.
+        // Bracketed prose must not be adopted as a section header.
         let bracket_prose = "[editor]\n# [ ] a task\n# line_wrap = true\n";
         assert_eq!(check_commented_examples(bracket_prose), Ok(1));
 
-        // A real commented-out header still is one, in both spellings.
         assert_eq!(
             table_header("[export.html]").as_deref(),
             Some("[export.html]")
@@ -535,14 +443,11 @@ mod tests {
         assert_eq!(table_header("[editor"), None);
     }
 
-    /// `[table]` / `[[array.of.tables]]` if `line` is exactly a TOML table
-    /// header, else `None`.
+    /// `[table]` / `[[array.of.tables]]` if `line` is exactly a TOML table header.
     ///
-    /// The bracket content must be a dotted run of bare-key characters,
-    /// which is what separates a header from bracketed *prose* — a comment
-    /// line like `# [ ] a task` or `# [see the note above]` would otherwise
-    /// be adopted as the current section and every example after it checked
-    /// against a table that does not exist.
+    /// The bracket content must be a dotted run of bare-key characters — that is what
+    /// separates a header from bracketed prose (`# [ ] a task`), which would otherwise be
+    /// adopted as the current section.
     fn table_header(line: &str) -> Option<String> {
         let inner = line
             .strip_prefix("[[")
@@ -558,39 +463,28 @@ mod tests {
         bare.then(|| line.to_owned())
     }
 
-    /// Uncomment every `# key = value` example in a reference config and
-    /// check it against the live `Config` schema, scoped to whichever
-    /// table it sits under.  Returns how many examples were checked, or
-    /// the first failure.  See the caller for why this exists.
+    /// Uncomment every `# key = value` example and check it against the live `Config`
+    /// schema, scoped to its table.  Returns how many were checked, or the first failure.
     ///
-    /// Section tracking is a line scan, not a TOML parse, so it rests on
-    /// the reference file's layout: a commented-out `# [section]` header
-    /// claims every commented example below it until the next header of
-    /// either kind.  A commented header dropped into the middle of a live
-    /// table would therefore misattribute the examples that follow — but
-    /// that misattribution *fails the test* rather than skipping a check,
-    /// so the failure mode is a false alarm the author sees immediately,
-    /// never a stale example slipping through.
+    /// Section tracking is a line scan, not a TOML parse: a commented `# [section]` header
+    /// claims every commented example below it until the next header.  A commented header
+    /// inside a live table would misattribute what follows — but that *fails* the test,
+    /// so the failure mode is a visible false alarm, never a skipped check.
     fn check_commented_examples(raw: &str) -> Result<usize, String> {
         let mut section = String::new();
         let mut checked = 0;
 
         for (lineno, line) in raw.lines().enumerate() {
             let trimmed = line.trim();
-            // A live table header, or a commented-out one (`# [dev]`, which
-            // is how the reference file presents a whole optional section).
+            // A live table header, or a commented-out one (`# [dev]`).
             let candidate = trimmed.strip_prefix('#').map_or(trimmed, str::trim);
             if let Some(header) = table_header(candidate) {
                 section = header;
                 continue;
             }
-            // Only commented lines are of interest; live ones are already
-            // covered by the whole-file parse above.
             let Some(body) = trimmed.strip_prefix('#').map(str::trim) else {
                 continue;
             };
-            // Prose, not an example: `# ... some sentence ...`, or a
-            // continuation of a previous line's trailing comment.
             let Some((key, _)) = body.split_once('=') else {
                 continue;
             };
@@ -625,14 +519,9 @@ mod tests {
         Ok(checked)
     }
 
-    /// Every keybinding the shipped `config/keybindings.toml` shows as a
-    /// commented example must be one the user can actually uncomment.
-    ///
-    /// This is the file's whole purpose, and it has been wrong before: it
-    /// used to present `Action = ""` as the way to leave something
-    /// unbound, which is a parse error that silently drops the entry.
-    /// Uncomment every `# Name = "chord"` line and put it through the same
-    /// action-name and `parse_key` validation the loader uses.
+    /// Every commented example in `config/keybindings.toml` must be one the user can
+    /// actually uncomment.  It has been wrong before: it used to present `Action = ""` as
+    /// the way to leave something unbound, which is a parse error that drops the entry.
     #[test]
     fn shipped_reference_keybindings_are_all_uncommentable() {
         let raw = include_str!("../../config/keybindings.toml");
@@ -642,7 +531,6 @@ mod tests {
                 continue;
             };
             let body = body.trim();
-            // Only consider lines shaped like a binding: `Name = "chord"`.
             let Some((name, value)) = body.split_once('=') else {
                 continue;
             };
@@ -667,11 +555,7 @@ mod tests {
         );
     }
 
-    /// The export folder lives inside the config directory, so a
-    /// `--no-config` run must not enumerate it — the HTML-export modal
-    /// falls back to the compiled-in stylesheet, which is what the flag
-    /// asks for.  The second half proves the empty result came from the
-    /// gate and not from an empty folder.
+    /// The second half proves the empty result came from the gate, not an empty folder.
     #[test]
     fn export_stylesheets_are_not_listed_while_the_config_dir_is_disabled() {
         let _lock = crate::test_env::env_lock();
@@ -687,10 +571,8 @@ mod tests {
         assert_eq!(list_export_stylesheets(dir.path()).len(), 1);
     }
 
-    /// Defense in depth behind `list_theme_names`: even handed a custom
-    /// theme name directly, a disabled run reads no file and substitutes
-    /// the capability-appropriate built-in — with no `MissingTheme`
-    /// warning, because nothing is missing.
+    /// Even handed a custom theme name directly, a disabled run reads no file and warns
+    /// nothing — excluded is not missing.
     #[test]
     fn a_user_theme_is_not_read_while_the_config_dir_is_disabled() {
         let _lock = crate::test_env::env_lock();
@@ -699,8 +581,7 @@ mod tests {
         std::fs::create_dir_all(&themes).unwrap();
         std::fs::write(themes.join("mine.toml"), "[h1]\nfg = \"red\"\n").unwrap();
 
-        // `ThemeFile` has no `PartialEq`; its TOML rendering is a faithful
-        // stand-in and reports a readable diff on failure.
+        // `ThemeFile` has no `PartialEq`; its TOML rendering stands in.
         let render = |f: &ThemeFile| toml::to_string(f).expect("theme file serialises");
         let builtin = render(&(&Theme::builtin(TRUECOLOR_FALLBACK_THEME).unwrap()).into());
 
@@ -713,8 +594,7 @@ mod tests {
             assert_eq!(render(&file), builtin);
         }
 
-        // Ungated, the same call reads the file — so the assertions above
-        // are about the gate, not about a misdirected path.
+        // Ungated, the same call reads the file — so the above is about the gate.
         let (file, fallback) = read_theme_named(dir.path(), "mine", true, &mut warnings);
         assert_eq!(fallback, None);
         assert_ne!(
@@ -734,7 +614,6 @@ mod tests {
         std::fs::write(export.join("default.css"), "").unwrap();
         std::fs::write(export.join("notes.txt"), "").unwrap();
         std::fs::write(export.join("UPPER.CSS"), "").unwrap();
-        // The scaffolded fork-able reference is not a `.css` and is excluded.
         std::fs::write(export.join("default.css.example"), "").unwrap();
 
         let found = list_export_stylesheets(dir.path());

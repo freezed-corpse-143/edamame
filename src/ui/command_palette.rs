@@ -1,13 +1,6 @@
-//! Fuzzy-searchable command palette.
-//!
-//! The palette is a centred modal with a single-line input on top of a
-//! scrollable list of matched actions.  When the input is empty, all actions
-//! are shown organized into named sections (`Suggested`, `File`, `Edit`, …);
-//! once the user types, the shared [`SearchableList`] fuzzy-ranks every entry
-//! against the query and sections collapse into a flat ranked list.
-//!
-//! The widget is deliberately UI-only: selecting a row produces an [`Action`],
-//! which the adapter dispatches through the normal `edit_ops::apply` path.
+//! Fuzzy-searchable command palette.  An empty query shows every action in named sections;
+//! typing collapses them into a flat [`SearchableList`] ranking.  UI-only: selecting a row
+//! yields an [`Action`] that the adapter dispatches through `edit_ops::apply`.
 
 mod actions;
 
@@ -26,10 +19,7 @@ use crate::ui::searchable_list::{
     draw_searchable_list_modal, ListModalOpts, RowCtx, SearchableList, VisibleRow, MAX_LIST_ROWS,
 };
 
-/// One palette row: an action plus its display label and bound chord.
-///
-/// Showing the chord next to the label is how users learn bindings
-/// organically — typing "save" surfaces `Save file  (Ctrl-S)`.
+/// One palette row.  The chord is shown beside the label so users learn bindings organically.
 #[derive(Debug, Clone)]
 pub struct PaletteEntry {
     pub action: Action,
@@ -37,23 +27,17 @@ pub struct PaletteEntry {
     pub chord: Option<String>,
 }
 
-/// Placeholder shown in the empty search field.
 const PLACEHOLDER: &str = "Search commands…";
 
-/// Width of "(no matches)" copy, used as a floor so the modal doesn't snap
-/// narrower than the placeholder.
+/// Width of the "(no matches)" copy, a floor on the modal width.
 const NO_MATCHES_WIDTH: u16 = 12;
 
 /// Build the palette's list component from `keymap`.
 ///
-/// A single `Export…` entry covers every target — the format (HTML, or any
-/// configured `[[export.custom]]` converter) is chosen inside the export
-/// modal's Format list, so the palette carries no per-converter rows.
-///
-/// `vim_enabled` drops `Exit to preview`: vim never rests in Preview
-/// (Normal is its resting mode), so the action would flip the editor into
-/// Preview only for the next keystroke to leave it again.  The keybinds
-/// overlay and the hint line hide the same action for the same reason.
+/// A single `Export…` entry covers every target; the format is chosen inside the export modal.
+/// `vim_enabled` drops `Exit to preview`: vim never rests in Preview, so the action would flip
+/// the editor there only for the next keystroke to leave again.  The keybinds overlay and the
+/// hint line hide it for the same reason.
 pub fn build_palette_list(keymap: &KeyMap, vim_enabled: bool) -> SearchableList<PaletteEntry> {
     SearchableList::new(build_entries(keymap, vim_enabled), |e: &PaletteEntry| {
         e.label.as_str()
@@ -61,8 +45,7 @@ pub fn build_palette_list(keymap: &KeyMap, vim_enabled: bool) -> SearchableList<
     .with_sections(palette_sections)
 }
 
-/// Render the palette modal.  Returns the `esc` close-hint rect for click
-/// hit-testing.
+/// Render the palette modal; returns the `esc` close-hint rect for click hit-testing.
 pub fn render_palette(
     list: &mut SearchableList<PaletteEntry>,
     area: Rect,
@@ -98,9 +81,8 @@ pub fn render_palette(
     )
 }
 
-/// Content-aware width for the palette body: max over `entries` of
-/// `marker(2) + label_w + 1 (gap) + chord_w`.  Sized on the whole entry list
-/// so the modal doesn't jiggle in width as the user filters.
+/// Body width: max over all entries of `marker(2) + label + gap(1) + chord`.  Sized on the whole
+/// list so the modal doesn't jiggle as the user filters.
 fn palette_content_width(entries: &[PaletteEntry]) -> u16 {
     max_row_width(entries, |e| {
         let label_w = e.label.chars().count();
@@ -109,8 +91,6 @@ fn palette_content_width(entries: &[PaletteEntry]) -> u16 {
     })
 }
 
-/// Format one palette row via the shared modal-row formatter (chord
-/// right-aligned).
 fn format_row(entry: &PaletteEntry, focused: bool, theme: &Theme, width: u16) -> Line<'static> {
     let chord = entry.chord.as_deref().unwrap_or("");
     format_modal_row(
@@ -123,7 +103,7 @@ fn format_row(entry: &PaletteEntry, focused: bool, theme: &Theme, width: u16) ->
     )
 }
 
-/// Format a section header as a thin separator: `─ Title ───────`.
+/// `─ Title ───────`
 fn format_section_header(title: &str, theme: &Theme, width: u16) -> Line<'static> {
     let prefix = format!("─ {} ", title);
     let prefix_w = prefix.chars().count();
@@ -132,9 +112,8 @@ fn format_section_header(title: &str, theme: &Theme, width: u16) -> Line<'static
     Line::from(Span::styled(text, theme.modal_section_heading))
 }
 
-/// Empty-query sectioned layout: `Suggested` first (curated order), then each
-/// action category in [`SECTION_ORDER`].  Suggested actions also appear in
-/// their category section.
+/// Empty-query layout: `Suggested` in curated order, then each category in [`SECTION_ORDER`].
+/// Suggested actions also appear in their category.
 fn palette_sections(entries: &[PaletteEntry]) -> Vec<VisibleRow> {
     let mut rows = Vec::new();
     rows.push(VisibleRow::Header("Suggested".to_owned()));
@@ -170,7 +149,7 @@ fn palette_sections(entries: &[PaletteEntry]) -> Vec<VisibleRow> {
     rows
 }
 
-/// Curated "Suggested" entries shown when the palette opens with no input.
+/// Curated entries shown first when the palette opens with no input.
 const SUGGESTED_ACTIONS: &[Action] = &[
     Action::OpenSettings,
     Action::SwitchTheme,
@@ -184,13 +163,11 @@ const SUGGESTED_ACTIONS: &[Action] = &[
     Action::ShowAbout,
 ];
 
-/// True when `action` is part of the curated suggested list.
 fn is_suggested(action: &Action) -> bool {
     SUGGESTED_ACTIONS.contains(action)
 }
 
-/// Section ordering for the empty-state view.  Each action maps to exactly one
-/// section via [`section_of`]; the Suggested section is handled separately.
+/// Section order for the empty-state view; each action maps to one section via [`section_of`].
 const SECTION_ORDER: &[&str] = &["File", "Edit", "View", "Navigate", "Table", "Tools"];
 
 fn section_of(action: &Action) -> &'static str {
@@ -256,11 +233,7 @@ fn section_of(action: &Action) -> &'static str {
     }
 }
 
-/// Build the full action list shown in the palette.  Each entry has a
-/// human-readable label and (optionally) the bound chord.  Sorted
-/// alphabetically by label (the empty-state view re-orders via sections; a
-/// typed query is sorted by fuzzy score).  See [`build_palette_list`] for
-/// the `vim_enabled` gate.
+/// The full entry list, sorted by label.  See [`build_palette_list`] for the `vim_enabled` gate.
 fn build_entries(keymap: &KeyMap, vim_enabled: bool) -> Vec<PaletteEntry> {
     let mut entries: Vec<PaletteEntry> = ALL_ACTIONS
         .iter()
@@ -296,8 +269,6 @@ mod tests {
 
     #[test]
     fn exit_to_preview_hidden_under_vim() {
-        // Vim never rests in Preview, so the entry is dropped — and only
-        // that entry: every other action survives the gate unchanged.
         let default = build_entries(&keymap(), false);
         let vim = build_entries(&keymap(), true);
         assert!(default.iter().any(|e| e.action == Action::ExitToPreview));
@@ -311,8 +282,7 @@ mod tests {
         assert_eq!(vim_all, default_rest);
     }
 
-    /// Render once into a TestBackend so the list observes its visible-window
-    /// size (needed before scroll/paging assertions).
+    /// Render once so the list observes its visible-window size before scroll assertions.
     fn render(list: &mut SearchableList<PaletteEntry>, w: u16, h: u16) -> String {
         use ratatui::{backend::TestBackend, Terminal};
         let theme: &'static Theme = Box::leak(Box::new(Theme::default()));
@@ -445,7 +415,6 @@ mod tests {
         let first = list.focused_item_index();
         list.handle_key(&key(KeyCode::Down));
         assert_ne!(list.focused_item_index(), first);
-        // Focus never lands on a header even after exhausting the list.
         for _ in 0..count + 5 {
             list.handle_key(&key(KeyCode::Down));
             assert!(list.focused_item_index().is_some());
@@ -460,8 +429,6 @@ mod tests {
         assert!(list.query().is_empty());
     }
 
-    /// A single `Export…` entry represents every target; the format is
-    /// chosen inside the modal, so there is exactly one export row.
     #[test]
     fn there_is_a_single_export_entry() {
         let entries = build_entries(&keymap(), false);

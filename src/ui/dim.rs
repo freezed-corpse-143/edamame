@@ -1,26 +1,9 @@
 //! Editor-area dimming behind a modal.
 //!
-//! A modal renders on top of the editor; the editor stays visible
-//! around it but should read as recessed so the user's eye lands on
-//! the modal first.  Two strategies depending on terminal color
-//! depth:
-//!
-//! - **Truecolor terminals** ([`ColorDepth::TrueColor`]) — convert
-//!   each cell's foreground and background to RGB, blend toward the
-//!   theme's `default_bg` by [`BLEND_T`], and write the result back as
-//!   `Color::Rgb`.  Preserves structure (headings, code blocks,
-//!   tables stay legible as silhouettes) while clearly fading the
-//!   editor.
-//!
-//! - **Anything else** — fall back to a [`Modifier::DIM`] sweep.  On
-//!   Ansi256 we additionally force the foreground to `text_muted` so
-//!   the dim is more pronounced than the modifier alone delivers
-//!   (terminals often render `DIM` as ~10% drop in luminance, which is
-//!   barely visible).
-//!
-//! The 256-entry ANSI palette LUT in [`ANSI_PALETTE`] is the standard
-//! xterm 256-color table; values are well-known so adjusting them is
-//! not a priority.
+//! Truecolor terminals ([`ColorDepth::TrueColor`]) blend each cell's fg/bg toward the theme's
+//! `default_bg` by [`BLEND_T`], which keeps document structure legible as silhouettes.  Anything
+//! else gets a [`Modifier::DIM`] sweep; Ansi256 also forces the foreground to `text_muted`,
+//! because terminals often render `DIM` as a barely visible ~10% luminance drop.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -29,15 +12,10 @@ use ratatui::style::{Color, Modifier};
 use crate::config::Theme;
 use crate::terminal::{Capabilities, ColorDepth};
 
-/// Fraction of the way each cell color is blended toward the theme's
-/// `default_bg` on truecolor terminals.  0.0 = untouched, 1.0 = fully
-/// erased.  Tune by editing this constant — empirically 0.5 reads as
-/// "moderately recessed" without losing document structure.
+/// Blend fraction toward `default_bg` on truecolor terminals: 0.0 = untouched, 1.0 = erased.
 const BLEND_T: f32 = 0.6;
 
-/// Apply the dim effect to `area` of `buf` for the active terminal
-/// capabilities.  `theme` supplies the blend target (`default_bg`) and
-/// the Ansi256 fallback foreground (`text_muted`).
+/// Dim `area` of `buf` using the strategy for the active color depth.
 pub fn dim_area(buf: &mut Buffer, area: Rect, caps: &Capabilities, theme: &Theme) {
     match caps.color_depth {
         ColorDepth::TrueColor => dim_truecolor(buf, area, theme),
@@ -46,15 +24,11 @@ pub fn dim_area(buf: &mut Buffer, area: Rect, caps: &Capabilities, theme: &Theme
     }
 }
 
-/// Truecolor sweep: blend each cell's fg/bg toward `default_bg` by
-/// [`BLEND_T`].  Cells with `Color::Reset` foreground or background
-/// keep that side untouched (we don't know the terminal's actual
-/// default color).
+/// Truecolor sweep.  A `Color::Reset` side is left untouched: the terminal's real default
+/// color is unknown.
 fn dim_truecolor(buf: &mut Buffer, area: Rect, theme: &Theme) {
     let target = match color_to_rgb(theme.default_bg()) {
         Some(rgb) => rgb,
-        // Theme's default_bg is `Reset` — fall back to the simple
-        // sweep; we have no concrete blend target.
         None => return dim_modifier_only(buf, area),
     };
     for y in area.y..area.y + area.height {
@@ -74,10 +48,7 @@ fn dim_truecolor(buf: &mut Buffer, area: Rect, theme: &Theme) {
     }
 }
 
-/// Ansi256 sweep: replace fg with `text_muted` and insert
-/// `Modifier::DIM`.  The foreground swap is what produces the visible
-/// dim — the modifier alone is too subtle on most terminals to
-/// communicate "behind a modal".
+/// Ansi256 sweep: `text_muted` foreground plus `Modifier::DIM`.
 fn dim_ansi256(buf: &mut Buffer, area: Rect, theme: &Theme) {
     let muted = theme.text_muted();
     for y in area.y..area.y + area.height {
@@ -90,8 +61,7 @@ fn dim_ansi256(buf: &mut Buffer, area: Rect, theme: &Theme) {
     }
 }
 
-/// Plain `Modifier::DIM` sweep — the fallback for low-color or
-/// monochrome terminals where we have no useful color to swap in.
+/// Plain `Modifier::DIM` sweep for low-color or monochrome terminals.
 fn dim_modifier_only(buf: &mut Buffer, area: Rect) {
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
@@ -102,9 +72,7 @@ fn dim_modifier_only(buf: &mut Buffer, area: Rect) {
     }
 }
 
-/// Linear blend from `src` toward `target` by `t` ∈ `[0, 1]`.  Math
-/// runs in u16 to avoid u8 overflow on the multiply; final clamp is
-/// implicit because both operands are ≤ 255 and `t` is bounded.
+/// Linear blend from `src` toward `target` by `t` ∈ `[0, 1]`.
 fn blend_toward(src: [u8; 3], target: [u8; 3], t: f32) -> [u8; 3] {
     let t = t.clamp(0.0, 1.0);
     let mix = |a: u8, b: u8| -> u8 {
@@ -119,9 +87,7 @@ fn blend_toward(src: [u8; 3], target: [u8; 3], t: f32) -> [u8; 3] {
     ]
 }
 
-/// Convert a `Color` to its RGB triple where one is determinable.
-/// Returns `None` for `Color::Reset` (terminal default — we don't
-/// know its concrete RGB).
+/// RGB triple for a `Color`; `None` for `Color::Reset`, whose concrete RGB is unknown.
 fn color_to_rgb(color: Color) -> Option<[u8; 3]> {
     match color {
         Color::Reset => None,
@@ -146,18 +112,12 @@ fn color_to_rgb(color: Color) -> Option<[u8; 3]> {
     }
 }
 
-/// Standard xterm 256-color palette.
-///
-/// - `0..16` — system colors (terminal-themable, but we use the
-///   widely-accepted defaults so the blend target is stable).
-/// - `16..232` — 6×6×6 color cube; index `16 + 36r + 6g + b` where
-///   each component is one of `[0, 95, 135, 175, 215, 255]`.
-/// - `232..256` — 24-step grayscale ramp from `8` to `238`.
+/// Standard xterm 256-color palette: 16 system colors (the conventional defaults, since the
+/// terminal's own are unknowable), the 6×6×6 cube, then the 24-step gray ramp.
 const ANSI_PALETTE: [[u8; 3]; 256] = build_ansi_palette();
 
 const fn build_ansi_palette() -> [[u8; 3]; 256] {
     let mut p = [[0u8; 3]; 256];
-    // System colors 0..16.
     p[0] = [0, 0, 0];
     p[1] = [128, 0, 0];
     p[2] = [0, 128, 0];
@@ -174,7 +134,6 @@ const fn build_ansi_palette() -> [[u8; 3]; 256] {
     p[13] = [255, 0, 255];
     p[14] = [0, 255, 255];
     p[15] = [255, 255, 255];
-    // 6×6×6 cube starting at index 16.
     let levels: [u8; 6] = [0, 95, 135, 175, 215, 255];
     let mut r = 0;
     while r < 6 {
@@ -190,7 +149,6 @@ const fn build_ansi_palette() -> [[u8; 3]; 256] {
         }
         r += 1;
     }
-    // Greyscale ramp 232..256.
     let mut k = 0;
     while k < 24 {
         let v = 8 + 10 * k as u8;
@@ -219,7 +177,6 @@ mod tests {
 
     #[test]
     fn blend_halfway_is_midpoint() {
-        // 100 → 0 by half = 50; 50 → 100 by half = 75; etc.
         let r = blend_toward([100, 50, 200], [0, 100, 0], 0.5);
         assert_eq!(r, [50, 75, 100]);
     }
@@ -242,17 +199,14 @@ mod tests {
 
     #[test]
     fn ansi_palette_known_indices() {
-        // Spot-checks against the published xterm 256-color table.
         assert_eq!(ANSI_PALETTE[0], [0, 0, 0]); // black
         assert_eq!(ANSI_PALETTE[15], [255, 255, 255]); // white
         assert_eq!(ANSI_PALETTE[16], [0, 0, 0]); // cube 0,0,0
         assert_eq!(ANSI_PALETTE[231], [255, 255, 255]); // cube 5,5,5
         assert_eq!(ANSI_PALETTE[232], [8, 8, 8]); // first grey
         assert_eq!(ANSI_PALETTE[255], [238, 238, 238]); // last grey
-                                                        // 196 is the bright red commonly used for `error`.
-        assert_eq!(ANSI_PALETTE[196], [255, 0, 0]);
-        // 208 is orange (edamame's `primary`).
-        assert_eq!(ANSI_PALETTE[208], [255, 135, 0]);
+        assert_eq!(ANSI_PALETTE[196], [255, 0, 0]); // bright red
+        assert_eq!(ANSI_PALETTE[208], [255, 135, 0]); // orange
     }
 
     #[test]
@@ -265,10 +219,6 @@ mod tests {
 
     #[test]
     fn dim_truecolor_blends_each_cell_toward_default_bg() {
-        // 4-cell row of bright orange fg on near-black bg.  Run the
-        // production `dim_truecolor` and verify every cell ends up at
-        // the precomputed blend midpoint against the theme's
-        // `default_bg`.
         use ratatui::style::Style;
         let theme = crate::config::Theme::default();
         let target = color_to_rgb(theme.default_bg()).expect("default theme has rgb-able bg");

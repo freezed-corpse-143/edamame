@@ -14,25 +14,17 @@ use super::raw_text::{raw_line_byte_start, raw_source_lines};
 use crate::markdown::code_layout::{code_raw_col_to_rendered_col, is_code_fence_row};
 use crate::markdown::list_layout::{raw_list_marker_char_width, rendered_list_marker_char_width};
 
-/// Build a `Line` showing `raw_text` with a block cursor at `cursor_col`.
-///
-/// If `cursor_col` is `None`, no cursor is drawn (other lines of the block).
+/// [`make_raw_line_with_selection`] with no selection.
 #[cfg(test)]
 pub(super) fn make_raw_line(raw_text: &str, theme: &Theme) -> Line<'static> {
     make_raw_line_with_selection(raw_text, None, theme)
 }
 
-/// Build a `Line` showing `raw_text` (the cursor's block, raw-revealed), with
-/// `selection_cols` painted in the theme's selection background.
-/// `selection_cols` is a `[start, end)` range in char columns within
-/// `raw_text`.
+/// A `Line` of `raw_text` (the raw-revealed cursor block) with `selection_cols` (a `[start, end)`
+/// char range) painted in the selection background.
 ///
-/// The cursor itself is NOT embedded here: it is painted onto the resolved
-/// cell by `line_render`'s cursor override at render time.  This keeps the
-/// wrapped layout computed from the *bare* source text, matching the wrap that
-/// the scroll / navigation code (which never sees the cursor glyph) uses — a
-/// `▏` bar glyph baked into the line would otherwise shift word-wrap breaks
-/// and desync the two.
+/// The cursor is NOT embedded: `line_render` paints it onto the resolved cell, so the wrap is
+/// computed from the bare source and matches the wrap the scroll/navigation code uses.
 pub(super) fn make_raw_line_with_selection(
     raw_text: &str,
     selection_cols: Option<(usize, usize)>,
@@ -41,14 +33,9 @@ pub(super) fn make_raw_line_with_selection(
     make_raw_line_over(raw_text, selection_cols, theme, theme.normal)
 }
 
-/// [`make_raw_line_with_selection`] over a caller-supplied `base` style
-/// instead of `theme.normal`.  A revealed line inside a block that paints
-/// its own surface — a blockquote's wash, the way
-/// [`make_code_styled_body_line`] does for a code block's — must keep that
-/// surface while it shows raw source, or the one row the user is editing
-/// blinks out of the block it belongs to.  `base` is also the line-level
-/// style, so `line_render`'s trailing-cell fill carries the surface to the
-/// viewport edge.
+/// [`make_raw_line_with_selection`] over a caller-supplied `base` style, so a revealed line
+/// inside a block with its own surface (a blockquote wash) keeps that surface. `base` is also
+/// the line-level style, so `line_render`'s trailing-cell fill carries it to the viewport edge.
 pub(super) fn make_raw_line_over(
     raw_text: &str,
     selection_cols: Option<(usize, usize)>,
@@ -59,9 +46,7 @@ pub(super) fn make_raw_line_over(
     let chars: Vec<char> = raw_text.chars().collect();
     let total = chars.len();
 
-    // Always emit one span per char so per-char styling stays predictable when
-    // cursor and selection overlap.  The runs of same-style chars don't need to
-    // be coalesced — ratatui's Line works fine with short spans.
+    // One span per char keeps per-char styling predictable when cursor and selection overlap.
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(total);
     for (i, ch) in chars.iter().enumerate() {
         let mut style = base;
@@ -73,15 +58,9 @@ pub(super) fn make_raw_line_over(
     Line::from(spans).style(base)
 }
 
-/// Build a `Line` for one body row of a mermaid block revealed as a code
-/// block: `raw_text` carries the source line with optional cursor and
-/// selection overlays, and the line's base style is `code_block_text` so
-/// `render_line_from_visual`'s trailing-cell fill extends the code
-/// background to the full viewport width.
-///
-/// Char positions are kept 1:1 with `raw_text` (no leading-pad column),
-/// so mouse click → raw col mapping in `rendered_sub_line_to_offset`
-/// continues to work without offset adjustments.
+/// One body row of a mermaid block revealed as a code block, with `code_block_text` as the
+/// line style so the trailing-cell fill extends the code background. Char positions stay 1:1
+/// with `raw_text` (no leading pad) so click → raw col mapping needs no adjustment.
 pub(super) fn make_code_styled_body_line(
     raw_text: &str,
     selection_cols: Option<(usize, usize)>,
@@ -103,23 +82,13 @@ pub(super) fn make_code_styled_body_line(
     Line::from(spans).style(base)
 }
 
-/// Post-render pass: paint `style` on top of the rendered cells of a
-/// given rendered line for the source byte range `[sel_start_byte,
-/// sel_end_byte)`, if that range touches the line's block.  Shared by
-/// the selection overlay (`theme.selection`) and the search-match
-/// overlays (`theme.selection` / `selection_muted`).
+/// Post-render pass: paint `style` over the rendered cells of one rendered line for the source
+/// byte range `[sel_start_byte, sel_end_byte)`. Shared by the selection, search-match, `:s`
+/// preview, and yank-flash overlays.
 ///
-/// Computes the raw byte range of *this specific rendered line* within its
-/// block (by splitting the block's raw text on newlines), intersects with the
-/// requested byte range, and highlights only the rendered cols that
-/// correspond to covered bytes.  Falls back to "whole line" highlight for
-/// blocks where the per-line mapping can't be determined cleanly.
-///
-/// The per-line intersection is what lets a **multi-line** range paint
-/// correctly: a search match containing `\n`, a `:s` preview span, and a
-/// linewise selection all arrive here spanning several lines (and, via
-/// the caller's block window, several blocks).  Keep the clamp — do not
-/// "simplify" it into an assumption that the range fits one line.
+/// Intersects the range with *this rendered line's* raw bytes within its block, then maps the
+/// covered raw cols to rendered cols per block kind. Keep the per-line clamp: multi-line
+/// ranges (a search match containing `\n`, a linewise selection) rely on it.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn paint_byte_range_overlay(
     editor: &EditorState,
@@ -143,23 +112,13 @@ pub(super) fn paint_byte_range_overlay(
     let Some(block_range) = editor.parsed.source_map.original_range_for_byte(block_byte) else {
         return;
     };
-    // Does the selection touch this block at all?
     if block_range.end <= sel_start_byte || block_range.start >= sel_end_byte {
         return;
     }
 
-    // Figure out which RAW line within the block this rendered line maps to.
-    // For tables, the renderer prepends a top border and interleaves the
-    // alignment row as a box-drawing separator, so the mapping shifts.  For
-    // other blocks that produce one rendered line per raw line (code blocks,
-    // lists where each item is a single-line paragraph), it's 1:1.
     let source = editor.buffer.contents();
-    // `source.get(..)` rather than direct indexing — when `parsed_dirty` is
-    // set, an in-line edit (e.g. an emoji insertion) has shifted byte
-    // offsets after the cursor, so `block_range` may now end inside a
-    // multi-byte UTF-8 sequence in the live buffer.  Empty-string fallback
-    // skips selection painting on this block for one frame; the next parse
-    // refresh restores correct ranges.
+    // `get` rather than indexing: with `parsed_dirty` set, an in-line edit may have shifted
+    // offsets so `block_range` ends inside a multi-byte sequence. Skipping one frame is fine.
     let block_text = source
         .get(block_range.start..block_range.end.min(source.len()))
         .unwrap_or("");
@@ -169,14 +128,10 @@ pub(super) fn paint_byte_range_overlay(
         .rendered_lines_for_byte(block_range.start);
     let sub_idx_in_block = rendered_line_idx.saturating_sub(rendered_span.start);
     let is_table = table_edit::is_table_block(block_text);
-    // Wrap-chunk index of a table sub-line within its logical row: a
-    // wrapped cell shows chunk `table_sub` of its content on this line.
+    // Wrap-chunk index of a table sub-line within its logical row.
     let mut table_sub = 0usize;
     let raw_line_idx = if is_table {
-        // Tables can have multi-line headers / data rows when
-        // cell content wraps.  Use the box-drawing-glyph classifier
-        // instead of a fixed alternating-line pattern so the selection
-        // highlight maps onto the right raw row regardless of wrap.
+        // Rows can wrap, so classify by box-drawing glyph rather than assume alternation.
         let own_end = rendered_span.end.min(editor.parsed.lines.len());
         let block_lines = editor
             .parsed
@@ -193,21 +148,17 @@ pub(super) fn paint_byte_range_overlay(
                 table_sub = *sub;
                 row + 2
             }
-            // Separators and borders don't carry a raw-byte mapping —
-            // skip the highlight rather than paint a speculative one.
+            // Separators and borders carry no raw-byte mapping.
             _ => return,
         }
     } else {
         sub_idx_in_block
     };
 
-    // Byte range of the raw line within the block's source text.
     let raw_lines: Vec<&str> = block_text.split('\n').collect();
-    // Real lines (no phantom trailing entry) — the fence test below must use
-    // these, not `raw_lines`.
+    // Real lines (no phantom trailing entry) — the fence test below must use these.
     let content_lines = raw_source_lines(block_text);
     if raw_line_idx >= raw_lines.len() {
-        // Out-of-range raw line — no highlight rather than a speculative one.
         return;
     }
     let raw_line = raw_lines[raw_line_idx];
@@ -215,16 +166,12 @@ pub(super) fn paint_byte_range_overlay(
     let raw_line_start_abs = block_range.start + raw_line_start;
     let raw_line_end_abs = raw_line_start_abs + raw_line.len();
 
-    // Selection's intersection with this raw line (in absolute bytes).
     let line_sel_start = sel_start_byte.max(raw_line_start_abs);
     let line_sel_end = sel_end_byte.min(raw_line_end_abs);
     if line_sel_start >= line_sel_end {
-        // Selection doesn't actually cover any bytes on THIS rendered line,
-        // even though it covers the block — nothing to paint.
         return;
     }
 
-    // Raw col range within the raw line.
     let start_raw_col = raw_line[..line_sel_start - raw_line_start_abs]
         .chars()
         .count();
@@ -232,9 +179,6 @@ pub(super) fn paint_byte_range_overlay(
         .chars()
         .count();
 
-    // Map raw cols to rendered cols.  Tables go cell-by-cell via pipe
-    // positions.  List items compose the marker offset with the inline
-    // collapse map.  Paragraph lines use the inline collapse map directly.
     let Some(line) = editor.parsed.lines.get(rendered_line_idx) else {
         return;
     };
@@ -245,20 +189,13 @@ pub(super) fn paint_byte_range_overlay(
     let inline_map = editor.inline_map_for(buffer_line_idx, raw_line);
     let actual_rendered: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
 
-    // Block-kind-aware prefix adjustments: headings render behind a
-    // level-deep space prefix and code blocks behind a single leading
-    // pad cell, both invisible to the inline collapse map (which only
-    // models inline markup).  Without the shift, the fallback paths
-    // below paint one or more cells to the left of the actual text.
-    // Looked up via `real_block_for_byte` — a source-map block index
-    // must NOT be used against `parsed.blocks` (its index space counts
-    // blank-line virtual blocks, so the two diverge in any document
-    // with blank lines).  `line_sel_start` is a byte inside the
-    // covered text, so it lands inside the block's real range.
+    // Headings (level-deep space prefix) and code blocks (one leading pad cell) shift the
+    // rendered text in ways the inline collapse map doesn't model. Looked up via
+    // `real_block_for_byte` — a source-map block index must NOT index `parsed.blocks`, whose
+    // index space counts blank-line virtual blocks.
     let block_kind = editor.parsed.real_block_for_byte(line_sel_start);
 
-    // Marker widths for the list arm below — `Some` only when the block
-    // really is a `Block::List` AND this raw line carries its own marker.
+    // `Some` only for a real `Block::List` whose raw line carries its own marker.
     let list_marker_widths = if matches!(block_kind, Some(crate::markdown::Block::List { .. })) {
         raw_list_marker_char_width(raw_line).zip(rendered_list_marker_char_width(line))
     } else {
@@ -266,16 +203,8 @@ pub(super) fn paint_byte_range_overlay(
     };
 
     if is_table {
-        // A cell may wrap onto several rendered sub-lines, and the match's
-        // raw columns land in at most ONE wrap chunk per cell.  Map the raw
-        // range to the per-cell rendered segments visible on *this*
-        // wrap-chunk (`table_sub`): a cell whose chunk doesn't overlap the
-        // match contributes no segment, so the highlight never bleeds onto a
-        // sub-line that doesn't actually show the matched text.  This is the
-        // unified path for the first sub-line (`table_sub == 0`, the first
-        // chunk) and every continuation alike — the old first-line mapping
-        // ignored wrapping and painted a spurious clamped highlight on
-        // sub-line 0 for a match that really sits on a later chunk.
+        // A match's raw cols land in at most one wrap chunk per cell; mapping per `table_sub`
+        // keeps the highlight off sub-lines that don't show the matched text.
         for (rs, re) in crate::markdown::table_layout::table_raw_col_range_to_rendered_segments(
             raw_line,
             line,
@@ -292,23 +221,11 @@ pub(super) fn paint_byte_range_overlay(
 
     let (rend_start, rend_end) =
         if let Some(crate::markdown::Block::CodeBlock { fenced, .. }) = block_kind {
-            // Code body rows render the raw text 1:1 behind one leading
-            // pad cell.  Indented (non-fenced) blocks additionally drop
-            // the up-to-4-space indent that pulldown-cmark strips from the
-            // content.  Both terms live in `markdown::code_layout`, shared
-            // with the cursor indicator and the mouse hit-test.
-            //
-            // Fence rows render unrelated text — the ` lang ` label (or an
-            // NBSP placeholder) for the opening fence, and an NBSP
-            // placeholder for the closing fence — so a raw→rendered column
-            // mapping is meaningless.  When the selection touches a fence
-            // row, highlight the whole rendered row so the selection reads
-            // as covering it (Visual / V-LINE) rather than leaving a gap at
-            // the top and bottom of a selected block.  The lines come from
-            // `raw_source_lines`, NOT the `raw_lines` split above: a block
-            // range ending in a newline gives `split('\n')` a phantom
-            // trailing entry, which would make the real closing fence look
-            // like a body row and map its columns instead of washing the row.
+            // Body rows render 1:1 behind a pad cell (indented blocks also drop the stripped
+            // indent); both terms live in `markdown::code_layout`. Fence rows render unrelated
+            // text, so wash the whole row instead of mapping columns. Fence detection uses
+            // `content_lines`, not `raw_lines`: the phantom trailing entry would make the
+            // closing fence look like a body row.
             if is_code_fence_row(*fenced, raw_line_idx, &content_lines) {
                 (0, actual_rendered)
             } else {
@@ -319,24 +236,16 @@ pub(super) fn paint_byte_range_overlay(
             block_kind,
             Some(crate::markdown::Block::MetadataBlock { .. })
         ) {
-            // Frontmatter renders verbatim — every character in its source
-            // column — so the mapping is the identity.  The inline collapse
-            // map must not be consulted here: it re-parses the line as
-            // Markdown, where a quoted YAML value picks up smart quotes and
-            // a `*` opens emphasis, neither of which the rendered row has.
-            // The list arm below is skipped for the same reason a YAML
-            // sequence entry isn't a list item.
+            // Frontmatter renders verbatim, so the mapping is the identity. The inline map
+            // must not be consulted: it re-parses the line as Markdown (smart quotes, `*`
+            // emphasis) that the rendered row doesn't have.
             (
                 start_raw_col.min(actual_rendered),
                 end_raw_col.min(actual_rendered),
             )
         } else if let Some(crate::markdown::Block::Heading { level, .. }) = block_kind {
-            // Headings render as a level-deep space prefix plus the
-            // collapsed inline content; shift the mapped cols right by the
-            // prefix.  A length mismatch (big-H1 rows, the setext
-            // underline, smart-punctuation collapse) skips the highlight
-            // instead of falling back to raw cols, which would be
-            // off-by-prefix.
+            // Prefix shift plus the collapse map. A length mismatch (big-H1 rows, setext
+            // underline) skips the highlight rather than painting one off-by-prefix.
             let prefix = heading_prefix_width(*level);
             let content_rendered = actual_rendered.saturating_sub(prefix);
             match (
@@ -347,14 +256,9 @@ pub(super) fn paint_byte_range_overlay(
                 _ => return,
             }
         } else if let Some((rmw, rmw_r)) = list_marker_widths {
-            // List-item line of a real List block: the marker widths handle
-            // the `- ` / `1. ` prefix shift, composed with the inline
-            // collapse map so bold / italic / link markup inside the item
-            // also lines up.  Gated on the AST kind — a Paragraph line that
-            // merely *sniffs* like a marker (`2. ` lazy continuation) takes
-            // the plain paragraph mapping below instead.  A raw line inside
-            // a List block without its own marker (continuation line) also
-            // falls through to the paragraph mapping.
+            // Marker widths handle the `- ` / `1. ` shift, composed with the collapse map.
+            // Gated on the AST kind: a Paragraph that merely sniffs like a marker, or a
+            // continuation line without its own marker, takes the paragraph mapping.
             let content_rendered = actual_rendered.saturating_sub(rmw_r);
             let map_col = |raw_col: usize| -> Option<usize> {
                 if raw_col < rmw {
@@ -367,30 +271,19 @@ pub(super) fn paint_byte_range_overlay(
             };
             match (map_col(start_raw_col), map_col(end_raw_col)) {
                 (Some(mut rend_start), Some(rend_end)) => {
-                    // A selection that reaches the line's first column covers the
-                    // rendered marker too — most notably VisualLine, which widens to
-                    // whole lines, but also any charwise span whose intermediate
-                    // lines are fully selected.  The marker map above snaps such a
-                    // start forward to the content column, leaving the `1. ` / `• `
-                    // prefix unpainted; pull it back to col 0 so the whole rendered
-                    // row highlights.
+                    // A selection reaching col 0 (VisualLine, or a fully covered intermediate
+                    // line) must paint the marker too; the map snapped the start forward.
                     if start_raw_col == 0 {
                         rend_start = 0;
                     }
                     (rend_start, rend_end)
                 }
-                // Inline-map count mismatch (smart-punctuation collapse, …):
-                // skip the highlight rather than paint an off-by-N one —
-                // mirroring the heading branch — except a col-0 start
-                // (VisualLine) still washes the whole row so line selections
-                // never vanish.
+                // Mismatch: skip rather than paint off-by-N, except a col-0 start still
+                // washes the whole row so line selections never vanish.
                 _ if start_raw_col == 0 => (0, actual_rendered),
                 _ => return,
             }
         } else {
-            // Paragraph line (or a marker-less line inside a list block):
-            // use the inline collapse map so selection highlights track
-            // rendered glyph positions.
             match (
                 inline_map.raw_to_rendered_checked(start_raw_col, actual_rendered),
                 inline_map.raw_to_rendered_checked(end_raw_col, actual_rendered),
@@ -407,8 +300,7 @@ pub(super) fn paint_byte_range_overlay(
     );
 }
 
-/// Rendered-cell width of the space prefix the renderer puts in front
-/// of a heading's inline content (one cell per level — see
+/// Cells of the space prefix before a heading's content (one per level — see
 /// `Renderer::render_heading`).
 fn heading_prefix_width(level: pulldown_cmark::HeadingLevel) -> usize {
     use pulldown_cmark::HeadingLevel::*;
@@ -422,18 +314,10 @@ fn heading_prefix_width(level: pulldown_cmark::HeadingLevel) -> usize {
     }
 }
 
-/// Post-render pass: paint every visible search match over the
-/// rendered document.  Called by `EditorView` after the Preview /
-/// Rendered widget render — both walk `parsed.lines` with the same
-/// wrap, so one overlay walk serves both view modes.  The focused
-/// match gets the full `theme.selection` treatment; all others recede
-/// onto the muted `theme.selection_muted` wash.  No-op outside a
-/// search flow.
-///
-/// Every range is clamped against the live source (`partition_point`
-/// bounds + the byte-length guard) so a stale match list — possible
-/// for one frame after an external content swap — skips rather than
-/// panics.
+/// Post-render pass: paint every visible search match; the focused one in `theme.selection`,
+/// the rest in `selection_muted`. Called by `EditorView` for both Preview and Rendered, which
+/// share the same wrap. Ranges are clamped against the live source so a stale match list
+/// (one frame after an external content swap) skips rather than panics.
 pub(crate) fn paint_search_overlays(
     editor: &EditorState,
     buf: &mut TuiBuf,
@@ -443,10 +327,7 @@ pub(crate) fn paint_search_overlays(
     let Some(search) = editor.search.as_ref() else {
         return;
     };
-    // A live `:s` preview may have rewritten the buffer, so any search
-    // session's byte ranges are stale against the previewed text (its
-    // freshness refresh is paused too).  Suspend the wash — it reappears
-    // untouched once the preview reverts.
+    // A live `:s` preview rewrites the buffer, so search byte ranges are stale against it.
     if editor.substitute_preview.is_some() {
         return;
     }
@@ -478,8 +359,7 @@ pub(crate) fn paint_search_overlays(
             .original_byte_for_rendered_line(line_idx)
             .and_then(|b| editor.parsed.source_map.original_range_for_byte(b));
         if let Some(block_range) = block_range {
-            // Matches are sorted; jump to the first that could touch
-            // this block and stop at the first past it.
+            // Matches are sorted: jump to the first that could touch this block.
             let start = search
                 .matches
                 .partition_point(|m| m.end <= block_range.start);
@@ -515,14 +395,9 @@ pub(crate) fn paint_search_overlays(
     }
 }
 
-/// Post-render pass: paint the live `:s` substitution preview's highlight
-/// ranges over the rendered document — match ranges while the pattern is
-/// being typed, the inserted replacement segments once the replacement
-/// field exists (the buffer already shows the substituted text; this wash
-/// marks what changed).  Shares the visible-line walk with
-/// [`paint_search_overlays`], but with a single style (`theme.selection`)
-/// for every range — the preview has no focus concept, matching nvim's
-/// one `Substitute` highlight group.  No-op outside a preview session.
+/// Post-render pass: paint the live `:s` preview's highlight ranges (matches while typing the
+/// pattern, inserted replacement segments once one exists). Same walk as
+/// [`paint_search_overlays`], single style — the preview has no focus concept.
 pub(crate) fn paint_substitute_preview_overlays(
     editor: &EditorState,
     buf: &mut TuiBuf,
@@ -560,8 +435,6 @@ pub(crate) fn paint_substitute_preview_overlays(
             .original_byte_for_rendered_line(line_idx)
             .and_then(|b| editor.parsed.source_map.original_range_for_byte(b));
         if let Some(block_range) = block_range {
-            // Ranges are sorted; jump to the first that could touch
-            // this block and stop at the first past it.
             let start = preview
                 .highlights
                 .partition_point(|r| r.end <= block_range.start);
@@ -592,12 +465,8 @@ pub(crate) fn paint_substitute_preview_overlays(
     }
 }
 
-/// Post-render pass: paint the recently-yanked span as a brief highlight
-/// "flash" over the rendered document, confirming a `y` operation the way
-/// neovim's yank highlight does.  Shares the same visible-line walk as
-/// [`paint_search_overlays`] but for the single [`EditorState::yank_flash`]
-/// range, using `theme.selection`.  No-op once the flash window has
-/// elapsed (`active_yank_flash` returns `None`).
+/// Post-render pass: neovim-style yank highlight over [`EditorState::yank_flash`]'s range.
+/// Same walk as [`paint_search_overlays`].
 pub(crate) fn paint_yank_flash(editor: &EditorState, buf: &mut TuiBuf, area: Rect, theme: &Theme) {
     let Some(flash) = editor.active_yank_flash() else {
         return;
@@ -697,9 +566,7 @@ pub(super) fn paint_cols_on_line(
         if row_sel_start >= row_sel_end {
             continue;
         }
-        // Continuation rows are pre-padded with `indent` blank cells so the
-        // wrapped text aligns with the first row's text column; the
-        // selection background must shift by the same amount.
+        // Continuation rows are pre-padded with `indent` cells; shift by the same amount.
         let row_indent = if row_off == 0 { 0 } else { indent };
         for i in row_sel_start..row_sel_end {
             let x_off = row_indent + (i - row_start);
@@ -714,16 +581,9 @@ pub(super) fn paint_cols_on_line(
     }
 }
 
-/// Paint `overlay.raw_text` into the cell's rendered column range, inverting
-/// the character at `overlay.cursor_in_cell` to draw the cursor.  Writes
-/// directly to the `TuiBuf` — the caller must have already rendered the
-/// underlying row so the pipes and neighbouring cells are intact.
-///
-/// `selection_cols` is the `[start, end)` char range within `overlay.raw_text`
-/// that should carry the theme's selection background.  Painting selection here
-/// (rather than relying on the generic `paint_selection_overlay`) is necessary
-/// because the cell overlay replaces whatever was already in those cells — any
-/// earlier selection highlight would be clobbered.
+/// Paint `overlay.raw_text` into the cell's rendered column range, directly into the buffer
+/// (the underlying row must already be rendered). `selection_cols` is painted here because
+/// the overlay clobbers whatever the generic selection pass already painted.
 pub(super) fn overlay_raw_cell(
     buf: &mut TuiBuf,
     area: Rect,
@@ -731,8 +591,7 @@ pub(super) fn overlay_raw_cell(
     overlay: &CellOverlay,
     selection_cols: Option<(usize, usize)>,
     theme: &Theme,
-    // The block-cursor style when the cursor is visible this frame, or `None`
-    // when it's blinked off / the cursor isn't in this cell's row.
+    // Block-cursor style when visible this frame; `None` when blinked off or not in this row.
     cursor: Option<Style>,
 ) {
     if visual_y >= area.height {
@@ -741,11 +600,7 @@ pub(super) fn overlay_raw_cell(
     let abs_y = area.y + visual_y;
     let cell_width = overlay.rendered_end.saturating_sub(overlay.rendered_start);
     let raw_chars: Vec<char> = overlay.raw_text.chars().collect();
-    // `theme.normal` carries the theme's `default_bg`; letting it
-    // through here would clobber the table-row stripe painted under
-    // the cell.  Strip the bg so the underlying cell's bg is
-    // preserved — selection/cursor styles bring their own bg back
-    // when applied on top.
+    // Strip `theme.normal`'s bg so the table-row stripe under the cell survives.
     let base_style = Style {
         bg: None,
         ..theme.normal
@@ -762,18 +617,12 @@ pub(super) fn overlay_raw_cell(
         if matches!(selection_cols, Some((s, e)) if i >= s && i < e) {
             style = style.patch(theme.selection);
         }
-        // Block cursor: recolor the cell, leaving the char visible.
         if let Some(cursor_style) = cursor.filter(|_| overlay.cursor_in_cell == Some(i)) {
             style = cursor_style;
         }
         if let Some(cell) = buf.cell_mut((abs_x, abs_y)) {
-            // `Cell::set_style` only inserts/removes modifiers via
-            // `add_modifier` / `sub_modifier`; without an explicit clear,
-            // modifiers from the underlying rendered cell — e.g. `BOLD`
-            // painted for `**TUI framework**` — survive the overlay and
-            // bleed through.  Zero them by hand so the raw markdown chars
-            // render in plain weight, while leaving fg/bg untouched so the
-            // row's stripe color shows through.
+            // `Cell::set_style` only adds/removes modifiers, so e.g. the BOLD of a rendered
+            // `**x**` would bleed through the raw chars; zero them by hand.
             cell.modifier = Modifier::empty();
             cell.set_char(ch);
             cell.set_style(style);
@@ -789,9 +638,7 @@ mod tests {
 
     #[test]
     fn make_raw_line_keeps_source_text_verbatim() {
-        // The cursor is no longer baked into the line (it is painted onto the
-        // resolved cell by the render override), so the line content is exactly
-        // the source text — no substituted glyph, no appended cursor cell.
+        // The cursor is painted onto the resolved cell, not baked into the line.
         let theme = Theme::default();
         let line = make_raw_line("hello", &theme);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -802,7 +649,6 @@ mod tests {
     fn make_raw_line_with_selection_paints_range() {
         let theme = Theme::default();
         let line = make_raw_line_with_selection("hello", Some((1, 3)), &theme);
-        // Cols 1..3 carry the selection background; others don't.
         assert_eq!(line.spans[1].style.bg, theme.selection.bg);
         assert_eq!(line.spans[2].style.bg, theme.selection.bg);
         assert_ne!(line.spans[0].style.bg, theme.selection.bg);

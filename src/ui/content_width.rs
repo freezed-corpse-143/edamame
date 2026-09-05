@@ -1,20 +1,12 @@
-//! Tiny shared helper for the "max width over a row set" calculation
-//! every modal overlay does to size itself to its content.
-//!
-//! Each overlay's content width is `max(per_row_width)` plus a few
-//! extras (longest description, longest error) — the per-row mapping
-//! differs but the `iter().map().max().unwrap_or(0) as u16` shape is
-//! identical, so the helper takes a closure.
+//! Shared "max width over a row set" helpers used by modal overlays to size themselves to their
+//! content.  The per-row mapping differs per overlay, so the helper takes a closure.
 
-/// Return the maximum width (in `usize` terms) yielded by `width_of`
-/// over the rows, capped to `u16`.  Empty iterators return 0.
+/// Maximum width yielded by `width_of` over the rows, as `u16`.  Empty rows give 0.
 pub fn max_row_width<T>(rows: &[T], width_of: impl Fn(&T) -> usize) -> u16 {
     rows.iter().map(width_of).max().unwrap_or(0) as u16
 }
 
-/// Width of an optional text region `prefix_len + text.chars().count()`,
-/// or 0 when `text` is `None`.  Convenience for the longest-error and
-/// longest-description companions every overlay computes.
+/// Width of an optional text region (`prefix_len` plus its chars), or 0 when `text` is `None`.
 pub fn optional_text_width(text: Option<&str>, prefix_len: usize) -> u16 {
     text.map(|s| (prefix_len + s.chars().count()) as u16)
         .unwrap_or(0)

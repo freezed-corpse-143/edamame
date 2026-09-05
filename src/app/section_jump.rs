@@ -1,14 +1,9 @@
-//! "Go to section" support: build the heading list at modal-open time,
-//! debounce live-preview scroll while the modal is open, and apply the
-//! confirm / cancel transitions when it closes.
+//! "Go to section" support: build the heading list at modal-open time, debounce live-preview
+//! scroll while the modal is open, and apply the confirm / cancel transitions when it closes.
 //!
-//! The debounce mirrors the autosave shape — an `Option<Instant>` on
-//! `App`, contributed to [`App::next_deadline`] via
-//! [`App::section_jump_deadline`], drained in
-//! [`App::tick_section_jump`] (called from `tick_timers`).  Holding
-//! `↓` on the picker resets the timer; when the user lets go for
-//! `SECTION_JUMP_DELAY` the most-recent `target_scroll` is applied and
-//! the timer clears.
+//! The debounce mirrors the autosave shape — an `Option<Instant>` on `App`, contributed to
+//! [`App::next_deadline`] via [`App::section_jump_deadline`] and drained in
+//! [`App::tick_section_jump`].
 
 use std::time::{Duration, Instant};
 
@@ -18,23 +13,15 @@ use crate::ui::HeadingEntry;
 
 use super::App;
 
-/// Debounce window for live-preview scrolls.  Long enough to absorb a
-/// held arrow key's autorepeat (~50 ms cadence on most platforms);
-/// short enough that a tap feels immediate.  Tuned by feel — same
-/// order of magnitude as the `RAW_REVEAL_DELAY` jitter suppression.
+/// Debounce window for live-preview scrolls: long enough to absorb a held arrow key's autorepeat
+/// (~50 ms), short enough that a tap feels immediate.
 pub(super) const SECTION_JUMP_DELAY: Duration = Duration::from_millis(150);
 
 impl App {
-    /// Open the "Go to section" modal.  Walks `ParsedDoc::blocks` to
-    /// collect every `Block::Heading`, precomputes the
-    /// `target_scroll` for each one in the active mode, picks the
-    /// preselected entry (nearest heading at or before the cursor's
-    /// buffer line), and pushes a [`crate::app::modal::SectionPickerModal`] onto the
-    /// modal stack.
+    /// Open the "Go to section" modal, preselecting the nearest heading at or before the cursor.
     ///
-    /// `doc_width` is the viewport width used to derive `target_scroll`
-    /// — runs at the live document area width so the modal's previews
-    /// land at the same row the editor will paint.
+    /// `doc_width` must be the live document area width, so the modal's previewed `target_scroll`
+    /// lands at the same row the editor will paint.
     pub fn open_section_picker(&mut self, doc_width: usize) {
         let entries = collect_heading_entries(&self.editor, doc_width);
         let cursor_line = self.editor.buffer.char_to_line(self.editor.cursor.offset);
@@ -49,19 +36,15 @@ impl App {
         self.needs_draw = true;
     }
 
-    /// Live-preview path: arm (or extend) the debounce window so the
-    /// scroll fires after the user stops navigating.  Multiple calls
-    /// during a held arrow keep resetting the timer; the run loop
-    /// applies the most-recent `target_scroll` once
-    /// [`SECTION_JUMP_DELAY`] elapses.
+    /// Arm (or extend) the debounce window; the run loop applies the most-recent `target_scroll`
+    /// once [`SECTION_JUMP_DELAY`] elapses.
     pub(crate) fn arm_section_jump(&mut self, target_scroll: usize) {
         self.section_jump_pending_since = Some(Instant::now());
         self.section_jump_target_scroll = Some(target_scroll);
     }
 
-    /// Esc path: restore the original viewport snapshot and clear any
-    /// pending preview so a debounce that's mid-flight doesn't fire
-    /// after we've already reverted.
+    /// Esc path: restore the viewport snapshot, clearing any pending preview so a mid-flight
+    /// debounce can't fire after the revert.
     pub(crate) fn cancel_section_jump(&mut self, original_scroll: usize) {
         self.section_jump_pending_since = None;
         self.section_jump_target_scroll = None;
@@ -72,19 +55,14 @@ impl App {
         self.needs_draw = true;
     }
 
-    /// Enter path: apply the target scroll immediately (overriding any
-    /// pending debounce) and move the cursor to the end of
-    /// `buffer_line`.  Cursor placement is a no-op in Preview mode
-    /// visually — the cursor isn't drawn — but we still set
-    /// `cursor.offset` so a later mode switch lands the cursor at the
-    /// right place.
+    /// Enter path: apply the target scroll immediately and move the cursor to the end of
+    /// `buffer_line`.  The cursor move is invisible in Preview mode but still recorded, so a later
+    /// mode switch lands in the right place.
     pub(crate) fn commit_section_jump(&mut self, buffer_line: usize, target_scroll: usize) {
         self.section_jump_pending_since = None;
         self.section_jump_target_scroll = None;
         let scroll_changed = self.editor.scroll != target_scroll;
         self.editor.scroll = target_scroll;
-        // Move the cursor to the end of the heading line (after the
-        // last text char, before the trailing newline if any).
         let end_offset = end_of_line_offset(&self.editor, buffer_line);
         self.editor.cursor.offset = end_offset;
         self.editor.cursor.preferred_col = self.editor.cursor.cell_col(&self.editor.buffer);
@@ -95,9 +73,7 @@ impl App {
         self.needs_draw = true;
     }
 
-    /// Per-iteration debounce step.  When the pending timer has been
-    /// armed for at least [`SECTION_JUMP_DELAY`], apply the stashed
-    /// target scroll and clear the timer.
+    /// Per-iteration debounce step: apply the stashed target scroll once the window elapses.
     pub(super) fn tick_section_jump(&mut self) {
         let Some(since) = self.section_jump_pending_since else {
             return;
@@ -115,19 +91,14 @@ impl App {
         self.section_jump_pending_since = None;
     }
 
-    /// Earliest instant the run loop must wake to apply a pending
-    /// section-jump scroll.  Contributed to [`App::next_deadline`] so
-    /// `recv_timeout` wakes exactly when the window expires — no
-    /// polling.
+    /// Earliest instant the run loop must wake to apply a pending section-jump scroll.
     pub(super) fn section_jump_deadline(&self) -> Option<Instant> {
         self.section_jump_pending_since
             .map(|t| t + SECTION_JUMP_DELAY)
     }
 }
 
-/// Build the heading-entry list from the editor's parsed document.
-/// `target_scroll` is computed per current mode using the visual-row
-/// helpers on `ParsedDoc` (Rendered/Preview) and `EditorState` (Raw).
+/// Build the heading-entry list, computing `target_scroll` for the editor's current mode.
 fn collect_heading_entries(
     state: &crate::editor::EditorState,
     doc_width: usize,
@@ -147,12 +118,9 @@ fn collect_heading_entries(
         let target_scroll = match state.mode {
             Mode::Raw => state.visual_rows_before_raw_line(buffer_line, width),
             _ => {
-                // `block_idx` indexes `parsed.blocks` / `real_ranges`, which
-                // contains only real blocks; the source map's index space
-                // also includes blank-line virtual blocks, so a direct
-                // `rendered_lines_for_block(block_idx)` would land on the
-                // wrong block whenever blank lines separate real blocks.
-                // Route through the byte → virtual-idx → rendered lookup.
+                // `block_idx` indexes real blocks only; the source map's index space also has
+                // blank-line virtual blocks, so `rendered_lines_for_block(block_idx)` would land
+                // on the wrong block.  Route through the byte lookup instead.
                 let rendered = state.parsed.source_map.rendered_lines_for_byte(byte_start);
                 state.parsed.visual_rows_before(rendered.start, width)
             }
@@ -167,11 +135,8 @@ fn collect_heading_entries(
     entries
 }
 
-/// Find the index of the heading whose buffer line is the largest one
-/// `<= cursor_line`.  Returns `0` when the cursor sits before every
-/// heading (or the list is empty).  Relies on the document-order
-/// invariant of `entries`: a `take_while` is sound because no later
-/// entry can have a smaller `buffer_line`.
+/// Index of the heading with the largest `buffer_line <= cursor_line`; `0` when there is none.
+/// The `take_while` is sound only because `entries` is in document order.
 fn preselected_index(entries: &[HeadingEntry], cursor_line: usize) -> usize {
     entries
         .iter()
@@ -180,8 +145,7 @@ fn preselected_index(entries: &[HeadingEntry], cursor_line: usize) -> usize {
         .saturating_sub(1)
 }
 
-/// Char offset of the end of `line_idx` (after the last text char,
-/// before any trailing `\n`).
+/// Char offset of the end of `line_idx`, before any trailing `\n`.
 fn end_of_line_offset(state: &crate::editor::EditorState, line_idx: usize) -> usize {
     let line_count = state.buffer.line_count();
     if line_count == 0 {
@@ -191,10 +155,8 @@ fn end_of_line_offset(state: &crate::editor::EditorState, line_idx: usize) -> us
     let start = state.buffer.line_to_char(idx);
     let line_slice = state.buffer.rope().line(idx);
     let len = line_slice.len_chars();
-    // A non-final line ends in `\n`.  Trim it from the offset so the
-    // cursor lands before it rather than at column 0 of the next line.
-    // The buffer is always `\n`-normalized on load (see
-    // `Buffer::load_file`), so there is no `\r` to account for.
+    // Trim the `\n` so the cursor lands before it, not at column 0 of the next line.  The buffer
+    // is `\n`-normalized on load, so there is no `\r` to account for.
     let trim = usize::from(len > 0 && line_slice.char(len - 1) == '\n');
     start + len.saturating_sub(trim)
 }
@@ -214,20 +176,14 @@ mod tests {
 
     #[test]
     fn collect_entries_target_scroll_is_correct_with_blank_separator_blocks() {
-        // Regression: previously the collector indexed
-        // `rendered_lines_for_block` with the `parsed.blocks` index,
-        // which doesn't include blank-line virtual blocks — so the
-        // second heading's target_scroll was off whenever a blank
-        // line separated it from the first block.
+        // Regression: indexing `rendered_lines_for_block` with the `parsed.blocks` index skewed
+        // every heading after a blank line.
         let mut app = make_app();
         load(&mut app, "# First\n\n## Second\n\nbody\n");
         app.editor.mode = Mode::Rendered;
         let entries = collect_heading_entries(&app.editor, 80);
         assert_eq!(entries.len(), 2);
-        // First heading starts at rendered-line 0.
         assert_eq!(entries[0].target_scroll, 0);
-        // Second heading must point past the blank line(s) separating
-        // the two blocks, not at the blank's rendered position.
         assert!(
             entries[1].target_scroll >= 2,
             "target_scroll for second heading was {}; expected at least 2 \
@@ -290,21 +246,16 @@ mod tests {
     fn end_of_line_offset_lands_before_trailing_newline() {
         let mut app = make_app();
         load(&mut app, "abc\ndef\n");
-        // Line 0 is "abc\n" — end_of_line should be after 'c', i.e. 3.
         assert_eq!(end_of_line_offset(&app.editor, 0), 3);
-        // Line 1 is "def\n" — start 4, end at 7.
         assert_eq!(end_of_line_offset(&app.editor, 1), 7);
     }
 
     #[test]
     fn end_of_line_offset_handles_crlf_line_endings() {
         let mut app = make_app();
-        // CRLF is normalized to `\n` on load, so the rope is "abc\ndef\n"
-        // and offsets are the same as an LF file — no `\r` to trim.
+        // CRLF is normalized to `\n` on load, so offsets match the LF file above.
         load(&mut app, "abc\r\ndef\r\n");
-        // Line 0 is "abc\n" — end_of_line lands after 'c' (offset 3).
         assert_eq!(end_of_line_offset(&app.editor, 0), 3);
-        // Line 1 starts at 4 ("def\n"); end is after 'f' (7).
         assert_eq!(end_of_line_offset(&app.editor, 1), 7);
     }
 
@@ -314,7 +265,6 @@ mod tests {
         load(&mut app, "# Heading one\n\nbody\n");
         app.editor.mode = Mode::Rendered;
         app.commit_section_jump(0, 0);
-        // "# Heading one" is 13 chars; cursor should land at offset 13.
         assert_eq!(app.editor.cursor.offset, 13);
     }
 
@@ -343,7 +293,7 @@ mod tests {
     fn tick_applies_target_after_window_elapses() {
         let mut app = make_app();
         app.arm_section_jump(5);
-        // Force the pending timestamp into the past so the tick fires.
+        // Force the timestamp into the past so the tick fires.
         app.section_jump_pending_since =
             Some(Instant::now() - SECTION_JUMP_DELAY - Duration::from_millis(5));
         app.tick_section_jump();
@@ -357,7 +307,6 @@ mod tests {
         let mut app = make_app();
         app.arm_section_jump(5);
         app.tick_section_jump();
-        // Just-armed timer: scroll should not have advanced yet.
         assert_eq!(app.editor.scroll, 0);
         assert!(app.section_jump_pending_since.is_some());
     }

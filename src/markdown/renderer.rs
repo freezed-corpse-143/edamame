@@ -21,17 +21,14 @@ use super::render_cache::{RenderCache, RenderSettings};
 
 const IMAGE_PREFIX: &str = "Image: ";
 
-/// Callback used by the renderer to look up the aspect-aware row count
-/// for an image block, given its URL and its **ordinal** — the 0-based
-/// index of the block among the document's image blocks, in document
-/// order.  See `Renderer::with_image_row_override`.
+/// Aspect-aware row count for an image block, keyed by URL and by **ordinal**
+/// — the 0-based index of the block among the document's image blocks, in
+/// document order.  See `Renderer::with_image_row_override`.
 ///
-/// The ordinal is what separates two blocks carrying the same URL, which
-/// a document repeating one image (`![logo](logo.png)` in a header and a
-/// footer) does routinely.  It matches the index into
-/// `ParsedDoc::image_blocks`: both count `Block::ImageBlock`s in document
-/// order over the same block list, and both promotions that create one
-/// (`promote_image_paragraphs`, `promote_diagram_code_blocks`) act on
+/// The ordinal is what separates two blocks carrying the same URL (one image
+/// repeated in a header and a footer).  It matches the index into
+/// `ParsedDoc::image_blocks`: both count `Block::ImageBlock`s in document order
+/// over the same block list, and the promotions that create one act on
 /// top-level blocks only, so no nested image block can shift the count.
 pub type ImageRowOverride<'t> = &'t dyn Fn(&str, usize) -> Option<usize>;
 
@@ -40,42 +37,29 @@ pub struct Renderer<'t> {
     pub(super) theme: &'t Theme,
     /// Viewport width in terminal columns; used to size code block backgrounds.
     pub(super) viewport_width: usize,
-    /// Whether code block lines should wrap at viewport_width.
+    /// Whether code block lines should wrap at `viewport_width`.
     code_wrap: bool,
-    /// Maximum reserved rows per `Block::ImageBlock`; fed through from
-    /// `ImagesConfig::max_height` so the editor and renderer agree on the
-    /// row count.  Ignored when a block isn't an image block.
+    /// Rows reserved per `Block::ImageBlock` absent a row override; from
+    /// `ImagesConfig::max_height`, so editor and renderer agree.
     image_max_height: usize,
-    /// Optional per-image row override keyed by URL and image-block
-    /// ordinal.  Returns the aspect-aware row count when the image has been
-    /// decoded; `None` when the image is still pending / failed / absent
-    /// from the cache.  The renderer falls back to `image_max_height`
-    /// whenever this returns `None`, so pre-decode layout is stable.
+    /// Per-image row override; `None` from it (pending / failed / uncached
+    /// image) falls back to `image_max_height`, so pre-decode layout is stable.
     image_row_override: Option<ImageRowOverride<'t>>,
-    /// How many `Block::ImageBlock`s have been rendered so far in this
-    /// pass — the ordinal handed to `image_row_override`.  A `Cell` because
-    /// the whole render walk takes `&self`; a `Renderer` is built fresh per
-    /// `ParsedDoc` build, so it always starts at 0.  Counted in
-    /// `render_image_block` rather than in the render loops so it stays
-    /// exact under `render_with_counts_cached`, which skips `render_block`
-    /// for cache hits (image blocks are deliberately never cached, but the
-    /// count shouldn't depend on that staying true).
+    /// Ordinal handed to `image_row_override`.  A `Cell` because the render
+    /// walk takes `&self`; a `Renderer` is built fresh per `ParsedDoc` build,
+    /// so it always starts at 0.  Counted in `render_image_block` rather than
+    /// in the render loops so it stays exact under
+    /// `render_with_counts_cached`, which skips `render_block` on cache hits.
     image_block_seq: Cell<usize>,
-    /// When true, alternating data rows in tables are filled
-    /// with `Theme::table_row_even` / `Theme::table_row_odd`.  Off by
-    /// default; opt-in via `config.table.row_striping`.
+    /// Alternating `Theme::table_row_even` / `table_row_odd` fill for table
+    /// data rows; `config.table.row_striping`.
     pub(super) row_striping: bool,
-    /// When true, H1 headings render as 4 rows of "big text" via the
-    /// `tui-big-text` widget (Quadrant pixel size).  Falls back to the
-    /// regular one-line rendering when the title is too wide for the
-    /// viewport or contains non-ASCII characters.  Wired to
-    /// `config.editor.big_h1`.
+    /// Render H1 headings as big text, falling back to the one-line rendering
+    /// when the title is too wide or non-ASCII; `config.editor.big_h1`.
     big_h1: bool,
-    /// When true, a fenced code block whose info string names a grammar
-    /// we ship is rendered with per-token colours from the theme's
-    /// `syntax_*` fields.  Wired to `config.editor.syntax_highlighting`.
-    /// When false the highlighter is never called and body rows are the
-    /// single-span lines they were before the feature existed.
+    /// Per-token colors for fenced code blocks naming a grammar we ship;
+    /// `config.editor.syntax_highlighting`.  When false the highlighter is
+    /// never called and body rows are single-span lines.
     syntax_highlighting: bool,
 }
 
@@ -112,39 +96,31 @@ impl<'t> Renderer<'t> {
     }
 
     /// Install a `(URL, ordinal)` → row-count callback that overrides
-    /// `image_max_height` per image whenever the callback returns `Some(n)`.
-    /// Used to reserve exactly the rows a decoded image will occupy so wide
-    /// images don't leave blank padding rows beneath them, and to collapse
-    /// the one block whose raw source the cursor has revealed.
+    /// `image_max_height` per image.  Reserves exactly the rows a decoded
+    /// image will occupy, and collapses the block whose raw source the cursor
+    /// has revealed.
     pub fn with_image_row_override(mut self, override_fn: ImageRowOverride<'t>) -> Self {
         self.image_row_override = Some(override_fn);
         self
     }
 
-    /// Toggle alternating-row background fill for table data rows.
-    /// Wired to `config.table.row_striping`.
     pub fn with_row_striping(mut self, on: bool) -> Self {
         self.row_striping = on;
         self
     }
 
-    /// Enable big-text rendering for H1 headings.  Wired to
-    /// `config.editor.big_h1`.
     pub fn with_big_h1(mut self, on: bool) -> Self {
         self.big_h1 = on;
         self
     }
 
-    /// Enable syntax highlighting for fenced code blocks.  Wired to
-    /// `config.editor.syntax_highlighting`.
     pub fn with_syntax_highlighting(mut self, on: bool) -> Self {
         self.syntax_highlighting = on;
         self
     }
 
-    /// Render a list of top-level blocks to styled lines. Used by tests
-    /// in this module and `ui::preview`; production code uses
-    /// `render_with_counts` so it also gets per-block line counts.
+    /// Render a list of top-level blocks to styled lines.  Tests and
+    /// `ui::preview` only; production uses `render_with_counts`.
     #[allow(dead_code)]
     pub fn render(&self, blocks: &[Block]) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
@@ -188,20 +164,18 @@ impl<'t> Renderer<'t> {
             row_striping: self.row_striping,
             big_h1: self.big_h1,
             syntax_highlighting: self.syntax_highlighting,
-            // Read here rather than threaded in from `EditorState`: it is
-            // the renderer that consults the warm grammars, so this is
-            // the one place that can't fall out of step with them. Pinned
-            // to 0 when the feature is off so toggling it can't leave a
-            // stale generation in the fingerprint.
+            // Read here rather than threaded in from `EditorState`: the
+            // renderer consults the warm grammars, so this is the one place
+            // that can't fall out of step with them.  Pinned to 0 when off so
+            // toggling can't leave a stale generation in the fingerprint.
             highlight_generation: if self.syntax_highlighting {
                 highlight::warm_generation()
             } else {
                 0
             },
-            // The other half of the same job: a grammar refused for want
-            // of budget warms nothing, so the generation above cannot
-            // move for it.  Without this field the retry that
-            // `App::tick_syntax_warm` acts on would reparse into a fully
+            // A grammar refused for want of budget warms nothing, so the
+            // generation above cannot move for it; without this field the
+            // retry `App::tick_syntax_warm` drives would reparse into a fully
             // warm cache and never call the highlighter again.
             highlight_retry_epoch: if self.syntax_highlighting {
                 highlight::retry_epoch()
@@ -214,13 +188,11 @@ impl<'t> Renderer<'t> {
         let mut counts = Vec::with_capacity(blocks.len());
         for block in blocks {
             let before = lines.len();
-            // ImageBlock row counts depend on the decode cache (the row
-            // override), which changes without the AST changing — never
-            // cache them.  They render as cheap placeholder fills.
+            // ImageBlock row counts track the decode cache, which changes
+            // without the AST changing — never cache them.
             if matches!(block, Block::ImageBlock { .. }) {
                 self.render_block(block, &mut lines, "");
             } else if let Some(hit) = cache.entries.get(block) {
-                // Duplicate of a block already rendered this build.
                 lines.extend(hit.iter().cloned());
             } else if let Some((key, hit)) = prev.remove_entry(block) {
                 lines.extend(hit.iter().cloned());
@@ -234,8 +206,7 @@ impl<'t> Renderer<'t> {
             counts.push(lines.len() - before);
         }
 
-        // `prev` drops here: entries whose block no longer appears in the
-        // document are evicted.
+        // `prev` drops here, evicting entries whose block is gone.
         (lines, counts)
     }
 
@@ -286,7 +257,6 @@ impl<'t> Renderer<'t> {
                 self.render_table(*col_count, headers, rows, user_widths.as_deref(), out);
             }
             Block::Html(html) => {
-                // Render raw HTML as a muted code-like block.
                 for line in html.lines() {
                     out.push(Line::styled(
                         format!("{indent_prefix}{line}"),
@@ -295,11 +265,8 @@ impl<'t> Renderer<'t> {
                 }
             }
             Block::HtmlComment(_) => {
-                // Comments are annotation, not content — emit zero lines in
-                // Preview and Rendered modes.  Raw mode reads the rope
-                // directly, so the source text stays visible there.
-                // `per_block_own` records 0 for this block so navigation
-                // and source-map coverage stay consistent.
+                // Annotation, not content: zero rendered lines (raw mode reads
+                // the rope directly, so the source stays visible there).
             }
             Block::ImageBlock { alt, url } => {
                 self.render_image_block(alt, url, out);
@@ -315,14 +282,10 @@ impl<'t> Renderer<'t> {
 
     // ── Frontmatter ───────────────────────────────────────────────
     //
-    // A metadata block is data the user edits, so it renders *verbatim*
-    // — one rendered row per source line, every character in its source
-    // column.  That keeps the raw↔rendered column mapping the identity
-    // function (so clicks, selection projection and the cursor
-    // indicator need no block-specific arm) and keeps the block's row
-    // count 1:1 with its source lines, which is what the raw reveal
-    // requires.  The only thing rendering adds is color: the delimiter
-    // lines recede, the key half of each line reads as a field name.
+    // A metadata block renders *verbatim* — one rendered row per source line,
+    // every character in its source column — so the raw↔rendered column map
+    // stays the identity function and the row count stays 1:1 with the source
+    // lines (what the raw reveal requires).  Rendering only adds color.
 
     fn render_metadata_block(
         &self,
@@ -345,11 +308,9 @@ impl<'t> Renderer<'t> {
     }
 
     /// Split one frontmatter line into a `key`-styled head and a
-    /// `value`-styled tail.  The split is cosmetic — a shallow scan for
-    /// the flavor's separator, not a YAML/TOML parse — so a line it
-    /// can't read (a list entry, a wrapped scalar, a comment) simply
-    /// renders whole in the value style.  The two spans concatenate back
-    /// to `line` byte for byte either way.
+    /// `value`-styled tail.  Cosmetic — a shallow separator scan, not a
+    /// YAML/TOML parse — so an unreadable line renders whole in the value
+    /// style.  The spans concatenate back to `line` byte for byte either way.
     fn metadata_line(&self, kind: MetadataKind, line: &str) -> Line<'static> {
         let sep = match kind {
             MetadataKind::Yaml => ':',
@@ -367,22 +328,13 @@ impl<'t> Renderer<'t> {
 
     // ── Footnote definition ───────────────────────────────────────
     //
-    // Rendered in place wherever it appears in the source as:
+    // Rendered in place as `  <label>.  definition body text… ↩`.
     //
-    //   1.  definition body text… ↩
-    //
-    // The leader `  <label>.  ` (two spaces, the raw label — matching the
-    // reference markers, never renumbered for display — a period, then
-    // two spaces) is column-width-matched to the raw `[^<label>]: ` leader
-    // it replaces, so the 1:1 rendered↔raw column mapping holds across the
-    // body and a click anywhere on the leader resolves to the definition's
-    // source bytes (the back-link).  The trailing `↩` glyph (with a space
-    // before it) is the visible back-link affordance — clicking it returns
-    // to the reference the reader followed (or, if they scrolled here
-    // directly, jumps to the footnote's first reference); being appended
-    // chrome with no raw byte, the mouse layer hit-tests it on the rendered
-    // line directly (`mouse_ops::footnotes::back_link_glyph_at_click`).
-    // Continuation lines are indented to align under the body text.
+    // The leader is column-width-matched to the raw `[^<label>]: ` it replaces,
+    // so the 1:1 rendered↔raw column mapping holds across the body.  The
+    // trailing `↩` is appended chrome backed by no raw byte, so the mouse layer
+    // hit-tests it on the rendered line
+    // (`mouse_ops::footnotes::back_link_glyph_at_click`).
 
     fn render_footnote_definition(
         &self,
@@ -396,7 +348,6 @@ impl<'t> Renderer<'t> {
         }
         let leader = format!("  {label}.  ");
         let cont_indent = " ".repeat(leader.chars().count());
-        // Space + return glyph, appended at the very end of the definition.
         let back = " ↩";
 
         if body.is_empty() {
@@ -425,20 +376,13 @@ impl<'t> Renderer<'t> {
 
     // ── Image block ───────────────────────────────────────────────
     //
-    // Emits N rows: the first carries the `[Image: alt]` placeholder (so
-    // unsupported terminals and raw-reveal still have something textual
-    // to show), the remaining rows are empty `Line::raw` entries so the
-    // block reserves vertical space for a graphics-capable terminal's
-    // image overlay (painted by `ui::image_view::paint_images` after the
-    // line-render pass).
+    // Emits N rows: an `[Image: alt]` placeholder (what unsupported terminals
+    // and raw-reveal show) followed by empty lines reserving space for the
+    // overlay `ui::image_view::paint_images` paints afterwards.
     //
-    // `N` is:
-    //   * The `image_row_override` callback's value when the image has
-    //     been decoded, so wide images reserve exactly their aspect
-    //     height and don't leave blank rows underneath.
-    //   * `image_max_height` otherwise — keeps `per_block_own` stable
-    //     during the pending / failed states so navigation doesn't
-    //     depend on decode order.
+    // N comes from `image_row_override` once decoded, else `image_max_height`
+    // — which keeps `per_block_own` stable while pending or failed, so
+    // navigation doesn't depend on decode order.
 
     fn render_image_block(&self, alt: &str, url: &str, out: &mut Vec<Line<'static>>) {
         let name = if alt.trim().is_empty() {
@@ -509,47 +453,22 @@ impl<'t> Renderer<'t> {
 
     // ── Big H1 ────────────────────────────────────────────────────
     //
-    // Render an H1's inline text as one or two rows of "big text"
-    // using `tui_big_text::BigText` with `PixelSize::Octant` (each
-    // glyph 4 cells × 2 cells).  Long titles word-wrap onto a second
-    // big-text line if they don't fit in the viewport at full size;
-    // titles that need a third or more wrapped lines fall back to the
-    // regular one-line styled rendering — past two big-text lines the
-    // H1 starts dominating the viewport like a poster instead of a
-    // heading.
+    // Renders an H1's text as one or two rows of `tui_big_text::BigText` at
+    // `PixelSize::Octant` (4 × 2 cells per glyph), emitting
+    // `2 * chunks.len() + 1` lines.  The temporary buffers are pre-filled with
+    // the palette background so the surrounding empty cells carry the real
+    // editor background — `Color::Reset` would render as terminal-default.
     //
-    // Each wrapped chunk is rendered into its own 2-row buffer with
-    // `.centered()` alignment so each line centres independently in
-    // the viewport.  A subtle `palette.muted` shadow is painted under
-    // each word's bottom glyph row, breaking at inter-word spaces.
-    //
-    // The temporary buffers are pre-filled with `palette.default_bg`
-    // so both the cells the BigText widget paints AND the surrounding
-    // empty cells carry the real editor background — `Color::Reset`
-    // would render as terminal-default (typically the wrong shade).
-    //
-    // Total emission: `2 * chunks.len() + 1` rendered lines (2 glyph
-    // rows per chunk + 1 rule line).
-    //
-    // Returns `false` and emits nothing when:
-    //   * the title contains a non-ASCII character (font8x8 only covers
-    //     ASCII and would render the rest as blank squares),
-    //   * a single word is wider than the viewport (would need
-    //     mid-word breaking that looks worse than the plain fallback),
-    //   * or the title needs 3+ wrapped lines to fit.
-    // The caller falls back to the regular one-line styled rendering.
+    // Returns `false`, emitting nothing, when the title is non-ASCII (font8x8
+    // covers ASCII only), when one word is wider than the viewport, or when it
+    // needs 3+ wrapped lines — past two, an H1 reads as a poster.  The caller
+    // then falls back to the one-line styled rendering.
     fn try_render_h1_big(&self, inlines: &[Inline], out: &mut Vec<Line<'static>>) -> bool {
         const GLYPH_W_PER_CHAR: usize = 4;
         const GLYPH_H: u16 = 2;
         const MAX_WRAPPED_LINES: usize = 2;
 
         let plain = inlines_to_plain(inlines);
-        // Transliterate common Unicode typography to ASCII equivalents
-        // (em/en dash, ellipsis, curly quotes, nbsp).  font8x8's
-        // basic_latin glyph set only covers ASCII; anything else would
-        // render as a blank square.  After substitution, anything still
-        // non-ASCII (accented letters, arrows, emoji, math symbols) is
-        // a hard fall back to the regular one-line render.
         let normalized = normalise_for_big_text(plain.trim());
         if normalized.is_empty() || !normalized.is_ascii() {
             return false;
@@ -574,9 +493,8 @@ impl<'t> Renderer<'t> {
         let blank_spacer = Line::styled(" ".repeat(viewport), bg_style);
 
         for (chunk_idx, chunk) in chunks.iter().enumerate() {
-            // Blank spacer row between wrapped chunks so the two big-
-            // text lines have a clear gap and don't visually merge into
-            // a 4-row block.
+            // Gap between wrapped chunks, so they don't merge into one
+            // 4-row block.
             if chunk_idx > 0 {
                 out.push(blank_spacer.clone());
             }
@@ -591,7 +509,6 @@ impl<'t> Renderer<'t> {
                 .lines(vec![Line::from(chunk.clone())])
                 .build();
             big.render(area, &mut buf);
-            // Per-word shadow on the bottom glyph row of THIS chunk.
             let bottom = GLYPH_H - 1;
             let glyph_start_x = (viewport.saturating_sub(chunk_glyph_w)) / 2;
             for (i, ch) in chunk.chars().enumerate() {
@@ -620,15 +537,11 @@ impl<'t> Renderer<'t> {
         indent_prefix: &str,
     ) {
         let prefix = indent_prefix.to_string();
-        // Split at both HardBreaks and SoftBreaks so every source-level line
-        // break produces its own visual line.  CommonMark collapses soft breaks
-        // into spaces, but in a TUI editor we preserve the author's line layout
-        // so rendered content mirrors the source line-for-line.
-        //
-        // Each break-delimited segment is rendered by `render_inlines` rather
-        // than inline-by-inline: adjacent footnote references fuse into a
-        // single marker, which only that function can see.  `slice::split`
-        // always yields at least one segment, so `last` is well-defined.
+        // Split at both breaks so every source line break gets its own visual
+        // line: CommonMark collapses soft breaks into spaces, but the rendered
+        // content has to mirror the source line-for-line.  Segments go through
+        // `render_inlines`, not inline-by-inline, because adjacent footnote
+        // references fuse into one marker and only that function sees the run.
         let segments: Vec<&[Inline]> = inlines
             .split(|i| matches!(i, Inline::HardBreak | Inline::SoftBreak))
             .collect();
@@ -641,11 +554,8 @@ impl<'t> Renderer<'t> {
             }
             spans.extend(self.render_inlines(segment, Style::default()));
 
-            // Every break emits its line unconditionally (a blank one for an
-            // empty segment); only the trailing segment is suppressed when it
-            // holds nothing but the indent prefix.  Reads more clearly as
-            // "non-empty and not just a single whitespace span"; collapsing
-            // into a single negation hides the intent.
+            // Every break emits its line, blank ones included; only a trailing
+            // segment holding nothing but the indent prefix is suppressed.
             #[allow(clippy::nonminimal_bool)]
             let keep = i < last
                 || (!spans.is_empty() && !(spans.len() == 1 && spans[0].content.trim().is_empty()));
@@ -661,19 +571,17 @@ impl<'t> Renderer<'t> {
     /// background fill out to the viewport edge.
     ///
     /// `tokens` are char ranges **into `text`** — already re-based by the
-    /// caller for a wrapped segment. With none, this reproduces the
-    /// single-span line the renderer emitted before highlighting existed,
-    /// character for character; that equivalence is what lets an unknown
-    /// language, a switched-off setting and an over-cap block share the
-    /// pre-feature snapshots.
+    /// caller for a wrapped segment.  With none, this reproduces the
+    /// single-span pre-highlighting line character for character, which is what
+    /// lets an unknown language, a switched-off setting and an over-cap block
+    /// share the pre-feature snapshots.
     ///
-    /// The leading space is [`code_layout::CODE_PAD_COLS`]. The cursor
-    /// indicator, the selection / search overlay and the mouse hit-test all
-    /// map columns through that module, so this prefix and that constant
-    /// have to agree — `code_block_render_agrees_with_code_layout_column_map`
-    /// fails if they drift. Splitting the row into several spans does not
-    /// disturb the mapping: `line_render` flattens spans to `(char, style)`
-    /// pairs, so the raw↔rendered *char index* relation is unchanged.
+    /// The leading space is [`code_layout::CODE_PAD_COLS`]; the cursor
+    /// indicator, overlays and the mouse hit-test map columns through that
+    /// module, so prefix and constant must agree
+    /// (`code_block_render_agrees_with_code_layout_column_map` catches drift).
+    /// Extra spans don't disturb the mapping: `line_render` flattens spans to
+    /// `(char, style)` pairs.
     fn code_body_row(&self, text: &str, tokens: &[Token], block_width: usize) -> Line<'static> {
         let base = self.theme.code_block_text;
         let pad_to = block_width.saturating_sub(code_layout::CODE_PAD_COLS);
@@ -688,8 +596,8 @@ impl<'t> Renderer<'t> {
         let run = |from: usize, to: usize| -> String { chars[from..to].iter().collect() };
         let mut col = 0usize;
         for token in tokens {
-            // Clamp defensively: a grammar that reported past end of line
-            // should mis-colour, never panic on a slice.
+            // Clamp: a grammar reporting past end of line should mis-color,
+            // never panic on a slice.
             let start = token.range.start.min(chars.len()).max(col);
             let end = token.range.end.min(chars.len()).max(start);
             if col < start {
@@ -705,8 +613,7 @@ impl<'t> Renderer<'t> {
             spans.push(Span::styled(run(col, chars.len()), base));
         }
 
-        // Fill to the viewport edge so the code surface reaches it, matching
-        // the `{:<pad_to$}` of the untokenized path above.
+        // Fill to the viewport edge, matching the `{:<pad_to$}` above.
         if let Some(pad) = pad_to.checked_sub(chars.len()).filter(|p| *p > 0) {
             spans.push(Span::styled(" ".repeat(pad), base));
         }
@@ -720,27 +627,21 @@ impl<'t> Renderer<'t> {
         fenced: bool,
         out: &mut Vec<Line<'static>>,
     ) {
-        // Split on '\n' and strip exactly one trailing empty string (the artifact
-        // of pulldown-cmark always ending code content with '\n').  This ensures
-        // that a genuine blank line *within* the code block is preserved while
-        // the final newline does not produce a spurious extra blank line.
+        // Strip exactly one trailing empty string (pulldown-cmark always ends
+        // code content with '\n'), so a genuine blank line inside the block
+        // survives but the final newline adds no spurious row.
         let mut raw_lines: Vec<&str> = content.split('\n').collect();
         if raw_lines.last() == Some(&"") {
             raw_lines.pop();
         }
 
-        // Display width: capped at viewport_width so that short lines are never
-        // over-padded (which would cause them to wrap in the terminal and produce
-        // blank lines after every row of code).
+        // Capped at the viewport so short lines are never over-padded, which
+        // would wrap in the terminal and add a blank line after every code row.
         let block_width = self.viewport_width.max(1);
 
-        // Opening-fence row: fenced blocks always reserve a leading padded
-        // row matching the code background.  When a language tag is present
-        // the row carries the ` lang ` label styled with `code_block_lang`;
-        // otherwise it's an NBSP-padded placeholder matching the closing
-        // fence.  In both cases the actual ``` glyphs only become visible
-        // when the cursor enters this raw line and `RenderedView` reveals
-        // the raw source for that row.
+        // Opening-fence row: a ` lang ` label when tagged, else an NBSP-padded
+        // placeholder.  The ``` glyphs appear only when the cursor enters the
+        // row and `RenderedView` reveals its raw source.
         if fenced {
             if let Some(lang) = language {
                 out.push(Line::styled(
@@ -753,15 +654,11 @@ impl<'t> Renderer<'t> {
             }
         }
 
-        // Token runs for every body line, or empty when the feature is off,
-        // the fence names no language, the language is one we do not ship, or
-        // the block is over `highlight`'s size caps.  All of those collapse
-        // to the same thing downstream — `code_body_row` with no tokens,
-        // which is byte-for-byte the pre-feature line.
-        //
-        // Note this is asked once for the whole block, not per line: the
-        // grammar's parser state runs across lines, which is what makes a
-        // block comment or a multi-line string classify past its first row.
+        // Token runs per body line; empty when the feature is off, no/unknown
+        // language, or over `highlight`'s size caps — all of which collapse to
+        // `code_body_row` with no tokens.  Asked once for the whole block, not
+        // per line: the grammar's parser state runs across lines, which is what
+        // classifies a block comment or multi-line string past its first row.
         let tokens = if self.syntax_highlighting {
             highlight::highlight_block(language, &raw_lines)
         } else {
@@ -770,14 +667,12 @@ impl<'t> Renderer<'t> {
         let row_tokens = |i: usize| tokens.get(i).map(Vec::as_slice).unwrap_or(&[]);
 
         if self.code_wrap {
-            // Wrap long lines at viewport_width.
             let wrap_at = self.viewport_width.max(1);
             for (i, line) in raw_lines.iter().enumerate() {
                 let chars: Vec<char> = line.chars().collect();
                 if chars.is_empty() {
-                    // Use NBSP (U+00A0) instead of regular spaces: ratatui's WordWrapper
-                    // treats NBSP as non-whitespace and won't produce a spurious extra
-                    // blank line for all-whitespace input.
+                    // NBSP, not spaces: ratatui's WordWrapper treats it as
+                    // non-whitespace and so emits no extra blank line.
                     let padded = "\u{00A0}".repeat(block_width);
                     out.push(Line::styled(padded, self.theme.code_block_text));
                     continue;
@@ -786,33 +681,21 @@ impl<'t> Renderer<'t> {
                 while start < chars.len() {
                     let end = (start + wrap_at - 1).min(chars.len());
                     let slice: String = chars[start..end].iter().collect();
-                    // Tokens are addressed against the whole source line, so
-                    // each wrapped segment takes the overlapping part re-based
-                    // to its own column 0.
+                    // Tokens address the whole source line, so each segment
+                    // takes the overlapping part re-based to its own column 0.
                     let seg = highlight::slice_tokens(row_tokens(i), start, end);
                     out.push(self.code_body_row(&slice, &seg, block_width));
                     start = end;
                 }
             }
         } else {
-            // No wrapping: each source line becomes one display line, padded to
-            // block_width with the code background so the colored block fills
-            // the viewport edge.  Lines longer than viewport_width are not
-            // truncated here — the terminal clips them — but we never pad
-            // beyond viewport_width, so short lines do not wrap.
-            //
-            // The single leading space below is `code_layout::CODE_PAD_COLS`:
-            // it shifts every raw column one cell right, and the cursor
-            // indicator, the selection / search overlay and the mouse
-            // hit-test all map through that module rather than re-deriving
-            // it.  Changing this prefix means changing it there —
-            // `code_block_render_agrees_with_code_layout_column_map` fails
-            // if the two drift.
+            // One display line per source line, padded to `block_width` so the
+            // surface reaches the viewport edge.  Over-long lines are clipped by
+            // the terminal, never truncated here; padding never exceeds the
+            // viewport, so short lines do not wrap.
             for (i, line) in raw_lines.iter().enumerate() {
                 if line.is_empty() {
-                    // Use NBSP (U+00A0) instead of regular spaces: ratatui's WordWrapper
-                    // treats NBSP as non-whitespace and won't produce a spurious extra
-                    // blank line for all-whitespace input (preview mode uses Paragraph::wrap).
+                    // NBSP, as in the wrapped path above.
                     let padded = "\u{00A0}".repeat(block_width);
                     out.push(Line::styled(padded, self.theme.code_block_text));
                 } else {
@@ -821,10 +704,7 @@ impl<'t> Renderer<'t> {
             }
         }
 
-        // Closing-fence placeholder row: fenced blocks reserve a trailing
-        // padded row matching the code background.  The actual ``` glyphs
-        // only become visible when the cursor enters this raw line and
-        // `RenderedView` reveals the raw source for that row.
+        // Closing-fence placeholder, revealed the same way as the opening one.
         if fenced {
             let padded = "\u{00A0}".repeat(block_width);
             out.push(Line::styled(padded, self.theme.code_block_text));
@@ -834,10 +714,8 @@ impl<'t> Renderer<'t> {
     // ── Blockquote ────────────────────────────────────────────────
 
     fn render_blockquote(&self, blocks: &[Block], out: &mut Vec<Line<'static>>) {
-        // Render inner blocks to a temporary buffer, inserting a blank line
-        // between consecutive child blocks so blank lines inside the source
-        // blockquote (e.g. `>` on its own between paragraphs) remain visible.
-        // Each inner line is then prefixed with the ▎ bar.
+        // A blank line between consecutive child blocks keeps a bare `>` in the
+        // source visible as a quoted blank row.
         let mut inner_lines: Vec<Line<'static>> = Vec::new();
         for (i, block) in blocks.iter().enumerate() {
             if i > 0 {
@@ -847,14 +725,11 @@ impl<'t> Renderer<'t> {
         }
 
         for line in inner_lines {
-            // The quote's own style is the *base*, not a replacement: each
-            // inner span keeps whatever it resolved to (bold, italic, a code
-            // span's own surface, a highlight, a link's underline) and simply
-            // inherits the quote wash underneath it.  Overwriting the spans
-            // wholesale — which is what this used to do — silenced every
-            // inline style inside a quote (issue #33).  An inner block's own
-            // line style (a nested code block's surface) layers on first so
-            // it wins over the wash, as it does outside a quote.
+            // The quote style is the *base*, not a replacement: each inner span
+            // keeps its own resolved style and inherits the wash underneath.
+            // Overwriting wholesale silenced every inline style inside a quote
+            // (issue #33).  An inner block's line style layers on first, so a
+            // nested code block's surface still wins over the wash.
             let base = self.theme.blockquote_text.patch(line.style);
             let bar = Span::styled("▎ ", base.patch(self.theme.blockquote_bar));
             let mut spans = vec![bar];
@@ -862,10 +737,8 @@ impl<'t> Renderer<'t> {
                 let content = span.content.into_owned();
                 spans.push(Span::styled(content, base.patch(span.style)));
             }
-            // The line-level style is what `line_render` fills the trailing
-            // cells with, so the wash reaches the viewport edge the way a
-            // code block's does, and what the indent zone of a wrapped
-            // continuation row is blank-filled with.
+            // `line_render` fills trailing cells and wrapped-row indents with
+            // the line-level style, so the wash reaches the viewport edge.
             out.push(Line::from(spans).style(base));
         }
     }
@@ -881,11 +754,9 @@ impl<'t> Renderer<'t> {
             | Inline::Italic(inner)
             | Inline::Strikethrough(inner)
             | Inline::Highlight(inner) => self.rendered_inlines_char_width(inner),
-            // Code span renders as its content only — the backtick
-            // delimiters are dropped, with no pad cells.
+            // Content only; the backticks are dropped, with no pad cells.
             Inline::Code(c) => c.chars().count(),
-            // Link renders as just the visible text (bracket contents, or a
-            // URL/filename fallback when empty).
+            // The visible text, or a URL/filename fallback when empty.
             Inline::Link { text, url, .. } => {
                 let text_width = self.rendered_inlines_char_width(text);
                 if text_width == 0 {
@@ -904,13 +775,10 @@ impl<'t> Renderer<'t> {
                 IMAGE_PREFIX.chars().count() + name_width + 2
             }
             Inline::HtmlComment(_) => 0,
-            // Footnote reference renders as a bracketed marker of the raw
-            // label — one column per character.  Unreachable in practice:
-            // `footnote_run_at` matches a run of one as readily as a run of
-            // three, so `rendered_inlines_char_width` — the only caller —
-            // measures *every* reference, lone or fused, before this arm is
-            // consulted.  Kept for exhaustiveness, and deliberately built
-            // from `reference_marker` so it can't state a second format.
+            // Unreachable: `footnote_run_at` matches a run of one as readily as
+            // a run of three, so the only caller measures every reference before
+            // this arm is consulted.  Kept for exhaustiveness, and built from
+            // `reference_marker` so it can't state a second format.
             Inline::FootnoteReference { label } => {
                 reference_marker(std::iter::once(label.as_str()))
                     .chars()
@@ -924,8 +792,8 @@ impl<'t> Renderer<'t> {
         let mut total = 0;
         let mut i = 0;
         while i < inlines.len() {
-            // Adjacent references fuse into one marker, so measure the run
-            // through the same helper that renders it.
+            // Adjacent references fuse, so measure the run through the same
+            // helper that renders it.
             if let Some((marker, run_len)) = footnote_run_at(inlines, i) {
                 total += marker.chars().count();
                 i += run_len;
@@ -943,11 +811,9 @@ impl<'t> Renderer<'t> {
         let mut out: Vec<Span<'static>> = Vec::new();
         let mut i = 0;
         while i < inlines.len() {
-            // A run of adjacent references collapses into one marker
-            // (`[^1][^2]` → `[1,2]`), so it has to be consumed as a group
-            // rather than one inline at a time.  This is the only rendering
-            // entry point — `render_paragraph` splits at breaks and calls
-            // back in here — so the fusion can't be bypassed.
+            // Adjacent references collapse into one marker (`[^1][^2]` →
+            // `[1,2]`), so the run is consumed as a group.  This is the only
+            // rendering entry point, so the fusion can't be bypassed.
             if let Some((marker, run_len)) = footnote_run_at(inlines, i) {
                 out.push(Span::styled(marker, base.patch(self.theme.footnote)));
                 i += run_len;
@@ -984,11 +850,9 @@ impl<'t> Renderer<'t> {
             }
 
             Inline::Code(code) => {
-                // When the surrounding inline scope carries strikethrough
-                // (either an explicit `~~…~~` or a checked task item's
-                // muted text), pick the dim code-span style and preserve
-                // the CROSSED_OUT modifier so the snippet still reads as
-                // struck-through alongside the rest of the run.
+                // Under strikethrough (explicit `~~…~~` or a checked task
+                // item), take the dim style and keep CROSSED_OUT so the snippet
+                // still reads as struck through.
                 let style = if base.add_modifier.contains(Modifier::CROSSED_OUT) {
                     self.theme.code_span_dim.add_modifier(Modifier::CROSSED_OUT)
                 } else {
@@ -998,9 +862,7 @@ impl<'t> Renderer<'t> {
             }
 
             Inline::Link { text, url, .. } => {
-                // Pick a per-link style by URL kind: in-document
-                // heading anchors and local files read as more
-                // peripheral than full web links per theming.md.
+                // Per-link style by URL kind — see docs/dev/theming.md.
                 let style = link_style_for(url, self.theme);
                 if inlines_to_plain(text).trim().is_empty() {
                     vec![Span::styled(link_fallback(url), style)]
@@ -1028,21 +890,14 @@ impl<'t> Renderer<'t> {
             }
 
             Inline::HtmlComment(_) => {
-                // Zero spans — inline HTML comments are annotation, not
-                // visible content.  The surrounding paragraph's other
-                // inlines render normally.
+                // Annotation, not visible content.
                 Vec::new()
             }
 
             Inline::FootnoteReference { label } => {
-                // Bracketed marker of the raw label in the footnote chrome
-                // color (`[^1]` → `[1]`).  The `[^label]` source bytes back
-                // this single rendered span; `InlineColMap` accounts for the
-                // width difference.  Unreachable in practice, for the same
-                // reason as the width arm above: `render_inlines` is the only
-                // caller and `footnote_run_at` intercepts a lone reference
-                // too, so nothing reaches here.  Kept for exhaustiveness, and
-                // built from `reference_marker` so the format stays single.
+                // Unreachable, as in the width arm above: `footnote_run_at`
+                // intercepts a lone reference too.  `InlineColMap` accounts for
+                // the `[^label]` → `[label]` width difference.
                 vec![Span::styled(
                     reference_marker(std::iter::once(label.as_str())),
                     base.patch(self.theme.footnote),
@@ -1052,8 +907,7 @@ impl<'t> Renderer<'t> {
             Inline::SoftBreak => vec![Span::raw(" ")],
 
             Inline::HardBreak => {
-                // Hard breaks in inline contexts just become a space; the
-                // caller (render_paragraph) handles them as line splits.
+                // A space here; `render_paragraph` handles the line split.
                 vec![Span::raw(" ")]
             }
         }
@@ -1065,17 +919,13 @@ impl<'t> Renderer<'t> {
 /// `note` → `[note]`, `[^1][^2][^3]` → `[1,2,3]`).  Labels are never
 /// renumbered for display, so the marker never diverges from the source.
 ///
-/// This is the `[N]` convention the bundled HTML export stylesheet already
-/// uses (`config/export/default.css`), so the two surfaces now agree.
+/// Matches the `[N]` convention of the bundled export stylesheet
+/// (`config/export/default.css`).
 ///
-/// The marker is deliberately plain ASCII.  It used to be superscript —
-/// `⁽¹⁾`, built from U+207D/U+207E — but those two codepoints are absent
-/// from most monospace fonts, and a terminal that falls back to a
-/// proportional face for them draws the parenthesis with an advance wider
-/// than the cell.  Ghostty only shrinks such a glyph to fit for a curated
-/// codepoint list, and otherwise lets it spill into the next cell, so the
-/// parenthesis was drawn on top of the digit.  Nothing here may reintroduce
-/// a codepoint outside Basic Latin without checking that.
+/// Deliberately plain ASCII: the superscript form (U+207D/U+207E) is absent
+/// from most monospace fonts, and a terminal falling back to a proportional
+/// face draws it wider than the cell, overlapping the digit.  Do not
+/// reintroduce a codepoint outside Basic Latin without re-checking that.
 pub(crate) fn reference_marker<'a>(labels: impl IntoIterator<Item = &'a str>) -> String {
     let mut out = String::from("[");
     for (i, label) in labels.into_iter().enumerate() {
@@ -1091,10 +941,9 @@ pub(crate) fn reference_marker<'a>(labels: impl IntoIterator<Item = &'a str>) ->
 /// If a run of adjacent `Inline::FootnoteReference` starts at `start`,
 /// return its fused marker and the number of inlines it consumed.
 ///
-/// "Adjacent" means adjacent *inlines* — `[^1][^2]` fuses, `[^1] [^2]`
-/// does not, because the space between them is its own `Inline::Text`.
-/// Rendering and width measurement both route through here so the marker
-/// they produce can't drift apart.
+/// "Adjacent" means adjacent *inlines* — `[^1][^2]` fuses, `[^1] [^2]` does
+/// not, the space being its own `Inline::Text`.  Rendering and width
+/// measurement both route through here so their markers can't drift apart.
 fn footnote_run_at(inlines: &[Inline], start: usize) -> Option<(String, usize)> {
     if !matches!(inlines.get(start), Some(Inline::FootnoteReference { .. })) {
         return None;
@@ -1110,19 +959,11 @@ fn footnote_run_at(inlines: &[Inline], start: usize) -> Option<(String, usize)> 
     Some((reference_marker(labels), run_len))
 }
 
-/// Convert one row of a freshly-painted ratatui `Buffer` into a styled
-/// `Line<'static>`, coalescing consecutive cells with identical styles
-/// into a single `Span`.  Used to lift the output of in-memory widget
-/// rendering (e.g. `tui_big_text::BigText`) back into the
-/// `Vec<Line<'static>>` model the rest of the renderer pipeline expects.
-/// Substitute common Unicode typography characters with their ASCII
-/// equivalents so the big-H1 renderer can show them.  font8x8's
-/// `basic_latin` glyph table — the only set tui-big-text consults by
-/// default — covers exactly U+0020..=U+007E; anything outside that
-/// range renders as a blank square.  Substituting `—` → `-`, `…` →
-/// `...`, curly quotes → straight, etc. preserves the visual intent
-/// of the title without changing what text we're rendering at the
-/// document level (the substitution is rendering-only).
+/// Substitute common Unicode typography with ASCII so the big-H1 renderer can
+/// show it: font8x8's `basic_latin` table covers exactly U+0020..=U+007E and
+/// renders anything else as a blank square.  Rendering-only — the document text
+/// is untouched, and whatever is still non-ASCII afterwards makes the caller
+/// fall back to the plain render.
 fn normalise_for_big_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -1138,12 +979,9 @@ fn normalise_for_big_text(text: &str) -> String {
     out
 }
 
-/// Greedy word-wrap for the big-H1 renderer.  Splits `text` on
-/// whitespace and packs words into lines no wider than `max_chars`.
-/// Returns `None` if any single word exceeds `max_chars` — in that
-/// case the caller falls back to the regular one-line render rather
-/// than emitting a hard-broken word that would look worse than no
-/// big-text at all.
+/// Greedy word-wrap for the big-H1 renderer, packing words into lines no wider
+/// than `max_chars`.  `None` if any single word exceeds `max_chars`: the caller
+/// then falls back to the plain render rather than hard-breaking a word.
 fn word_wrap_for_big_text(text: &str, max_chars: usize) -> Option<Vec<String>> {
     let mut lines: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -1204,15 +1042,12 @@ fn buffer_row_to_line(buf: &Buffer, y: u16) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Byte index just past the `key` + separator run of a frontmatter line,
-/// or `None` when the line has no readable key.
+/// Byte index just past the `key` + separator run of a frontmatter line, or
+/// `None` when the line has no readable key.
 ///
-/// Deliberately conservative: the separator must be the first `sep` on
-/// the line, the key must be non-empty after its indent, and the
-/// separator must be followed by a space or end the line — so a bare
-/// URL value (`url: https://…`) splits at the first colon that reads as
-/// a separator rather than the one inside the scheme, and a line that is
-/// only a value (`  - tag`) gets no split at all.
+/// Deliberately conservative — first `sep` on the line, non-empty key, and the
+/// separator followed by a space or end of line — so `url: https://…` splits at
+/// the separator rather than the scheme's colon, and `  - tag` doesn't split.
 fn metadata_key_end(line: &str, sep: char) -> Option<usize> {
     let idx = line.find(sep)?;
     if line[..idx]
@@ -1251,8 +1086,7 @@ mod tests {
 
     // ── Render cache ──────────────────────────────────────────────────
 
-    /// The memoized path must be output-identical to the uncached path,
-    /// both on a cold cache (all misses) and a warm one (all hits).
+    /// Output-identical to the uncached path on both a cold and a warm cache.
     #[test]
     fn cached_render_matches_uncached() {
         let src = "# Title\n\nSome **bold** prose.\n\n- a\n- b\n\n\
@@ -1270,8 +1104,6 @@ mod tests {
         assert_eq!(warm.1, plain_counts);
     }
 
-    /// Entries for blocks no longer in the document are evicted, and a
-    /// duplicate block is served from a single entry.
     #[test]
     fn cache_evicts_dropped_blocks_and_shares_duplicates() {
         let r = renderer();
@@ -1290,9 +1122,8 @@ mod tests {
         ));
     }
 
-    /// A settings change (here: viewport width) must invalidate the whole
-    /// cache — a stale-width hit would render rules/tables at the wrong
-    /// width.
+    /// A settings change must invalidate the cache — a stale-width hit would
+    /// render rules and tables at the wrong width.
     #[test]
     fn cache_cleared_on_settings_change() {
         let blocks = parse("---\n");
@@ -1308,10 +1139,8 @@ mod tests {
         assert_eq!(wide_lines, wide.render(&blocks));
     }
 
-    /// Toggling syntax highlighting must invalidate the cache too. The
-    /// `Block` value is unchanged by the toggle, so without the
-    /// `RenderSettings` field a cached hit would keep painting the old
-    /// setting — the exact trap `render_cache`'s module doc warns about.
+    /// The `Block` value is unchanged by the toggle, so without the
+    /// `RenderSettings` field a hit would keep painting the old setting.
     #[test]
     fn cache_cleared_when_syntax_highlighting_toggles() {
         let src = "```rust\nfn main() {}\n```\n";
@@ -1333,8 +1162,7 @@ mod tests {
         assert_eq!(off_again, off_lines);
     }
 
-    /// Image blocks are never cached — their row count tracks the decode
-    /// cache, not the AST.
+    /// Image row counts track the decode cache, not the AST.
     #[test]
     fn image_blocks_bypass_cache() {
         let blocks = vec![Block::ImageBlock {
@@ -1356,18 +1184,15 @@ mod tests {
 
     #[test]
     fn big_h1_emits_two_glyph_rows_plus_rule() {
-        // Octant pixel-size: 4 cells per glyph horizontally, 2 rows tall.
         let theme = Box::leak(Box::new(Theme::default()));
         let r = Renderer::new(theme).with_big_h1(true);
         let lines = r.render(&parse("# Hi\n"));
-        // 2 glyph rows + 1 rule line.
         assert_eq!(
             lines.len(),
             3,
             "expected 2 glyph rows + rule, got {}",
             lines.len()
         );
-        // The first 2 rows should each contain at least one block glyph.
         for (i, line) in lines.iter().take(2).enumerate() {
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(
@@ -1375,7 +1200,6 @@ mod tests {
                 "row {i} had no block glyph: {text:?}"
             );
         }
-        // Last row is the H1 rule.
         let rule: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             rule.contains('─'),
@@ -1387,7 +1211,6 @@ mod tests {
     fn big_h1_falls_back_for_non_ascii_title() {
         let theme = Box::leak(Box::new(Theme::default()));
         let r = Renderer::new(theme).with_big_h1(true);
-        // Non-ASCII title — font8x8 doesn't cover it, so we fall back.
         let lines = r.render(&parse("# Héllo\n"));
         assert_eq!(lines.len(), 2, "expected plain 2-line H1 fallback");
     }
@@ -1395,8 +1218,7 @@ mod tests {
     #[test]
     fn big_h1_falls_back_for_unbreakable_word_wider_than_viewport() {
         let theme = Box::leak(Box::new(Theme::default()));
-        // 21 chars × 4 = 84 cells — exceeds the 80-col viewport AND is
-        // a single unbreakable word, so word-wrap can't help.
+        // 21 chars × 4 = 84 cells, over the 80-col viewport, and unbreakable.
         let r = Renderer::new(theme)
             .with_big_h1(true)
             .with_viewport_width(80);
@@ -1407,8 +1229,7 @@ mod tests {
     #[test]
     fn big_h1_falls_back_when_more_than_two_wrapped_lines_needed() {
         let theme = Box::leak(Box::new(Theme::default()));
-        // viewport=40 → max 10 chars per big-text line.  Three 9-char
-        // words need 3 lines to wrap, which exceeds the 2-line cap.
+        // Max 10 chars per line; three 9-char words need 3, over the 2-line cap.
         let r = Renderer::new(theme)
             .with_big_h1(true)
             .with_viewport_width(40);
@@ -1424,9 +1245,8 @@ mod tests {
     #[test]
     fn big_h1_word_wraps_to_two_big_lines_with_blank_spacer() {
         let theme = Box::leak(Box::new(Theme::default()));
-        // viewport=40 → max 10 chars per line.  "hello world!" wraps
-        // into ["hello", "world!"].  Emission: chunk1 (2 rows) + blank
-        // spacer (1 row) + chunk2 (2 rows) + rule (1 row) = 6 lines.
+        // Max 10 chars per line, so this wraps into two chunks:
+        // 2 + 1 spacer + 2 + 1 rule = 6 lines.
         let r = Renderer::new(theme)
             .with_big_h1(true)
             .with_viewport_width(40);
@@ -1437,9 +1257,6 @@ mod tests {
             "expected 2 chunks × 2 glyphs + spacer + rule, got {}",
             lines.len()
         );
-        // Rows 0,1 = chunk 1 glyphs; row 2 = spacer; rows 3,4 = chunk 2
-        // glyphs; row 5 = rule.  Spacer row should have NO block glyph
-        // characters; chunk rows should each have at least one.
         for &i in &[0usize, 1, 3, 4] {
             let text: String = lines[i].spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(
@@ -1460,11 +1277,9 @@ mod tests {
     fn big_h1_renders_em_dash_via_ascii_substitution() {
         let theme = Box::leak(Box::new(Theme::default()));
         let r = Renderer::new(theme).with_big_h1(true);
-        // Em dash would normally fail the ASCII check; the renderer
-        // substitutes it with a hyphen so the title still renders big.
+        // Em dash would fail the ASCII check but is substituted with a hyphen,
+        // so this is 2 glyph rows + rule, not the 2-line plain fallback.
         let lines = r.render(&parse("# A — B\n"));
-        // 1 chunk × 2 glyph rows + rule = 3 lines, NOT the 2-line plain
-        // fallback.  (5 chars × 4 cells = 20, fits in 80.)
         assert_eq!(
             lines.len(),
             3,
@@ -1481,9 +1296,7 @@ mod tests {
         assert_eq!(normalise_for_big_text("‘x’"), "'x'");
         assert_eq!(normalise_for_big_text("“x”"), "\"x\"");
         assert_eq!(normalise_for_big_text("a\u{00A0}b"), "a b");
-        // Anything not in the substitution table stays put — accented
-        // letters fall through to the ASCII check at the call site,
-        // which then triggers the plain-render fallback.
+        // Untabled characters stay put and fail the caller's ASCII check.
         assert_eq!(normalise_for_big_text("café"), "café");
     }
 
@@ -1511,7 +1324,7 @@ mod tests {
     #[test]
     fn code_block_has_content() {
         let lines = render("```\nfoo\n```\n");
-        // Line 0 is the opening-fence placeholder; the body lives on line 1.
+        // Line 0 is the opening-fence placeholder.
         let body_text: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(body_text.contains("foo"));
     }
@@ -1521,11 +1334,9 @@ mod tests {
     /// Opt this thread into inline grammar compilation for every language
     /// the source's fences name.
     ///
-    /// Compilation is asynchronous in production — a cold grammar renders
-    /// plain and a worker compiles it — so without this a render test
-    /// asserts on whichever grammars an *unrelated* test happened to warm
-    /// first, and passes or fails by test order. See
-    /// `markdown::highlight::warm_inline`.
+    /// Compilation is asynchronous in production, so without this a render test
+    /// asserts on whichever grammars an unrelated test happened to warm first
+    /// and passes or fails by test order.  See `highlight::warm_inline`.
     fn warm_fence_languages(src: &str) {
         for line in src.lines() {
             let Some(info) = line.trim_start().strip_prefix("```") else {
@@ -1537,8 +1348,7 @@ mod tests {
         }
     }
 
-    /// Render a document with highlighting on, which the plain `render`
-    /// helper leaves off (matching `Renderer::new`'s default).
+    /// Render with highlighting on, which the plain `render` helper leaves off.
     fn render_highlighted(src: &str) -> Vec<Line<'static>> {
         warm_fence_languages(src);
         let blocks = parse(src);
@@ -1564,7 +1374,6 @@ mod tests {
         // Line 0 is the ` rust ` label row, line 1 the body.
         let spans = spans_of(&lines[1]);
         assert!(spans.len() > 1, "body should be tokenized, got {spans:?}");
-        // `fn` is a keyword; `main` is a function name.
         let keyword = spans.iter().find(|(t, _)| t == "fn").expect("an `fn` span");
         assert_eq!(keyword.1.fg, theme.syntax_keyword.fg);
         let func = spans
@@ -1590,9 +1399,8 @@ mod tests {
 
     #[test]
     fn highlighting_does_not_change_the_text_or_the_row_count() {
-        // The column geometry `code_layout` describes is a property of the
-        // characters, not the spans, so highlighting must leave both the
-        // text and the number of rows exactly as they were.
+        // `code_layout`'s column geometry is a property of the characters, not
+        // the spans, so text and row count must survive highlighting.
         let src = "```rust\nfn main() {}\nlet x = 1;\n```\n";
         let plain = render(src);
         let lit = render_highlighted(src);
@@ -1604,8 +1412,7 @@ mod tests {
 
     #[test]
     fn an_unknown_language_renders_exactly_like_highlighting_off() {
-        // The equivalence `TokenClass` having no `Default` variant buys:
-        // unknown language, no language and feature-off are one path.
+        // Unknown language, no language and feature-off are one path.
         for src in [
             "```frobnicate\nfn main() {}\n```\n",
             "```\nfn main() {}\n```\n",
@@ -1623,8 +1430,7 @@ mod tests {
 
     #[test]
     fn the_language_label_row_keeps_the_whole_info_string() {
-        // Only the grammar lookup takes the first token; the label shows
-        // what the author actually wrote.
+        // Only the grammar lookup takes the first token.
         let lines = render_highlighted("```rust,ignore\nfn main() {}\n```\n");
         assert!(plain_text(&lines[0]).contains("rust,ignore"));
         // ...and the block is still highlighted, via the `rust` prefix.
@@ -1634,8 +1440,8 @@ mod tests {
 
     #[test]
     fn a_wrapped_token_keeps_its_style_on_both_rows() {
-        // `code_wrap` splits a source line into several visual rows, so the
-        // tokens have to be clipped and re-based per segment.
+        // Wrapping splits a source line into rows, so tokens are clipped and
+        // re-based per segment.
         let theme = Theme::default();
         let long = format!("let s = \"{}\";", "x".repeat(60));
         let src = format!("```rust\n{long}\n```\n");
@@ -1646,9 +1452,6 @@ mod tests {
             .with_code_wrap(true)
             .with_syntax_highlighting(true)
             .render(&blocks);
-        // Every row carrying part of the string literal must style it; the
-        // literal is far longer than the 20-column viewport, so it spans
-        // several rows.
         let string_rows = lines
             .iter()
             .filter(|l| {
@@ -1670,12 +1473,10 @@ mod tests {
         assert!(first_text.contains('▎'));
     }
 
-    /// A blank line inside a blockquote (`>` with nothing else) must remain
-    /// visible as a quoted blank row between the surrounding paragraphs.
+    /// A bare `>` stays visible as a quoted blank row.
     #[test]
     fn blockquote_blank_line_rendered() {
         let lines = render("> first\n>\n> third\n");
-        // Expect three lines, all starting with the blockquote bar.
         assert_eq!(lines.len(), 3, "got {} lines", lines.len());
         for line in &lines {
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -1684,7 +1485,6 @@ mod tests {
                 "line did not start with bar: {text:?}"
             );
         }
-        // Middle line's content (after the bar) should be empty / whitespace.
         let middle: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             middle.trim_start_matches('▎').trim().is_empty(),
@@ -1692,8 +1492,7 @@ mod tests {
         );
     }
 
-    /// Soft breaks in the source should produce a new visual line — the TUI
-    /// editor preserves the author's line layout instead of collapsing to spaces.
+    /// Soft breaks produce a new visual line rather than collapsing to spaces.
     #[test]
     fn soft_break_produces_new_line() {
         let lines = render("alpha\nbeta\ngamma\n");
@@ -1761,7 +1560,6 @@ mod tests {
             span.style.add_modifier.contains(Modifier::CROSSED_OUT),
             "code span inside strikethrough should still be struck through"
         );
-        // And a plain (non-struck) code span keeps the bright variant.
         let plain_lines = r.render(&parse("alpha `snippet` beta\n"));
         let plain_span = plain_lines[0]
             .spans
@@ -1773,8 +1571,8 @@ mod tests {
 
     #[test]
     fn inline_code_inside_checked_task_item_uses_dim_code_style() {
-        // task_strikethrough is true by default, so checked items
-        // propagate CROSSED_OUT through `base` into the code span.
+        // `task_strikethrough` defaults on, so checked items propagate
+        // CROSSED_OUT through `base` into the code span.
         let theme = Box::leak(Box::new(Theme::default()));
         let r = Renderer::new(theme);
         let blocks = parse("- [x] do `thing` now\n");
@@ -1799,15 +1597,12 @@ mod tests {
         assert!(span.style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
-    /// Tables render with a thick double-line separator beneath the header
-    /// and a thin separator between successive data rows — so every row
-    /// carries a visible bottom border.
     #[test]
     fn table_has_thick_header_separator_and_inter_row_borders() {
         let src = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
         let lines = render(src);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
-        // Expected layout: top, header, thick, data1, thin, data2, bottom.
+        // Layout: top, header, thick, data1, thin, data2, bottom.
         assert_eq!(texts.len(), 7, "got {texts:#?}");
         assert!(texts[0].starts_with('┌'), "top: {:?}", texts[0]);
         assert!(
@@ -1823,16 +1618,10 @@ mod tests {
         assert!(texts[6].starts_with('└'), "bottom: {:?}", texts[6]);
     }
 
-    /// A multi-row data row whose cell contains styled inlines
-    /// (e.g. `**bold**` or `` `code` ``) must preserve the inline
-    /// styling on every wrapped sub-line.  Plain-text rendering would
-    /// drop the bold/code spans — the inline-aware wrap keeps
-    /// them.
+    /// Plain-text rendering would drop a wrapped cell's bold/code spans; the
+    /// inline-aware wrap keeps them.
     #[test]
     fn table_multirow_cell_preserves_inline_styles() {
-        // Force a wrap: narrow viewport so the prose cell breaks.
-        // The bold word in cell 1 should come out as a styled span
-        // (BOLD modifier set) on whichever sub-line it lands on.
         let theme = Box::leak(Box::new(Theme::default()));
         let r = Renderer::new(theme).with_viewport_width(28);
 
@@ -1843,9 +1632,6 @@ mod tests {
         );
         let lines = r.render(&blocks);
 
-        // Walk every line of the rendered table and assert that at
-        // least one span carries the BOLD modifier with content
-        // matching `really` (possibly trimmed by wrap).
         let mut found_bold = false;
         for line in &lines {
             for span in &line.spans {
@@ -1863,9 +1649,8 @@ mod tests {
         );
     }
 
-    /// A long inline code span no longer pins its column wide: the cell's
-    /// `min` is the breakable floor, so the table compresses to the
-    /// viewport and the code span hard-splits across rendered rows.
+    /// A long code span doesn't pin its column wide: the cell's `min` is the
+    /// breakable floor, so the table compresses and the span hard-splits.
     #[test]
     fn table_breaks_long_inline_code_to_fit_viewport() {
         let src = "| id | code |\n\
@@ -1879,8 +1664,6 @@ mod tests {
                 line_text(line)
             );
         }
-        // The code span is split — no single line holds it whole — but no
-        // characters are lost across the break.
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(
             !texts
@@ -1899,11 +1682,6 @@ mod tests {
         );
     }
 
-    /// The code span's pad cells (the rendered stand-ins for the raw
-    /// backticks) must survive wrapping: a code token starting a wrap
-    /// row keeps its leading pad, and the final chunk keeps the
-    /// trailing pad.  They render as NBSP so the wrap tokenizer can't
-    /// trim them like inter-word spaces.
     #[test]
     fn table_code_span_wraps_without_pads() {
         let src = "| intro `breakable_code_name` | x |\n\
@@ -1966,15 +1744,12 @@ mod tests {
             src.push_str(&format!("{i}. item {i}\n"));
         }
         let lines = render(&src);
-        // Single-digit items get a leading space so they align under the
-        // two-digit items ("10. "/"11. "/"12. ").  First line should start
-        // with " 1. ", not "1. ".
+        // Single-digit items get a leading space to align under two-digit ones.
         assert!(
             line_text(&lines[0]).starts_with(" 1. "),
             "got {:?}",
             line_text(&lines[0])
         );
-        // Line 9 is " 9. "; line 10 is "10. " (no leading space).
         assert!(
             line_text(&lines[8]).starts_with(" 9. "),
             "got {:?}",
@@ -1989,9 +1764,8 @@ mod tests {
 
     #[test]
     fn nested_ordered_list_aligns_with_source_indent() {
-        // Source nests at 4 spaces (CommonMark / GFM convention).  Render
-        // matches so that switching to raw view doesn't visually shift the
-        // nested marker.
+        // Render matches the source's 4-space nesting, so switching to raw view
+        // doesn't shift the nested marker.
         let lines = render("1. outer\n    1. inner\n2. next\n");
         assert_eq!(lines.len(), 3);
         assert_eq!(line_text(&lines[0]), "1. outer");
@@ -2001,8 +1775,7 @@ mod tests {
 
     #[test]
     fn nested_bullet_list_uses_four_space_indent() {
-        // Nested markers render at the same `INDENT_WIDTH` (4) indent the raw
-        // source uses, so de-rendering the block causes no horizontal shift.
+        // Same `INDENT_WIDTH` as the raw source, so de-rendering doesn't shift.
         let lines = render("- outer\n    - inner\n- next\n");
         assert_eq!(lines.len(), 3);
         assert_eq!(line_text(&lines[0]), "• outer");
@@ -2012,8 +1785,7 @@ mod tests {
 
     #[test]
     fn task_items_render_as_bullet_plus_checkbox() {
-        // Tasks are decorated bullets — the bullet always renders, with
-        // the checkbox immediately after.
+        // Tasks are decorated bullets: bullet, then checkbox.
         let lines = render("- [ ] outer\n    - [ ] inner\n- [ ] next\n");
         assert_eq!(lines.len(), 3);
         assert_eq!(line_text(&lines[0]), "• [ ] outer");
@@ -2029,13 +1801,9 @@ mod tests {
         assert_eq!(line_text(&lines[2]), "• [✓] done");
     }
 
-    /// Nested-checklist regression: an empty item Tab-indent produces a
-    /// blank-line-separated list.  That forces pulldown-cmark into
-    /// "loose-list" mode, which wraps each item's content in a
-    /// `Paragraph` — the `TaskListMarker` then sits *inside* the
-    /// paragraph instead of directly under `Item`.  The parser must pick
-    /// up the marker in both positions so the parent items keep their
-    /// checkbox rendering instead of regressing to bullets.
+    /// Regression: a blank-line-separated list is "loose", so pulldown-cmark
+    /// wraps each item in a `Paragraph` and the `TaskListMarker` sits inside it
+    /// rather than under `Item`.  The parser must find it in both positions.
     #[test]
     fn loose_task_list_still_renders_checkboxes() {
         let lines = render("- [ ] parent\n\n    - [ ] nested\n- [ ] sibling\n");
@@ -2078,16 +1846,11 @@ mod tests {
 
     #[test]
     fn block_level_html_comment_between_paragraphs_is_invisible() {
-        // The surrounding paragraphs render normally; the comment contributes
-        // zero rendered lines.  Blank-line gap bytes on either side are still
-        // tracked by `ParsedDoc` (not tested here — parser/renderer level
-        // only).
         let lines = render("alpha\n\n<!-- hidden -->\n\nbeta\n");
         let texts: Vec<String> = lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
-        // No rendered line contains the comment marker.
         assert!(
             !texts.iter().any(|t| t.contains("<!--")),
             "comment leaked: {texts:?}"
@@ -2101,9 +1864,7 @@ mod tests {
         let lines = render("before <!-- inline --> after\n");
         assert_eq!(lines.len(), 1);
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        // The comment markers themselves must not render.
         assert!(!text.contains("<!--"), "got {text:?}");
-        // The surrounding words still render.
         assert!(text.contains("before"));
         assert!(text.contains("after"));
     }

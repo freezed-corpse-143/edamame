@@ -1,33 +1,23 @@
-//! Ex-command parsing and substitution — CP9.
+//! Ex-command parsing and substitution.
 //!
-//! [`parse_ex`] is a *pure* parser from the command-line text (the part
-//! after the leading `:`) to an [`ExCommand`].  `:w` / `:q` / `:wq` map to
-//! App effects the reducer bubbles up as outcomes (so the dirty-buffer
-//! confirm fires exactly as for `Ctrl-Q`); `:s` / `:%s` are executed *here*
-//! against `&mut EditorState` by [`execute_substitute`].  This is the only
-//! place a regex engine is used — the `/` search path stays literal substring
-//! + smartcase, never regex (see `docs/vim-implementation-plan.md` §1, CP9).
-//!
-//! The substitution is applied as a **single** [`EditDelta`], so an entire
-//! `:%s/…/…/g` is one undo unit.
+//! [`parse_ex`] is a *pure* parser from the text after the leading `:` to an [`ExCommand`].
+//! `:w` / `:q` / `:wq` become App effects the reducer bubbles up as outcomes; `:s` / `:%s` are
+//! executed here by [`execute_substitute`], as one [`EditDelta`] so a whole `:%s/…/…/g` undoes
+//! in a single step.  This is the only place a regex engine is used — the `/` search path stays
+//! literal substring + smartcase.
 //!
 //! **The pattern sees the whole range at once**, not one line at a time
-//! ([`region_haystack`] + [`for_each_region_match`]), so it may match
-//! across a line break (`:%s/  \n/ /g`).  Three properties hold that
-//! together: `multi_line(true)` at both compile sites keeps `^`/`$`
-//! anchoring per line, the region excludes the last line's own break so a
-//! match can never escape the range, and the non-`g` walk replaces the
-//! first match *starting on* each line rather than one per command.
+//! ([`region_haystack`] + [`for_each_region_match`]), so it may match across a line break.
+//! Three properties hold that together: `multi_line(true)` at both compile sites keeps `^`/`$`
+//! anchoring per line, the region excludes the last line's own break so a match can never
+//! escape the range, and the non-`g` walk replaces the first match *starting on* each line.
 //!
-//! **Vim syntax in, vim syntax out.** The pattern is written in vim's regex
-//! dialect and translated to `fancy-regex` by
-//! [`vim_regex::translate_pattern`](super::vim_regex::translate_pattern); the
-//! replacement is written with vim's `\1` / `&` / `\U…\E` and applied per
-//! match by [`vim_regex::expand_replacement`](super::vim_regex::expand_replacement).
-//! `fancy-regex` (not the `regex` crate) is the engine, so pattern
-//! backreferences and the lookaround that `\<`/`\>` translate to are
-//! available.  An escaped delimiter (`\/`) is reduced to a literal `/` during
-//! parsing, before the pattern reaches the translator.
+//! **Vim syntax in, vim syntax out**: the pattern is translated by
+//! [`vim_regex::translate_pattern`](super::vim_regex::translate_pattern) and the replacement
+//! expanded per match by
+//! [`vim_regex::expand_replacement`](super::vim_regex::expand_replacement).  The engine is
+//! `fancy-regex`, not `regex`, so backreferences and the lookaround `\<`/`\>` translate to are
+//! available.  An escaped delimiter (`\/`) is reduced to a literal during parsing.
 
 use fancy_regex::{Regex, RegexBuilder};
 
@@ -40,36 +30,26 @@ use crate::editor::EditorState;
 pub enum ExCommand {
     /// `:w` — write the buffer.
     Write,
-    /// `:w <path>` / `:write <path>` — write a snapshot to the given path
-    /// *without* changing the buffer's own path (real-vim `:w {file}`
-    /// semantics; the user keeps editing the current file).  `force` is a
-    /// trailing `!` (`:w! <path>`), which skips the overwrite-confirmation
-    /// prompt.
+    /// `:w <path>` — write a snapshot *without* changing the buffer's own path (real-vim
+    /// `:w {file}` semantics).  `force` is a trailing `!`, skipping the overwrite prompt.
     WriteCopy { path: String, force: bool },
-    /// `:saveas <path>` — write the buffer to the given path and *adopt*
-    /// it as the buffer's home (subsequent `:w` target the new path).
-    /// `force` is a trailing `!` (`:saveas! <path>`).
+    /// `:saveas <path>` — write and *adopt* the path, so later `:w` target it.
     WriteAs { path: String, force: bool },
-    /// `:saveas` with no argument — prompt for a path (the user always
-    /// wants the path-entry modal here, even on an already-named buffer).
+    /// `:saveas` with no argument — prompt for a path, even on an already-named buffer.
     SaveAsPrompt,
     /// `:q` — quit (dirty-guarded).
     Quit,
     /// `:wq` — write then quit.
     WriteQuit,
-    /// `:wq <path>` — write a snapshot to the given path (copy semantics,
-    /// like `:w <path>`), then quit.  `force` is a trailing `!`
-    /// (`:wq! <path>`).
+    /// `:wq <path>` — copy semantics like `:w <path>`, then quit.
     WriteQuitCopy { path: String, force: bool },
-    /// `:x` — write then quit, but only write when the buffer is modified
-    /// (the canonical vim behavior; `:wq` always writes).
+    /// `:x` — write only when modified, then quit (`:wq` always writes).
     WriteQuitIfModified,
     /// `:s/…` (current line), `:%s/…` (whole file), or `:'<,'>s/…` (the
     /// last visual selection's line span).
     Substitute(Substitution),
-    /// `:42` — jump to a 1-based line number.  `:$` (last line) parses to
-    /// `GoToLine(u32::MAX)`, which the motion layer clamps to the last
-    /// content line just as it clamps any other overshoot.
+    /// `:42` — jump to a 1-based line number.  `:$` parses to `GoToLine(u32::MAX)`, which the
+    /// motion layer clamps like any other overshoot.
     GoToLine(u32),
 }
 
@@ -80,8 +60,8 @@ pub enum SubstituteRange {
     CurrentLine,
     /// `:%s` — every line in the buffer.
     AllLines,
-    /// `:'<,'>s` — the line span of the last visual selection, resolved
-    /// against the concrete bounds threaded into [`execute_substitute`].
+    /// `:'<,'>s` — the last visual selection's line span, resolved against the bounds threaded
+    /// into [`execute_substitute`].
     VisualRange,
 }
 
@@ -90,16 +70,13 @@ pub enum SubstituteRange {
 pub struct Substitution {
     /// The line span the substitution runs over.
     pub range: SubstituteRange,
-    /// The vim regex pattern (escaped delimiters already reduced); translated
-    /// to `fancy-regex` syntax at execution time.
+    /// The vim regex pattern, escaped delimiters already reduced.
     pub pattern: String,
     /// The vim replacement text (`\1` / `&` / `\U…\E`), expanded per match.
     pub replacement: String,
-    /// Whether the second delimiter was typed (`:s/foo/` vs `:s/foo`).
-    /// Both parse to an empty `replacement`, but the live preview must
-    /// distinguish "still typing the pattern" (highlight matches only)
-    /// from "replace with nothing" (preview the deletion).  The execute
-    /// path ignores this — an absent field and an empty one both delete.
+    /// Whether the second delimiter was typed (`:s/foo/` vs `:s/foo`).  Both parse to an empty
+    /// `replacement`, but the live preview must tell "still typing the pattern" from "replace
+    /// with nothing".  The execute path ignores it — both delete.
     pub replacement_present: bool,
     /// `g` flag — replace every match on a line, not just the first.
     pub global: bool,
@@ -107,8 +84,7 @@ pub struct Substitution {
     pub ignore_case: bool,
 }
 
-/// A parse- or execution-time ex error.  Its `Display` is the text the
-/// reducer flashes on the hint line.
+/// A parse- or execution-time ex error; its `Display` is what the reducer flashes.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExError {
     #[error("Not an editor command: {0}")]
@@ -127,18 +103,14 @@ pub enum ExError {
 pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
     let s = input.trim();
 
-    // Optional `'<,'>` visual-range prefix — the marks vim inserts when `:`
-    // is pressed in Visual / Visual-Line.  It only qualifies a `:s`; on any
-    // other command the whole line falls through to `UnknownCommand` below.
+    // The `'<,'>` marks vim inserts when `:` is pressed in Visual.  Only qualifies a `:s`.
     let (visual_range, s) = match s.strip_prefix("'<,'>") {
         Some(rest) => (true, rest.trim_start()),
         None => (false, s),
     };
 
-    // Substitution: `%s/…` (all lines), `s/…` (current line), or `'<,'>s/…`
-    // (the visual selection).  A bare `:s` (vim's "repeat last substitution")
-    // is out of scope, so a delimiter must follow.  A `%` overrides any
-    // `'<,'>` prefix, matching vim's last-range-wins rule.
+    // A bare `:s` ("repeat last substitution") is out of scope, so a delimiter must follow.
+    // A `%` overrides any `'<,'>` prefix, matching vim's last-range-wins rule.
     if let Some(rest) = s.strip_prefix("%s") {
         return parse_substitute(SubstituteRange::AllLines, rest);
     }
@@ -153,23 +125,15 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
         }
     }
 
-    // Beyond `:s`, edamame has no ranged ex commands, but `:` in Visual
-    // auto-inserts `'<,'>` — so the write / quit family simply ignores the
-    // range and acts on the whole buffer (a Visual `:w` / `:wq` / `:q` does
-    // what the user means rather than erroring on the prefix they never typed).
-    //
-    // The write / save-as family may carry a path argument, so it can't go
-    // through the exact-match table below (`:w foo.md` must not be an
-    // "unknown command").  A bare `:w` / `:wq` resolves here too.
+    // The write / quit family ignores a `'<,'>` prefix and acts on the whole buffer — `:` in
+    // Visual auto-inserts marks the user never typed.  It also can't go through the exact-match
+    // table below, because its members may carry a path argument.
     if let Some(cmd) = parse_write_forms(s) {
         return Ok(cmd);
     }
 
-    // `:42` / `:$` — a bare line address, vim's shortest "go to line".  Only
-    // without a `'<,'>` prefix: `:'<,'>42` is a range the command never asked
-    // for, so it falls through to `UnknownCommand` like every other non-`:s`
-    // ranged form.  An out-of-range number is clamped by the motion layer, not
-    // rejected here; a number too large for `u32` saturates to the same place.
+    // A bare line address, only without a `'<,'>` prefix.  Out-of-range numbers are clamped by
+    // the motion layer, not rejected here; one too large for `u32` saturates to the same place.
     if !visual_range {
         if s == "$" {
             return Ok(ExCommand::GoToLine(u32::MAX));
@@ -182,23 +146,18 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
     match s {
         "q" | "quit" => Ok(ExCommand::Quit),
         "x" | "xit" => Ok(ExCommand::WriteQuitIfModified),
-        // An unknown command keeps any `'<,'>` prefix in the message so the
-        // user sees exactly what failed to parse.
+        // Keep any `'<,'>` prefix in the message so the user sees what failed to parse.
         _ if visual_range => Err(ExError::UnknownCommand(input.trim().to_owned())),
         other => Err(ExError::UnknownCommand(other.to_owned())),
     }
 }
 
-/// Parse the write / save-as command family, every member of which may
-/// carry a path argument: `:w[!] [path]`, `:write[!] [path]`,
-/// `:saveas[!] [path]`, and `:wq[!] [path]`.  A trailing `!` (force) is
-/// accepted and ignored — edamame has no read-only buffer concept.
-/// Returns `None` for anything outside this family so the caller's
-/// exact-match table can handle `:q`, `:x`, …
+/// Parse the write / save-as family — `:w[!]`, `:write[!]`, `:saveas[!]`, `:wq[!]`, each
+/// optionally with a path.  `None` for anything else, so the caller's exact-match table can
+/// handle `:q`, `:x`, …
 fn parse_write_forms(s: &str) -> Option<ExCommand> {
-    // Split the command word (up to the first whitespace) from its
-    // argument; `s` is already outer-trimmed, so the remainder is the
-    // path verbatim (internal spaces preserved, no surrounding blanks).
+    // `s` is already outer-trimmed, so the remainder is the path verbatim — internal spaces
+    // preserved.
     let (head, rest) = match s.find(char::is_whitespace) {
         Some(i) => (&s[..i], s[i..].trim_start()),
         None => (s, ""),
@@ -207,7 +166,7 @@ fn parse_write_forms(s: &str) -> Option<ExCommand> {
     let word = head.strip_suffix('!').unwrap_or(head);
     let path = (!rest.is_empty()).then(|| rest.to_owned());
     match (word, path) {
-        // `:saveas <path>` re-points; a bare `:saveas` prompts for a name.
+        // `:saveas` re-points the buffer; bare, it prompts for a name.
         ("saveas", Some(path)) => Some(ExCommand::WriteAs { path, force }),
         ("saveas", None) => Some(ExCommand::SaveAsPrompt),
         // `:w <path>` writes a copy and keeps the current file (real vim).
@@ -264,10 +223,9 @@ fn parse_substitute(range: SubstituteRange, rest: &str) -> Result<ExCommand, ExE
     }))
 }
 
-/// Take one delimiter-terminated field from `s`.  Returns the field text —
-/// with `\<delim>` reduced to a literal `<delim>`, every other escape kept
-/// for the regex engine — and the slice *after* the terminating delimiter,
-/// or `None` when no unescaped delimiter remains (the field runs to the end).
+/// Take one delimiter-terminated field from `s`, returning the field text — with an escaped
+/// delimiter reduced to a literal, every other escape kept for the regex engine — and the slice
+/// after the terminator, or `None` when the field runs to the end.
 fn take_field(s: &str, delim: char) -> (String, Option<&str>) {
     let mut out = String::new();
     let mut escaped = false;
@@ -288,27 +246,19 @@ fn take_field(s: &str, delim: char) -> (String, Option<&str>) {
             out.push(c);
         }
     }
-    // A trailing backslash with no following char is kept literally.
+    // A trailing backslash with nothing after it is kept literally.
     if escaped {
         out.push('\\');
     }
     (out, None)
 }
 
-/// Execute a substitution against the editor and return the number of
-/// matches replaced (`Ok(0)` when the pattern never matched — a no-op that
-/// records no edit).  The vim pattern is translated to `fancy-regex` syntax
-/// first (`translate_pattern`), and the replacement is expanded per match by
-/// `expand_replacement` (so vim's `\1` / `&` / `\U…\E` all work).  The whole
-/// substitution is applied as one [`EditDelta`] so it undoes in a single step.
-/// The pattern runs over the whole resolved range at once, so it may match
-/// across a line break; without the `g` flag only the first match *starting
-/// on* each line is replaced, matching vim's per-line semantics.
+/// Execute a substitution and return the number of matches replaced; `Ok(0)` when the pattern
+/// never matched, recording no edit.  See the module docs for the range and dialect rules.
 ///
-/// `visual_range` supplies the inclusive `(first, last)` buffer-line span for a
-/// [`SubstituteRange::VisualRange`] substitution (the marks vim carries from
-/// the last Visual selection).  It is ignored for the other ranges, and a
-/// `VisualRange` with no bounds falls back to the current line.
+/// `visual_range` is the inclusive `(first, last)` line span for a
+/// [`SubstituteRange::VisualRange`]; ignored for the other ranges, and a `VisualRange` with no
+/// bounds falls back to the current line.
 pub fn execute_substitute(
     editor: &mut EditorState,
     sub: &Substitution,
@@ -318,10 +268,8 @@ pub fn execute_substitute(
         return Err(ExError::EmptyPattern);
     }
     let translated = translate_pattern(&sub.pattern)?;
-    // `multi_line` keeps `^`/`$` anchoring per line now that the pattern
-    // sees the whole range at once; it is independent of
-    // `dot_matches_new_line`, which stays off so `.` still refuses to
-    // cross a line break (vim's behavior).
+    // `multi_line` keeps `^`/`$` anchoring per line even though the pattern sees the whole
+    // range; `dot_matches_new_line` stays off so `.` still refuses to cross a break, as in vim.
     let re = RegexBuilder::new(&translated)
         .case_insensitive(sub.ignore_case)
         .multi_line(true)
@@ -336,13 +284,11 @@ pub fn execute_substitute(
     let count = edit.count;
     let range_first = edit.range_first;
     editor.apply_delta(edit.delta);
-    // Park the cursor at the start of the first affected line rather than at
-    // the end of the inserted region (`apply_delta`'s default), which for
-    // `:%s` would jump to end-of-document.  A multi-line match can shrink
-    // the line count, but `range_first` indexes the *first* line of the
-    // range and every line before the first match is byte-identical
-    // pre/post, so it still names the same text (the `min` below covers a
-    // range whose own first line was consumed).
+    // Park the cursor at the start of the first affected line, not at the end of the inserted
+    // region (`apply_delta`'s default), which for `:%s` would jump to end-of-document.
+    // `range_first` still names the same text after a shrinking multi-line match: every line
+    // before the first match is byte-identical pre/post.  The `min` covers a range whose own
+    // first line was consumed.
     let target = editor
         .buffer
         .line_to_char(range_first.min(editor.buffer.line_count().saturating_sub(1)));
@@ -350,10 +296,8 @@ pub fn execute_substitute(
     Ok(count)
 }
 
-/// Resolve a substitution's inclusive `(first, last)` buffer-line span.
-/// `None` only for an empty buffer (`line_count == 0`).  `cursor_line` is
-/// the line the cursor sits on (for [`SubstituteRange::CurrentLine`] and a
-/// [`SubstituteRange::VisualRange`] with no recorded bounds).
+/// Resolve a substitution's inclusive `(first, last)` line span; `None` only for an empty
+/// buffer.
 pub(crate) fn resolve_substitute_lines(
     buffer: &crate::document::Buffer,
     cursor_line: usize,
@@ -374,41 +318,30 @@ pub(crate) fn resolve_substitute_lines(
     })
 }
 
-/// The fully-computed edit for one substitution, produced by
-/// [`build_substitution`] against an unmodified buffer.  Pure data — the
-/// shared seam between the commit path ([`execute_substitute`]) and the
-/// live preview (`vim_ops::preview`).
+/// The fully-computed edit for one substitution, produced by [`build_substitution`] against an
+/// unmodified buffer.  The shared seam between the commit path and the live preview.
 pub(crate) struct SubstitutionEdit {
-    /// The single char-offset delta rewriting lines `range_first..=` the
-    /// last scanned line.
+    /// The single char-offset delta rewriting `range_first` through the last scanned line.
     pub delta: EditDelta,
     /// Total matches replaced.
     pub count: usize,
-    /// Post-apply byte ranges of each inserted replacement segment,
-    /// absolute in the rewritten buffer (preceding text is untouched, so
-    /// offsets before the rewritten region are identical pre/post).
+    /// Post-apply byte ranges of each inserted replacement, absolute in the rewritten buffer.
     pub replaced_ranges: Vec<std::ops::Range<usize>>,
-    /// First line of the resolved range (where the commit path parks the
-    /// cursor).
+    /// First line of the resolved range; where the commit path parks the cursor.
     pub range_first: usize,
     /// First line that actually matched (where the preview scrolls to).
     pub first_match_line: usize,
 }
 
-/// The text of lines `first..=last` as one string, plus the char and byte
-/// offsets it begins at.
+/// The text of lines `first..=last` as one string, plus the char and byte offsets it starts at.
 ///
-/// The last line's own line break is **excluded**, which is the whole
-/// enforcement of the range bound: a pattern can only match inside the
-/// returned text, so a `\n` pattern can never consume the break that
-/// separates `last` from the line after it.  That is what keeps
-/// `:'<,'>s` from editing outside the selection, at the cost of one
-/// divergence from real vim — a single-line `:s/\n//` cannot join with
-/// the next line.
+/// The last line's own break is **excluded**, and that is the entire enforcement of the range
+/// bound: a `\n` pattern can never consume the break separating `last` from the line after it,
+/// so `:'<,'>s` cannot edit outside the selection.  One divergence from real vim follows — a
+/// single-line `:s/\n//` cannot join with the next line.
 ///
-/// A `:%s` resolves `last` to ropey's phantom line *after* a trailing
-/// newline, which has no break of its own to strip — so `:%s` does see
-/// the file's final newline and may consume it.
+/// `:%s` resolves `last` to ropey's phantom line after a trailing newline, which has no break to
+/// strip, so it does see (and may consume) the file's final newline.
 pub(crate) fn region_haystack(
     buffer: &crate::document::Buffer,
     first: usize,
@@ -422,15 +355,12 @@ pub(crate) fn region_haystack(
     (hay, start_char, start_byte)
 }
 
-/// Length in chars of the line-break sequence ending `line`, or 0 when it
-/// has none (the buffer's last line).  Not a bare `strip_suffix('\n')`:
-/// ropey is built with default features, so it splits lines on the full
-/// Unicode set (a lone `\r`, VT, FF, NEL, LS, PS as well as LF) and a line
-/// may end in any of them.  (`\r\n` never reaches here — document text is
-/// normalized to pure `\n` on load; see `Buffer::load_file` — but a lone
-/// `\r` embedded in content still splits a line, hence the `'\r'` arm.)
-/// Each is one char, matching what the old per-line `strip_suffix('\n')`
-/// did, and keeping `(?m)$` anchoring in the same place.
+/// Length in chars of the line-break ending `line`, or 0 for the buffer's last line.
+///
+/// Not a bare `strip_suffix('\n')`: ropey splits lines on the full Unicode set (lone `\r`, VT,
+/// FF, NEL, LS, PS as well as LF).  `\r\n` never reaches here — text is normalized on load —
+/// but a lone `\r` in content still splits a line.  Each break is one char, which keeps `(?m)$`
+/// anchoring in the same place.
 fn line_break_len(line: ropey::RopeSlice) -> usize {
     let n = line.len_chars();
     if n == 0 {
@@ -443,30 +373,20 @@ fn line_break_len(line: ropey::RopeSlice) -> usize {
     ))
 }
 
-/// Visit every match a substitution over `hay` would act on, in document
-/// order, passing each one's captures and the **buffer line its match
-/// starts on**.  Returns `Ok(true)` for a complete walk, `Ok(false)` when
-/// `on_match` broke out (the preview's match cap).
+/// Visit every match a substitution over `hay` would act on, in document order, passing each
+/// one's captures and the **buffer line its match starts on**.  `Ok(false)` when `on_match`
+/// broke out (the preview's match cap).
 ///
-/// This is the single match-finding implementation: the commit path, the
-/// replacement preview, and the highlight-only preview all drive it, so
-/// what the preview highlights is by construction what pressing Enter
-/// replaces.
+/// The single match-finding implementation, driven by the commit path and both preview modes,
+/// so what the preview highlights is by construction what Enter replaces.
 ///
-/// The two flag arms differ in more than a `break`:
-///
-/// - **`global`** delegates to `captures_iter`, so the engine's own
-///   empty-match advancement rules apply unchanged (`:%s/a*/X/g` must
-///   behave exactly as it did when this walked one line at a time).
-/// - **Non-global** is vim's real per-line rule — the first match
-///   *starting on* each line — so after an accepted match it resumes at
-///   the start of the line following the last line that match covered.
-///   `captures_from_pos` (not `captures(&hay[pos..])`) keeps the
-///   preceding text as context, so `(?m)^` at the resume point only
-///   fires when it really follows a line break and lookbehind still
-///   sees what precedes it.  The resume is strictly greater than the
-///   match start even for a zero-width match, so the loop always
-///   terminates without an explicit char bump.
+/// - **`global`** delegates to `captures_iter`, keeping the engine's empty-match advancement
+///   rules unchanged.
+/// - **Non-global** implements vim's per-line rule — the first match *starting on* each line —
+///   resuming at the line after the last one the match covered.  `captures_from_pos` (not
+///   `captures(&hay[pos..])`) keeps the preceding text as context, so `(?m)^` fires only after
+///   a real line break and lookbehind still sees what precedes.  The resume is strictly past
+///   the match start even for a zero-width match, so the loop always terminates.
 pub(crate) fn for_each_region_match<F>(
     buffer: &crate::document::Buffer,
     base_byte: usize,
@@ -502,10 +422,9 @@ where
         if on_match(&caps, start_line).is_break() {
             return Ok(false);
         }
-        // Last line the match actually covered.  A non-empty match ending
-        // exactly at a line start (any pattern ending in `\n`) stopped
-        // *before* that line's first char, so that line is still eligible
-        // — without this correction the scan would skip it wholesale.
+        // Last line the match actually covered.  A non-empty match ending exactly at a line
+        // start stopped *before* that line's first char, so that line is still eligible;
+        // without this correction the scan would skip it wholesale.
         let end_line = buffer.byte_to_line(base_byte + whole.end());
         let covered = if whole.end() > whole.start()
             && base_byte + whole.end() == buffer.rope().line_to_byte(end_line)
@@ -514,8 +433,7 @@ where
         } else {
             end_line.max(start_line)
         };
-        // Resume at the start of the next line, or end the walk when that
-        // is past the region.
+        // Resume at the next line's start, or end the walk when that is past the region.
         let next = covered + 1;
         pos = if next >= buffer.line_count() {
             hay.len() + 1
@@ -529,21 +447,13 @@ where
     Ok(true)
 }
 
-/// Build the combined edit for a substitution without applying anything.
-/// Returns `Ok(None)` when the pattern never matched (or the buffer is
-/// empty) — the commit path turns that into "Pattern not found".
+/// Build the combined edit for a substitution without applying it.  `Ok(None)` when the pattern
+/// never matched (or the buffer is empty) — the commit path turns that into "Pattern not found".
 ///
-/// The regex runs over the whole resolved range at once
-/// ([`region_haystack`]), not line by line, so a pattern may match across
-/// a line break.  `^`/`$` still anchor per line because both compile
-/// sites set `multi_line(true)`, and `.` still refuses to cross a break
-/// (`dot_matches_new_line` stays off).
-///
-/// `match_cap` bounds the walk for the live preview.  It stops on a
-/// **match** boundary rather than a line boundary: `removed` is then the
-/// prefix of the region that `inserted` actually transformed, which stays
-/// a verbatim slice of buffer text however the matches straddle lines.
-/// The commit path passes `None` — a real `:%s` is never truncated.
+/// `match_cap` bounds the walk for the live preview, stopping on a **match** boundary rather
+/// than a line boundary: `removed` is then the prefix of the region `inserted` actually
+/// transformed, which stays a verbatim slice of buffer text however matches straddle lines.
+/// The commit path passes `None`.
 pub(crate) fn build_substitution(
     buffer: &crate::document::Buffer,
     cursor_line: usize,
@@ -559,8 +469,7 @@ pub(crate) fn build_substitution(
     };
     let (hay, start_char, base_byte) = region_haystack(buffer, first, last);
 
-    // `out` is one contiguous string whose byte 0 sits at `base_byte`, and
-    // text before the region is untouched by the delta — so a span in
+    // `out`'s byte 0 sits at `base_byte` and text before the region is untouched, so a span in
     // `out` is already a valid absolute post-apply byte range.
     let mut out = String::new();
     let mut copied = 0usize;
@@ -588,8 +497,7 @@ pub(crate) fn build_substitution(
     if total == 0 {
         return Ok(None);
     }
-    // `copied` is always a match end, hence a char boundary — a legal cut
-    // for both the transformed text and the original it came from.
+    // `copied` is always a match end, hence a char boundary in both strings.
     let removed = if completed {
         out.push_str(&hay[copied..]);
         hay
@@ -614,8 +522,7 @@ pub(crate) fn build_substitution(
 mod tests {
     use super::*;
 
-    /// `rep: None` models a missing replacement field (`:s/foo`, no second
-    /// delimiter) — `replacement_present` false, empty replacement.
+    /// `rep: None` models a missing replacement field (`:s/foo`, no second delimiter).
     fn sub(
         range: SubstituteRange,
         pat: &str,
@@ -722,8 +629,7 @@ mod tests {
         assert_eq!(parse_ex(" 1 "), Ok(ExCommand::GoToLine(1)));
         // `:$` is the last line; the motion layer does the clamping.
         assert_eq!(parse_ex("$"), Ok(ExCommand::GoToLine(u32::MAX)));
-        // A number past `u32` saturates rather than erroring — it lands on
-        // the last line either way.
+        // A number past `u32` saturates rather than erroring.
         assert_eq!(
             parse_ex("99999999999999"),
             Ok(ExCommand::GoToLine(u32::MAX))
@@ -765,9 +671,8 @@ mod tests {
 
     #[test]
     fn replacement_present_tracks_the_second_delimiter() {
-        // `s/foo/` and `s/foo` both parse to an empty replacement, but only
-        // the former typed the second delimiter — the live preview keys the
-        // highlight-only vs. deletion-preview distinction off this bit.
+        // Both parse to an empty replacement; the live preview keys highlight-only vs.
+        // deletion-preview off which one typed the second delimiter.
         assert_eq!(
             parse_ex("s/foo/"),
             Ok(sub(CurrentLine, "foo", Some(""), false, false))
@@ -807,8 +712,7 @@ mod tests {
             parse_ex("'<,'>%s/a/b/"),
             Ok(sub(AllLines, "a", Some("b"), false, false))
         );
-        // The write / quit family ignores a `'<,'>` prefix (Visual `:` inserts
-        // it) and acts on the whole buffer.
+        // The write / quit family ignores a `'<,'>` prefix and acts on the whole buffer.
         assert_eq!(parse_ex("'<,'>w"), Ok(ExCommand::Write));
         assert_eq!(parse_ex("'<,'>wq"), Ok(ExCommand::WriteQuit));
         assert_eq!(parse_ex("'<,'>q"), Ok(ExCommand::Quit));
@@ -857,12 +761,10 @@ mod tests {
     #[test]
     fn region_haystack_excludes_the_last_lines_own_newline() {
         let b = Buffer::from_str("a\nb\nc\n");
-        // Lines 0..=1: the break after "b" belongs to line 1 and is
-        // dropped, so no pattern can reach line 2.
+        // The break after "b" belongs to line 1 and is dropped, so nothing can reach line 2.
         assert_eq!(region_haystack(&b, 0, 1).0, "a\nb");
-        // `:%s` resolves `last` to the phantom line after the trailing
-        // newline, which has no break of its own — so the region really
-        // is the whole file, final newline included.
+        // `:%s` resolves `last` to the phantom line after the trailing newline, so the region
+        // really is the whole file.
         assert_eq!(region_haystack(&b, 0, b.line_count() - 1).0, "a\nb\nc\n");
         // A buffer with no trailing newline loses nothing either.
         let b2 = Buffer::from_str("a\nb");
@@ -879,17 +781,15 @@ mod tests {
         let edit = build_substitution(&b, 0, &re(&s.pattern), &s, None, None)
             .unwrap()
             .expect("matched");
-        // Match 1 covers lines 0-1, so the scan resumes at line 2 (not
-        // line 1); match 2 covers 2-3; line 4 has no room left.
+        // Match 1 covers lines 0-1, so the scan resumes at line 2; match 2 covers 2-3.
         assert_eq!(edit.count, 2);
         assert_eq!(edit.delta.inserted, "X\nX\ne");
     }
 
     #[test]
     fn a_match_ending_at_a_line_start_leaves_that_line_eligible() {
-        // Pattern `\n` ends exactly on the next line's first byte.  If the
-        // resume rule skipped to `end_line + 1`, every other line would be
-        // silently passed over.
+        // Pattern `\n` ends exactly on the next line's first byte; a resume rule of
+        // `end_line + 1` would silently skip every other line.
         let b = Buffer::from_str("a\nb\nc\nd");
         let s = substitution(sub(AllLines, r"\n", Some("-"), false, false));
         let edit = build_substitution(&b, 0, &re(&s.pattern), &s, None, None)
@@ -907,9 +807,8 @@ mod tests {
             .unwrap()
             .expect("matched");
         assert_eq!(edit.count, 2);
-        // `removed` must stay a verbatim prefix of the region's text —
-        // cutting on a *line* boundary would leave it misaligned once
-        // matches straddle lines.
+        // `removed` must stay a verbatim prefix of the region: a *line*-boundary cut would
+        // misalign it once matches straddle lines.
         assert_eq!(edit.delta.removed, "a\na\n");
         assert_eq!(edit.delta.inserted, "bb");
         assert!(b.contents().starts_with(&edit.delta.removed));
@@ -917,8 +816,7 @@ mod tests {
 
     #[test]
     fn a_match_cannot_escape_the_resolved_range() {
-        // The visual range is lines 0..=1; the break after "b" is outside
-        // the region, so only the break after "a" can match.
+        // The break after "b" is outside the range, so only the one after "a" can match.
         let b = Buffer::from_str("a\nb\nc\nd");
         let s = substitution(sub(VisualRange, r"\n", Some("-"), true, false));
         let edit = build_substitution(&b, 0, &re(&s.pattern), &s, Some((0, 1)), None)
@@ -937,8 +835,7 @@ mod tests {
             .unwrap()
             .expect("matched");
         assert_eq!(edit.delta.inserted, "XY\nXY\n");
-        // Offsets index the rewritten buffer, whose text before the region
-        // (here, nothing) is unchanged.
+        // Offsets index the rewritten buffer; text before the region is unchanged.
         assert_eq!(edit.replaced_ranges, vec![0..2, 3..5]);
     }
 }

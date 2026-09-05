@@ -1,26 +1,16 @@
-//! Viewport / scroll arithmetic for `EditorState`.
-//!
-//! Scroll bounds are measured in **visual** rows for Rendered/Preview mode
-//! (long lines wrap at `viewport_width` and consume multiple rows) and in
-//! buffer lines for Raw mode.  Methods here keep that distinction
-//! transparent to callers: pass viewport width and let the implementation
-//! pick the right ruler.
+//! Viewport / scroll arithmetic for `EditorState`.  Scroll bounds are visual rows (wrapped
+//! at `viewport_width`) in Rendered/Preview and buffer lines in Raw; pass the width and the
+//! implementation picks the ruler.
 
 use crate::document::visual_cache::VisualRowCache;
 use crate::editor::state::{line_text_trimmed, raw_cursor_visual_row, rendered_cursor_visual_row};
 use crate::editor::{EditorState, Mode};
 
-/// Raw-mode visual-row cache entry.  Pairs a [`VisualRowCache`] with the
-/// `Buffer::version()` it was built from so a cheap `u64` comparison
-/// detects edits that have invalidated the cached prefix sum.
-///
-/// Width-mismatch invalidation is handled by [`VisualRowCache`] itself —
-/// only the buffer-version key is unique to raw mode.
+/// Raw-mode visual-row cache entry: a [`VisualRowCache`] keyed by the `Buffer::version()`
+/// it was built from (width invalidation is the cache's own job).
 #[derive(Debug, Clone)]
 pub(crate) struct RawVisualRowCache {
-    /// `Buffer::version()` snapshot at the time the cache was built.
     buffer_version: u64,
-    /// The actual prefix-sum table.
     inner: VisualRowCache,
 }
 
@@ -29,8 +19,7 @@ impl EditorState {
         self.scroll = self.scroll.saturating_sub(n);
     }
 
-    /// Scroll down by `n` visual rows. The maximum scroll is set so that the
-    /// last visual row can reach the very top of the viewport.
+    /// Scroll down by `n` visual rows; the last row may reach the top of the viewport.
     pub fn scroll_down(&mut self, n: usize, _viewport_height: usize) {
         let total = self.total_visual_rows_for_mode(self.viewport_width);
         let max = total.saturating_sub(1);
@@ -42,11 +31,6 @@ impl EditorState {
     }
 
     /// Scroll so the last document line sits at the bottom of the viewport.
-    ///
-    /// `viewport_width` is used to compute visual-wrap-aware scroll positions
-    /// in Rendered/Preview mode, where long rendered lines may wrap onto
-    /// multiple visual rows.  In Raw mode visibility is measured by logical
-    /// buffer lines, so `viewport_width` is ignored.
     pub fn scroll_to_bottom(&mut self, viewport_height: usize, viewport_width: usize) {
         let total = self.total_visual_rows_for_mode(viewport_width);
         if total == 0 {
@@ -56,11 +40,8 @@ impl EditorState {
         }
     }
 
-    /// Smallest scroll offset such that rendered line `target_last` fits on the
-    /// last visual row of a viewport of `viewport_height` rows, accounting for
-    /// word-wrap at `viewport_width`.  Walks backward from `target_last`,
-    /// accumulating visual rows, and stops when adding another line would
-    /// overflow the viewport.
+    /// Smallest scroll offset at which rendered line `target_last` still fits on the last
+    /// visual row of a `viewport_height`-row viewport wrapped at `viewport_width`.
     #[allow(dead_code)]
     pub(crate) fn scroll_for_last_visible(
         &self,
@@ -80,13 +61,10 @@ impl EditorState {
         let mut rows_used = 0usize;
         let mut line_idx = target_last;
         loop {
-            // O(1) cache lookup — the historical inline `visual_rows_for_line`
-            // call here was a per-keystroke cost on long documents.
             let rows = self
                 .parsed
                 .visual_rows_for_line_at(line_idx, viewport_width);
             if rows_used + rows > viewport_height {
-                // Including this line would overflow — start from the next one.
                 return line_idx + 1;
             }
             rows_used += rows;
@@ -97,9 +75,7 @@ impl EditorState {
         }
     }
 
-    /// If the cursor has scrolled above the top of the viewport (because the
-    /// user scrolled down past it), move the cursor to the first visible line.
-    /// No-op in Preview mode (no editing cursor there).
+    /// Pull a cursor that was scrolled off the top back to the first visible line.
     pub fn clamp_cursor_to_viewport_top(&mut self) {
         if self.mode == Mode::Preview {
             return;
@@ -127,12 +103,6 @@ impl EditorState {
     }
 
     /// Ensure the cursor is visible within the viewport.
-    ///
-    /// In Raw mode, visibility is based on buffer line numbers.
-    /// In Rendered/Preview mode, visibility is measured in visual rows —
-    /// long rendered lines wrap at `viewport_width` and consume multiple rows,
-    /// so scroll bounds must account for that or the last lines of the
-    /// document get pushed off-screen.
     pub fn ensure_cursor_visible(&mut self, viewport_height: usize, viewport_width: usize) {
         if viewport_height == 0 {
             return;
@@ -146,9 +116,7 @@ impl EditorState {
         }
     }
 
-    /// Sum of visual rows for rendered lines `first..=last`, wrapped at
-    /// `width`.  Delegates to the per-frame visual-row cache.  Used by
-    /// tests in this crate.
+    /// Sum of visual rows for rendered lines `first..=last` wrapped at `width` (test helper).
     #[allow(dead_code)]
     pub(crate) fn visual_rows_between(&self, first: usize, last: usize, width: usize) -> usize {
         self.parsed.visual_rows_between(first, last, width)
@@ -170,26 +138,14 @@ impl EditorState {
         self.with_raw_visual_cache(width, |c| c.total())
     }
 
-    /// Run `f` against the raw-mode visual-row cache, rebuilding it first
-    /// if either the buffer version or the width has changed since the
-    /// last build.  Keeps a small LRU of recent (width) entries — the
-    /// editor-view layout queries at two distinct widths per frame
-    /// (the full doc-area width to decide on a scrollbar gutter, and
-    /// the post-gutter width for scrollbar metrics + `viewport_width`),
-    /// so a single-slot cache thrashes on every frame.  Two-phase borrow
-    /// keeps the immutable check separate from the `borrow_mut` so we
-    /// don't alias the `RefCell`.
+    /// Run `f` against the raw-mode visual-row cache, rebuilding on a buffer-version or width
+    /// change.  A small LRU of widths is kept because the editor view queries two distinct
+    /// widths per frame (pre- and post-scrollbar-gutter), so a single slot would thrash.
     fn with_raw_visual_cache<R>(&self, width: usize, f: impl FnOnce(&VisualRowCache) -> R) -> R {
-        /// Distinct widths kept warm — must be ≥ 2 so the per-frame
-        /// "decide bar / display bar" two-width pattern doesn't churn.
+        /// Must be ≥ 2 for the two-width-per-frame pattern.
         const LRU_CAP: usize = 2;
         let width = width.max(1);
         let buffer_version = self.buffer.version();
-        // Promote-or-build pass.  If a warm entry matches both the
-        // buffer version and width, move it to the front of the LRU.
-        // Otherwise build a fresh entry and prepend, evicting beyond
-        // LRU_CAP.  A buffer-version mismatch invalidates the entire
-        // cache because every entry is keyed off the same buffer.
         let mut entries = self.raw_visual_rows.borrow_mut();
         if entries
             .first()

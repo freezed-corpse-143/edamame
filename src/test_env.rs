@@ -1,43 +1,30 @@
 //! Test-only helpers for mutating process environment variables.
 //!
-//! **Crate-wide, deliberately.**  `std::env::set_var` is `unsafe` because
-//! it races any concurrent `env::var` in the same process — and cargo runs
-//! every test in a binary on parallel threads.  A per-module lock is
-//! therefore not enough: `config::config` mutates `XDG_CONFIG_HOME` while
-//! `cli::doctor` reads it, and `terminal::capabilities` mutates
-//! `TERM_PROGRAM` while `cli::doctor` reads that too.  One lock shared by
-//! the whole crate is what actually excludes them.
+//! **The lock is crate-wide, deliberately.**  `std::env::set_var` is `unsafe` because it races any
+//! concurrent `env::var`, and cargo runs a binary's tests on parallel threads.  A per-module lock
+//! can't exclude the real pairs: `config::config` writes `XDG_CONFIG_HOME` while `cli::doctor`
+//! reads it, and `terminal::capabilities` writes `TERM_PROGRAM` while `cli::doctor` reads that.
 //!
-//! Two rules for any test that touches the environment:
+//! Two rules for any test touching the environment:
 //!
-//! 1. Take [`env_lock`] first, and hold it for the whole test.
-//! 2. Mutate only through [`EnvGuard`], so the variable is restored even
-//!    if an assertion panics — a leaked `XDG_CONFIG_HOME` pointing at a
-//!    deleted `tempdir` fails every later config test for no reason.
+//! 1. Take [`env_lock`] first and hold it for the whole test — readers included, since a read is
+//!    the other half of the same race.
+//! 2. Mutate only through [`EnvGuard`], so a panicking assertion can't leak an `XDG_CONFIG_HOME`
+//!    pointing at a deleted tempdir and fail every later config test.
 //!
-//! A test that only *reads* the environment must also take the lock; it
-//! is the read side of the same race.
-//!
-//! The same lock also serialises [`config::persistence::SuppressGuard`],
-//! which flips a process-global `AtomicBool` rather than an environment
-//! variable — and the read side of *that* race is easy to miss, because
-//! such a test touches no environment variable of its own.  Any test
-//! that observes `config_reads_allowed` / `config_writes_allowed` — which
-//! means any test calling `list_export_stylesheets`, `list_theme_names`,
-//! `read_theme_named`, or `Config::save` — must take the lock too, or it
-//! reads the gate while a suppressing test on another thread holds it
-//! closed and sees an empty list it can't explain.
+//! The same lock serialises [`config::persistence::SuppressGuard`], which flips a process-global
+//! `AtomicBool`.  That read side is easy to miss because such a test touches no environment
+//! variable of its own: anything observing the config gate — `list_export_stylesheets`,
+//! `list_theme_names`, `read_theme_named`, `Config::save` — must take the lock, or it reads the
+//! gate while another thread holds it closed and sees an inexplicably empty list.
 //!
 //! [`config::persistence::SuppressGuard`]: crate::config::persistence::SuppressGuard
 
 use std::env;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-/// Serialises every environment-touching test in the crate.
-///
-/// Poisoning is ignored: [`EnvGuard`]'s `Drop` has already restored the
-/// variable by the time a panicking test releases the lock, so there is
-/// no corrupt state for the next holder to inherit.
+/// Serialises every environment-touching test in the crate.  Poisoning is ignored: [`EnvGuard`]'s
+/// `Drop` has already restored the variable by the time a panicking test releases the lock.
 pub fn env_lock() -> MutexGuard<'static, ()> {
     static M: OnceLock<Mutex<()>> = OnceLock::new();
     M.get_or_init(|| Mutex::new(()))
@@ -45,8 +32,7 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// Sets (or clears) one environment variable and restores its previous
-/// value on drop.  Create it only while holding [`env_lock`].
+/// Sets or clears one environment variable, restoring it on drop.  Create only under [`env_lock`].
 pub struct EnvGuard {
     key: &'static str,
     prev: Option<String>,
@@ -88,34 +74,27 @@ impl Drop for EnvGuard {
     }
 }
 
-/// The crate-wide env lock plus suppressed config reads and writes, as
-/// one guard.
+/// The crate-wide env lock plus suppressed config reads and writes, as one guard.
 ///
-/// A test that drives a code path calling [`Config::save`] must hold
-/// this.  Nothing in the test environment redirects
-/// `~/.config/edamame` by default, so an unguarded `save()` rewrites the
-/// *developer's own* config — and a value asserted in a test is exactly
-/// the kind of value that does damage there (an update-check test
-/// recording a `v999.0.0` tag suppresses the real update notice
-/// forever).  Suppressing the gate is preferable to pointing
-/// `XDG_CONFIG_HOME` at a tempdir: the write is what the test wants
-/// gone, not merely relocated, and `Config::save` already returns
-/// `Ok(())` under it, so no assertion has to know.
+/// **Any test that can reach [`Config::save`] must hold this.**  Nothing redirects
+/// `~/.config/edamame` during a test run, so an unguarded save rewrites the *developer's own*
+/// config — with exactly the damaging values tests assert (an update-check test recording
+/// `v999.0.0` silences the real update notice forever).  Suppressing the gate beats pointing
+/// `XDG_CONFIG_HOME` at a tempdir: the write should be gone, not relocated, and `Config::save`
+/// still returns `Ok(())`.
 ///
-/// Reads are suppressed alongside writes because the gate is one flag —
-/// see [`crate::config::persistence`].  A test that needs a real write
-/// (`save_writes_nothing_while_config_writes_are_suppressed`) takes
-/// [`env_lock`] and an [`EnvGuard`] on `XDG_CONFIG_HOME` instead.
+/// Reads are suppressed alongside writes because the gate is one flag (see
+/// [`crate::config::persistence`]).  The one test needing a real write takes [`env_lock`] plus an
+/// [`EnvGuard`] on `XDG_CONFIG_HOME` instead.
 pub struct ConfigIsolation {
-    // Declaration order is drop order: the suppression must be lifted
-    // while the lock is still held, or another test observes the gate
-    // mid-restore.
+    // Declaration order is drop order: the suppression must lift while the lock is still held, or
+    // another test observes the gate mid-restore.
     _suppress: crate::config::persistence::SuppressGuard,
     _lock: MutexGuard<'static, ()>,
 }
 
-/// Take [`ConfigIsolation`] for the rest of the current scope.  Hold it
-/// for the whole test body, and take it only once — it is a mutex.
+/// Take [`ConfigIsolation`] for the current scope.  Hold it for the whole test body and take it
+/// only once — it is a mutex.
 pub fn config_isolation() -> ConfigIsolation {
     let lock = env_lock();
     ConfigIsolation {

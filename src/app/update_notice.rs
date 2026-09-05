@@ -1,24 +1,13 @@
-//! App-level orchestration for the update check: when to spawn one,
-//! what to do with the answer, and when a startup finding is allowed to
-//! interrupt.
+//! App-level orchestration for the update check: when to spawn one, what to do with the
+//! answer, and when a startup finding may interrupt.  [`super::update_check`] is the pure
+//! fetch/parse/policy leaf; this is the plumbing around it.
 //!
-//! [`super::update_check`] is the pure fetch/parse/policy leaf; this is
-//! the plumbing around it, in its own file for the same reason
-//! `autosave.rs` and `diff_advance.rs` are — it is a small state
-//! machine with its own timing, and `actions.rs` is already large.
-//!
-//! The one genuinely awkward part is *when* the startup notice may
-//! appear.  Every other startup modal is built synchronously in
-//! `App::new` and pushed in one deliberate priority order; this one
-//! depends on a network result that arrives long after that ordering
-//! has been decided, so it cannot join the batch.  Instead a finding is
-//! parked in `pending_update_notice` and [`App::tick_update_notice`]
-//! pushes it on the first frame the modal stack is empty — which is a
-//! member of the existing `tick_timers` family, not a new per-frame
-//! mechanism.  Gating on "stack is empty" rather than on "no welcome
-//! modal" is what makes it robust: it cannot stomp the first-run
-//! welcome, a config warning, the capabilities notice, or anything
-//! added later, without needing to know any of them exist.
+//! The awkward part is *when* the startup notice may appear.  Every other startup modal is
+//! built synchronously in `App::new`, but this one depends on a network result arriving
+//! after that ordering is decided, so a finding is parked in `pending_update_notice` and
+//! [`App::tick_update_notice`] pushes it on the first frame the stack is empty.  Gating on
+//! "stack is empty" rather than "no welcome modal" means it cannot stomp any other startup
+//! modal without needing to know it exists.
 
 use super::modal;
 use super::update_check::{self, ReleaseInfo, ReleaseStatus};
@@ -29,19 +18,11 @@ impl App {
 
     /// Run the automatic check, if [`App::new`] decided one was due.
     ///
-    /// A member of the `tick_timers` family rather than a one-shot call
-    /// from `run()`, because it may have to wait: the first-run welcome
-    /// modal is where the user answers the `check_for_updates`
-    /// question, and firing the request before they have answered would
-    /// make the request the setting exists to gate — the one launch
-    /// where consent is actually asked for would be the one launch that
-    /// asks too late.  So while that modal is up the decision stays
-    /// parked, and the setting is re-read *after* it closes so a
-    /// decline is honored on the very first run.
-    ///
-    /// Only the welcome gates it; the config warning and the
-    /// capabilities notice are not consent surfaces for this and a
-    /// check behind them is silent either way.
+    /// A `tick_timers` member rather than a one-shot call because it may have to wait: the
+    /// first-run welcome modal is where `check_for_updates` is answered, so while it is up
+    /// the decision stays parked and the setting is re-read *after* it closes — a first-run
+    /// decline is then honored on that same launch.  Only the welcome gates it; it is the
+    /// only consent surface for this.
     pub(super) fn spawn_startup_update_check(&mut self) {
         if !self.startup_update_check_due {
             return;
@@ -50,28 +31,22 @@ impl App {
             return;
         }
         self.startup_update_check_due = false;
-        // Re-read rather than trusting the decision `App::new` made:
-        // the welcome that just closed may have turned the check off.
+        // Re-read: the welcome that just closed may have turned the check off.
         if !self.config.editor.check_for_updates {
             return;
         }
         if !self.spawn_release_check_tracked(true) {
             return;
         }
-        // Stamped at *spawn*, not on arrival.  A worker that hangs
-        // until the timeout, or a process killed before the result
-        // lands, would otherwise leave the clock untouched and re-check
-        // on every single launch — the retry storm the throttle exists
-        // to prevent.  The cost is that a transient failure waits out
-        // the full interval before trying again, which is the right
-        // trade for a notification nobody is waiting on.
+        // Stamped at *spawn*, not on arrival: a hung worker or a process killed before
+        // the result lands would otherwise re-check on every launch.  The cost is that a
+        // transient failure waits out the full interval.
         self.config.editor.last_update_check = update_check::now_unix();
         self.save_update_bookkeeping("last-update-check timestamp");
     }
 
-    /// Spawn a check unless one is already in flight.  Returns whether
-    /// a worker was actually started.  The single spawn site, so
-    /// `release_check_in_flight` and `update_check_is_startup` can't
+    /// Spawn a check unless one is in flight; returns whether a worker started.  The
+    /// single spawn site, so `release_check_in_flight` and `update_check_is_startup` can't
     /// disagree about what is running.
     fn spawn_release_check_tracked(&mut self, is_startup: bool) -> bool {
         if self.release_check_in_flight {
@@ -88,8 +63,7 @@ impl App {
 
     // ── Result ─────────────────────────────────────────────────────────────
 
-    /// Route a resolved release check.  Replaces what used to be an
-    /// inline arm in `handle_async_event`.
+    /// Route a resolved release check.
     pub(super) fn handle_release_check_result(&mut self, result: Result<ReleaseInfo, String>) {
         self.release_check_in_flight = false;
         let was_startup = std::mem::take(&mut self.update_check_is_startup);
@@ -99,8 +73,7 @@ impl App {
         let status = ReleaseStatus::from_fetch(result);
         self.latest_release = Some(status.clone());
 
-        // An open modal is showing this result live — the explicit
-        // path, or a startup notice the user has already been handed.
+        // An open modal shows this result live.
         let mut on_screen = false;
         if let Some(open) = self.modal_stack.find_first_mut::<modal::UpdateModal>() {
             open.set_status(status.clone());
@@ -108,10 +81,8 @@ impl App {
         }
 
         if on_screen {
-            // Already told, by definition.  Recording it here keeps
-            // "at most one notice per version" true across the
-            // explicit path too, so a user who checked by hand isn't
-            // greeted by the same news at the next launch.
+            // Already told: keeps "at most one notice per version" true for the explicit
+            // path too, so a manual check isn't repeated at the next launch.
             self.mark_update_notified(&status);
         } else if was_startup {
             if let Some(info) =
@@ -124,8 +95,6 @@ impl App {
     }
 
     /// Push a parked startup finding once nothing else is on screen.
-    /// A no-op on every frame but the one where that first becomes
-    /// true, in the shape of the other `tick_*` members.
     pub(super) fn tick_update_notice(&mut self) {
         if self.pending_update_notice.is_none() || !self.modal_stack.is_empty() {
             return;
@@ -142,25 +111,18 @@ impl App {
 
     // ── Explicit check ─────────────────────────────────────────────────────
 
-    /// Open the update modal on demand — the About page's
-    /// `[ Check for updates ]` button and the `CheckForUpdates`
-    /// palette action both land here.
+    /// Open the update modal on demand (About page button, `CheckForUpdates` action).
     ///
-    /// An explicit request always re-fetches, ignoring the daily
-    /// throttle: that gate bounds unattended chatter, and this is the
-    /// opposite of unattended.  A cached *positive* result is shown
-    /// meanwhile so the modal isn't blank — including an `Inconclusive`
-    /// one, which reached GitHub and has both version numbers to show.
-    /// A cached *failure* is not, because re-showing "couldn't check"
-    /// while a fresh attempt is already running would be answering a
-    /// question the user just asked again with a stale answer.
+    /// Always re-fetches, ignoring the daily throttle — that gate bounds *unattended*
+    /// chatter.  A cached positive result (`Inconclusive` included) is shown meanwhile so
+    /// the modal isn't blank; a cached *failure* is not, since answering a just-asked
+    /// question with a stale "couldn't check" is worse than showing the fetch in progress.
     pub fn open_update_modal(&mut self) {
         if self.modal_stack.contains::<modal::UpdateModal>() {
             return;
         }
         self.spawn_release_check_tracked(false);
-        // A queued startup notice is superseded — the user is about to
-        // see the same thing, and it must not reappear afterwards.
+        // A queued startup notice is superseded and must not reappear afterwards.
         self.pending_update_notice = None;
 
         let status = match self.latest_release.clone() {
@@ -179,9 +141,8 @@ impl App {
 
     // ── Bookkeeping ────────────────────────────────────────────────────────
 
-    /// Record that the user has been shown this release, so the
-    /// startup notice doesn't repeat it.  A no-op for every status but
-    /// `Available` — there is nothing to suppress about good news.
+    /// Record that the user has seen this release, so the startup notice doesn't repeat
+    /// it.  A no-op for every status but `Available`.
     fn mark_update_notified(&mut self, status: &ReleaseStatus) {
         let ReleaseStatus::Available(info) = status else {
             return;
@@ -193,17 +154,10 @@ impl App {
         self.save_update_bookkeeping("update-notified tag");
     }
 
-    /// Persist background bookkeeping *without* the "Configuration
-    /// updated" flash `save_config_with_flash` raises: the user changed
-    /// no setting, and a toast for a timestamp write is pure noise.
-    /// Under `--no-config` `Config::save` already declines to write, so
-    /// this needs no gate of its own — the session simply re-checks on
-    /// the next launch, which is what that flag promises.
-    ///
-    /// `pub(super)` for [`super::post_upgrade`], whose
-    /// `last_version_seen` stamp is the same kind of write for the
-    /// same reasons; one helper so the two can't phrase their failure
-    /// logging differently.
+    /// Persist background bookkeeping *without* the "Configuration updated" flash: the
+    /// user changed no setting.  Under `--no-config`, `Config::save` already declines to
+    /// write, so no gate is needed here.  `pub(super)` for [`super::post_upgrade`], whose
+    /// `last_version_seen` stamp is the same kind of write.
     pub(super) fn save_update_bookkeeping(&mut self, what: &str) {
         if let Err(e) = self.config.save() {
             tracing::warn!(
@@ -222,15 +176,10 @@ mod tests {
     use crate::app::test_utils::make_app;
     use crate::app::AppEvent;
 
-    /// A `make_app()` plus the config-isolation guard, as one call.
-    ///
-    /// Every test here drives a path that can reach `Config::save`
-    /// (`mark_update_notified` and the startup stamp both persist), and
-    /// nothing redirects `~/.config/edamame` in a test run — so an
-    /// unguarded test would rewrite the developer's own config, and
-    /// leave `update_notified_for = "v999.0.0"` in it, silencing the
-    /// real update notice for good.  Returned as a tuple so the guard
-    /// outlives the test body: `let (_iso, mut app) = isolated_app();`.
+    /// A `make_app()` plus the config-isolation guard.  Every test here can reach
+    /// `Config::save`, which unguarded would leave `update_notified_for = "v999.0.0"` in
+    /// the developer's own config and silence the real notice for good.  Returned as a
+    /// tuple so the guard outlives the test body.
     fn isolated_app() -> (crate::test_env::ConfigIsolation, App) {
         let iso = crate::test_env::config_isolation();
         let app = make_app();
@@ -244,8 +193,7 @@ mod tests {
         }
     }
 
-    /// A tag no real build will reach, so `is_newer` says yes whatever
-    /// `CARGO_PKG_VERSION` happens to be.
+    /// A tag no real build will reach, so `is_newer` says yes whatever the version is.
     const NEWER: &str = "v999.0.0";
 
     #[test]
@@ -254,7 +202,6 @@ mod tests {
         app.update_check_is_startup = true;
         app.handle_release_check_result(Ok(info(NEWER)));
         assert_eq!(app.pending_update_notice, Some(info(NEWER)));
-        // Queued, not pushed — the stack decision belongs to the tick.
         assert!(!app.modal_stack.contains::<modal::UpdateModal>());
     }
 
@@ -288,9 +235,8 @@ mod tests {
         assert_eq!(app.pending_update_notice, None);
     }
 
-    /// Dismiss whatever `App::new` queued (a fresh `Config` has
-    /// `show_welcome`, so the first-run welcome modal is always there)
-    /// to reach the "nothing on screen" state the notice waits for.
+    /// Dismiss whatever `App::new` queued (a default config always shows the welcome) to
+    /// reach the "nothing on screen" state the notice waits for.
     fn clear_modals(app: &mut App) {
         while !app.modal_stack.is_empty() {
             app.modal_stack.pop();
@@ -300,8 +246,6 @@ mod tests {
     #[test]
     fn the_notice_waits_for_an_empty_modal_stack() {
         let (_iso, mut app) = isolated_app();
-        // Exactly the case this mechanism exists for: a first run,
-        // where the welcome modal is already up when the check lands.
         assert!(
             app.modal_stack.contains::<modal::WelcomeModal>(),
             "a default config puts the welcome modal on the stack"
@@ -349,7 +293,6 @@ mod tests {
         app.pending_update_notice = Some(info(NEWER));
         app.open_update_modal();
         assert_eq!(app.pending_update_notice, None);
-        // And the tick can't resurrect it once the modal is dismissed.
         clear_modals(&mut app);
         app.tick_update_notice();
         assert!(!app.modal_stack.contains::<modal::UpdateModal>());
@@ -410,8 +353,6 @@ mod tests {
 
     #[test]
     fn the_startup_check_waits_for_the_first_run_welcome() {
-        // The welcome modal is where `check_for_updates` is asked, so
-        // the request must not have gone out before it is answered.
         let (_iso, mut app) = isolated_app();
         assert!(app.modal_stack.contains::<modal::WelcomeModal>());
         app.startup_update_check_due = true;
@@ -426,8 +367,7 @@ mod tests {
 
     #[test]
     fn declining_on_the_welcome_cancels_the_startup_check() {
-        // …and the answer is read *after* the modal closes, so a
-        // first-run decline is honored on that same launch.
+        // The answer is read *after* the modal closes, so a first-run decline is honored.
         let (_iso, mut app) = isolated_app();
         app.startup_update_check_due = true;
         clear_modals(&mut app);

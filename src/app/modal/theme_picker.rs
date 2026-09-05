@@ -1,8 +1,7 @@
-//! Theme picker modal.  Drives a
-//! [`SearchableList<String>`](crate::ui::searchable_list::SearchableList) of
-//! theme names plus an appearance toggle.  Live-preview swaps the palette in
-//! place as focus moves ([`ListEvent::FocusChanged`]); selecting a theme
-//! writes `config.theme`, saves the config, and reapplies the palette.
+//! Theme picker modal: a
+//! [`SearchableList<String>`](crate::ui::searchable_list::SearchableList) of theme names plus an
+//! appearance toggle.  Focus movement live-previews the palette; selecting writes `config.theme`
+//! and saves.
 
 use std::any::Any;
 
@@ -19,18 +18,17 @@ use crate::ui::theme_picker::{build_theme_list, render_theme_picker};
 
 pub struct ThemePickerModal {
     list: SearchableList<String>,
-    /// Theme that was active when the picker opened — drives the `current`
-    /// suffix and the focused-row preselect.
+    /// Theme active when the picker opened — drives the `current` suffix and the preselect.
     current: String,
     /// Live appearance mode (flips with the toggle).
     mode: AppearanceMode,
-    /// Theme active when the picker opened.  Restored on Esc/cancel.
+    /// Restored on Esc/cancel.
     original_theme: String,
     /// Appearance mode active when the picker opened.
     original_mode: AppearanceMode,
-    /// Most-recently-active theme under Dark while this session was open.
+    /// Most-recently-active theme under each mode while the picker has been open, so a
+    /// mode round-trip restores the theme rather than re-resolving it.
     remembered_dark: Option<String>,
-    /// Mirror of `remembered_dark` for Light.
     remembered_light: Option<String>,
     esc_button_rect: Option<Rect>,
     toggle_rect: Option<Rect>,
@@ -77,10 +75,8 @@ impl ThemePickerModal {
             .unwrap_or(&self.original_theme)
     }
 
-    /// Compute + apply the modal-state half of a mode switch: remember the
-    /// outgoing theme, rebuild the list for `target`, re-focus the preview.
-    /// Returns the theme name that should become live; the caller applies it
-    /// to `App`.
+    /// The modal-state half of a mode switch: remember the outgoing theme, rebuild the list for
+    /// `target`, re-focus the preview.  Returns the theme the caller should make live on `App`.
     fn switch_mode(&mut self, target: AppearanceMode) -> String {
         let prev_mode = self.mode;
         let prev_theme = self.current_theme().to_owned();
@@ -125,20 +121,17 @@ impl ThemePickerModal {
         ModalOutcome::CloseAnd(Box::new(move |app| {
             let theme_changed = app.config.theme != name;
             let mode_changed = app.config.appearance != selected_mode;
-            // Commit through `set_theme` unconditionally — even when the
-            // name is unchanged.  On an indexed-color session the user
-            // may be confirming the substituted theme itself, and that
-            // confirmation is exactly what clears the downgrade stash so
-            // the choice reaches disk.
+            // Commit through `set_theme` even when the name is unchanged: on an indexed-color
+            // session the user may be confirming the substituted theme, which clears the
+            // downgrade stash so the choice reaches disk.
             let downgrade_cleared = app.config.theme_downgraded_from.is_some();
             app.config.set_theme(name.clone());
             app.config.appearance = selected_mode;
             if theme_changed || mode_changed {
                 app.apply_active_theme();
             }
-            // Save when anything the user can see changed, or when the
-            // stash was just cleared — otherwise the cleared downgrade
-            // would only reach disk on some later, unrelated save.
+            // Also save on a cleared downgrade stash, which is otherwise invisible and would
+            // reach disk only on some later, unrelated save.
             if name != original_theme || selected_mode != original_mode || downgrade_cleared {
                 app.save_config_with_flash("failed to persist theme change");
             }

@@ -1,14 +1,9 @@
-//! Mouse event parsing and dispatch.
+//! Mouse event parsing and dispatch: raw `crossterm::event::MouseEvent` → [`MouseAction`].
 //!
-//! Translates raw `crossterm::event::MouseEvent` values into high-level
-//! [`MouseAction`]s that the editor can apply.  The dispatcher tracks click
-//! timing and drag state so it can surface double-click / triple-click and
-//! click-drag semantics from the flat stream of terminal mouse events.
-//!
-//! Coordinate translation (terminal columns/rows → editor-area cells) happens
-//! at dispatch time: events that fall outside the document area are dropped
-//! (returning `None`), while events inside are reported in
-//! document-area-relative coordinates.
+//! The dispatcher tracks click timing and drag state so it can surface double/triple-click and
+//! click-drag semantics from the flat terminal event stream.  Coordinates are translated at
+//! dispatch time: events outside the document area return `None`, ones inside are reported
+//! relative to it.
 
 use std::time::{Duration, Instant};
 
@@ -19,37 +14,27 @@ use ratatui::layout::Rect;
 /// (double-click, triple-click).  400 ms matches the common X11 default.
 pub const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
-/// Default lines scrolled per wheel tick when no `config.editor.mouse_scroll_lines`
-/// override is supplied.  One-line steps are the finest granularity the terminal
-/// can report and preserve the rule that scrolling does not move the
-/// cursor.  Users can configure a coarser step (2 or 3) for a snappier feel.
+/// Default lines per wheel tick, absent a `config.editor.mouse_scroll_lines` override.
 pub const DEFAULT_WHEEL_STEP: usize = 1;
 
-/// High-level mouse action produced by the dispatcher.
-///
-/// All coordinates are relative to the document area (the editor's drawable
-/// region, excluding the status bar).
+/// High-level mouse action produced by the dispatcher.  Coordinates are relative to the
+/// document area (the drawable region, excluding the status bar).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseAction {
-    /// Single left-button click at `(col, row)`.  Places the cursor, clears
-    /// any selection, and becomes the anchor for a subsequent drag.  The
-    /// `modifiers` are the crossterm `KeyModifiers` in effect during the
-    /// click — used to distinguish plain clicks (cursor
-    /// placement) from `Ctrl`-clicks (follow link).
+    /// Single left click: place the cursor, clear the selection, become the drag anchor.
+    /// `modifiers` distinguishes a plain click from a Ctrl-click (follow link).
     Click {
         col: u16,
         row: u16,
         modifiers: KeyModifiers,
     },
-    /// Second click within `MULTI_CLICK_WINDOW` at the same cell — select the
-    /// word under the cursor.
+    /// Second click within [`MULTI_CLICK_WINDOW`] at the same cell — select the word.
     DoubleClick {
         col: u16,
         row: u16,
         modifiers: KeyModifiers,
     },
-    /// Third click within `MULTI_CLICK_WINDOW` at the same cell — select the
-    /// whole line.
+    /// Third click within [`MULTI_CLICK_WINDOW`] at the same cell — select the line.
     TripleClick {
         col: u16,
         row: u16,
@@ -57,11 +42,9 @@ pub enum MouseAction {
     },
     /// Left-button drag: extend the selection from the anchor to `(col, row)`.
     Drag { col: u16, row: u16 },
-    /// Left-button release.  Currently informational; kept so future phases
-    /// can distinguish "dragging" from "settled" selections.
+    /// Left-button release.  Informational — lets a caller tell "dragging" from "settled".
     Release,
-    /// Wheel scroll.  Positive values scroll *down* (content moves up); the
-    /// magnitude is already pre-multiplied by the dispatcher's `wheel_step`.
+    /// Wheel scroll; positive scrolls *down*, already multiplied by `wheel_step`.
     Scroll(i32),
 }
 
@@ -71,15 +54,11 @@ pub struct MouseDispatcher {
     last_click_cell: Option<(u16, u16)>,
     click_count: u32,
     left_down: bool,
-    /// Whether the gesture that is ending (or just ended) included at least
-    /// one `Drag` event.  A press that turned into a drag is not part of a
-    /// double-click chord — every GUI toolkit breaks the chain there, and
-    /// without it a grab → drag → release → *re-grab the same cell* (the
-    /// natural retry when a table row or column border didn't land where
-    /// the user wanted) arrives as a `DoubleClick` and arms no drag at all.
+    /// Whether the current gesture included a `Drag`.  A press that turned into one is not
+    /// part of a double-click chord: without this, re-grabbing the same cell after an
+    /// unsatisfying drag arrives as a `DoubleClick` and arms no drag at all.
     dragged_since_down: bool,
-    /// Lines emitted per wheel tick (see `DEFAULT_WHEEL_STEP`).  Seeded from
-    /// `config.editor.mouse_scroll_lines` via `with_wheel_step`.
+    /// Lines per wheel tick, seeded from `config.editor.mouse_scroll_lines`.
     wheel_step: usize,
 }
 
@@ -94,9 +73,7 @@ impl MouseDispatcher {
         Self::with_wheel_step(DEFAULT_WHEEL_STEP)
     }
 
-    /// Construct a dispatcher with a caller-supplied wheel-step.  `App::new`
-    /// uses this to seed the dispatcher from
-    /// `config.editor.mouse_scroll_lines`.
+    /// Construct a dispatcher with a caller-supplied wheel step.
     pub fn with_wheel_step(wheel_step: usize) -> Self {
         Self {
             last_click_time: None,
@@ -108,27 +85,20 @@ impl MouseDispatcher {
         }
     }
 
-    /// Update the wheel step at runtime.  Called when the user changes
-    /// `config.editor.mouse_scroll_lines` via the settings overlay so
-    /// the new value takes effect without restarting the app.
+    /// Update the wheel step at runtime, so a settings-overlay change takes effect live.
     pub fn set_wheel_step(&mut self, wheel_step: usize) {
         self.wheel_step = wheel_step.max(1);
     }
 
-    /// Current wheel step (lines per wheel tick).  Exposed for tests
-    /// that verify settings-overlay live-update wiring.
+    /// Current wheel step, for the settings live-update tests.
     #[cfg(test)]
     pub fn wheel_step(&self) -> usize {
         self.wheel_step
     }
 
-    /// Translate a raw mouse event into a [`MouseAction`].
-    ///
-    /// `doc_area` is the editor's document area in terminal coordinates.
-    /// Events outside that area return `None` so the caller can ignore clicks
-    /// on the status bar or on any future popup widgets.  Drag events outside
-    /// the area still return `None` — selections freeze until the cursor
-    /// re-enters the document area.
+    /// Translate a raw mouse event into a [`MouseAction`].  `doc_area` is the document area in
+    /// terminal coordinates; events outside it return `None`, so a drag that leaves the area
+    /// freezes the selection until it re-enters.
     pub fn dispatch(&mut self, event: MouseEvent, doc_area: Rect) -> Option<MouseAction> {
         let in_area = contains(doc_area, event.column, event.row);
         let (rel_col, rel_row) = if in_area {
@@ -173,9 +143,7 @@ impl MouseDispatcher {
                 })
             }
             MouseEventKind::Drag(MouseButton::Left) if self.left_down => {
-                // The chord-breaking flag is set even for a drag that left
-                // the document area — the gesture was still a drag, whether
-                // or not the editor got to see this particular step.
+                // Set even for a drag outside the document area — the gesture was still a drag.
                 self.dragged_since_down = true;
                 in_area.then_some(MouseAction::Drag {
                     col: rel_col,
@@ -339,10 +307,8 @@ mod tests {
         );
     }
 
-    /// A press that turned into a drag isn't the first half of a chord, so
-    /// re-grabbing the same cell right afterwards must report a fresh
-    /// `Click` — otherwise the retry after an unsatisfying table-row or
-    /// column-border drag silently arms nothing.
+    /// A press that became a drag isn't the first half of a chord, so re-grabbing the same
+    /// cell must report a fresh `Click` — otherwise the retry silently arms nothing.
     #[test]
     fn drag_breaks_the_double_click_chord() {
         let mut d = MouseDispatcher::new();
@@ -359,8 +325,7 @@ mod tests {
         );
     }
 
-    /// …and the drag that broke it doesn't keep breaking it: the press
-    /// after the retry chords normally again.
+    /// …and the break doesn't persist: the press after the retry chords normally again.
     #[test]
     fn chord_resumes_after_a_dragless_click() {
         let mut d = MouseDispatcher::new();

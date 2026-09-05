@@ -15,35 +15,22 @@ use super::parse_offsets;
 
 /// Parse a Markdown string into a list of `Block` AST nodes.
 pub fn parse(text: &str) -> Vec<Block> {
-    // Annotate loose-list items with their preceding blank-line count so the
-    // renderer reproduces the legibility spacing.  Operating on a transient
-    // ranges vector — `parse` doesn't expose ranges to callers — keeps
-    // callers like the help overlay rendering with the same semantics
-    // as the editor pipeline.
     let (mut blocks, ranges) = parse_raw_with_ranges(text);
     annotate_list_blanks(&mut blocks, &ranges, text);
-    // Promote pure-comment `Block::Html` entries to `Block::HtmlComment` BEFORE
-    // the tui-columns merge runs so the merge can find the comment by its new
-    // variant.  Keeping these two passes separate — generic comment hiding
-    // first, tui-columns absorption second — is what lets isolated
-    // `<!-- tui-columns: ... -->` blocks outside any table remain as hidden
-    // `Block::HtmlComment`s instead of being silently dropped.
+    // The comment promotion must run first so the merge can find comments by their new
+    // variant; keeping the two passes separate is what lets an isolated
+    // `<!-- tui-columns -->` outside any table survive as a hidden comment.
     promote_html_comments(&mut blocks);
     attach_trailing_tui_columns_comments(&mut blocks);
     promote_image_paragraphs(&mut blocks, None);
     blocks
 }
 
-/// Lower-level parse that returns blocks without the post-pass that merges
-/// trailing `<!-- tui-columns: [..] -->` comments into preceding tables.
-/// Callers that need to walk blocks alongside `parse_offsets::
-/// top_level_block_ranges` in a 1:1 correspondence must use this and apply
-/// [`attach_trailing_tui_columns_comments`] themselves after any range-aware
-/// mutations.
-///
-/// The editor pipeline uses [`parse_raw_with_ranges`] instead (one parse
-/// for blocks AND ranges); this stays as the ranges-free entry point for
-/// module tests and the pipeline benchmarks.
+/// [`parse`] without the trailing-`<!-- tui-columns -->` merge, so callers walking blocks
+/// 1:1 against `parse_offsets::top_level_block_ranges` can apply
+/// [`attach_trailing_tui_columns_comments`] after their own range-aware mutations.  The
+/// editor pipeline uses [`parse_raw_with_ranges`]; this is the ranges-free entry point for
+/// module tests and benchmarks.
 #[allow(dead_code)]
 pub fn parse_raw(text: &str) -> Vec<Block> {
     let parser = Parser::new_ext(text, parse_offsets::options_for(text));
@@ -51,19 +38,12 @@ pub fn parse_raw(text: &str) -> Vec<Block> {
     parse_blocks(&mut events)
 }
 
-/// Like [`parse_raw`], but also returns the top-level byte range of each
-/// block — equivalent to pairing `parse_raw` with
-/// [`parse_offsets::top_level_block_ranges`], in a **single**
-/// pulldown-cmark pass instead of two.  The ranges are collected by a
-/// [`parse_offsets::RangeTracker`] observing the same offset-iterator
-/// events the AST builder consumes, so blocks and ranges stay 1:1 by
-/// construction.
+/// [`parse_raw`] plus each block's top-level byte range, in a **single** pulldown-cmark
+/// pass: a [`parse_offsets::RangeTracker`] observes the same events the AST builder
+/// consumes, so blocks and ranges are 1:1 by construction.
 ///
-/// This is the editor pipeline's parse entry point (`ParsedDoc::build`);
-/// see docs/dev/performance.md — the pass this merge removed
-/// (`parse_offsets::top_level_block_ranges`) measures 4.6 ms on the
-/// 20k-line prose corpus against a 20.5 ms single-pass pipeline, so it
-/// was ~18% of the two-pass total.
+/// The editor pipeline's parse entry point.  Folding the second pass in saved ~18% of the
+/// pipeline — see docs/dev/performance.md.
 pub fn parse_raw_with_ranges(text: &str) -> (Vec<Block>, Vec<Range<usize>>) {
     let mut tracker = parse_offsets::RangeTracker::new(|_| true);
     let mut events = Parser::new_ext(text, parse_offsets::options_for(text))
@@ -74,9 +54,7 @@ pub fn parse_raw_with_ranges(text: &str) -> (Vec<Block>, Vec<Range<usize>>) {
         })
         .peekable();
     let blocks = parse_blocks(&mut events);
-    // `parse_blocks` stops at the top-level end-of-stream, which normally
-    // exhausts the iterator — but drain defensively so the tracker has
-    // seen every event before we take its ranges.
+    // Drain defensively so the tracker has seen every event before we take its ranges.
     while events.next().is_some() {}
     drop(events);
     (blocks, tracker.into_ranges())
@@ -84,10 +62,9 @@ pub fn parse_raw_with_ranges(text: &str) -> (Vec<Block>, Vec<Range<usize>>) {
 
 // ─── Block parsing ────────────────────────────────────────────────────────────
 //
-// All functions use a peek-first pattern: inspect `events.peek()` to decide
-// what to do, then call `events.next()` to consume the event.  This lets us
-// handle tight list items, where pulldown-cmark emits `Text` directly inside
-// an `Item` without a surrounding `Paragraph`.
+// Peek-first throughout: inspect `events.peek()`, then `events.next()` to consume.  That
+// is what lets tight list items work, where pulldown-cmark emits `Text` directly inside an
+// `Item` with no surrounding `Paragraph`.
 
 fn parse_blocks<'a, I>(events: &mut std::iter::Peekable<I>) -> Vec<Block>
 where
@@ -139,8 +116,7 @@ where
                 blocks.push(parse_metadata_block(events));
             }
 
-            // Inline content at block level: tight lists emit Text/Code
-            // directly inside Item without a Paragraph wrapper.
+            // Tight lists emit inline content directly inside Item, no Paragraph wrapper.
             Some(Event::Text(_))
             | Some(Event::Code(_))
             | Some(Event::SoftBreak)
@@ -156,7 +132,6 @@ where
                 }
             }
 
-            // Skip anything else (e.g. TaskListMarker at block level)
             _ => {
                 events.next();
             }
@@ -166,9 +141,8 @@ where
     blocks
 }
 
-/// Consume `Start(Paragraph) … End(Paragraph)` and return the resulting
-/// `Block::Paragraph`.  Empty paragraphs (only soft breaks etc.) collapse
-/// to `None` so `parse_blocks` doesn't push a noise entry.
+/// Consume `Start(Paragraph) … End(Paragraph)`.  An empty paragraph collapses to `None`
+/// so `parse_blocks` doesn't push a noise entry.
 fn parse_paragraph_block<'a, I>(events: &mut std::iter::Peekable<I>) -> Option<Block>
 where
     I: Iterator<Item = Event<'a>>,
@@ -183,9 +157,8 @@ where
     }
 }
 
-/// Consume `Start(Heading { level, .. }) … End(Heading)`.  Returns `None`
-/// only when the peeked event was lying about being a heading (defensive
-/// — should never happen against a well-formed pulldown-cmark stream).
+/// Consume `Start(Heading { .. }) … End(Heading)`.  `None` only if the peeked event was
+/// not in fact a heading — defensive against a malformed event stream.
 fn parse_heading_block<'a, I>(events: &mut std::iter::Peekable<I>) -> Option<Block>
 where
     I: Iterator<Item = Event<'a>>,
@@ -209,16 +182,13 @@ where
     Block::BlockQuote { blocks: inner }
 }
 
-/// Consume `Start(FootnoteDefinition(label)) … End(FootnoteDefinition)`,
-/// parsing the definition body as a nested block sequence (mirrors
-/// `parse_blockquote_block`).
+/// Consume a footnote definition, parsing its body as a nested block sequence.
 fn parse_footnote_definition_block<'a, I>(events: &mut std::iter::Peekable<I>) -> Block
 where
     I: Iterator<Item = Event<'a>>,
 {
     let label = match events.next() {
         Some(Event::Start(Tag::FootnoteDefinition(l))) => l.into_string(),
-        // Defensive: the caller only invokes us after peeking the Start.
         _ => String::new(),
     };
     let inner = parse_blocks(events);
@@ -229,11 +199,9 @@ where
     }
 }
 
-/// Consume `Start(MetadataBlock(kind)) … End(MetadataBlock(_))`.  The body
-/// arrives as plain `Event::Text` (pulldown-cmark does no inline parsing
-/// inside a metadata block), so the stored `content` is the frontmatter
-/// verbatim, minus the two delimiter lines the events' *ranges* — but not
-/// their payloads — cover.
+/// Consume a metadata block.  The body arrives as plain `Event::Text` (no inline parsing
+/// inside), so `content` is the frontmatter verbatim, minus the two delimiter lines that
+/// the events' *ranges* — but not their payloads — cover.
 fn parse_metadata_block<'a, I>(events: &mut std::iter::Peekable<I>) -> Block
 where
     I: Iterator<Item = Event<'a>>,
@@ -242,8 +210,7 @@ where
         Some(Event::Start(Tag::MetadataBlock(MetadataBlockKind::PlusesStyle))) => {
             MetadataKind::Toml
         }
-        // Defensive: the caller only invokes us after peeking the Start,
-        // and YAML is the flavor `---` opens.
+        // YAML is the flavor `---` opens.
         _ => MetadataKind::Yaml,
     };
     let content = collect_text_until_end(events);
@@ -302,12 +269,9 @@ where
     }
 }
 
-/// pulldown-cmark 0.11+ wraps HTML blocks in `Start(HtmlBlock)` /
-/// `End(HtmlBlock)` around one-or-more `Html(...)` events.  Consume the
-/// wrapper so the outer loop's `End(_) => break` doesn't swallow the rest
-/// of the document when content follows an HTML block (e.g. a persisted
-/// `<!-- tui-columns: ... -->` comment between a table and subsequent
-/// paragraphs).
+/// Consume the `Start(HtmlBlock)` / `End(HtmlBlock)` wrapper pulldown-cmark 0.11+ puts
+/// around `Html(...)` events, so the outer loop's `End(_) => break` doesn't swallow every
+/// block after an HTML block.
 fn parse_html_block<'a, I>(events: &mut std::iter::Peekable<I>) -> Block
 where
     I: Iterator<Item = Event<'a>>,
@@ -345,17 +309,9 @@ where
             Some(Event::Start(Tag::Item)) => {
                 events.next(); // consume Start(Item)
 
-                // Task-list marker location depends on whether the
-                // surrounding list is *tight* or *loose*:
-                //
-                //   tight:  Start(Item) → TaskListMarker → Text(…) → End(Item)
-                //   loose:  Start(Item) → Start(Paragraph) → TaskListMarker
-                //             → Text(…) → End(Paragraph) → End(Item)
-                //
-                // Handle both.  In the loose case we speculatively consume
-                // the `Start(Paragraph)` so the remaining events inside it
-                // can be parsed with `parse_inlines` (which doesn't handle
-                // a dangling `End(Paragraph)` on its own).
+                // A loose list wraps the marker in a Paragraph, a tight one doesn't.  In
+                // the loose case the `Start(Paragraph)` is consumed speculatively, since
+                // `parse_inlines` can't handle a dangling `End(Paragraph)`.
                 let mut task: Option<bool> = None;
                 if let Some(Event::TaskListMarker(_)) = events.peek() {
                     if let Some(Event::TaskListMarker(checked)) = events.next() {
@@ -375,9 +331,8 @@ where
 
                 let mut blocks: Vec<Block> = Vec::new();
                 if paragraph_consumed {
-                    // Finish the opened paragraph ourselves, then delegate
-                    // to `parse_blocks` for anything else inside the item
-                    // (nested lists, additional paragraphs, etc.).
+                    // Close the paragraph we opened, then let `parse_blocks` take the
+                    // rest of the item (nested lists, further paragraphs).
                     let inlines = parse_inlines(events);
                     consume_end(events); // End(Paragraph)
                     if !inlines.is_empty() {
@@ -469,10 +424,8 @@ where
 
 // ─── Highlight post-processing ────────────────────────────────────────────────
 
-/// Split a plain text string into `Inline`s, detecting `==highlight==` spans.
-///
-/// pulldown-cmark does not natively support `==text==` highlight syntax, so we
-/// post-process each `Text` event to find and convert those spans.
+/// Split a text string into `Inline`s, detecting `==highlight==` spans — pulldown-cmark
+/// has no native support for them, so each `Text` event is post-processed here.
 fn parse_highlight_in_text(text: &str) -> Vec<Inline> {
     let mut result = Vec::new();
     let mut rest = text;
@@ -512,7 +465,6 @@ where
     let mut inlines = Vec::new();
 
     loop {
-        // Stop at end markers or block-level events.
         match events.peek() {
             None | Some(Event::End(_)) => break,
             Some(Event::Start(Tag::Paragraph))
@@ -534,18 +486,12 @@ where
             Event::Code(code) => inlines.push(Inline::Code(code.into_string())),
             Event::SoftBreak => inlines.push(Inline::SoftBreak),
             Event::HardBreak => inlines.push(Inline::HardBreak),
-            // pulldown-cmark 0.11+ splits HTML events by context: block-level
-            // HTML comes in as `Event::Html` (handled by the block loop) and
-            // inline HTML as `Event::InlineHtml`.  We still match both here
-            // so a pre-0.11 event stream (should one leak through) or a
-            // raw-HTML event reported inside a paragraph is handled
-            // identically.
+            // 0.11+ reports inline HTML as `InlineHtml`; both are matched so a raw-HTML
+            // event reported inside a paragraph is handled identically.
             Event::Html(html) | Event::InlineHtml(html) => {
                 let s = html.into_string();
-                // Inline HTML that is a single balanced `<!-- ... -->` comment
-                // becomes `Inline::HtmlComment` — rendered as zero spans.  All
-                // other inline HTML (e.g. a stray `<br>`) falls back to
-                // `Inline::Text` so the source is still visible.
+                // A balanced comment renders as zero spans; anything else stays text so
+                // the source is still visible.
                 if post_pass::is_html_comment_only(&s) {
                     inlines.push(Inline::HtmlComment(s));
                 } else {
@@ -596,17 +542,14 @@ where
                 });
             }
 
-            // Footnote reference (`[^label]`).  pulldown-cmark only emits
-            // this when a matching definition exists.  The raw label is
-            // rendered verbatim inside the bracketed marker — no display
-            // renumbering.
+            // Emitted only when a matching definition exists.  The raw label is kept
+            // verbatim — no display renumbering.
             Event::FootnoteReference(label) => {
                 inlines.push(Inline::FootnoteReference {
                     label: label.into_string(),
                 });
             }
 
-            // Task list marker inside a list item paragraph — skip here.
             Event::TaskListMarker(_) => {}
 
             _ => {}
@@ -628,8 +571,7 @@ where
     }
 }
 
-/// Collect all `Event::Text` content until the next `Event::End`, then consume
-/// that `End`.
+/// Collect `Event::Text` content until the next `Event::End`, consuming that `End`.
 fn collect_text_until_end<'a, I>(events: &mut std::iter::Peekable<I>) -> String
 where
     I: Iterator<Item = Event<'a>>,
@@ -656,9 +598,7 @@ mod tests {
     use crate::markdown::ast::{Block, Inline};
     use pulldown_cmark::HeadingLevel;
 
-    /// `parse_raw_with_ranges` must produce exactly what the old two-pass
-    /// pairing produced: `parse_raw`'s blocks and
-    /// `parse_offsets::top_level_block_ranges`'s ranges, 1:1.
+    /// The merged parse must produce exactly what the two-pass pairing produced.
     #[test]
     fn merged_parse_matches_two_pass_parse() {
         let src = "# Title\n\nA paragraph with **bold**.\n\n- item one\n- item two\n\n\
@@ -845,8 +785,7 @@ mod tests {
 
     #[test]
     fn image_with_surrounding_whitespace_still_promotes() {
-        // pulldown-cmark can attach zero-width text inlines around an image
-        // (e.g. from trailing spaces).  The promotion pass must tolerate them.
+        // pulldown-cmark can attach zero-width text inlines around an image.
         let blocks = parse("   ![dog](dog.png)   \n");
         assert!(
             matches!(&blocks[0], Block::ImageBlock { url, .. } if url == "dog.png"),
@@ -878,8 +817,7 @@ mod tests {
 
     #[test]
     fn paragraph_with_two_images_does_not_promote() {
-        // Two images in one paragraph = mixed content; keep as-is so both
-        // render as inline `[Image: alt]` placeholders.
+        // Mixed content: both stay inline `[Image: alt]` placeholders.
         let blocks = parse("![a](a.png) ![b](b.png)\n");
         assert!(matches!(&blocks[0], Block::Paragraph { .. }));
     }
@@ -899,25 +837,20 @@ mod tests {
 
     #[test]
     fn block_level_html_tag_is_not_promoted() {
-        // A `<div>` block is NOT a comment and must remain `Block::Html` so
-        // the renderer still prints the raw source.
         let blocks = parse("<div>stuff</div>\n");
         assert!(matches!(&blocks[0], Block::Html(_)), "got {:?}", blocks[0]);
     }
 
     #[test]
     fn isolated_tui_columns_comment_not_adjacent_to_table_stays_hidden_comment() {
-        // An isolated `<!-- tui-columns -->` outside any table is still a
-        // comment — no table to absorb it into — so it should survive as a
-        // `Block::HtmlComment` (which the renderer hides).  Regression guard
-        // for the trailing-comment specialisation case.
+        // With no table to absorb it, the comment must survive as a hidden
+        // `Block::HtmlComment` rather than being dropped.
         let blocks = parse("<!-- tui-columns: [10, 20, 30] -->\n\nSome text.\n");
         assert!(
             matches!(&blocks[0], Block::HtmlComment(_)),
             "got {:?}",
             blocks[0]
         );
-        // Downstream paragraph remains.
         assert!(matches!(&blocks[1], Block::Paragraph { .. }));
     }
 
@@ -937,8 +870,6 @@ mod tests {
 
     #[test]
     fn inline_html_tag_stays_as_text() {
-        // Unknown inline HTML (e.g. `<br>`) is NOT a comment and must stay
-        // as `Inline::Text` so the raw source is visible.
         let blocks = parse("line <br> end\n");
         match &blocks[0] {
             Block::Paragraph { inlines } => {
@@ -956,11 +887,8 @@ mod tests {
 
     #[test]
     fn tui_columns_still_absorbed_after_html_comment_promotion() {
-        // Regression: after the generic `promote_html_comments` runs, the
-        // trailing-comment attach pass must still consume the comment when
-        // it directly follows a table.  This test was passing before the
-        // refactor (see `table_picks_up_trailing_tui_columns_comment`) and
-        // must continue to pass.
+        // The attach pass must still consume the comment after the generic
+        // `promote_html_comments` has converted it.
         let src = "| a | b |\n|---|---|\n| 1 | 2 |\n<!-- tui-columns: [10, 20] -->\n";
         let blocks = parse(src);
         assert_eq!(blocks.len(), 1);
@@ -975,8 +903,7 @@ mod tests {
 
     // ── Loose-list blank annotation ───────────────────────────────────────
 
-    /// Return the single `Block::List` in `blocks`, panicking if there is
-    /// not exactly one.  Loose lists stay a single block now, so every test
+    /// The single `Block::List` in `blocks` — loose lists stay one block, so every test
     /// below asserts against one list plus its per-item blank counts.
     fn only_list(blocks: &[Block]) -> (&[ListItem], bool, Option<u64>) {
         let lists: Vec<&Block> = blocks
@@ -1000,9 +927,8 @@ mod tests {
 
     #[test]
     fn ordered_list_blank_between_items_stays_one_list_and_is_annotated() {
-        // A blank line between items makes the list "loose" but keeps it a
-        // single ordered list; numbering comes straight from pulldown-cmark
-        // (1, 2, 3, 4) and the item after the blank carries a count of 1.
+        // A blank makes the list loose but keeps it one ordered list; numbering comes
+        // straight from pulldown-cmark and the item after the blank counts 1.
         let blocks = parse("1. a\n2. b\n\n3. c\n4. d\n");
         let (items, ordered, start) = only_list(&blocks);
         assert!(ordered);
@@ -1013,9 +939,8 @@ mod tests {
 
     #[test]
     fn ordered_list_restart_numbering_no_longer_splits() {
-        // Source numbers restart at 1 after the blank, but CommonMark treats
-        // this as one loose list; edamame follows suit now (renders 1,2,3,4)
-        // instead of the old split-into-two behavior.
+        // Source numbers restart at 1 after the blank, but CommonMark makes this one
+        // loose list, so it renders 1,2,3,4.
         let blocks = parse("1. a\n2. b\n\n1. c\n2. d\n");
         let (items, ordered, start) = only_list(&blocks);
         assert!(ordered);
@@ -1035,9 +960,7 @@ mod tests {
 
     #[test]
     fn list_item_with_fenced_code_block_containing_blank_line_is_not_annotated() {
-        // A blank line inside a fenced code block embedded in a list item
-        // must not be counted as an inter-item separator — the next bullet
-        // belongs to the same list with no preceding blank.
+        // A blank inside an embedded fence is not an inter-item separator.
         let src = "- intro\n  ```toml\n  [a]\n\n  [b]\n  ```\n  trailing\n- next item\n";
         let blocks = parse(src);
         let (items, _, _) = only_list(&blocks);
@@ -1056,9 +979,7 @@ mod tests {
 
     #[test]
     fn nested_list_with_blank_line_inside_top_level_item_stays_one_list() {
-        // A blank line *inside* a nested item's content shouldn't count as a
-        // top-level separator — the gap is only relevant between items at the
-        // same indent level.
+        // Only gaps between items at the same indent level count.
         let blocks = parse("- outer\n  - nested\n- next\n");
         let (items, _, _) = only_list(&blocks);
         assert_eq!(items.len(), 2);
@@ -1077,10 +998,7 @@ mod tests {
 
     #[test]
     fn interior_blank_without_separator_blank_is_not_annotated() {
-        // A blank line interior to an item's content (between the item's
-        // first paragraph and its continuation) is not an inter-item
-        // separator — the next marker sits directly after the continuation,
-        // so item `b` carries a zero count.
+        // A blank interior to an item's content is not an inter-item separator.
         let blocks = parse("- a\n\n  cont\n- b\n");
         let (items, _, _) = only_list(&blocks);
         assert_eq!(items.len(), 2);
@@ -1097,9 +1015,7 @@ mod tests {
 
     #[test]
     fn multi_line_item_content_before_separator_blank_counts_one() {
-        // An item whose content spans several lines (continuation + nested
-        // fenced code block) followed by a blank-separated second item stays
-        // a single list; only the blank directly above item 2 is counted.
+        // Only the blank directly above item 2 is counted.
         let src = "1. **first** item\n   continuation\n\n   ```rust\n   let x = 1;\n   ```\n\n2. second\n";
         let (mut blocks, ranges) = parse_raw_with_ranges(src);
         annotate_list_blanks(&mut blocks, &ranges, src);
@@ -1113,7 +1029,6 @@ mod tests {
     #[test]
     fn footnote_reference_and_definition_parse() {
         let blocks = parse("Text.[^1]\n\n[^1]: The note.\n");
-        // First block: paragraph carrying the reference.
         match &blocks[0] {
             Block::Paragraph { inlines } => {
                 assert!(
@@ -1125,7 +1040,6 @@ mod tests {
             }
             other => panic!("expected Paragraph, got {other:?}"),
         }
-        // Last block: the definition.
         assert!(
             blocks
                 .iter()
@@ -1136,9 +1050,8 @@ mod tests {
 
     #[test]
     fn footnote_labels_are_preserved_verbatim() {
-        // The parser stores raw labels and does NOT remap them to display
-        // numbers — rendered markers never diverge from the source.  `3` is
-        // referenced before `1`, but each keeps its own label.
+        // Raw labels are never remapped to display numbers, so a marker can't diverge
+        // from the source: `3` is referenced before `1` and each keeps its label.
         let src = "First[^3] then[^1].\n\n[^1]: one.\n\n[^3]: three.\n";
         let blocks = parse(src);
         let mut ref_labels: Vec<String> = Vec::new();
@@ -1152,7 +1065,6 @@ mod tests {
             }
         }
         assert_eq!(ref_labels, vec!["3".to_string(), "1".to_string()]);
-        // Definitions keep their raw labels too.
         let def_labels: Vec<String> = blocks
             .iter()
             .filter_map(|b| match b {
@@ -1165,8 +1077,7 @@ mod tests {
 
     #[test]
     fn undefined_footnote_reference_stays_literal_text() {
-        // pulldown-cmark only emits a FootnoteReference when a matching
-        // definition exists; `[^x]` with no definition is literal text.
+        // A reference with no definition is literal text.
         let blocks = parse("A dangling[^x] marker.\n");
         match &blocks[0] {
             Block::Paragraph { inlines } => {
@@ -1186,17 +1097,11 @@ mod tests {
         assert!(post_pass::is_html_comment_only("<!-- hi -->"));
         assert!(post_pass::is_html_comment_only("   <!-- hi -->   "));
         assert!(post_pass::is_html_comment_only("<!---->"));
-        // Multiple whitespace-separated comments also count — they're all
-        // annotation, none of it should reach the rendered output.
         assert!(post_pass::is_html_comment_only("<!-- a --> <!-- b -->"));
         assert!(post_pass::is_html_comment_only("<!-- a --><!-- b -->"));
-        // Tag, not a comment.
         assert!(!post_pass::is_html_comment_only("<div>foo</div>"));
-        // Comment with trailing text.
         assert!(!post_pass::is_html_comment_only("<!-- a --> tail"));
-        // Unclosed.
         assert!(!post_pass::is_html_comment_only("<!-- a"));
-        // Too short to be balanced (delimiters would overlap).
         assert!(!post_pass::is_html_comment_only("<!-->"));
     }
 
@@ -1224,9 +1129,8 @@ mod tests {
         );
     }
 
-    /// Frontmatter is data, not prose: the content must arrive verbatim,
-    /// with no smart-punctuation substitution and no inline parsing, so a
-    /// quoted value or an `*` in a glob round-trips unchanged.
+    /// Frontmatter is data, not prose: verbatim, with no smart punctuation or inline
+    /// parsing, so a quoted value or a glob's `*` round-trips unchanged.
     #[test]
     fn frontmatter_content_is_verbatim() {
         let blocks = parse("---\nglob: \"src/*.rs\" -- x\n---\n\nBody.\n");
@@ -1236,10 +1140,9 @@ mod tests {
         assert_eq!(content, "glob: \"src/*.rs\" -- x\n");
     }
 
-    /// Frontmatter is the *first* thing in a file.  pulldown-cmark's
-    /// extensions are not anchored that way, so a `---` separator sitting
-    /// immediately above a heading would otherwise open a block that the
-    /// next `---` closes, turning the section between them into metadata.
+    /// Frontmatter is the *first* thing in a file, but pulldown-cmark's extension is not
+    /// anchored that way: an unguarded `---` above a heading would open a metadata block
+    /// that the next `---` closes.
     #[test]
     fn a_mid_document_rule_pair_stays_prose() {
         let blocks = parse("Intro.\n\n---\n## Section 2\n\nText.\n\n---\n## Section 3\n");
@@ -1252,8 +1155,7 @@ mod tests {
         assert_eq!(blocks[1], Block::HorizontalRule);
     }
 
-    /// A file that opens `+++` enables only the TOML flavor, so a later
-    /// `---` pair cannot be claimed as YAML frontmatter.
+    /// Opening `+++` enables only the TOML flavor, so a later `---` pair can't be claimed.
     #[test]
     fn a_toml_opening_file_does_not_claim_a_later_dash_pair() {
         let blocks = parse("+++\na = 1\n+++\n\n---\nSection\n---\n\nEnd.\n");
@@ -1271,8 +1173,7 @@ mod tests {
         );
     }
 
-    /// A leading blank line means the delimiter is not at byte 0, and
-    /// Hugo / Jekyll / Obsidian all require it to be.
+    /// Hugo / Jekyll / Obsidian all require the delimiter at byte 0.
     #[test]
     fn a_delimiter_below_a_blank_first_line_is_not_frontmatter() {
         let blocks = parse("\n---\ntitle: Foo\n---\n\nBody.\n");

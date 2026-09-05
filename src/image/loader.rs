@@ -1,15 +1,9 @@
-//! Resolve image URLs to decoded bytes.
+//! Resolve image URLs to decoded images.  Local paths are read relative to the document (or
+//! absolutely, including `file://`); `http(s)` URLs are fetched via `ureq` when the
+//! `RemoteImagePolicy` plus the per-session flag allow it.
 //!
-//! Local paths are read from disk relative to the document path (or
-//! absolute if the URL starts with `/` or uses the `file://` scheme).
-//! `http://` and `https://` URLs are fetched via `ureq` when allowed by
-//! the configured `RemoteImagePolicy` plus the per-session "allow remote"
-//! flag.
-//!
-//! This function is **blocking**; the intended call site is a background
-//! thread that reports completion via `AppEvent::ImageReady`.  Keeping it
-//! blocking (rather than async) avoids an async runtime dependency and
-//! keeps the rest of the code-base free of `async fn`s.
+//! [`resolve`] is **blocking** — the call site is the decode worker thread, which reports back via
+//! `AppEvent::ImageReady`.  Blocking rather than async keeps an async runtime out of the tree.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -22,14 +16,11 @@ use ratatui::layout::Rect;
 use crate::config::RemoteImagePolicy;
 use crate::image::svg::{rasterize_svg, SvgError, SvgScaleMode, SvgSizing};
 
-/// Decoded image paired with its origin info — sufficient for
-/// `ImageCache::decoded` to key the entry and for debugging.
+/// A decoded image plus the URL `ImageCache` keys it by.
 ///
-/// `scratch` is an optional pre-rendered halfblocks `Buffer` for a known
-/// target rect, built on the decode worker thread so the UI thread's
-/// first paint doesn't pay a cold-path sync encode.  `None` when image
-/// support is absent or when the dispatcher didn't supply the picker +
-/// target width at decode time.
+/// `scratch` is a pre-rendered halfblocks `Buffer` for a known target rect, built on the worker so
+/// the first paint doesn't pay a cold sync encode.  `None` without image support, or when the
+/// dispatcher supplied no picker and target width.
 #[derive(Debug)]
 pub struct LoadedImage {
     pub url: String,
@@ -37,8 +28,7 @@ pub struct LoadedImage {
     pub scratch: Option<(Rect, Buffer)>,
 }
 
-/// Errors reported by [`resolve`].  The UI falls back to the
-/// `[Image: alt]` placeholder on any variant.
+/// Errors from [`resolve`]; the UI falls back to the `[Image: alt]` placeholder on any of them.
 #[derive(Debug, thiserror::Error)]
 pub enum ImageLoadError {
     #[error("remote image blocked by policy: {0}")]
@@ -71,54 +61,32 @@ pub enum ImageLoadError {
     UnsupportedScheme(String),
 }
 
-/// HTTP timeout for remote image fetches.  Long enough for a busy
-/// connection, short enough that the UI doesn't appear hung for minutes
-/// if a server ghosts us.
+/// HTTP timeout for remote image fetches, so a ghosting server can't hang the worker for
+/// minutes.
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Cap on the size of a *local* image file read off disk.  Remote fetches
-/// are already bounded by ureq's 10 MB body limit, but local files
-/// otherwise had no cap at all — a multi-gigabyte file would be slurped
-/// into memory in one `std::fs::read` before the decode limits below even
-/// apply.  64 MB is comfortably above any real raster a terminal would
-/// display.
+/// Cap on a *local* image file read off disk.  Remote fetches are bounded by ureq's own body
+/// limit, but without this a multi-gigabyte file is slurped into memory by one `std::fs::read`
+/// before the decode limits below can apply.
 const MAX_LOCAL_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Hard ceilings applied to every raster decode (see [`decode`]).  A
-/// highly-compressed raster (PNG zlib ratios routinely exceed 1000:1)
-/// expands enormously on decode, and `image`'s decoder allocates the full
-/// pixel buffer *before* the loader's `pre_resize` can shrink it — so the
-/// only place to bound peak memory is at decode time, via `image::Limits`.
-/// 50 000 px per side is far larger than any terminal can show, and the
-/// allocation cap bounds the worst-case RGBA buffer to a couple hundred
-/// MB so a decode bomb errors out instead of aborting the process.
+/// Hard ceilings on every raster decode (see [`decode`]).  PNG zlib ratios routinely exceed
+/// 1000:1 and `image` allocates the full pixel buffer *before* [`pre_resize`] can shrink it, so
+/// decode time via `image::Limits` is the only place to bound peak memory — a decode bomb errors
+/// out instead of aborting the process.
 const MAX_DECODE_DIMENSION: u32 = 50_000;
 const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 
 /// Resolve `url` to a decoded `DynamicImage`.
 ///
-/// * `doc_path` — path of the currently-open document (used as the base
-///   for relative image paths).  Pass `None` for an unsaved buffer;
-///   relative URLs then resolve against the current working directory.
-/// * `remote_policy` — `Ask` / `Always` / `Never` from config.  `Ask` is
-///   interpreted as "blocked unless the per-session flag is set" — the
-///   App shows the prompt on document load and flips the flag based on
-///   the user's choice.
-/// * `session_allow_remote` — set by the remote-load prompt's
-///   `Yes` / `Always` buttons.  Takes precedence over a `Never`
-///   persisted policy only if the caller has already verified its
-///   provenance (the prompt itself defers to policy).
-/// * `max_cells` / `font_size` — the target ceiling for pre-resizing
-///   the decoded image so the main thread never has to resize on a
-///   render path.  Passing `None` disables pre-resize (the main thread
-///   will do it in the protocol, incurring a one-time cost on first
-///   paint — acceptable for tests that don't exercise rendering).
+/// * `doc_path` — base for relative image paths; `None` resolves against the working directory.
+/// * `remote_policy` — `Ask` means "blocked unless `session_allow_remote` is set".
+/// * `session_allow_remote` — set by the remote-load prompt, which itself defers to policy.
+/// * `max_cells` / `font_size` — pre-resize ceiling.  `None` skips it, leaving the resize to the
+///   protocol layer on first paint.
 ///
-/// Pre-resize runs on the worker thread **before** the image reaches
-/// the main thread.  This means by the time `paint_images` builds the
-/// `StatefulProtocol` the image already has `cells <= max_cells`, and
-/// `Resize::Fit` is a no-op on every subsequent frame — no re-encoding
-/// on scroll.
+/// Pre-resizing here, on the worker, is what makes `Resize::Fit` a no-op once the image reaches
+/// `paint_images` — so scrolling never re-encodes.
 pub fn resolve(
     url: &str,
     doc_path: Option<&Path>,
@@ -171,9 +139,8 @@ pub fn resolve(
     })
 }
 
-/// Downscale `image` to fit within `max_cells × font_size` pixels while
-/// preserving aspect ratio.  Returns the original image unmodified when
-/// it already fits, so small images don't pay the resize cost.
+/// Downscale to fit `max_cells × font_size` pixels, preserving aspect ratio.  An image that
+/// already fits is returned untouched.
 fn pre_resize(image: DynamicImage, max_cells: (u16, u16), font_size: (u16, u16)) -> DynamicImage {
     let max_w_px = u32::from(max_cells.0) * u32::from(font_size.0);
     let max_h_px = u32::from(max_cells.1) * u32::from(font_size.1);
@@ -183,18 +150,12 @@ fn pre_resize(image: DynamicImage, max_cells: (u16, u16), font_size: (u16, u16))
     if image.width() <= max_w_px && image.height() <= max_h_px {
         return image;
     }
-    // `Triangle` (bilinear) is ~3–5× faster than `Lanczos3` and
-    // visually indistinguishable at thumbnail sizes.  The image is
-    // subsequently re-encoded by `ratatui-image`'s protocol layer
-    // (halfblocks averages 2 pixels per cell, native graphics just
-    // transmits the pre-scaled pixels), so the extra Lanczos quality
-    // would never reach the terminal anyway.
+    // `Triangle` is ~3–5× faster than `Lanczos3`, and the protocol layer re-encodes afterwards,
+    // so the extra Lanczos quality would never reach the terminal anyway.
     image.resize(max_w_px, max_h_px, image::imageops::FilterType::Triangle)
 }
 
-/// True when `url` is an `http://` or `https://` URL.  Other schemes
-/// (`data:`, `file:`, `ftp:`, …) are not considered remote: `file:` is
-/// handled as a local path, everything else is rejected in
+/// True for `http(s)` URLs only.  `file:` is a local path; every other scheme is rejected by
 /// [`resolve_local_path`].
 pub fn is_remote(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
@@ -202,13 +163,11 @@ pub fn is_remote(url: &str) -> bool {
 }
 
 fn resolve_local_path(url: &str, doc_path: Option<&Path>) -> Result<PathBuf, ImageLoadError> {
-    // Accept `file:///abs/path` and bare paths.  Reject any other scheme.
     if let Some(stripped) = url.strip_prefix("file://") {
         return Ok(PathBuf::from(stripped));
     }
     if let Some((scheme, _)) = url.split_once(':') {
-        // A bare Windows path ("C:/…") has a single-char scheme — treat
-        // any single-char prefix as not-a-scheme so we don't reject those.
+        // A bare Windows path ("C:/…") looks like a single-char scheme; don't reject those.
         let looks_like_scheme = scheme.len() > 1
             && scheme
                 .chars()
@@ -228,19 +187,13 @@ fn resolve_local_path(url: &str, doc_path: Option<&Path>) -> Result<PathBuf, Ima
 }
 
 fn fetch_remote(url: &str) -> Result<Vec<u8>, ImageLoadError> {
-    // ureq 3 replaced `AgentBuilder` with a typed config builder
-    // (`Config` → `Agent` via `Into`) and split the single read timeout
-    // into receive-response / receive-body phases.  We bound the connect
-    // and both receive phases at `REMOTE_TIMEOUT` so a slow server can't
-    // hang the decode worker.
+    // All three phases are bounded, so a slow server can't hang the decode worker.
     let config = ureq::Agent::config_builder()
         .timeout_connect(Some(REMOTE_TIMEOUT))
         .timeout_recv_response(Some(REMOTE_TIMEOUT))
         .timeout_recv_body(Some(REMOTE_TIMEOUT))
         .build();
-    // Build the agent with a resolver that refuses internal IP ranges so a
-    // remote image can't be used to probe loopback / LAN / cloud-metadata
-    // endpoints (SSRF).  See `PublicOnlyResolver`.
+    // The custom resolver is the SSRF guard — see `PublicOnlyResolver`.
     let agent = ureq::Agent::with_parts(
         config,
         ureq::unversioned::transport::DefaultConnector::default(),
@@ -253,9 +206,7 @@ fn fetch_remote(url: &str) -> Result<Vec<u8>, ImageLoadError> {
             url: url.to_owned(),
             source: Box::new(source),
         })?;
-    // ureq 3 reads the body off the response itself; `read_to_vec`
-    // surfaces transport errors as `ureq::Error`, so they route through
-    // the same `Http` variant as the request failure above.
+    // Body-read transport errors are `ureq::Error` too, so they route through the same variant.
     response
         .body_mut()
         .read_to_vec()
@@ -267,15 +218,13 @@ fn fetch_remote(url: &str) -> Result<Vec<u8>, ImageLoadError> {
 
 // ── SSRF guard ──────────────────────────────────────────────────────────────
 
-/// A name resolver that drops any address in an internal range, wrapping
-/// ureq's `DefaultResolver`.  Once the user allows remote images for a
-/// document, *every* `http(s)` URL in it is fetched — so without this a
-/// benign-looking URL (or a `3xx` redirect from one) could reach
-/// `127.0.0.1`, a LAN host, or the `169.254.169.254` cloud-metadata
-/// endpoint.  Filtering on the *resolved* IP rather than the hostname
-/// defeats literal-IP URLs, DNS names pointed at private space (DNS
-/// rebinding), and every redirect hop uniformly, because ureq re-resolves
-/// each hop through this resolver.
+/// A resolver that drops internal addresses, wrapping ureq's `DefaultResolver`.  Once remote
+/// images are allowed for a document *every* `http(s)` URL in it is fetched, so without this a
+/// benign-looking URL — or a `3xx` redirect from one — could reach loopback, a LAN host, or the
+/// cloud-metadata endpoint.
+///
+/// Filtering the *resolved* IP rather than the hostname defeats literal-IP URLs, DNS rebinding,
+/// and every redirect hop uniformly, since ureq re-resolves each hop through here.
 #[derive(Debug, Default)]
 struct PublicOnlyResolver {
     inner: ureq::unversioned::resolver::DefaultResolver,
@@ -296,20 +245,17 @@ impl ureq::unversioned::resolver::Resolver for PublicOnlyResolver {
             }
         }
         if allowed.is_empty() {
-            // Every candidate address was internal — treat the host as
-            // unresolvable rather than connecting to it.
+            // Every candidate was internal: unresolvable, rather than connect to it.
             return Err(ureq::Error::HostNotFound);
         }
         Ok(allowed)
     }
 }
 
-/// True for any IP edamame must not connect to when fetching a remote
-/// image: loopback, RFC1918 private, link-local (incl. the
-/// `169.254.169.254` cloud-metadata address), carrier-grade NAT,
-/// unique-local / link-local IPv6, and the unspecified / broadcast /
-/// documentation ranges.  IPv4-mapped IPv6 addresses are unwrapped and
-/// re-checked so `::ffff:127.0.0.1` can't slip past.
+/// True for any IP a remote image fetch must not reach: loopback, RFC1918, link-local (including
+/// the `169.254.169.254` metadata address), CGNAT, IPv6 unique- and link-local, and the
+/// unspecified / broadcast / documentation ranges.  IPv4-mapped IPv6 is unwrapped and re-checked,
+/// so `::ffff:127.0.0.1` cannot slip past.
 fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -337,18 +283,15 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// True when `url`'s path ends in `.svg` (case-insensitive), ignoring any
-/// `?query` / `#fragment` suffix on a remote URL.  Detection is by
-/// extension only: a remote URL that serves SVG without a `.svg` path
-/// (e.g. `?format=svg`) falls through to the raster decoder and fails
-/// like any non-image — that is the documented trade-off.
+/// True when `url`'s path ends in `.svg`, ignoring any query or fragment.  Extension only: a URL
+/// serving SVG from a non-`.svg` path falls through to the raster decoder and fails like any
+/// non-image.
 fn is_svg_url(url: &str) -> bool {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     path.to_ascii_lowercase().ends_with(".svg")
 }
 
-/// Decode `bytes` into a `DynamicImage`, picking the SVG rasterizer for
-/// `.svg` URLs and the raster (`image` crate) decoder otherwise.
+/// Decode `bytes`, picking the SVG rasterizer for `.svg` URLs and the raster decoder otherwise.
 fn decode_any(
     url: &str,
     bytes: &[u8],
@@ -362,10 +305,9 @@ fn decode_any(
     }
 }
 
-/// Decode raster `bytes` into a `DynamicImage` through `image::ImageReader`
-/// with [`image::Limits`] in force, so a compression bomb is rejected with
-/// a `Decode` error rather than driving an OOM that `catch_unwind` cannot
-/// contain.  Replaces the unbounded `image::load_from_memory`.
+/// Decode raster `bytes` with [`image::Limits`] in force, so a compression bomb is rejected with
+/// a `Decode` error rather than an OOM `catch_unwind` cannot contain.  Never use the unbounded
+/// `image::load_from_memory` here.
 fn decode(url: &str, bytes: &[u8]) -> Result<DynamicImage, ImageLoadError> {
     let mut limits = image::Limits::no_limits();
     limits.max_image_width = Some(MAX_DECODE_DIMENSION);
@@ -385,17 +327,12 @@ fn decode(url: &str, bytes: &[u8]) -> Result<DynamicImage, ImageLoadError> {
     })
 }
 
-/// Rasterize SVG `bytes` to a `DynamicImage`.  Unlike a diagram, a user's
-/// SVG file has a meaningful natural size, so it is only downscaled to
-/// fit the envelope (`SvgSizing::Natural`) — `Resize::Fit` then displays
-/// it 1:1, crisp at natural size — and its transparency is preserved
-/// (no background fill) to composite over the document like a
-/// transparent PNG.  The subsequent `pre_resize` is a no-op here because
-/// the rasterizer has already capped the pixel size at the envelope.
+/// Rasterize SVG `bytes`.  Unlike a diagram, a user's SVG has a meaningful natural size, so it is
+/// only *downscaled* to the envelope (`SvgSizing::Natural`) and its transparency is preserved.
+/// The later [`pre_resize`] is a no-op — the rasterizer already capped the pixel size.
 ///
-/// Only UTF-8 SVG bytes are accepted; a UTF-16-encoded or BOM-prefixed
-/// file is reported as an `Svg` parse error rather than silently failing
-/// elsewhere.  Both are rare for hand- and tool-authored SVGs.
+/// Only UTF-8 is accepted; a UTF-16 or BOM-prefixed file reports an `Svg` parse error rather than
+/// failing obscurely later.
 fn decode_svg(
     url: &str,
     bytes: &[u8],
@@ -425,9 +362,7 @@ fn decode_svg(
 mod tests {
     use super::*;
 
-    /// Generate a tiny valid PNG in-memory using the `image` crate so the
-    /// test doesn't depend on a hand-crafted byte string (which is easy
-    /// to get wrong — CRCs, IDAT compression, etc.).
+    /// A tiny valid PNG, encoded rather than hand-written (CRCs, IDAT compression).
     fn tiny_png() -> Vec<u8> {
         use image::{ImageBuffer, Rgba};
         let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
@@ -640,12 +575,9 @@ mod tests {
 
     #[test]
     fn pre_resize_downscales_oversized_images() {
-        // 40×40 pixels > 20×10 cells × 2×2 font = 40×20 pixels? hmm
-        // Use big-enough numbers to ensure the image is downscaled.
         let big = DynamicImage::new_rgba8(500, 500);
+        // Envelope is 200×200 px, so 500×500 fits down to 200×200.
         let resized = pre_resize(big, (20, 10), (10, 20));
-        // max_w_px = 200, max_h_px = 200 → fit preserves aspect, so
-        // 500×500 → 200×200.
         assert!(resized.width() <= 200);
         assert!(resized.height() <= 200);
     }

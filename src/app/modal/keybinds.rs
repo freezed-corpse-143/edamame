@@ -1,16 +1,9 @@
-//! Keybinds overlay.  Adapter wrapping
-//! [`crate::ui::KeybindsState`].
+//! Keybinds overlay: adapter wrapping [`crate::ui::KeybindsState`].
 //!
-//! Edits are buffered inside the overlay's draft keymap / overrides
-//! and only applied to the live [`crate::config::KeyMap`] and
-//! [`crate::config::KeyBindingOverrides`] when the user activates
-//! `[ Save ]`.  Esc and `[ Cancel ]` discard the draft.  Persistence
-//! to `keybindings.toml` happens on Save and only on Save.
-//!
-//! Save failures (missing config dir, disk write errors) surface as a
-//! warning [`crate::ui::ModalKind::Warning`] notice and keep the
-//! overlay open with the user's drafts intact, so they can retry
-//! without losing work.
+//! Edits are buffered in the overlay's draft keymap / overrides and reach the live
+//! [`crate::config::KeyMap`] — and `keybindings.toml` — only on `[ Save ]`; Esc and
+//! `[ Cancel ]` discard.  A save failure surfaces as a warning notice and keeps the overlay
+//! open with the drafts intact.
 
 use std::any::Any;
 
@@ -36,16 +29,12 @@ impl KeybindsOverlayModal {
     }
 }
 
-/// Try to persist the draft overrides to `keybindings.toml`.  Returns
-/// `Err(message)` on missing config dir or write failure; the caller
-/// surfaces the message via [`App::notify`] and keeps the overlay
-/// open so the user can retry without losing their drafts.
+/// Persist the draft overrides to `keybindings.toml`, returning `Err(message)` for the caller
+/// to surface.
 ///
-/// Under `--no-config` this writes nothing and reports success, so the
-/// drafts still take effect for the session.  `save_to` truncates the
-/// whole file from the in-memory overrides — which a `--no-config`
-/// session never read — so without the gate one rebind would replace
-/// the user's entire `keybindings.toml` with that single entry.  See
+/// Under `--no-config` this writes nothing and reports success.  `save_to` truncates the whole
+/// file from the in-memory overrides — which such a session never read — so without the gate
+/// one rebind would replace the user's entire `keybindings.toml`.  See
 /// [`crate::config::persistence`].
 fn try_persist(overrides: &KeyBindingOverrides) -> Result<(), String> {
     if !config::config_writes_allowed() {
@@ -61,10 +50,8 @@ fn try_persist(overrides: &KeyBindingOverrides) -> Result<(), String> {
     })
 }
 
-/// Swap the drafts onto `app` after a successful persist.  Only the
-/// in-memory state is touched here; disk has already been written —
-/// unless writes are suppressed, in which case the flash says so rather
-/// than claiming a save that didn't happen.
+/// Swap the drafts onto `app` after a successful persist.  When writes are suppressed the
+/// flash says so rather than claiming a save that didn't happen.
 fn install_drafts(app: &mut App, keymap: KeyMap, overrides: KeyBindingOverrides) {
     app.keymap = Some(keymap);
     app.keybindings = overrides;
@@ -76,12 +63,9 @@ fn install_drafts(app: &mut App, keymap: KeyMap, overrides: KeyBindingOverrides)
     app.flash(msg, MessageKind::Success);
 }
 
-/// Map a `KeybindsResponse::Save` to a `ModalOutcome` that either
-/// closes-with-install on success or stays-open-with-warning on
-/// failure.  `on_failure_outcome` controls how the warning is
-/// delivered: from `handle_key` we have `&mut App` directly so the
-/// notify is inline and we return `Continue`; from `handle_click` we
-/// don't, so we return `ContinueAnd(notify)`.
+/// Map a `KeybindsResponse::Save` to a `ModalOutcome`: close-and-install on success, stay open
+/// with a warning on failure.  `notify_inline` is `Some` only from `handle_key`, which holds
+/// `&mut App`; `handle_click` does not, so its warning goes through `ContinueAnd`.
 fn outcome_for_save(
     keymap: KeyMap,
     overrides: KeyBindingOverrides,
@@ -162,10 +146,8 @@ mod tests {
         assert!(app.modal_stack.contains::<KeybindsOverlayModal>());
     }
 
-    /// `save_to` truncates the whole file from the in-memory overrides,
-    /// which a `--no-config` session never read — so an ungated Save
-    /// would replace the user's real `keybindings.toml` with whatever
-    /// single rebind they made during a triage run.
+    /// An ungated Save would replace the user's real `keybindings.toml` with whatever single
+    /// rebind they made during a `--no-config` run.
     #[test]
     fn saving_writes_no_keybindings_file_while_writes_are_suppressed() {
         let _lock = crate::test_env::env_lock();
@@ -189,8 +171,8 @@ mod tests {
             assert!(!path.exists(), "--no-config must not create {path:?}");
         }
 
-        // Ungated, the same call does write — so the assertion above is
-        // about the gate, not about a misdirected path.
+        // Ungated the same call does write, so the assertion above is about the gate, not a
+        // misdirected path.
         assert_eq!(try_persist(&overrides), Ok(()));
         assert!(path.exists());
         assert!(std::fs::read_to_string(&path).unwrap().contains("ctrl+x"));

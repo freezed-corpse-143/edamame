@@ -1,15 +1,7 @@
-//! External-editor lifecycle extracted from `app.rs` in Step 2 of
-//! `refactor-app.md`.
+//! Suspending the TUI to run `$VISUAL` / `$EDITOR` on a file, and the OS-handler fallback.
 //!
-//! Owns:
-//! - [`ExternalEditorOutcome`] reporting whether the editor process
-//!   actually ran.
-//! - The shared suspend/resume dance in [`App::run_external_editor`].
-//! - Two App entry points, one for `config.toml` and one for the
-//!   current buffer's file, that wrap the shared helper with
-//!   pre-launch save and post-exit reload semantics.
-//! - [`App::spawn_open_worker`] for OS-handler fallbacks (URLs and
-//!   non-Markdown local files).
+//! [`App::run_external_editor`] owns the suspend/resume window; the entry points for
+//! `config.toml`, the current buffer, and a theme file wrap it with their own save/reload.
 
 use std::io::Stdout;
 use std::path::Path;
@@ -30,48 +22,26 @@ use super::flash::MessageKind;
 use super::theme_fallback;
 use super::{App, AppEvent};
 
-/// Result of [`App::run_external_editor`].  Tells the caller whether
-/// the editor actually ran so it can decide whether a post-exit
-/// reload is appropriate.
+/// Result of [`App::run_external_editor`]; tells the caller whether a post-exit reload makes sense.
 pub(super) enum ExternalEditorOutcome {
-    /// `$VISUAL` / `$EDITOR` was unset; the path was handed to the
-    /// OS handler via `open::that`.  No suspend happened.
+    /// No shell editor set; the path went to `open::that`. No suspend happened.
     OsHandler,
-    /// The TUI couldn't be suspended.  An error was already flashed.
+    /// The TUI could not be suspended. An error was already shown.
     SuspendFailed,
-    /// The editor process ran (or failed to launch) — here's the
-    /// outcome.
+    /// The editor process ran (or failed to launch).
     Exited(std::io::Result<std::process::ExitStatus>),
 }
 
 impl App {
-    /// Open `config.toml` in the user's text editor and reload the
-    /// config when the editor exits.  Prefers `$VISUAL` over
-    /// `$EDITOR` (the modern shell convention); falls back to
-    /// `open::that` (which delegates to the OS GUI handler) when
-    /// neither variable is set.
-    ///
-    /// When a shell editor is invoked we need to surrender the
-    /// terminal entirely: leave the alternate screen, drop raw mode,
-    /// disable mouse capture, etc., so the editor can talk to the
-    /// real TTY.  Once the editor exits we re-enter the TUI and
-    /// force a full redraw.
-    ///
-    /// `terminal` is borrowed mutably so we can call
-    /// [`Terminal::clear`] after re-entry — without this, ratatui's
-    /// in-memory buffer thinks the screen still holds whatever it
-    /// drew before suspension and skips redrawing unchanged cells.
+    /// Open `config.toml` in the user's editor, then reload the config and live-apply theme,
+    /// keybindings, and the rest of the editor-facing settings.
     pub(super) fn open_config_in_editor(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
         rx: &mpsc::Receiver<AppEvent>,
     ) {
-        // `--no-config` rules the config directory out of this session
-        // in both directions, and this one action would cross it twice:
-        // the seeding save below writes `config.toml`, and the reload
-        // after the editor exits would pull the user's real settings
-        // into a run started specifically to exclude them.  Refuse the
-        // whole flow rather than half-honour it.
+        // `--no-config` excludes the config dir in both directions: the seeding save would
+        // write it and the reload would pull the user's real settings in. Refuse the whole flow.
         if !config::config_writes_allowed() {
             self.notify(
                 "The config file is not in use while --no-config is in effect",
@@ -83,11 +53,6 @@ impl App {
             self.notify("No config directory available", ModalKind::Error);
             return;
         };
-        // Make sure the file exists before we hand it to an editor
-        // that might fail on a missing path.  `Config::save`
-        // serialises the in-memory config — same content the user
-        // would see if they navigated to the file via the file
-        // manager.
         if !path.exists() {
             if let Err(e) = self.config.save() {
                 tracing::warn!(error = %e, "failed to seed config.toml before editor launch");
@@ -98,55 +63,27 @@ impl App {
 
         let outcome = self.run_external_editor(&path, terminal, rx);
 
-        // Reload the config from disk so any edits the user made
-        // are reflected in the running session.  Failures fall back
-        // to the in-memory state with a warning — the user can
-        // restart edamame to retry.  Run the reload regardless of
-        // whether the editor actually launched: if we fell back to
-        // the OS handler the user might still have edited the file.
-        //
-        // Any non-fatal warnings (parse error, unknown keys, invalid
-        // keybinding entries) returned by `Config::load` are routed
-        // into the same `ConfigWarningModal` we use at startup so the
-        // user sees their typo as soon as they exit the editor.
+        // Reload even on the OS-handler fallback: the user may still have edited the file.
         let truecolor = self.capabilities.color_depth == ColorDepth::TrueColor;
-        // `persist_fallback = false`: the user just hand-edited
-        // `config.toml` in their `$EDITOR`.  If they set `theme` to a
-        // name whose file isn't on disk yet (typical "install the
-        // theme later" workflow), we surface the warning but must
-        // NOT silently rewrite the file they just saved seconds ago
-        // — that would fight their stated intent.  At startup the
-        // tradeoff goes the other way; see `Config::load` for the
-        // rationale.
-        // Captured before the reload replaces `self.config`: it tells
-        // us whether a substitution that fires below is *new* (the user
-        // just hand-edited `theme` to something this terminal can't
-        // render) or the same one they already acknowledged at startup.
-        // Only the former is worth a modal.
+        // `persist_fallback = false`: the user just hand-edited this file, so a theme whose
+        // file is not on disk yet must not be silently rewritten out of it (startup goes the
+        // other way; see `Config::load`).
+        // `previous_downgrade` decides whether a substitution below is new (worth a modal) or
+        // the one already acknowledged at startup.
         let previous_downgrade = self.config.theme_downgraded_from.clone();
         match Config::load(truecolor, false) {
             Ok(loaded) => {
                 self.config = loaded.config;
                 self.keybindings = loaded.keybindings;
-                // Rebuild the keymap so any keybinding edits take
-                // effect for the next keystroke.
                 match KeyMap::build(&self.keybindings) {
                     Ok(km) => self.keymap = Some(km),
                     Err(e) => {
                         tracing::warn!(error = %e, "rebuilt KeyMap failed after editor exit");
                     }
                 }
-                // Live-apply the theme so a `theme = "..."` edit in
-                // the external editor takes effect without a
-                // restart.  Uses the already-loaded `ThemeFile` so
-                // we don't read the theme TOML twice.
-                //
-                // Re-apply the indexed-color substitution first: the
-                // reload just replaced `config.theme` with whatever is
-                // on disk, which on a terminal without 24-bit color is
-                // exactly the palette we swapped away from at startup.
-                // Without this, exiting `$EDITOR` would repaint the
-                // session unreadable.
+                // Re-apply the indexed-color substitution before building the theme: the reload
+                // restored the on-disk palette, which on a non-truecolor terminal is exactly
+                // the one swapped away at startup.
                 let mut theme_file = loaded.theme;
                 if let Some(d) = theme_fallback::apply(&mut self.config, &self.capabilities) {
                     theme_file = d.theme_file;
@@ -164,18 +101,9 @@ impl App {
                     Box::leak(Box::new(Theme::from_file(&theme_file, monochrome)));
                 self.theme = new_theme;
                 self.editor.set_theme(new_theme);
-                // Everything else the editor reads out of `Config`, via
-                // the single site `App::new` and the document-swap path
-                // already share.  The reload replaced `self.config`
-                // wholesale, so without this an edit to `big_h1`,
-                // `syntax_highlighting`, `cursor_blink` or
-                // `table.row_striping` in the very file the user just
-                // saved would have no effect until the next launch —
-                // silently, since the flash still says "Configuration
-                // updated".  Theme and keybindings were live-applied
-                // above precisely because someone noticed them; this
-                // covers the rest of the family, and any future member
-                // of it, without a fourth list to keep in sync.
+                // Everything else the editor reads out of `Config`, through the one site
+                // `App::new` and the document-swap path share, so no setting is silently
+                // deferred to the next launch.
                 let (images_on, diagrams_on) =
                     (self.images_layout_enabled(), self.diagrams_layout_enabled());
                 super::configure_new_editor(&mut self.editor, &self.config, images_on, diagrams_on);
@@ -194,27 +122,18 @@ impl App {
                 self.flash("Configuration updated", MessageKind::Success);
             }
             ExternalEditorOutcome::Exited(Ok(s)) => {
-                // Non-zero exit is often deliberate (`:cq` in Vim, signal,
-                // editor abort) — surface it as a passing hint rather than
-                // a blocking modal.
+                // Non-zero exit is often deliberate (`:cq`), so a hint rather than a modal.
                 self.flash(format!("Editor exited {s}"), MessageKind::Info);
             }
             ExternalEditorOutcome::Exited(Err(e)) => {
                 self.notify(format!("Editor failed: {e}"), ModalKind::Error);
             }
-            // Suspend failure / OS-handler fallback already flashed
-            // their own status — no extra message here.
             ExternalEditorOutcome::SuspendFailed | ExternalEditorOutcome::OsHandler => {}
         }
     }
 
-    /// Save the current buffer (best-effort) and open it in the
-    /// user's `$VISUAL` / `$EDITOR`.  After the editor exits the
-    /// buffer is reloaded from disk so external edits are picked up
-    /// — without this, subsequent saves from edamame would silently
-    /// overwrite work done in the other editor.  Falls back to the
-    /// OS handler when no shell editor is set; same flow the
-    /// settings overlay uses for `config.toml`.
+    /// Save the current buffer, open it in the user's editor, and reload it from disk afterward
+    /// so a later save from edamame cannot overwrite the external edits.
     pub(super) fn open_current_file_in_editor(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -225,7 +144,6 @@ impl App {
             return;
         };
 
-        // Save first so the external editor sees the in-memory state.
         if self.editor.dirty {
             if let Err(e) = self.save_buffer() {
                 tracing::warn!(error = %e, "failed to save buffer before editor launch");
@@ -236,13 +154,8 @@ impl App {
 
         let outcome = self.run_external_editor(&path, terminal, rx);
 
-        // Reload the buffer from disk so any external edits are
-        // reflected.  Skipped on suspend failure (terminal is in a
-        // degraded state already) and on the OS-handler fallback
-        // (the OS handler returns immediately and the user may not
-        // have closed the file yet — reloading prematurely would
-        // discard their in-edamame edits while they're still
-        // working).
+        // Not on the OS-handler fallback: it returns immediately, and reloading while the user
+        // is still editing elsewhere would discard their in-edamame edits.
         if matches!(outcome, ExternalEditorOutcome::Exited(_)) {
             if let Err(e) = self.load_file_into_editor(path) {
                 tracing::warn!(error = %e, "failed to reload buffer after editor exit");
@@ -265,11 +178,8 @@ impl App {
         }
     }
 
-    /// Open a theme `.toml` in the user's `$VISUAL` / `$EDITOR`, then
-    /// reload the active theme so any edits take effect immediately.
-    /// Mirrors [`Self::open_config_in_editor`] but scoped to a single
-    /// theme file — the success modal pushed after
-    /// `Action::CreateCustomTheme` routes here.
+    /// Open a theme `.toml` in the user's editor and reload the active theme afterward.
+    /// Reached from the success modal after `Action::CreateCustomTheme`.
     pub(super) fn open_theme_in_editor(
         &mut self,
         path: &Path,
@@ -301,13 +211,8 @@ impl App {
         }
     }
 
-    /// Suspend the TUI, run an external editor on `path`, and resume.
-    /// Shared between the settings-overlay "Open config.toml" flow
-    /// and the palette "Open current file in system editor" flow:
-    /// both need the same read-thread / terminal dance around
-    /// `Command::status()`.  The caller is responsible for any
-    /// pre-launch save / post-exit reload — this helper only owns
-    /// the suspend / resume window.
+    /// Suspend the TUI, run `$VISUAL` / `$EDITOR` on `path`, and resume. Owns only the
+    /// suspend/resume window; callers handle any pre-launch save and post-exit reload.
     pub(super) fn run_external_editor(
         &mut self,
         path: &Path,
@@ -324,49 +229,27 @@ impl App {
             });
 
         let Some(editor) = editor else {
-            // No shell editor — fall back to the OS handler.  This
-            // is the same path link-following uses, so the
-            // user sees consistent behaviour whether $EDITOR is set
-            // or not.
             self.spawn_open_worker(path.display().to_string());
             self.flash("Opening with system default", MessageKind::Info);
             return ExternalEditorOutcome::OsHandler;
         };
 
-        // Pause our crossterm read thread so the editor has
-        // uncontested access to stdin.  Without this, our thread
-        // and the editor both call `read()` on the same fd: bytes
-        // get split between them, the editor sees corrupted input
-        // (the `1;rgb:...` artifact users reported was the OSC 11
-        // background-color response that neovim queried for, with
-        // some bytes stolen by us), and keystrokes feel laggy
-        // because half of them never reach the editor.
+        // Pause the crossterm read thread so the editor has stdin to itself. Otherwise both
+        // `read()` the same fd and bytes get split: the `1;rgb:...` artifact users reported was
+        // neovim's OSC 11 reply with some bytes stolen by us.
         if let Some(p) = self.read_paused.as_ref() {
             p.store(true, Ordering::Release);
         }
-        // Drop the filesystem watch for the duration of the external
-        // editor: `unwatch()` un-registers the parent directory from
-        // notify *and* clears the worker's active path, so any
-        // organic events generated by the editor's own writes never
-        // reach the main mpsc.  The forced reconcile on the resume
-        // side re-registers and replays the post-editor disk state
-        // — that is how the editor's edits get picked up, not
-        // through organic events at all.
+        // Drop the watch for the duration: the editor's writes must not reach the main mpsc as
+        // organic events. The forced reconcile on resume is how its edits get picked up.
         if let Some(w) = self.watcher.as_mut() {
             let _ = w.unwatch();
         }
-        // The poll loop wakes every 100 ms; sleep slightly longer
-        // so the read thread is guaranteed to have entered the
-        // paused branch before we hand stdin to the editor.
+        // The poll loop wakes every 100 ms; wait a little longer so the read thread has entered
+        // its paused branch, then discard anything parsed during the overlap.
         std::thread::sleep(Duration::from_millis(120));
-        // Discard any events that were already parsed during the
-        // overlap window so they don't reach the editor (or
-        // re-emerge in our channel after resume).
         while rx.try_recv().is_ok() {}
 
-        // Suspend the TUI.  Best-effort: a failure here means the
-        // editor would launch into a confused terminal state, so
-        // bail out and tell the user.
         if let Err(e) = crate::terminal::restore() {
             tracing::warn!(error = %e, "failed to suspend terminal for editor");
             self.notify(format!("Editor failed: {e}"), ModalKind::Error);
@@ -378,35 +261,22 @@ impl App {
 
         let status = std::process::Command::new(&editor).arg(path).status();
 
-        // Always try to restore the TUI, even if the editor failed —
-        // otherwise we strand the user in a half-suspended state.
+        // Always re-enter, even if the editor failed, or the user is stranded half-suspended.
         let mouse = self.capabilities.mouse;
         let kbd = self.capabilities.keyboard_enhancement;
         let restore_result = crate::terminal::re_enter(mouse, kbd);
         if let Err(e) = restore_result {
             tracing::error!(error = %e, "failed to re-enter TUI after editor");
-            // We can still draw something, but the terminal is in
-            // a degraded state.  Surface it loudly.
             self.notify(format!("Terminal restore failed: {e}"), ModalKind::Error);
         }
-        // Some terminals emit acknowledgements for the re-enter
-        // sequences (kitty keyboard, mouse mode).  Pause stays on
-        // here so any such bytes flow into the kernel buffer
-        // rather than racing with the read thread that's about to
-        // resume.  After this short wait, drain the channel and
-        // resume — the read thread will pick up anything still
-        // pending on its first post-resume poll.
+        // Some terminals acknowledge the re-enter sequences (kitty keyboard, mouse mode); keep
+        // the read thread paused briefly so those bytes are drained rather than raced.
         std::thread::sleep(Duration::from_millis(30));
         while rx.try_recv().is_ok() {}
         if let Some(p) = self.read_paused.as_ref() {
             p.store(false, Ordering::Release);
         }
-        // Re-arm the filesystem watcher on the active file path and
-        // request a forced reconcile — this is how the worker
-        // notices any edits the external editor made.  Both calls
-        // are best-effort: a watcher rebuild failure leaves us
-        // without external-edit prompts until the next file open,
-        // not in a corrupted state.
+        // Re-arm the watcher and force a reconcile; both best-effort.
         if let Some(file_path) = self.file_path.clone() {
             if let Some(w) = self.watcher.as_mut() {
                 if let Err(e) = w.watch(&file_path) {
@@ -418,21 +288,17 @@ impl App {
             }
         }
 
-        // Ratatui caches the previous frame; clearing forces it to
-        // redraw every cell on the next `terminal.draw` call.
+        // Ratatui caches the previous frame; the clear forces a full redraw, and it also wiped
+        // whatever a graphics protocol had on screen.
         let _ = terminal.clear();
-        // The clear wiped the screen, so nothing we previously
-        // transmitted to a graphics protocol is still displayed.
         self.editor.images.invalidate_native_paints();
         self.needs_draw = true;
 
         ExternalEditorOutcome::Exited(status)
     }
 
-    /// Spawn a worker thread that calls `open::that` and reports the
-    /// outcome via `AppEvent::LinkOpenResult`.  Keeps the UI thread
-    /// responsive — `xdg-open` can take several hundred milliseconds
-    /// on some desktops.
+    /// Call `open::that` on a worker thread (xdg-open can take hundreds of ms) and report the
+    /// outcome via `AppEvent::LinkOpenResult`.
     pub(super) fn spawn_open_worker(&self, target: String) {
         let Some(tx) = self.app_tx.clone() else {
             return;

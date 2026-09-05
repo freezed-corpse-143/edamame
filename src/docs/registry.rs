@@ -1,31 +1,15 @@
-//! The set of documentation pages compiled into the binary.
-//!
-//! [`ALL_DOCS`] is the single derivation for the generated index page
-//! and for cross-document link resolution: both iterate it, so a page
-//! added here reaches both without another edit.
-//!
-//! The command palette is the one consumer that does **not** derive
-//! from it — `ui::command_palette::actions::ALL_ACTIONS` is a
-//! hand-written list of `Action::OpenDoc(...)` literals, because that
-//! array is a `const` of unit-ish `Action` values rather than something
-//! built at runtime.  So a page added here needs exactly one more line
-//! there, and forgetting it would leave the page reachable only by a
-//! link from another page, silently and with nothing failing to
-//! compile.  `the_palette_lists_every_embedded_page_exactly_once` pins
-//! the two against each other.
+//! The documentation pages compiled into the binary. [`ALL_DOCS`] drives both the generated
+//! index and cross-document link resolution. The command palette does not derive from it
+//! (`ui::command_palette::actions::ALL_ACTIONS` is a `const` list of literals), so a new
+//! page needs one more line there; `the_palette_lists_every_embedded_page_exactly_once`
+//! pins the two together.
 
 use std::borrow::Cow;
 
-/// One page of the shipped manual.
-///
-/// [`DocId::Index`] is the odd member: it has no file behind it and is
-/// built at runtime by [`index_source`], so it is deliberately absent
-/// from [`ALL_DOCS`] — that array is "one entry per `include_str!`",
-/// which is what makes it the right thing to iterate when generating
-/// the index.
+/// One page of the shipped manual. [`DocId::Index`] has no file behind it — it is built by
+/// [`index_source`] — and so is absent from [`ALL_DOCS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DocId {
-    /// The generated landing page linking to every other page.
     Index,
     GettingStarted,
     Editing,
@@ -37,30 +21,20 @@ pub enum DocId {
     Security,
 }
 
-/// A page's file name, title, and embedded source.
 #[derive(Debug, Clone, Copy)]
 pub struct DocPage {
     pub id: DocId,
-    /// The file name as it appears in a Markdown link *inside* the
-    /// docs (`security.md`).  This is the join key cross-document
-    /// links resolve against, which is why it carries the extension
-    /// rather than being a bare slug.
+    /// File name as written in Markdown links inside the docs (`security.md`) — the join
+    /// key cross-document links resolve against, hence the extension.
     pub slug: &'static str,
-    /// Human-readable name, used by the status bar.
+    /// Status-bar name.
     pub title: &'static str,
-    /// The command palette's label for this page.
-    ///
-    /// Stored as a literal rather than built from `title`, because
-    /// `label_for` hands the palette a `&'static str` and formatting
-    /// one at runtime would mean leaking it.  Kept beside `title` so
-    /// the two are read and changed together.
+    /// A literal rather than derived from `title`: the palette wants a `&'static str`.
     pub palette_label: &'static str,
-    /// The page's Markdown, compiled in.
     pub source: &'static str,
 }
 
-/// Every embedded page, in the order the generated index lists them —
-/// roughly the order a new user should read them, not alphabetical.
+/// Every embedded page, in the order the index lists them (reading order, not alphabetical).
 pub const ALL_DOCS: &[DocPage] = &[
     DocPage {
         id: DocId::GettingStarted,
@@ -120,37 +94,25 @@ pub const ALL_DOCS: &[DocPage] = &[
     },
 ];
 
-/// The title the index page carries, both as its `# ` heading and as
-/// its status-bar label.
 const INDEX_TITLE: &str = "Documentation";
 
-/// The index's palette entry.  Named "Help" rather than "Docs" so it
-/// sorts away from the seven per-page entries and reads as the way in
-/// for someone who does not yet know which page they want.
+/// "Help" rather than "Docs" so it sorts away from the per-page entries.
 const INDEX_PALETTE_LABEL: &str = "Help: Documentation";
 
 impl DocId {
-    /// The page's entry in [`ALL_DOCS`], or `None` for [`DocId::Index`]
-    /// which has none.
     fn page(self) -> Option<&'static DocPage> {
         ALL_DOCS.iter().find(|p| p.id == self)
     }
 
-    /// Human-readable name, shown in the status bar as `Docs: <title>`.
     pub fn title(self) -> &'static str {
         self.page().map_or(INDEX_TITLE, |p| p.title)
     }
 
-    /// The command palette's label for this page.
     pub fn palette_label(self) -> &'static str {
         self.page().map_or(INDEX_PALETTE_LABEL, |p| p.palette_label)
     }
 
-    /// The page's Markdown source.
-    ///
-    /// `Cow` because [`DocId::Index`] is the only variant that has to
-    /// build its text; every real page hands back the `include_str!`d
-    /// `&'static str` with no allocation.
+    /// `Cow` because only [`DocId::Index`] has to build its text.
     pub fn source(self) -> Cow<'static, str> {
         match self.page() {
             Some(p) => Cow::Borrowed(p.source),
@@ -158,33 +120,17 @@ impl DocId {
         }
     }
 
-    /// The page a cross-document link names, matched on the file name
-    /// **exactly**.
-    ///
-    /// No leniency, for the same reason
-    /// [`crate::app::App::heading_line_for_fragment`] allows none: a
-    /// link that resolves only inside edamame is one an author ships
-    /// broken to GitHub without ever seeing it fail here.  Any path
-    /// with a directory component (`dev/theming.md`, `../SECURITY.md`)
-    /// declines and falls to the GitHub branch in
-    /// [`super::link::resolve_doc_reference`].
-    ///
-    /// The index is unreachable this way on purpose: it is generated,
-    /// so no page links to it by file name.
+    /// The page a cross-document link names, matched on the file name exactly. No leniency,
+    /// as in [`crate::app::App::heading_line_for_fragment`]: a link that resolves only inside
+    /// edamame ships broken to GitHub. Paths with a directory component decline and fall to
+    /// [`super::link::resolve_doc_reference`]'s GitHub branch; the index is unreachable here.
     pub fn from_slug(slug: &str) -> Option<Self> {
         ALL_DOCS.iter().find(|p| p.slug == slug).map(|p| p.id)
     }
 }
 
-/// Build the index page: a heading, a line of orientation, and one
-/// bullet per embedded page.
-///
-/// Generated at runtime rather than committed as a `docs/index.md`
-/// because the bullets must agree with [`ALL_DOCS`], and a checked-in
-/// file is one more copy to keep in step.  It is plain Markdown, so
-/// every bullet is an ordinary link the existing cross-document
-/// resolver already handles — the index needs no special case anywhere
-/// downstream.
+/// Build the index page as plain Markdown, generated at runtime so its bullets cannot
+/// drift from [`ALL_DOCS`]; every bullet is an ordinary link the resolver already handles.
 fn index_source() -> String {
     let mut out = String::from("# ");
     out.push_str(INDEX_TITLE);
@@ -226,19 +172,14 @@ mod tests {
     #[test]
     fn from_slug_matches_exactly_and_declines_paths() {
         assert_eq!(DocId::from_slug("security.md"), Some(DocId::Security));
-        // A directory component must never resolve — those are the
-        // contributor pages, which are not embedded.
         assert_eq!(DocId::from_slug("dev/theming.md"), None);
         assert_eq!(DocId::from_slug("../SECURITY.md"), None);
-        // No leniency: neither case folding nor a missing extension.
         assert_eq!(DocId::from_slug("Security.md"), None);
         assert_eq!(DocId::from_slug("security"), None);
     }
 
     #[test]
     fn the_index_is_not_reachable_by_file_name() {
-        // It is generated, so nothing links to it; a page claiming the
-        // name would shadow a real one.
         assert_eq!(DocId::from_slug("index.md"), None);
     }
 

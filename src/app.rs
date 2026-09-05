@@ -56,49 +56,25 @@ use self::nav::NavEntry;
 pub(crate) enum AppEvent {
     /// A raw crossterm terminal event.
     Term(Event),
-    /// Worker-thread notification that an image decode finished.
-    /// `Ok(LoadedImage)` inserts the decoded bytes into
-    /// `EditorState::images`; `Err((url, message))` records the failure
-    /// so we don't retry on every render.
+    /// An image decode finished.  `Err` records the failure so it isn't retried every render.
     ImageReady(Result<crate::image::LoadedImage, (String, String)>),
-    /// Encoder-thread notification that a `ResizeRequest` finished.
-    /// `Ok(response)` is routed to its originating `ThreadProtocol` via
-    /// `ImageCache::apply_resize_response`.  `Err(_)` is only used to
-    /// keep the pending-request FIFO balanced — the failed entry is
-    /// popped and the placeholder stays visible until a subsequent
-    /// frame re-enqueues the encode.
+    /// An encoder `ResizeRequest` finished.  `Err` only keeps the pending-request FIFO balanced:
+    /// the placeholder stays visible until a later frame re-enqueues the encode.
     ProtocolReady(Result<ratatui_image::thread::ResizeResponse, ratatui_image::errors::Errors>),
-    /// Worker-thread report that `open::that` finished on a
-    /// URL or non-Markdown local file.  Currently only logged; a later
-    /// change will surface failures on the hint line.
+    /// `open::that` finished on a URL or non-Markdown file.  Currently only logged.
     LinkOpenResult(std::result::Result<(), String>),
-    /// Watcher worker delivered an event for the open file.  A
-    /// `Change` is routed through the own-write content-hash filter
-    /// before being acted on; a `ReadError` is surfaced via a
-    /// dismissable warning modal.  See [`App::handle_watcher_event`].
+    /// A watcher event for the open file.  See [`App::handle_watcher_event`].
     Watcher(WatchedEvent),
-    /// Worker-thread report from the GitHub latest-release check —
-    /// spawned once at startup (throttled, opt-out) and on every
-    /// explicit "Check for updates".  `Ok` carries the tag plus the
-    /// already-bounded release notes; `Err(message)` is logged and
-    /// surfaces as a failure state on an explicit check only.  See
-    /// [`update_check`].
+    /// The GitHub latest-release check finished.  `Err` surfaces as a failure state on an
+    /// explicit check only.  See [`update_check`].
     ReleaseCheckResult(std::result::Result<update_check::ReleaseInfo, String>),
-    /// Background HTML-export worker finished.  The `u64` is the export
-    /// generation id of the spawning modal, so a result from a superseded
-    /// export (the user dismissed the modal and opened a fresh one while the
-    /// worker ran) is routed to the hint line instead of hijacking the new
-    /// modal.  When the still-open `ExportModal` matches that id it is
-    /// advanced to its success / error phase
-    /// (`ExportModal::on_export_done`).  `Ok(path)` is the written file;
-    /// `Err(message)` is a presentable failure string.
+    /// The export worker finished.  The `u64` is the spawning modal's generation id, so a result
+    /// from a superseded export goes to the hint line instead of hijacking the modal now open.
     ExportDone(u64, crate::export::ExportOutcome),
 }
 
-/// Generic modal prompt hosted on the hint line.
-/// The `handler` fn is the single callback invoked when one of the chord keys
-/// is pressed — it receives the triggering `KeyCode` so the same prompt type
-/// can host multiple-button flows.
+/// Generic modal prompt hosted on the hint line.  `handler` receives the triggering `KeyCode`, so
+/// one prompt type can host a multiple-button flow.
 #[allow(dead_code)] // first consumer lands later
 pub struct HintPrompt {
     pub prompt: String,
@@ -109,374 +85,184 @@ pub struct HintPrompt {
 /// The application: owns all state and drives the event loop.
 pub struct App {
     config: Config,
-    /// Keybinding overrides loaded from `keybindings.toml`.  Held so
-    /// `KeyMap::build` can be called in `run()` alongside capability
-    /// detection and kitty-enhancement key registration, same as before
-    /// the config split.
+    /// Overrides from `keybindings.toml`, held so `KeyMap::build` can run in `run()` alongside
+    /// capability detection.
     keybindings: KeyBindingOverrides,
     theme: &'static Theme,
     capabilities: Capabilities,
     file_path: Option<PathBuf>,
-    /// Name shown in the status bar in place of a file name, set only by
-    /// the difftool presentation (`--diff`).
-    ///
-    /// That session opens no file — `file_path` is `None` so nothing can
-    /// start a watcher on, or save over, the temp files git hands us —
-    /// which would otherwise leave the status bar reading `[No file]` for
-    /// every file in a `git difftool` loop, exactly when knowing which one
-    /// is under review matters most.
+    /// Status-bar name for the difftool presentation (`--diff`), which opens no file: `file_path`
+    /// stays `None` so nothing can watch or save over git's temp files, and without this the bar
+    /// would read `[No file]` for every file in a `git difftool` loop.
     diff_label: Option<String>,
-    /// The manual page currently open, if the live buffer came out of
-    /// [`crate::docs`] rather than off disk.
-    ///
-    /// Mutually exclusive with `file_path` for the same reason
-    /// `diff_label` is: an embedded page is pathless, so nothing can
-    /// watch it or save over it, and the status bar would otherwise
-    /// read `[No file]` for a document that has a perfectly good name.
-    /// It is also the gate that lets `follow_link` resolve a relative
-    /// link against the embedded set instead of the working directory
-    /// — see `App::open_doc_page`.
+    /// The manual page currently open, when the buffer came from [`crate::docs`] rather than
+    /// disk.  Mutually exclusive with `file_path` for the same pathless reason as `diff_label`,
+    /// and the gate that makes `follow_link` resolve a relative link against the embedded set.
     open_doc: Option<crate::docs::DocId>,
-    /// Set when the user ended a difftool session with `Quit` rather
-    /// than `Esc`, so `main` can stop the whole walk once the terminal
-    /// is back.
-    ///
-    /// The two exits mean different things across a multi-file review:
-    /// `Esc` is "done with this file, show me the next", `Ctrl-Q` is
-    /// "Quit diff". Acting on the second is `main`'s job and not
-    /// this type's, because it happens *after* `terminal::restore` —
-    /// see [`crate::app::difftool::stop_walk`], which ends the walk by
-    /// signalling the process group rather than by an exit code git
-    /// discards by default.
+    /// Set when a difftool session ended with `Quit` rather than `Esc` — "quit the whole walk"
+    /// rather than "show me the next file".  Acting on it is `main`'s job because it happens after
+    /// `terminal::restore`; see [`crate::app::difftool::stop_walk`].
     diff_stop_walk: bool,
     editor: EditorState,
     view_state: EditorViewState,
     should_quit: bool,
-    /// Session-only override for the master images-enabled switch,
-    /// set by `Yes` / `No` on the images-enabled prompt.  `Some(true)`
-    /// renders images for the rest of this process; `Some(false)`
-    /// keeps them as placeholders; `None` defers to `config.images.enabled`.
-    /// `Always` / `Never` persist the choice to config instead of
-    /// setting this flag.
+    /// Session-only override for the images switch, set by `Yes` / `No` on the prompt; `None`
+    /// defers to `config.images.enabled`.  `Always` / `Never` persist to config instead.
     session_images_enabled: Option<bool>,
-    /// Session-only override for the master diagrams-enabled switch,
-    /// set by `Yes` / `No` on the diagrams-enabled prompt.  Mirrors
-    /// [`Self::session_images_enabled`] — kept separate so the two
-    /// prompts can be answered independently.
+    /// Diagrams mirror of [`Self::session_images_enabled`], kept separate so the two prompts can
+    /// be answered independently.
     pub(crate) session_diagrams_enabled: Option<bool>,
     /// Click-count tracking and drag state for mouse input.
     mouse: MouseDispatcher,
-    /// Active drag target, set on mouse-down and read by each subsequent
-    /// `Drag` event.  `DragTarget::TextSelection` covers normal click-drag
-    /// text selection (the text-selection fallthrough); the other variants carry
-    /// the table-specific row / column / border drags.  Cleared on
-    /// `Release`.
+    /// Active drag target, set on mouse-down, read by each `Drag`, cleared on `Release`.
     drag_target: Option<mouse_ops::DragTarget>,
-    /// True when the most recent mouse-move landed inside the editor's
-    /// scrollbar gutter.  Used to render the thumb in its bright
-    /// "active" style on hover.  Reset whenever the pointer leaves the
-    /// gutter or the scrollbar disappears.
+    /// True while the pointer is in the scrollbar gutter, so the thumb renders in its hover style.
     scrollbar_hover: bool,
-    /// Last pointer shape we asked the terminal for.  Used to avoid writing
-    /// an OSC 22 escape on every mouse-move event when the shape hasn't
-    /// actually changed — keeps the output stream quiet on terminals that do
-    /// honour the escape and doesn't matter on those that don't.
+    /// Last pointer shape requested, so an unchanged shape doesn't write an OSC 22 escape on
+    /// every mouse-move.
     last_pointer_shape: PointerShape,
-    /// Once the user picks `Yes` / `Always` on the remote-load prompt,
-    /// this flag stays set for the rest of the process so further image
-    /// loads can proceed without a second prompt.  Persists only in
-    /// memory; `Always` also writes back to `config.images.remote_policy`.
+    /// Set by `Yes` / `Always` on the remote-load prompt, so later loads don't re-prompt.
+    /// Memory-only; `Always` also writes back to `config.images.remote_policy`.
     session_allow_remote: bool,
-    /// Counterpart of [`Self::session_allow_remote`] for a *declined*
-    /// remote prompt (`No`, or Escape).  The two session-answer flags
-    /// for images and diagrams are `Option<bool>`, so a decline is
-    /// recorded there by construction; `session_allow_remote` is a bare
-    /// bool, and without this companion flag a decline would be
-    /// indistinguishable from "never asked" — so every document opened
-    /// later in the session (link follow, back/forward) would re-queue
-    /// the prompt the user just dismissed.  `Never` persists to
-    /// `config.images.remote_policy` instead.
+    /// Counterpart of [`Self::session_allow_remote`] for a *declined* prompt.  Without it a
+    /// decline is indistinguishable from "never asked", and every document opened later in the
+    /// session would re-queue the prompt the user just dismissed.
     session_remote_declined: bool,
-    /// Sender for the encoder worker's channel, retained so a *newly
-    /// loaded document* can be given one.
-    ///
-    /// `ImageCache::get_protocol_pair` returns `None` without a sender
-    /// attached, and `paint_images` then draws the `[Image: alt]`
-    /// placeholder — so a cache that never receives it renders no image
-    /// at all, however healthy its decodes.  The cache is owned by
-    /// `EditorState`, and `load_file_into_editor` builds a whole new
-    /// one per document, so attaching once in `spawn_event_threads`
-    /// (which is all that used to happen) covered the startup document
-    /// and nothing else: every file opened by following a link or
-    /// navigating back showed reserved rows and a placeholder while its
-    /// images decoded perfectly in the background.  Kept here so the
-    /// swap site can re-attach.
+    /// Sender for the encoder worker's channel, retained so a *newly loaded document* can be
+    /// given one.  A cache without it renders placeholders however healthy its decodes, and a new
+    /// cache is built per document — attaching only at startup left every later file in that state.
     resize_tx: Option<mpsc::Sender<ratatui_image::thread::ResizeRequest>>,
-    /// Sender for the main loop's mpsc channel; retained so background
-    /// decode threads can push `AppEvent::ImageReady`.  Initialised in
-    /// `run`, so wrapped in `Option` during `new` construction.
+    /// Sender for the main loop's channel, so worker threads can push events.  `None` until
+    /// `run` creates it.
     app_tx: Option<mpsc::Sender<AppEvent>>,
-    /// Wall-clock timestamp of the last observed scroll change.  Used
-    /// by `is_scrolling` to decide whether images should fall back to
-    /// the halfblocks partial-render path (avoids per-frame re-encoding
-    /// of Sixel / iTerm2 graphics during continuous scroll).  Reset to
-    /// `None` on resize so a newly-visible image renders at the settled
-    /// protocol immediately.
+    /// Timestamp of the last scroll change.  `is_scrolling` reads it to fall back to halfblocks
+    /// mid-scroll rather than re-encoding Sixel / iTerm2 graphics per frame.  Cleared on resize.
     last_scroll_at: Option<Instant>,
-    /// Set whenever an `ImageReady` event updates the image cache but
-    /// the parsed doc hasn't yet been rebuilt to reflect the image's
-    /// aspect-aware row count.  Consumed at the top of the next loop
-    /// iteration — coalescing N simultaneous decodes into a single
-    /// `refresh_parsed` call instead of N.  Avoids stalling scroll
-    /// input when several image workers complete in quick succession.
+    /// An `ImageReady` updated the cache but the parse hasn't caught up to the new row count.
+    /// Consumed next iteration, coalescing N simultaneous decodes into one `refresh_parsed`.
     images_dirty: bool,
-    /// Drives the event-driven redraw gate: the main loop only calls
-    /// `terminal.draw()` when this is true.  Set by event handlers
-    /// that mutate visible state; cleared after a successful draw.
-    /// Initialized to `true` so the first iteration paints the opening
-    /// frame.  Without this gate, the 60 ms `recv_timeout` would fire a
-    /// full redraw ~17 times per second even with no input — the
-    /// dominant cause of idle CPU previously.
+    /// The redraw gate: the loop only draws when this is true.  Without it the `recv_timeout`
+    /// would redraw ~17 times a second at idle, the dominant idle-CPU cost.
     needs_draw: bool,
-    /// When `Some`, a `Resize` burst is in progress and draws are
-    /// suppressed until this instant passes.  Each subsequent Resize
-    /// extends the deadline, so a slow drag never paints mid-drag.
-    /// Cleared by the deadline-elapse branch in the main loop, which
-    /// then triggers a single settled-size redraw.
+    /// While `Some`, a `Resize` burst is in progress and draws are suppressed; each Resize
+    /// extends the deadline, so a slow drag paints only once it settles.
     resize_quiesce_at: Option<Instant>,
-    /// Wall-clock timestamp of the last `terminal.draw()` call.  Used by
-    /// the main-loop frame throttle: events can arrive faster than we
-    /// want to draw (every wheel tick is an event), so we coalesce by
-    /// skipping the draw when less than `MIN_FRAME_INTERVAL` has elapsed
-    /// since the previous draw.  `None` before the first draw.
+    /// Timestamp of the last draw, for the frame throttle: events arrive faster than we want to
+    /// draw (every wheel tick is one), so a draw within `MIN_FRAME_INTERVAL` is skipped.
     last_draw_at: Option<Instant>,
-    /// Most-recently observed width of the document area, refreshed at
-    /// the top of each main-loop iteration.  The image decode worker
-    /// uses it to pre-render the halfblocks scratch at the same
-    /// dimensions the UI thread will request on first paint — eliminates
-    /// the ~5-20 ms sync encode that `get_protocol_pair`'s cold path
-    /// previously did on the UI thread.  `0` until the first iteration.
-    ///
-    /// This is the *clamped* doc-area width (after
-    /// `editor.max_width_enabled` is applied), not the raw terminal
-    /// width — images render inside the doc area, so the scratch must
-    /// match the doc width or the first paint resizes anyway.
+    /// Latest document-area width, refreshed each iteration.  The decode worker pre-renders its
+    /// halfblocks scratch at this width, sparing the UI thread a 5-20 ms sync encode on first
+    /// paint.  It is the *clamped* doc width, not the terminal width, or the scratch would be
+    /// resized on that first paint anyway.
     last_area_width: u16,
-    /// Most recent document-area dimensions, cached each frame in
-    /// [`App::prepare_viewport`].  Modal click handlers (`fn
-    /// handle_click`) don't receive the live `DocDims` the keystroke
-    /// path does, so callbacks that need them — e.g. the dirty-guard
-    /// re-scrolling the cursor into view after navigating — read the
-    /// last-known values from here instead.  `0` until the first frame.
+    /// Document-area dimensions cached each frame, for modal click handlers, which don't receive
+    /// the live `DocDims` the keystroke path does.
     pub(crate) last_doc_height: usize,
     pub(crate) last_doc_width: usize,
-    /// FIFO of terminal events pulled off the channel ahead of time —
-    /// either by `drain_pending_image_ready` (which uses `try_recv` and
-    /// can't put events back) or by `drain_pending_key_events` (which
-    /// reads ahead so a burst of keystrokes can be coalesced into a
-    /// single dispatch).  `next_event` pops from the front before
-    /// consulting `rx`, preserving the user's event timeline — a
-    /// Resize sandwiched between two keystrokes is still processed
-    /// between them.
+    /// Terminal events read off the channel ahead of time (by the image drain, which can't put
+    /// them back, or by the key-coalescing read-ahead).  `next_event` pops from here before
+    /// consulting `rx`, so the user's event timeline is preserved.
     pending_events: VecDeque<Event>,
-    /// Back-stack: `NavigateBack` pops the most-recent entry
-    /// and restores it.  A new link-follow clears `nav_forward`
-    /// (browser semantics).
+    /// Back-stack; a new link-follow clears `nav_forward`, as a browser does.
     nav_back: Vec<NavEntry>,
-    /// Forward-stack: `NavigateBack` pushes the current state
-    /// here so `NavigateForward` can redo the navigation.
+    /// Forward-stack, pushed by `NavigateBack`.
     nav_forward: Vec<NavEntry>,
-    /// Raw URL of the link currently under the mouse pointer (as
-    /// written in the source), updated on every `MouseEventKind::Moved`
-    /// event.  While `Some`, the hint line replaces its chord row with
-    /// the URL — browser-status-bar style.  Only Preview and Rendered
-    /// produce hovers: the hit-test pairs link-styled spans with the
-    /// block's AST links, and Raw mode renders neither.
+    /// Raw URL under the pointer, as written in the source.  While `Some`, the hint line shows it
+    /// in place of the chord row.  Only Preview and Rendered produce hovers — the hit-test pairs
+    /// link-styled spans with the block's AST links, and Raw renders neither.
     hovered_link: Option<String>,
-    /// Transient message overlayed on the hint line.  Non-
-    /// error kinds auto-expire after `config.editor.transient_ms`;
-    /// errors stick until dismissed.  Set by [`App::flash`] from any
-    /// code path that wants a one-shot notification.
+    /// Transient hint-line message, set by [`App::flash`].  Non-error kinds auto-expire after
+    /// `config.editor.transient_ms`; errors stick until dismissed.
     transient: Option<TransientMessage>,
-    /// Live keymap used for input dispatch.  Built once at startup
-    /// from `keybindings`; mutated in place by the keybinds overlay
-    /// so rebinds take effect immediately.
+    /// Live keymap, built once at startup and mutated in place by the keybinds overlay.
     keymap: Option<KeyMap>,
-    /// Set by the settings overlay's "Open config.toml in default
-    /// editor" action.  Consumed by the run loop, which has the
-    /// `Terminal` handle needed to suspend / resume the TUI around
-    /// the editor process.
+    /// Set by the settings overlay's "Open config.toml" action, drained by the run loop, which
+    /// holds the `Terminal` handle needed to suspend / resume the TUI around the editor.
     pending_open_config_in_editor: bool,
-    /// Set by the palette's `OpenInExternalEditor` action.  Same
-    /// motivation as `pending_open_config_in_editor` — the dispatch
-    /// site doesn't have the `Terminal` handle, so the run loop
-    /// drains the flag.
+    /// Same deferral as `pending_open_config_in_editor`, for the palette's editor action.
     pending_open_file_in_editor: bool,
-    /// Set by the export-success modal's "Open in default editor"
-    /// button.  Drained by the run loop, which then suspends the TUI
-    /// and runs `$VISUAL` / `$EDITOR` on this path.  After the editor
-    /// exits the active theme is reloaded so user edits take effect.
+    /// Same deferral again, for a theme file; the active theme is reloaded once the editor exits.
     pub(crate) pending_open_theme_in_editor: Option<std::path::PathBuf>,
-    /// Pause flag for the crossterm read thread.  When `true`, the
-    /// thread sleeps instead of polling stdin, releasing it to a
-    /// child process (e.g. `$EDITOR` shelled out from the settings
-    /// overlay).  Without this, our read thread and the editor would
-    /// both try to consume the same bytes from the controlling
-    /// terminal, causing dropped keystrokes (lag) and stray escape
-    /// sequences leaking into the editor (the `1;rgb:...` artifact
-    /// users saw at the top of their `config.toml` after closing
-    /// neovim was an OSC 11 background-color response).
-    /// Initialized in [`Self::run`] alongside the read-thread spawn.
+    /// Pause flag for the crossterm read thread: while set it sleeps instead of polling stdin,
+    /// releasing it to a child process such as `$EDITOR`.  Without it both read the same bytes off
+    /// the controlling terminal, dropping keystrokes and leaking escape sequences into the editor
+    /// (an OSC 11 response is how `1;rgb:...` ended up at the top of users' `config.toml`).
     read_paused: Option<Arc<AtomicBool>>,
-    /// Active hint-line prompt (first consumer lands later).
-    /// Renders in place of the default hint chords; Escape dismisses.
+    /// Active hint-line prompt, rendered in place of the default chords; Escape dismisses.
     hint_prompt: Option<HintPrompt>,
-    /// Active stack of trait-based modals.  Adding a modal is one
-    /// `modal_stack.push(Box::new(...))` call; render priority and
-    /// input absorption are stack-order driven.
+    /// Active modal stack; render priority and input absorption are stack-order driven.
     modal_stack: ModalStack,
-    /// True when the user named a file that did not exist on disk;
-    /// `App::run` flashes "[New File]" once at startup so the user
-    /// understands the buffer is empty and saving will create the file.
+    /// The named file didn't exist; `App::run` flashes "[New File]" once at startup.
     started_with_new_file: bool,
-    /// Wall-clock instant of the most-recently observed buffer edit
-    /// for autosave debounce.  Reset on every dirtying edit (detected
-    /// via `Buffer::version()` change in [`App::tick_autosave`]); cleared
-    /// when the buffer flips clean (manual save, autosave success,
-    /// reload, …).  When set, the run loop wakes at
-    /// `t + config.editor.autosave_idle_ms` and persists the buffer.
+    /// Autosave debounce anchor: reset on every dirtying edit, cleared when the buffer goes
+    /// clean.  While set, the run loop wakes at `t + config.editor.autosave_idle_ms` to save.
     autosave_pending_since: Option<Instant>,
-    /// Last-observed `Buffer::version()`.  Used by `tick_autosave` to
-    /// detect that an edit has happened since the previous tick and
-    /// restart the debounce window.
+    /// Last-observed `Buffer::version()`, so `tick_autosave` can spot an edit since the last tick.
     autosave_last_seen_version: u64,
-    /// Debounce timer for the section picker's live-preview scroll.
-    /// Set whenever the user navigates the picker; cleared once
-    /// [`Self::tick_section_jump`] fires or the modal closes.  Without
-    /// the debounce, holding `↓` on the picker would thrash the
-    /// viewport for every focus change.
+    /// Debounce for the section picker's live-preview scroll; without it, holding `↓` thrashes
+    /// the viewport on every focus change.
     section_jump_pending_since: Option<Instant>,
-    /// Target scroll value to apply when the section-jump debounce
-    /// elapses.  `None` between jumps; overwritten on every preview so
-    /// only the most-recent target is kept.
+    /// Scroll target for that debounce; overwritten on every preview, so only the latest is kept.
     section_jump_target_scroll: Option<usize>,
-    /// Set when a diff hunk is accepted/rejected: holds the focused
-    /// hunk's resolved state visible for [`diff_advance::DIFF_ADVANCE_DELAY`]
-    /// before focus auto-advances to the next pending hunk.  `None`
-    /// when no advance is pending.  See [`App::tick_diff_advance`].
+    /// Keeps a just-decided hunk's resolved state visible for
+    /// [`diff_advance::DIFF_ADVANCE_DELAY`] before focus advances.  See [`App::tick_diff_advance`].
     diff_advance_pending_since: Option<Instant>,
-    /// Set when a search-flow replace lands: keeps the replacement
-    /// visible for [`search::SEARCH_ADVANCE_DELAY`] before focus
-    /// auto-advances to the next match.  `None` when no advance is
-    /// pending.  See [`App::tick_search_advance`].
+    /// The search-flow mirror of [`Self::diff_advance_pending_since`], for a landed replacement.
     search_advance_pending_since: Option<Instant>,
-    /// Active filesystem watcher for the open file, if any.  `None`
-    /// until the run loop calls [`App::start_file_watcher`] after the
-    /// initial buffer load.  Multi-tab work later swaps this for a
-    /// per-tab map — the `Option<Box<dyn FileWatcher>>` shape is
-    /// chosen so that refactor only touches this field and the
-    /// watch / unwatch call sites.
+    /// Filesystem watcher for the open file; `None` until [`App::start_file_watcher`] runs.  The
+    /// boxed-trait shape is chosen so multi-tab work can swap it for a per-tab map without
+    /// touching anything but this field and the watch / unwatch sites.
     pub(crate) watcher: Option<Box<dyn FileWatcher>>,
-    /// Content hash of the last-observed-on-disk bytes for the open
-    /// file.  Updated from three sources: initial load, every
-    /// successful save, and every accepted incoming `FileChanged`.
-    /// Consulted by the `FileChanged` arm to suppress echoes of our
-    /// own writes (the hash matches → drop the event silently).
-    /// `None` only during the brief window between `App::new()` and
-    /// the initial load — `Some` for any open file thereafter.
+    /// Hash of the last-observed on-disk bytes, updated on load, save, and every accepted
+    /// `FileChanged`.  The `FileChanged` arm compares against it to drop echoes of our own writes.
     pub(crate) last_disk_hash: Option<u64>,
-    /// Session cache of the GitHub release check: `None` until the
-    /// first fetch resolves, then the last resolved status.  Shared by
-    /// the silent startup check and every explicit one, so the update
-    /// modal has something to render the instant it opens even while a
-    /// fresh fetch is in flight.
+    /// Last resolved release-check status, shared by the startup and explicit checks so the
+    /// update modal has something to render the instant it opens.
     latest_release: Option<update_check::ReleaseStatus>,
     /// True while a release-check worker is in flight, so a second
     /// trigger can't spawn a duplicate request.
     release_check_in_flight: bool,
-    /// Whether the startup check should run, decided in [`App::new`]
-    /// by the pure `update_check::network_check_due` and consumed by
-    /// [`App::spawn_startup_update_check`] from `tick_timers`.  The
-    /// policy decision and the network action are split across that
-    /// boundary for two reasons: `App::new` has no channel to send a
-    /// result on, and the check waits out the first-run welcome modal —
-    /// the surface where the user answers the `check_for_updates`
-    /// question in the first place.
+    /// Whether the startup check should run, decided in [`App::new`] and acted on later by
+    /// [`App::spawn_startup_update_check`].  Split because `App::new` has no channel to send a
+    /// result on, and because the check waits out the welcome modal — where the user answers the
+    /// `check_for_updates` question in the first place.
     startup_update_check_due: bool,
-    /// Last `markdown::highlight::warm_generation()` this session acted
-    /// on.  Grammar compilation happens on a worker, so a code block in
-    /// a not-yet-compiled language renders plain; when the counter moves
-    /// `tick_syntax_warm` reparses so the colour lands.  Seeded from the
-    /// live counter rather than 0 — a second `App` in one process (the
-    /// test suite) would otherwise see a spurious change on its first
-    /// tick and reparse for nothing — and that read is taken *before*
-    /// this session's own first render queues anything, or a compile
-    /// landing in between would be seeded in as the starting value and
-    /// never seen as a change.
+    /// Last `markdown::highlight::warm_generation()` acted on.  Grammars compile on a worker, so
+    /// a block in a not-yet-compiled language renders plain until the counter moves and
+    /// `tick_syntax_warm` reparses.  Seeded from the live counter (a second `App` in one process
+    /// would otherwise reparse for nothing) and read *before* this session's first render, or a
+    /// compile landing in between would be seeded in and never seen as a change.
     syntax_warm_generation: u64,
-    /// Set when a *startup* check finds a release worth announcing,
-    /// cleared when `tick_update_notice` finds an empty modal stack and
-    /// pushes it.  An explicit check never touches this — it opens its
-    /// own modal directly.
+    /// A release a *startup* check found worth announcing, pushed once `tick_update_notice` sees
+    /// an empty modal stack.  An explicit check opens its own modal instead.
     pending_update_notice: Option<update_check::ReleaseInfo>,
-    /// True while the in-flight check is the silent startup one.  Only
-    /// that flavor may arm `pending_update_notice`; an explicit check
-    /// must never queue a notice behind the modal the user just
-    /// opened.
+    /// True while the in-flight check is the silent startup one — the only flavor that may arm
+    /// `pending_update_notice`.
     update_check_is_startup: bool,
-    /// A `#section` named on the command line
-    /// (`edamame notes.md#setup`), parked until the first frame knows
-    /// the document's dimensions and consumed there by
-    /// [`App::apply_startup_anchor`].  `None` on every launch that
-    /// named no section, and after the jump has been made.
+    /// A `#section` named on the command line, parked until the first frame knows the document's
+    /// dimensions and consumed there by [`App::apply_startup_anchor`].
     pub(crate) startup_anchor: Option<String>,
-    /// Vim modal-editing state.  `Some` iff `config.modal.handler ==
-    /// "vim"`; `None` for the default handler, which keeps every vim
-    /// code path inert for existing users.  Survives across keystrokes
-    /// (counts, pending operators, the active sub-mode) and is read by
-    /// the UI for the mode badge.
+    /// Vim modal-editing state; `Some` iff the vim handler is configured, which keeps every vim
+    /// code path inert otherwise.  Carries counts, pending operators, and the active sub-mode.
     vim: Option<VimState>,
-    /// The vim session parked while a read-only document is open.
-    ///
-    /// Reading mode rests in `Mode::Preview`, and vim-Normal and Preview
-    /// are alternative *resting* states that never coexist (see
-    /// [`leave_preview_under_vim`]) — so a read-only document suspends
-    /// vim rather than fighting it.  Parked rather than destroyed, so
-    /// the reader's session (registers, last search, sub-mode) survives
-    /// a trip into the manual and comes back with the next editable
-    /// buffer.  Moved in both directions by
-    /// [`App::sync_vim_suspension`], which is the only writer.
+    /// The vim session parked while a read-only document is open.  Preview and vim-Normal are
+    /// alternative *resting* states that never coexist (see [`leave_preview_under_vim`]), so a
+    /// read-only document suspends vim rather than fighting it — parked, not destroyed, so the
+    /// session survives a trip into the manual.  [`App::sync_vim_suspension`] is the only writer.
     parked_vim: Option<VimState>,
 }
 
-/// Apply the App-level configuration that every freshly built
-/// [`EditorState`] needs, at both of the two sites that build one:
-/// `App::new` for the startup document and
-/// [`App::load_file_into_editor`] for every document opened after it.
+/// Apply the App-level configuration every freshly built [`EditorState`] needs.  **Anything a new
+/// editor needs from `Config` belongs here, not at a call site**: the two building sites drifted
+/// twice, and both drifts were invisible until someone opened a second document.
 ///
-/// It exists because those two sites drifted, twice, and both drifts
-/// were invisible until someone opened a second document: the newer
-/// site never applied `cursor_blink` (so a `cursor_blink = false`
-/// config quietly started blinking again after following a link), and
-/// separately never re-attached the encoder-worker sender (so images
-/// decoded and then painted as placeholders forever — see
-/// [`App::resize_tx`]).  Anything a new `EditorState` needs from
-/// `Config` belongs here, not at a call site.
+/// It is also the **config-reload** path, re-applied after the user hand-edits `config.toml`.  That
+/// is why every field is written unconditionally: the reload replaced `self.config` wholesale, and
+/// a field left alone would silently keep its launch-time value while the flash claims otherwise.
 ///
-/// It is also the **config-reload** path: `external_editor` re-applies
-/// it after the user hand-edits `config.toml`, where the editor being
-/// configured is an existing one rather than a fresh one.  That is why
-/// every field is written unconditionally rather than only defaulted —
-/// the reload replaced `self.config` wholesale, and a field left alone
-/// here silently keeps its launch-time value while the flash claims the
-/// configuration was updated.
-///
-/// `images_layout_on` / `diagrams_layout_on` are passed rather than
-/// derived because the callers know them differently: `App::new`
-/// has no `self` to ask `images_layout_enabled()` yet.  The reparse at
-/// the end is conditional for the same reason it always was — the
-/// constructor already parsed once, and only a layout flag flipping off
-/// invalidates that parse.
+/// The layout flags are passed rather than derived because `App::new` has no `self` to ask yet.
+/// The trailing reparse is conditional because the constructor already parsed once, and only a
+/// layout flag flipping *off* invalidates that parse.
 fn configure_new_editor(
     editor: &mut EditorState,
     config: &Config,
@@ -502,20 +288,14 @@ fn configure_new_editor(
     leave_preview_under_vim(config, editor);
 }
 
-/// Vim modal editing replaces Preview with vim-Normal as the resting
-/// non-editing mode, so no editor may come to rest in Preview while it
-/// is on.  Every `EditorState` is born in `Mode::Preview`, and a new one
-/// is built for *every* document — so without this a file opened by
-/// link, back-navigation or an `$EDITOR` return landed in Preview, with
-/// its "Press any key to edit" prelude and browse-only chord row, while
-/// the status bar still read `NORMAL`.  One helper rather than a copy
-/// per site: the copies are how the per-document path was missed.
+/// Vim-Normal replaces Preview as the resting non-editing mode, so no editor may rest in Preview
+/// while vim is on.  Every `EditorState` is born in Preview and one is built per document, so
+/// without this a file opened by link or back-navigation landed in Preview — "Press any key to
+/// edit" and all — while the status bar read `NORMAL`.  One helper, because the copies are how the
+/// per-document path was missed.
 fn leave_preview_under_vim(config: &Config, editor: &mut EditorState) {
-    // A read-only document is the one editor that *must* rest in
-    // Preview: vim is suspended for its duration (`App::sync_vim_suspension`),
-    // so "force Preview" and "suspend vim" are one decision, not two.
-    // Leaving it here would drop the reader into Rendered with a cursor
-    // and a raw reveal, and no vim session to justify either.
+    // A read-only document is the one editor that *must* rest in Preview: vim is suspended for
+    // its duration, so "force Preview" and "suspend vim" are one decision, not two.
     if editor.readonly {
         return;
     }
@@ -534,42 +314,16 @@ impl App {
         capabilities: Capabilities,
         config_warnings: Vec<ConfigWarning>,
     ) -> Result<Self> {
-        // Leak the theme so it can be stored as `&'static Theme`.
+        // The theme is leaked so it can be held as `&'static Theme`: it is read from App, every
+        // widget, and `EditorState` on the hot render path, where a lifetime parameter would
+        // propagate through dozens of types and an `Arc` would cost a deref on every read.  It is
+        // a few KB, and `apply_active_theme` leaks a fresh one per (rare, user-initiated) theme
+        // change — see there for the alternatives considered.
         //
-        // Why `'static`: `Theme` is read from many places (App,
-        // every widget, `EditorState`) on the hot render path.
-        // Threading a lifetime parameter would propagate through
-        // dozens of types; wrapping in `Arc<Theme>` adds a refcount
-        // bump on every clone and a deref on every read.  `'static`
-        // sidesteps both — readers just hold a plain reference.
-        //
-        // Why leak: `'static` requires a backing allocation that
-        // outlives the program, and `Box::leak` is the simplest way
-        // to promote a heap allocation to that lifetime.  The
-        // process owns the leaked memory until exit; the OS
-        // reclaims it on termination.  `Theme` is a fixed-size
-        // struct of ~100 `Style` values (~few KB), so the one-shot
-        // startup leak is negligible.
-        //
-        // Live updates leak too: `apply_active_theme` (theme cycle
-        // in the settings overlay, post-editor reload) leaks a
-        // fresh `Theme` each time so `self.theme` can be reassigned
-        // while satisfying `'static`.  Theme changes are
-        // user-initiated and rare, so the accumulated cost stays
-        // small across a session — see `apply_active_theme` for the
-        // full rationale and the alternatives considered.
-        //
-        // `Theme::from_file` handles the monochrome fallback
-        // internally so `NoColor` terminals never emit color
-        // escapes regardless of the theme file's contents.
-        // Substitute an indexed-color theme when this terminal can't do
-        // 24-bit.  Every other built-in (and essentially every user
-        // theme) is authored in RGB; an indexed terminal quantizes those
-        // values, which routinely collapses fg and bg into the same cube
-        // entry — including inside the very modals that would explain
-        // the problem.  So the swap happens here, before the first
-        // frame, rather than being offered as advice.  Nothing is
-        // persisted: see `theme_fallback` and `Config::save`.
+        // Substitute an indexed-color theme when this terminal can't do 24-bit: essentially every
+        // theme is authored in RGB, and quantizing routinely collapses fg and bg into the same
+        // cube entry — including inside the modals that would explain the problem.  Nothing is
+        // persisted; see `theme_fallback`.
         let mut theme_file = theme_file;
         let theme_downgrade = theme_fallback::apply(&mut config, &capabilities).map(|d| {
             theme_file = d.theme_file;
@@ -579,17 +333,13 @@ impl App {
         let monochrome = capabilities.color_depth == ColorDepth::NoColor;
         let theme: &'static Theme = Box::leak(Box::new(Theme::from_file(&theme_file, monochrome)));
 
-        // Table buttons depend on mouse reporting; disable them on
-        // terminals that don't deliver mouse events so we never render inert
-        // gutter glyphs.
+        // Table buttons need mouse reporting; without it they would be inert gutter glyphs.
         if !capabilities.mouse {
             config.table.show_buttons = false;
         }
 
-        // Treat a non-existent path the same way `vim` / `nano` do:
-        // open an empty buffer associated with the path so the first
-        // save creates the file.  A "[New File]" flash is queued for
-        // the run loop so the user is told what happened.
+        // A non-existent path opens an empty buffer bound to it, as vim and nano do, so the first
+        // save creates the file.
         let mut started_with_new_file = false;
         let buffer = match &file_path {
             Some(path) if path.exists() => Buffer::load_file(path)?,
@@ -599,25 +349,17 @@ impl App {
             }
             None => Buffer::new(),
         };
-        // Seed the watcher's own-write filter from the just-loaded
-        // bytes so the very first inotify event after startup (which
-        // some editors synthesize when other tools touch the file
-        // around launch time) is compared against a real hash, not
-        // `None`.  An empty `[New File]` buffer hashes to a stable
-        // value too — fine, the next on-disk change will differ.
+        // Seed the watcher's own-write filter so the first inotify event after startup is
+        // compared against a real hash rather than `None`.
         let initial_disk_hash = Some(seahash::hash(buffer.contents().as_bytes()));
 
-        // Pass the probed font-size through so the renderer can compute
-        // aspect-aware row counts for decoded images.  Fall back to
-        // ratatui-image's Halfblocks default (10, 20) when no image
-        // picker was detected — any image render will be a no-op on
-        // those terminals anyway (capabilities.image_protocol == None).
+        // The renderer needs the font size for aspect-aware image row counts.  The fallback is
+        // ratatui-image's Halfblocks default; image rendering is a no-op on those terminals anyway.
         let image_font_size = capabilities
             .image_picker
             .as_ref()
             .map(|p| {
-                // ratatui-image 11 returns a `FontSize` struct here; we
-                // carry font size as a `(width, height)` tuple internally.
+                // ratatui-image returns a `FontSize`; we carry a `(width, height)` tuple.
                 let fs = p.font_size();
                 (fs.width, fs.height)
             })
@@ -631,16 +373,11 @@ impl App {
             config.images.max_width,
             image_font_size,
         );
-        // When the user has persisted `images.enabled = "never"`, image
-        // blocks must collapse to just the `[Image: alt]` placeholder —
-        // no reserved rows beneath.  The `Ask` / `Always` paths leave
-        // the layout reserved so the prompt / live decode populates the
-        // area; the declined-session flip happens in the prompt handler.
-        // A terminal without 24-bit color collapses them too, for the
-        // same reason `media_renderable` refuses to decode there — the
-        // quantized output reads as broken, not degraded.  Session-only:
-        // `config.images.enabled` is left untouched, so the user's
-        // choice returns with them to a capable terminal.
+        // Under `Never`, image blocks collapse to the placeholder with no reserved rows; `Ask` /
+        // `Always` keep the rows for the prompt or the live decode to fill.  A terminal without
+        // 24-bit color collapses them too, for the same reason `media_renderable` won't decode
+        // there — the quantized output reads as broken, not degraded.  That is session-only, so
+        // the user's choice returns with them to a capable terminal.
         let images_off = !capabilities.full_color()
             || matches!(config.images.enabled, crate::config::ImagesEnabled::Never);
         let diagrams_off = !capabilities.full_color()
@@ -648,71 +385,43 @@ impl App {
                 config.diagrams.enabled,
                 crate::config::DiagramsEnabled::Never
             );
-        // Start the grammar warm worker before the first render.  It
-        // does two jobs off the critical path: deserializing the syntax
-        // dump (~2 ms), and compiling each grammar a document names
-        // (~9 ms, ~18 ms for Rust's) — the latter being the one
-        // highlighting cost that is a function of how many *languages*
-        // are in play rather than of how much text is, so neither size
-        // cap bounds it.
+        // The grammar warm worker takes two costs off the critical path: deserializing the syntax
+        // dump (~2 ms) and compiling each grammar a document names (~9-18 ms) — the latter being
+        // the one highlighting cost that scales with how many *languages* are in play rather than
+        // how much text, so neither size cap bounds it.
         //
-        // This has to sit *above* `configure_new_editor`, which is where
-        // the first highlighted render happens — it flips
-        // `syntax_highlighting` on, and `set_syntax_highlighting`
-        // reparses.  Spawned below that line the thread has nothing left
-        // to get ahead of on any document containing a code block, which
-        // is the very case it exists for.
+        // It must be spawned *above* `configure_new_editor`, where the first highlighted render
+        // happens; below that line it has nothing left to get ahead of on the documents it exists
+        // for.  Skipped when highlighting is off — turning it on mid-session spawns the worker
+        // from the first warm request.
         //
-        // Skipped when the setting is off: nothing would ever ask it for
-        // a grammar, and the dump load would be pure waste.  Turning the
-        // setting on mid-session still works — the first warm request
-        // spawns the worker itself.
-        //
-        // Read the counter *before* either the worker or the first
-        // render exists, and carry that value to the field below.
-        // Reading it at the struct literal instead leaves a window: the
-        // render inside `configure_new_editor` queues the document's
-        // grammars, and a compile landing before the seed is taken would
-        // be captured as the starting value — `tick_syntax_warm` then
-        // sees no change, ever, and the block stays plain until some
-        // unrelated reparse. A read-only viewing session never has one.
+        // The generation counter is read here, before either the worker or the first render
+        // exists.  Reading it at the struct literal instead would capture a compile that landed in
+        // between as the starting value, and `tick_syntax_warm` would then never see a change.
         let syntax_warm_generation = crate::markdown::highlight::warm_generation();
         if config.editor.syntax_highlighting {
             crate::markdown::highlight::spawn_warm_worker();
         }
         configure_new_editor(&mut editor, &config, !images_off, !diagrams_off);
 
-        // Vim modal editing is opt-in via `config.modal.handler`.  The
-        // Preview escape that comes with it is handled by
-        // `configure_new_editor` above, shared with every document
-        // opened later, so the `NORMAL` badge shows from the first frame.
+        // The Preview escape vim needs is handled by `configure_new_editor` above, shared with
+        // every document opened later, so the `NORMAL` badge shows from the first frame.
         let vim = (config.modal.handler == VIM_HANDLER).then(VimState::default);
 
-        // PreviewView borrows `editor.parsed.lines` at render time, so
-        // no per-event clone is needed and the constructor is now
-        // parameterless.  This removed the dominant per-event allocation
-        // hotspot on large preview-mode documents.
+        // PreviewView borrows `editor.parsed.lines` at render time rather than cloning — this was
+        // the dominant per-event allocation on large preview-mode documents.
         let view_state = EditorViewState::new();
 
-        // Build startup-time modals.  Each is optional — `None` when
-        // its precondition isn't satisfied (no warnings, capability
-        // notice suppressed, document has no images, etc.).
-        //
-        // The first-run welcome modal subsumes the four legacy startup
-        // prompts (capability notice, images-enabled, remote-image,
-        // diagrams) — they're skipped while the welcome is still
-        // pending so the user is never double-prompted.
+        // Startup modals, each `None` when its precondition isn't met.  The first-run welcome
+        // subsumes the four legacy prompts, which are skipped while it is pending so the user is
+        // never double-prompted.
         let welcome_modal = modal::WelcomeModal::from_state(&capabilities, &config);
         let suppress_legacy_prompts = welcome_modal.is_some();
-        // The one-time post-upgrade notice, read from the bundled
-        // `CHANGELOG.md`.  Unlike the release-check notice this waits
-        // on nothing, so it joins the synchronous ordering below
-        // instead of being parked for `tick_update_notice`.  Only the
-        // *decision* happens here: the matching `last_version_seen`
-        // write is `App::run`'s, because `App::new` must stay
-        // disk-free — `test_utils::make_app` builds an `App` through
-        // it, mostly without a config-isolation guard.  See
-        // `app::post_upgrade`.
+        // The one-time post-upgrade notice, from the bundled `CHANGELOG.md`.  It waits on
+        // nothing, so it joins the ordering below rather than being parked for
+        // `tick_update_notice`.  Only the *decision* happens here: the `last_version_seen` write
+        // is `App::run`'s, because `App::new` must stay disk-free — `test_utils::make_app` builds
+        // an `App` through it, mostly without a config-isolation guard.
         let post_upgrade_modal = post_upgrade::startup_notice(
             &config.editor.last_version_seen,
             config.editor.show_welcome,
@@ -726,12 +435,9 @@ impl App {
                 &config.editor.seen_terminal_fingerprints,
             )
         };
-        // A first visit to a terminal that also can't render the user's
-        // theme is one story, not two.  When both notices would fire the
-        // capabilities summary — the more complete of the two — absorbs
-        // the substitution's explanation and the standalone modal is
-        // dropped; otherwise (terminal already seen, or the notice is
-        // suppressed behind the welcome) the standalone modal carries it.
+        // A first visit to a terminal that also can't render the user's theme is one story, not
+        // two: the capabilities summary absorbs the substitution's explanation when both fire,
+        // and the standalone modal carries it otherwise.
         let (capabilities_notice, theme_downgrade_modal) =
             match (capabilities_notice, theme_downgrade) {
                 (Some(notice), Some((configured, substituted))) => (
@@ -744,9 +450,8 @@ impl App {
                 ),
                 (notice, None) => (notice, None),
             };
-        // Also suppressed below 24-bit color: `media_renderable` refuses
-        // to decode there, so asking the user to opt in to something we
-        // will then decline to draw is worse than staying quiet.
+        // Suppressed below 24-bit color too: asking the user to opt in to something
+        // `media_renderable` will then decline to draw is worse than staying quiet.
         let media_capable = capabilities.full_color();
         let images_enabled_prompt = if suppress_legacy_prompts || !media_capable {
             None
@@ -765,24 +470,11 @@ impl App {
         };
         let wheel_step = config.editor.mouse_scroll_lines;
 
-        // Push the queued startup-time modals onto the stack in
-        // reverse-priority order so the highest-priority one is on
-        // top.  Order shown to the user when present: config-warning →
-        // theme-downgrade → welcome → post-upgrade → startup-notice →
-        // images-enabled → diagrams-enabled → remote-image.  The
-        // post-upgrade notice sits under the welcome because a first
-        // run has nothing to be welcomed *back* from.  The two rarely
-        // coincide — `show_welcome` being on is what routes a launch
-        // with no recorded version to the silent branch — but they are
-        // not exclusive: a user who leaves the welcome's "Show on next
-        // launch" toggle on keeps it true, and after an upgrade gets
-        // both.  Stacking is then correct, and this is the order they
-        // should be read in.  The theme-downgrade and
-        // startup-notice are mutually exclusive (see above): when both
-        // apply, the notice carries the downgrade text.  The legacy prompts (everything below
-        // welcome) are suppressed via `suppress_legacy_prompts` whenever
-        // the welcome itself is queued, so on a launch that shows the
-        // welcome the user only sees config-warning + welcome.
+        // Pushed in reverse-priority order, so the user reads: config-warning → theme-downgrade →
+        // welcome → post-upgrade → startup-notice → images-enabled → diagrams-enabled →
+        // remote-image.  The post-upgrade notice sits under the welcome because a first run has
+        // nothing to be welcomed *back* from; the two rarely coincide but are not exclusive, so
+        // stacking them in that order is the reading order.
         let mut modal_stack = ModalStack::new();
         if let Some(m) = remote_image_prompt {
             modal_stack.push(Box::new(m));
@@ -802,9 +494,8 @@ impl App {
         if let Some(m) = welcome_modal {
             modal_stack.push(Box::new(m));
         }
-        // Above the welcome: the theme substitution explains the colors
-        // every other modal is being drawn in, so it should be read
-        // first.  Below the config warning, which reports a broken file.
+        // Above the welcome: the substitution explains the colors every other modal is drawn in.
+        // Below the config warning, which reports a broken file.
         if let Some(m) = theme_downgrade_modal {
             modal_stack.push(Box::new(m));
         }
@@ -812,23 +503,10 @@ impl App {
             modal_stack.push(Box::new(m));
         }
 
-        // Warm the diagram pipeline's font caches off the
-        // critical path.  Two caches load fonts on first call:
-        //   * `mermaid_rs_renderer`'s internal fontdb (for text layout
-        //     metrics during SVG generation),
-        //   * our own shared `fontdb::Database` used by `usvg` when
-        //     rasterizing the SVG to PNG.
-        // Both scan OS font dirs (~100–300 ms each, worse cold).
-        // `diagram::warm_fontdb` primes both so the first real diagram
-        // render doesn't pay them.  Without this warmup (or with
-        // per-render loads as the previous implementation did), a
-        // document with N diagrams spawns N concurrent font scans —
-        // the dominant source of initial-load lag.
-        // Skipped when images are configured as `Never` — no diagram
-        // will ever decode, so the warmup would be wasted IO.
-        // Skipped when images are configured as `Never`, and when the
-        // terminal can't render them at all — no diagram will ever
-        // decode, so the warmup would be wasted IO.
+        // Warm both font caches the diagram pipeline loads on first call (mermaid's own fontdb
+        // and ours for `usvg`) off the critical path: each scans OS font dirs for 100-300 ms, and
+        // without this a document with N diagrams spawns N concurrent scans — the dominant source
+        // of initial-load lag.  Skipped when no diagram can ever decode, where it is wasted IO.
         if media_capable
             && !matches!(
                 config.diagrams.enabled,
@@ -838,11 +516,8 @@ impl App {
             std::thread::spawn(crate::diagram::warm_fontdb);
         }
 
-        // Decide the startup update check here, while `config` is still
-        // owned locally and before any modal can have been dismissed —
-        // but don't act on it: `app_tx` doesn't exist until `run()`
-        // spawns the event threads, so the network half waits for
-        // `spawn_startup_update_check`.
+        // Decided here, before any modal can have been dismissed, but acted on later: `app_tx`
+        // doesn't exist until `run()` spawns the event threads.
         let startup_update_check_due = update_check::network_check_due(
             config.editor.check_for_updates,
             config.editor.last_update_check,
@@ -912,51 +587,38 @@ impl App {
         })
     }
 
-    /// Record the `#section` the command line named, to be applied on
-    /// the first frame.  A builder rather than a `new` parameter: the
-    /// startup anchor is one caller's concern (`main`), and every other
-    /// construction site — the tests included — wants the default.
+    /// Record the `#section` the command line named, applied on the first frame.  A builder
+    /// rather than a `new` parameter: only `main` sets it, and every other site wants the default.
     #[must_use]
     pub fn with_startup_anchor(mut self, anchor: Option<String>) -> Self {
         self.startup_anchor = anchor;
         self
     }
 
-    /// Enable or disable vim modal editing for the running session,
-    /// keeping `config.modal.handler` and the editor mode in sync.
-    /// Mirrors the startup wiring in `App::new` so a mid-session toggle
-    /// (e.g. from the welcome modal) takes effect immediately instead of
-    /// waiting for the next launch.
+    /// Enable or disable vim modal editing mid-session, keeping `config.modal.handler` and the
+    /// editor mode in sync.  Mirrors the startup wiring in `App::new`.
     pub(crate) fn set_vim_enabled(&mut self, enabled: bool) {
         if enabled {
             self.config.modal.handler = VIM_HANDLER.into();
             if self.vim.is_none() {
                 self.vim = Some(VimState::default());
             }
-            // Vim-Normal replaces Preview as the resting mode, so leave
-            // Preview behind exactly as startup does.
+            // Leave Preview behind exactly as startup does.
             leave_preview_under_vim(&self.config, &mut self.editor);
         } else {
             self.config.modal.handler = DEFAULT_HANDLER.into();
             self.vim = None;
-            // Nothing to come back to: a session the user turned off
-            // must not reappear when they leave the manual.
+            // A session the user turned off must not reappear when they leave the manual.
             self.parked_vim = None;
         }
-        // Enabling vim while a read-only document is open parks the
-        // fresh session straight away, so the toggle takes effect on
-        // the next editable buffer rather than being lost.
+        // Enabling while a read-only document is open parks the fresh session straight away, so
+        // the toggle lands on the next editable buffer rather than being lost.
         self.sync_vim_suspension();
     }
 
-    /// Park or restore the vim session to match the live document's
-    /// read-only-ness.
-    ///
-    /// The single writer of [`App::parked_vim`], called by every path
-    /// that swaps the document (`load_doc_into_editor`,
-    /// `load_file_into_editor`) and by [`App::set_vim_enabled`].  It is
-    /// idempotent, so a path that calls it twice costs nothing and a
-    /// new document-swapping path only has to remember to call it once.
+    /// Park or restore the vim session to match the live document's read-only-ness.  The single
+    /// writer of [`App::parked_vim`], called by every document-swapping path; idempotent, so a new
+    /// one need only remember to call it.
     pub(super) fn sync_vim_suspension(&mut self) {
         if self.editor.readonly {
             if let Some(vim) = self.vim.take() {
@@ -967,23 +629,14 @@ impl App {
         }
     }
 
-    /// Drain any additional `ImageReady` events already sitting in
-    /// `rx` without blocking.  Called after handling the first
-    /// `ImageReady` in a burst so the main loop processes all
-    /// simultaneous decode completions as one unit, followed by a
-    /// single `refresh_parsed` on the next iteration.  Non-image
-    /// events are left in the channel for the next loop iteration to
-    /// handle normally.
+    /// Drain any further `ImageReady` events already in `rx`, so a burst of decode completions is
+    /// handled as one unit followed by a single `refresh_parsed`.
     fn drain_pending_image_ready(&mut self, rx: &mpsc::Receiver<AppEvent>) {
         loop {
             match rx.try_recv() {
-                // A Term event pulled via `try_recv` cannot be put
-                // back into the channel, so push it onto
-                // `pending_events` — the next loop iteration consults
-                // that queue before `recv_timeout` so events stay in
-                // their original order.  We keep draining so queued
-                // image-ready events behind the first key aren't
-                // starved.
+                // A `try_recv`'d Term event can't be put back, so it goes on `pending_events`,
+                // which the next iteration consults first.  Draining continues so image-ready
+                // events queued behind the first key aren't starved.
                 Ok(AppEvent::Term(e)) => self.pending_events.push_back(e),
                 Ok(ev) => self.handle_async_event(ev),
                 Err(_) => break,
@@ -997,18 +650,11 @@ impl App {
         &self.capabilities
     }
 
-    /// Run the event loop until the user quits.
-    ///
-    /// The body of this method is intentionally minimal: every step is
-    /// a named call into [`event_loop`].  Background threads, frame
-    /// preparation, drawing, and event dispatch each live in their own
-    /// method on `App`; this loop reads as a flat sequence of those
-    /// steps so the control flow is legible at a glance.
+    /// Run the event loop until the user quits.  The body is deliberately a flat sequence of
+    /// named calls into [`event_loop`], so the control flow is legible at a glance.
     pub fn run(&mut self, mut terminal: Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         self.startup_pointer_hint();
-        // Records the running version for the post-upgrade notice.
-        // Here rather than in `App::new` because it writes to disk and
-        // the constructor must not — see `app::post_upgrade`.
+        // Here rather than in `App::new` because it writes to disk and the constructor must not.
         self.stamp_last_version_seen();
         let rx = self.spawn_event_threads();
         self.start_file_watcher();
@@ -1049,10 +695,8 @@ impl App {
                 let focused = matches!(event, Event::FocusGained);
                 if self.editor.terminal_focused != focused {
                     self.editor.terminal_focused = focused;
-                    // Reset the blink phase so the cursor reappears solid
-                    // for a full interval on regaining focus, and so the
-                    // last visible/hidden phase before focus loss doesn't
-                    // determine what shows up on the next regain.
+                    // Reset the phase so the cursor reappears solid for a full interval,
+                    // whatever phase it was in when focus was lost.
                     self.editor.cursor_blink.reset();
                     self.needs_draw = true;
                 }
@@ -1142,16 +786,14 @@ mod vim_wiring_tests {
     fn vim_enabled_when_configured() {
         let app = app_with_handler("vim");
         assert!(app.vim.is_some(), "vim handler must enable vim state");
-        // Vim never rests in Preview — startup switches to Rendered so
-        // the NORMAL badge shows from the first frame.
+        // Vim never rests in Preview.
         assert_eq!(app.editor.mode, Mode::Rendered);
     }
 
     #[test]
     fn a_document_opened_under_vim_never_lands_in_preview() {
-        // Every document gets a fresh `EditorState`, born in Preview —
-        // so a link follow / back-navigation used to drop a vim session
-        // into Preview, complete with its "Press any key to edit" hint.
+        // Regression: every document gets a fresh `EditorState`, born in Preview, so a link
+        // follow used to drop a vim session there.
         let mut app = app_with_handler("vim");
         assert_eq!(app.editor.mode, Mode::Rendered);
 
@@ -1167,9 +809,8 @@ mod vim_wiring_tests {
         );
     }
 
-    /// Reading mode rests in `Mode::Preview`, and vim-Normal and
-    /// Preview are alternative resting states — so opening a read-only
-    /// document suspends vim rather than fighting it.
+    /// Preview and vim-Normal are alternative resting states, so a read-only document suspends
+    /// vim rather than fighting it.
     #[test]
     fn a_read_only_document_parks_the_vim_session_and_gives_it_back() {
         let mut app = app_with_handler("vim");
@@ -1183,8 +824,7 @@ mod vim_wiring_tests {
             "a read-only document rests in Preview even under vim"
         );
 
-        // The session comes back with the next editable buffer, carrying
-        // the state it was parked with.
+        // The session comes back with the next editable buffer, carrying its parked state.
         let mut f = tempfile::Builder::new()
             .suffix(".md")
             .tempfile()
@@ -1207,8 +847,7 @@ mod vim_wiring_tests {
         );
     }
 
-    /// Turning vim off while reading must not leave a session waiting to
-    /// reappear on the next editable document.
+    /// Turning vim off while reading must not leave a session waiting to reappear later.
     #[test]
     fn disabling_vim_while_reading_clears_the_parked_session() {
         let mut app = app_with_handler("vim");
@@ -1219,9 +858,8 @@ mod vim_wiring_tests {
         assert!(app.parked_vim.is_none(), "parked session cleared");
     }
 
-    /// Enabling vim while reading parks the fresh session straight away,
-    /// so the toggle takes effect on the next editable buffer instead of
-    /// dropping a cursor into a document that draws none.
+    /// Enabling vim while reading parks the fresh session instead of dropping a cursor into a
+    /// document that draws none.
     #[test]
     fn enabling_vim_while_reading_parks_it_instead_of_leaving_preview() {
         let mut app = app_with_handler("default");
@@ -1235,9 +873,7 @@ mod vim_wiring_tests {
 
     #[test]
     fn set_vim_enabled_mirrors_startup_wiring() {
-        // Enabling mid-session (e.g. from the welcome modal) must reach
-        // the exact state startup produces: vim state present, handler
-        // string flipped, and Preview left behind for Rendered.
+        // Enabling mid-session must reach the exact state startup produces.
         let mut app = app_with_handler("default");
         assert!(app.vim.is_none());
         assert_eq!(app.editor.mode, Mode::Preview);
@@ -1254,8 +890,7 @@ mod vim_wiring_tests {
 
     #[test]
     fn set_vim_enabled_false_clears_vim() {
-        // Disabling tears down vim state and restores the default handler
-        // string so a later `Config::save` writes `handler = "default"`.
+        // The handler string must revert too, so a later `Config::save` writes it.
         let mut app = app_with_handler("vim");
         assert!(app.vim.is_some());
 
@@ -1266,9 +901,7 @@ mod vim_wiring_tests {
 
     #[test]
     fn set_vim_enabled_true_is_idempotent() {
-        // A redundant enable (already-vim session re-saving the welcome
-        // modal) must preserve the live vim state, not swap in a fresh
-        // default — the guard is `if self.vim.is_none()`.
+        // A redundant enable must preserve the live vim state, not swap in a fresh default.
         let mut app = app_with_handler("vim");
         app.vim.as_mut().expect("vim active").pending_g = true;
         app.editor.mode = Mode::Raw;
@@ -1278,18 +911,16 @@ mod vim_wiring_tests {
             app.vim.as_ref().expect("vim still active").pending_g,
             "existing vim state is preserved, not reset"
         );
-        // A non-Preview mode is left untouched — only Preview is rewritten.
-        assert_eq!(app.editor.mode, Mode::Raw);
+        assert_eq!(app.editor.mode, Mode::Raw); // only Preview is rewritten
     }
 
-    // ── CP6: VisualLine clipboard widening (Ctrl-C / Ctrl-X / Ctrl-V) ──
+    // ── VisualLine clipboard widening ─────────────────────────────────
 
     use crate::config::Action;
     use crate::document::{Buffer, Selection};
     use crate::input::VimSubMode;
 
-    /// Install a VisualLine selection over `text` spanning the given charwise
-    /// `anchor`/`active` (deliberately ragged, mid-line endpoints).
+    /// A VisualLine selection over `text`, with deliberately ragged mid-line endpoints.
     fn app_in_visual_line(text: &str, anchor: usize, active: usize) -> App {
         let mut app = app_with_handler("vim");
         app.editor.replace_buffer(Buffer::from_str(text));
@@ -1302,13 +933,11 @@ mod vim_wiring_tests {
 
     #[test]
     fn visual_line_copy_grabs_whole_lines_without_snapping_selection() {
-        // Charwise span from mid-line-0 to mid-line-1; `Ctrl-C` must copy
-        // both whole lines (matching the VisualLine highlight).
+        // A charwise span from mid-line-0 to mid-line-1 must copy both whole lines.
         let mut app = app_in_visual_line("alpha\nbeta\ngamma", 2, 7);
         app.dispatch_action(Action::Copy, 40, 80);
         assert_eq!(app.editor.kill_ring, "alpha\nbeta\n");
-        // The persistent selection is restored to the charwise span — never
-        // snapped — and Visual continues.
+        // The stored selection is restored to the charwise span, never snapped.
         let sel = app.editor.selection.expect("selection restored");
         assert_eq!((sel.anchor, sel.active), (2, 7));
         assert_eq!(app.vim.as_ref().unwrap().sub_mode, VimSubMode::VisualLine);
@@ -1326,14 +955,11 @@ mod vim_wiring_tests {
 
     #[test]
     fn visual_line_paste_replaces_whole_lines_and_exits_visual() {
-        // Copy first so the paste source is deterministic whichever way
-        // `clipboard_text` resolves — `Copy` writes the OS clipboard *and*
-        // the kill-ring with the same linewise payload.
+        // Copy first so the paste source is deterministic whichever way `clipboard_text` resolves.
         let mut app = app_in_visual_line("alpha\nbeta\ngamma", 2, 2);
         app.dispatch_action(Action::Copy, 40, 80);
         assert_eq!(app.editor.kill_ring, "alpha\n", "test premise");
-        // Re-anchor the V-LINE selection on line 1 (again mid-line, so the
-        // charwise span is not the line) and paste over it.
+        // Re-anchor on line 1, again mid-line, so the charwise span is not the line.
         app.editor.selection = Some(Selection {
             anchor: 8,
             active: 8,
@@ -1351,10 +977,8 @@ mod vim_wiring_tests {
 
     #[test]
     fn charwise_visual_copy_grabs_the_inclusive_span() {
-        // In charwise Visual the widening is vim's inclusive one: `Ctrl-C`
-        // copies the highlighted span *plus* the char under the cursor, and
-        // leaves the stored half-open selection alone so a continued Visual
-        // session keeps its anchor.
+        // Charwise widening is vim's inclusive one — the span plus the char under the cursor —
+        // and leaves the stored half-open selection alone.
         let mut app = app_with_handler("vim");
         app.editor.replace_buffer(Buffer::from_str("alpha\nbeta"));
         let sel = Selection {
@@ -1372,7 +996,7 @@ mod vim_wiring_tests {
         );
     }
 
-    // ── CP9: Ex commands driven end-to-end through `dispatch_single_key` ───
+    // ── Ex commands, end-to-end through `dispatch_single_key` ─────────
 
     use crate::app::event_loop::DocDims;
     use crate::config::KeyMap;
@@ -1388,8 +1012,7 @@ mod vim_wiring_tests {
         }
     }
 
-    /// Type a full `:`-command (the `:`, the body, then Enter) into `app`
-    /// through the real key-dispatch entry point.
+    /// Type a full `:`-command into `app` through the real key-dispatch entry point.
     fn run_ex(app: &mut App, body: &str) {
         let keymap = KeyMap::build(&KeyBindingOverrides::default()).expect("keymap");
         let dims = ex_dims();
@@ -1441,8 +1064,7 @@ mod vim_wiring_tests {
         let mut app = app_with_handler("vim");
         app.editor.buffer.insert(0, "x");
         app.editor.dirty = true;
-        // Drop any startup modal so the assertion below sees only the
-        // quit-confirm the `:q` itself opens.
+        // Drop any startup modal so the assertion sees only the `:q`'s own quit-confirm.
         while app.modal_stack.pop().is_some() {}
         run_ex(&mut app, "q");
         assert!(!app.should_quit, "dirty :q must not quit silently");

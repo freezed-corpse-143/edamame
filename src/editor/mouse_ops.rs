@@ -1,9 +1,8 @@
 //! Apply [`MouseAction`] values to the editor state.
 //!
-//! Mirrors `edit_ops` but for mouse input: click placement, drag selection,
-//! word/line selection chords, wheel scrolling, and checkbox toggles.  All
-//! coordinate-to-buffer-offset translation happens here; the `mouse.rs`
-//! dispatcher only sees document-area-relative cells.
+//! Mirrors `edit_ops` for mouse input: click placement, drag selection, word/line chords,
+//! wheel scrolling, checkbox toggles, table gestures.  All coordinate-to-offset translation
+//! happens here; the `mouse.rs` dispatcher only sees document-area-relative cells.
 
 mod checkbox;
 mod coord;
@@ -40,47 +39,28 @@ use self::table_drag::{
     delete_table_column_at, delete_table_row_at, resize_widths,
 };
 
-/// What a mouse-down/drag interaction currently targets.
-///
-/// Replaced the old `Option<usize>` drag anchor with this enum so
-/// `MouseAction::Drag` events can dispatch on the user's original intent —
-/// text selection remains the fallback when the click didn't land on any
-/// table-specific region.
-///
-/// All variants carry only the state that's invariant across a single drag;
-/// the live mouse-event coordinates arrive with each `Drag` and get folded
-/// into whatever commit the `Release` produces.
+/// What a mouse-down/drag interaction targets, decided at mouse-down so `Drag` events dispatch
+/// on the original intent.  Variants carry only state invariant across the drag; live
+/// coordinates arrive with each `Drag` and are folded into the `Release` commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DragTarget {
-    /// Plain text selection anchored at a buffer char offset.  `cell` is
-    /// `Some((start, end))` when the drag began inside a table cell in
-    /// Rendered mode — `Drag` clamps the active end into that char range so
-    /// the selection never escapes the cell.  Computed once at mouse-down
-    /// (the buffer can't mutate mid-drag).
+    /// Text selection anchored at a char offset.  `cell` is the char range of the table cell
+    /// the drag began in (Rendered mode only); `Drag` clamps the active end into it.
     TextSelection {
         anchor: usize,
         cell: Option<(usize, usize)>,
     },
-    /// Row-handle drag in the table that begins at `table_byte_start`.
-    /// `row_idx` is a `TableInfo` row index (≥ 2 — header and alignment
-    /// aren't draggable).  Tracked across mouse-move events; the release
-    /// handler swaps rows between this starting index and the final drop.
+    /// Row-handle drag.  `row_idx` is a `TableInfo` row index (≥ 2: header and alignment rows
+    /// aren't draggable); `Release` swaps it with `hover_row_idx`.
     TableRow {
         table_byte_start: usize,
         row_idx: usize,
-        /// Most-recent hover target (updated by `Drag`).  Used by rendering
-        /// to highlight the drop indicator and by `Release` to pick the
-        /// swap destination.
+        /// Most-recent hover target; drives the drop indicator and the swap destination.
         hover_row_idx: usize,
     },
-    /// Column-border resize drag at border `col_idx` (the border between
-    /// columns `col_idx - 1` and `col_idx`; `col_idx == 0` is the left
-    /// outer border, unused here; `col_idx == col_count` is the right
-    /// outer border, also unused).  `start_widths` captures the rendered
-    /// widths at mouse-down so drag deltas are additive from the starting
-    /// point; `start_user_widths` captures which columns were already
-    /// user-pinned so the drag preserves prior pins on other columns
-    /// (partial-pin support — the comment can mix `[10, _, 15]` entries).
+    /// Column-border resize at border `col_idx` (between columns `col_idx - 1` and `col_idx`).
+    /// `start_widths` makes drag deltas additive from mouse-down; `start_user_widths` keeps
+    /// prior pins on other columns intact (the width comment may mix `[10, _, 15]` entries).
     TableColumnBorder {
         table_byte_start: usize,
         col_idx: usize,
@@ -88,42 +68,27 @@ pub enum DragTarget {
         start_user_widths: Vec<Option<usize>>,
         anchor_x: u16,
     },
-    /// Column-header drag in the table at `table_byte_start`, starting at
-    /// column `col_idx`.  `hover_col_idx` is the current drop target.
+    /// Column-header drag from `col_idx`; `hover_col_idx` is the current drop target.
     TableColumnHeader {
         table_byte_start: usize,
         col_idx: usize,
         hover_col_idx: usize,
     },
-    /// Scrollbar thumb drag.  `grab_offset` is the row offset from the
-    /// thumb's top edge to the initial mouse-down row, so the thumb
-    /// stays anchored under the pointer for the duration of the drag.
+    /// Scrollbar thumb drag.  `grab_offset` is the row distance from the thumb's top edge to
+    /// the mouse-down row, keeping the thumb anchored under the pointer.
     Scrollbar { grab_offset: u16 },
 }
 
-/// Number of lines a wheel tick scrolls beyond the last document line.
-///
-/// Mouse scrolling is allowed to park the last line near the top of the
-/// viewport so the user can comfortably read and edit the tail of a document.
-/// Keyboard scrolling uses the stricter bound in [`EditorState::scroll_down`]
-/// which keeps at least one line visible.
+/// Lines a wheel tick may scroll beyond the last document line.  Keyboard scrolling uses the
+/// stricter bound in [`EditorState::scroll_down`], which keeps at least one line visible.
 pub const MOUSE_SCROLL_OVERSHOOT: usize = 0;
 
-/// Hit-test the position `(col, row)` (in document-area-relative coords) to
-/// determine whether it falls on a clickable element: a task-list checkbox
-/// glyph, a Markdown link, one of the four table buttons (row-reorder
-/// `⠿`, column-reorder `⠿`, row-delete `✕`, column-delete `✕`), or a
-/// resizable column border (the `⇔` glyph and the surrounding `±1`
-/// resize-tolerance window).
+/// Whether `(col, row)` (document-area-relative) is on a clickable element: checkbox, link,
+/// footnote marker, one of the table buttons, or a resizable column border.  The leftmost outer
+/// border is not clickable (nothing to its left to resize).
 ///
-/// The leftmost outer column border is intentionally NOT classified —
-/// there's no column to its left to resize, so a click there falls
-/// through to cell placement and the cursor stays as text.
-///
-/// The complete answer, and the one tests ask.  The app's mouse-move
-/// handler instead composes [`hit_test_clickable_non_link`] with the
-/// hover it has already resolved for the hint line — see that function
-/// for why the link half is worth not asking twice.
+/// The complete answer, used by tests.  The app's mouse-move handler composes
+/// [`hit_test_clickable_non_link`] with the link hover it already resolved for the hint line.
 pub fn hit_test_clickable(
     state: &EditorState,
     col: u16,
@@ -135,19 +100,13 @@ pub fn hit_test_clickable(
         || link_at_rendered_pos(state, col as usize, row as usize, viewport_width).is_some()
 }
 
-/// [`hit_test_clickable`] minus the link test: checkboxes, footnote
-/// markers, the table buttons and the resizable column borders.
+/// [`hit_test_clickable`] minus the link test.
 ///
-/// The split exists for one caller.  `App::dispatch_mouse_event` resolves
-/// the hovered link for the hint line on every `Moved` event and then
-/// asked for the pointer shape at the same coordinates, so the full
-/// resolver — whose miss path allocates the line's char vector and wrap
-/// table, and whose hit path slices and re-parses the block — ran twice
-/// per pointer report for one answer.  It now passes its own
-/// `hovered_link` in place of the second call.  Keep the two composed in
-/// that order: `hovered_link` must be resolved for the *same* position
-/// and viewport width, which is what makes the substitution exact rather
-/// than approximate.
+/// Exists because `App::dispatch_mouse_event` already resolves the hovered link for the hint
+/// line on every `Moved` event; the link resolver is expensive (allocates the line's char vector
+/// and wrap table, re-parses the block on a hit), so it must not run twice per pointer report.
+/// The substitution is exact only when `hovered_link` was resolved for the same position and
+/// viewport width.
 pub fn hit_test_clickable_non_link(
     state: &EditorState,
     col: u16,
@@ -155,22 +114,15 @@ pub fn hit_test_clickable_non_link(
     viewport_width: usize,
     snapshots: &[TableLayoutSnapshot],
 ) -> bool {
-    // Table buttons + resize borders — snapshot hit-test is independent
-    // of rendered-line content (the `⠿` row-reorder glyph sits in the
-    // external gutter, beyond the table's own line width).  Checked
-    // first so the "past end of line" early-return below doesn't
-    // suppress the hand cursor for gutter clicks.
+    // Checked before the "past end of line" early return: the `⠿` row handle sits in the
+    // external gutter, beyond the table's own line width.
     for snap in snapshots {
         match snap.hit_test(col, row) {
             Some(TableHit::RowHandle { .. })
             | Some(TableHit::ColumnHandle { .. })
             | Some(TableHit::DeleteRowHandle { .. })
             | Some(TableHit::DeleteColumnHandle { .. }) => return true,
-            // Match the click dispatcher's predicate: only borders that
-            // actually drive a resize (interior + the rightmost outer)
-            // turn the cursor into a hand.  `col_idx == 0` is the
-            // leftmost outer border with no column to its left, so a
-            // click there falls through to cell placement.
+            // Same predicate as `dispatch_table_click`: the leftmost outer border is inert.
             Some(TableHit::ColumnBorder { col_idx })
                 if col_idx > 0 && col_idx <= snap.col_count =>
             {
@@ -187,29 +139,21 @@ pub fn hit_test_clickable_non_link(
     };
     let total_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
     if c >= total_width {
-        // Past the end of the rendered line — nothing visible to hover.
         return false;
     }
     let _ = visual_col;
 
-    // Footnote definition's trailing `↩` back-link glyph — appended chrome
-    // with no raw byte, so it needs the rendered-line hit-test (the leader
-    // and reference markers are covered by the source scan below).
+    // The `↩` back-link glyph is appended chrome with no raw byte, so it needs a
+    // rendered-line hit-test; markers and leaders are found by the source scan below.
     if footnotes::back_link_glyph_at_click(state, col, row).is_some() {
         return true;
     }
 
-    // Checkbox: reuse the full click-to-offset translation, since the glyph is
-    // rendered as plain `[ ]` / `[✓] ` text without a distinguishing style.
-    // Hover hitbox matches the toggle hitbox in `toggle_checkbox_at` —
-    // `item.start..task_box + 3` so the bullet itself shows the click cursor.
+    // Hover hitbox must match the toggle hitbox in `toggle_checkbox_at`
+    // (`item.start..task_box + 3`, so the bullet itself shows the click cursor).
     if let Some(offset) = click_to_char_offset(state, c, r, viewport_width) {
         let source = state.buffer.contents();
         let click_byte = state.buffer.rope().char_to_byte(offset);
-        // Footnote reference marker (the superscript) or a definition's
-        // back-link leader.  Both are styled but not underlined, so they
-        // need the same source-scan the click-follow path uses — keeping
-        // hover and click consistent.
         if footnotes::footnote_at_offset(&source, click_byte).is_some() {
             return true;
         }
@@ -227,15 +171,9 @@ pub fn hit_test_clickable_non_link(
     false
 }
 
-/// Preview-mode mouse handler.  Selection lives in
-/// `state.visual_selection` (rendered-line `(line_idx, char_col)` pairs)
-/// rather than `state.selection` (rope offsets) so the Copy action can
-/// extract rendered text without Markdown markers — see
-/// `Action::Copy` in `edit_ops.rs`.
-///
-/// All coordinate math and word-boundary logic is shared with the
-/// Rendered/Raw path: this function only owns the per-mode storage and
-/// the Preview-specific "plain click follows links" policy.
+/// Preview-mode mouse handler.  Selection lives in `state.visual_selection` (rendered-line
+/// coordinates) rather than `state.selection` so `Action::Copy` can extract rendered text
+/// without Markdown markers.  Preview is read-only, so a plain click on a link follows it.
 fn apply_preview_action(
     state: &mut EditorState,
     action: MouseAction,
@@ -244,8 +182,6 @@ fn apply_preview_action(
 ) {
     match action {
         MouseAction::Click { col, row, .. } => {
-            // Preview is read-only: any click on a link (plain or Ctrl)
-            // follows it; there's no cursor placement to disambiguate.
             if follow_link_at_click(state, col, row, viewport_width) {
                 *drag_target = None;
                 state.drag_in_progress = false;
@@ -253,9 +189,7 @@ fn apply_preview_action(
             }
             match rendered_click_to_line_col(state, col as usize, row as usize, viewport_width) {
                 Some((line_idx, char_col)) => {
-                    // A click inside a table cell pins the selection to that
-                    // cell: the band constrains drag extension, painting,
-                    // and copy to the cell's column range.
+                    // A click inside a table cell pins drag, painting, and copy to that cell.
                     let band = preview_table_cell_band(state, line_idx, char_col);
                     let char_col = match band {
                         Some(b) => char_col.clamp(b.cols.0, b.cols.1),
@@ -266,10 +200,7 @@ fn apply_preview_action(
                         active: (line_idx, char_col),
                         band,
                     });
-                    // The `anchor: 0` is unused by Preview's Drag arm
-                    // (which extends the visual selection, not a rope
-                    // selection) — it only needs to be `Some(_)` so the
-                    // Drag arm below doesn't no-op.
+                    // `anchor` is unused here; the Drag arm only checks for `Some(_)`.
                     *drag_target = Some(DragTarget::TextSelection {
                         anchor: 0,
                         cell: None,
@@ -298,11 +229,8 @@ fn apply_preview_action(
                 rendered_click_to_line_col(state, col as usize, row as usize, viewport_width)
             {
                 if let Some(b) = preview_table_cell_band(state, line_idx, char_col) {
-                    // Triple-click inside a table cell selects the whole
-                    // cell: every wrapped sub-line of its row, limited to
-                    // the cell's column band, ending at the last sub-line's
-                    // trimmed content end (mirrors Rendered-mode
-                    // `select_line_at_cursor`).
+                    // Whole cell: every wrapped sub-line of the row within the column band,
+                    // ending at the last sub-line's trimmed content (as `select_line_at_cursor`).
                     let end_col = state
                         .parsed
                         .lines
@@ -370,10 +298,8 @@ fn apply_preview_action(
     }
 }
 
-/// Word range under `(line_idx, char_col)` in the Preview rendered-line
-/// coordinate system.  Defers boundary detection to the shared
-/// `word_range_around`; only the char-source closure is Preview-specific
-/// (chars come from the rendered `Line`'s span sequence).
+/// Word range under `(line_idx, char_col)` in rendered-line coordinates; boundary detection is
+/// the shared `word_range_around`.
 fn preview_word_range(
     state: &EditorState,
     line_idx: usize,
@@ -388,8 +314,7 @@ fn preview_word_range(
     if let Some(range) = word_range_around(chars.len(), clamped, |i| chars[i]) {
         return Some(range);
     }
-    // On whitespace — fall back to a single-char selection so the user
-    // still gets visible feedback from the double-click.
+    // On whitespace, select the single char so the double-click still gives visible feedback.
     if clamped < chars.len() {
         Some((clamped, clamped + 1))
     } else {
@@ -397,29 +322,15 @@ fn preview_word_range(
     }
 }
 
-/// Hit-test a mouse-down at `(col, row)` against every visible table's
-/// layout snapshot and start / perform whatever that hit implies.
+/// Hit-test a mouse-down against every visible table snapshot and arm a drag target or perform
+/// a delete.  Returns `true` when the click was consumed; `false` when it should fall through
+/// to cursor placement (a `Cell` hit, the inert leftmost outer border, or no table).
 ///
-/// Returns `true` when the click was consumed (a drag target was armed, or
-/// a row / column was deleted) and the caller should stop; `false` when the
-/// click should fall through to ordinary cursor placement — a `Cell` hit,
-/// the inert leftmost outer border, or no table under the pointer at all.
-///
-/// Shared by the single-, double-, and triple-click arms — all three
-/// behave identically.  Multi-clicks matter because a table interaction is
-/// a *gesture*: the user grabs a handle, drags, releases, and — when the
-/// result isn't what they wanted — immediately grabs the same cell again.
-/// That second press arrives as a `DoubleClick`, and while these arms did
-/// no table hit-testing it armed no drag at all, so the retry silently did
-/// nothing (and a third try did nothing either).  Re-dispatching here makes
-/// the retry behave like the first attempt.
-///
-/// The `✕` double-click guard deliberately does **not** live here: it is a
-/// cooldown keyed off the last delete (`table_delete_allowed`), not off the
-/// click chord.  Gating on the chord looks equivalent and isn't — the
-/// multi-click window restarts on every press, so a user clicking `✕`
-/// steadily faster than the window stays in the chord indefinitely and
-/// every press after the first is swallowed with no feedback.
+/// Shared by the single-, double-, and triple-click arms: a quick re-grab of a handle after a
+/// release arrives as a `DoubleClick`, and must behave like the first press.  The `✕` guard is
+/// a cooldown keyed off the last delete (`table_delete_allowed`), not off the click chord — the
+/// multi-click window restarts on every press, so chord-gating would swallow every press of a
+/// user clicking steadily.
 fn dispatch_table_click(
     state: &mut EditorState,
     snapshots: &[TableLayoutSnapshot],
@@ -436,13 +347,8 @@ fn dispatch_table_click(
         return false;
     };
 
-    // Handles are painted only on the cursor's table (`paint_handles`), but
-    // hit-testing runs against every visible snapshot — so a press on an
-    // unpainted handle focuses that table first, which is the same click
-    // that makes the buttons appear, rather than acting on a control the
-    // user was never shown.  `Cell` and the inert leftmost outer border are
-    // excluded: they fall through to ordinary cursor placement, which
-    // focuses the table at the *clicked* position rather than at its start.
+    // `Cell` and the inert leftmost border fall through to cursor placement, which focuses the
+    // table at the clicked position rather than at its start.
     let acts_on_handle = match hit {
         TableHit::Cell { .. } => false,
         TableHit::ColumnBorder { col_idx } => col_idx > 0 && col_idx <= snap.col_count,
@@ -474,10 +380,7 @@ fn dispatch_table_click(
             true
         }
         TableHit::ColumnBorder { col_idx } => {
-            // Resize targets: every interior border AND the rightmost
-            // outer border (the latter resizes the last column).  The
-            // leftmost outer border (`col_idx == 0`) has no column to its
-            // left, so it stays inert.
+            // Interior borders and the rightmost outer border (resizes the last column).
             if col_idx > 0 && col_idx <= snap.col_count {
                 let source = state.buffer.contents();
                 if let Some(info) = table_edit::find_table_at(&source, snap.table_byte_start) {
@@ -493,7 +396,6 @@ fn dispatch_table_click(
                     return true;
                 }
             }
-            // Outer border — fall through to cell placement.
             false
         }
         TableHit::DeleteRowHandle { row_idx } => {
@@ -526,40 +428,26 @@ fn dispatch_table_click(
             state.drag_in_progress = false;
             true
         }
-        // Cell — fall through to normal cursor placement.
         TableHit::Cell { .. } => false,
     }
 }
 
-/// A `✕` press within this long of the previous delete is a double-click
-/// on one button, not a request to delete a second row.
-///
-/// Anchored to the *delete*, so it always expires: a user clicking the
-/// handle steadily deletes one row per cooldown rather than — as a
-/// multi-click chord would have it — one row and then nothing at all.
+/// A `✕` press within this long of the previous delete is a double-click on one button, not a
+/// request to delete a second row.  Anchored to the delete so it always expires.
 const TABLE_DELETE_COOLDOWN: Duration = Duration::from_millis(250);
 
-/// Whether enough time has passed since the last click-driven table delete
-/// for another one to count as deliberate.  See [`TABLE_DELETE_COOLDOWN`].
 fn table_delete_allowed(state: &EditorState) -> bool {
     state
         .last_table_delete_at
         .is_none_or(|t| t.elapsed() >= TABLE_DELETE_COOLDOWN)
 }
 
-/// Focus guard for every table handle: when the cursor isn't in `snap`'s
-/// table, move it there and report `true` so the caller consumes the click
-/// *without* acting on the handle.
+/// Focus guard for every table handle: when the cursor isn't in `snap`'s table, move it there
+/// and return `true` so the caller consumes the click without acting on the handle.
 ///
-/// `paint_handles` draws the `⠿` / `⇔` / `✕` glyphs only on the table the
-/// cursor is currently inside, but hit-testing runs against every visible
-/// table's snapshot — so a press anywhere in another table's handle zones
-/// would drive a control that was never drawn there: a click on its right
-/// border deleting a row, or a drag along its top border reordering its
-/// columns.  Every handle therefore asks the user to focus the table
-/// first, which is the same click that makes the buttons appear, so the
-/// hit-test surface and the painted affordance always describe the same
-/// table.
+/// `paint_handles` draws handles only on the cursor's table, but hit-testing runs against every
+/// visible snapshot; without this a press on another table would drive a control the user was
+/// never shown.
 fn focus_table_first(
     state: &mut EditorState,
     snap: &TableLayoutSnapshot,
@@ -584,11 +472,8 @@ fn focus_table_first(
 
 /// Apply a mouse action to the editor.
 ///
-/// `drag_target` persists state across a click → drag → release sequence.
-/// `snapshots` are the per-frame table layout snapshots captured at the end
-/// of the last render; they drive hit-testing for table-specific drag
-/// classification (row handles, column borders, column handles).  Pass an
-/// empty slice when no tables are visible.
+/// `drag_target` persists across a click → drag → release sequence.  `snapshots` are the table
+/// layout snapshots captured by the last render (empty when no tables are visible).
 pub fn apply(
     state: &mut EditorState,
     action: MouseAction,
@@ -597,14 +482,8 @@ pub fn apply(
     viewport_height: usize,
     viewport_width: usize,
 ) {
-    // Preview-mode clicks store their selection in rendered-line
-    // coordinates (`state.visual_selection`) rather than rope offsets
-    // (`state.selection`), so the copy path can extract the rendered text
-    // verbatim — no Markdown markers.  Preview also intentionally does NOT
-    // trigger `enter_edit_if_preview` on mouse input: the user may want to
-    // copy without flipping into edit mode (which would expose raw markers
-    // under the pointer).  Keyboard actions still flip via
-    // `enter_edit_if_preview` in `edit_ops`.
+    // Mouse input deliberately never calls `enter_edit_if_preview`: the user may want to copy
+    // rendered text without flipping into edit mode and exposing raw markers.
     if state.mode == Mode::Preview {
         apply_preview_action(state, action, drag_target, viewport_width);
         return;
@@ -616,19 +495,14 @@ pub fn apply(
             row,
             modifiers,
         } => {
-            // Ctrl-click on a link bypasses cursor placement
-            // entirely — we return early after firing the link-open
-            // side effect so the cursor stays where it was.
+            // Ctrl-click on a link leaves the cursor where it was.
             if modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                 && follow_link_at_click(state, col, row, viewport_width)
             {
                 return;
             }
-            // Rendered mode: a plain click on a footnote marker or a
-            // definition back-link follows it (matching Preview), without
-            // needing Ctrl.  Scoped to Rendered — in Raw mode the markers
-            // are literal editable text, so a plain click there places the
-            // cursor (Ctrl-click still follows via the block above).
+            // A plain click follows footnotes in Rendered mode only; in Raw the markers are
+            // literal editable text, so a plain click places the cursor.
             if state.mode == Mode::Rendered
                 && follow_footnote_at_click(state, col, row, viewport_width)
             {
@@ -636,10 +510,6 @@ pub fn apply(
                 state.drag_in_progress = false;
                 return;
             }
-            // hit-test the click against every visible table's
-            // layout snapshot.  Row-handle / column-handle / column-border
-            // hits set a table-specific `DragTarget`; Cell hits fall through
-            // to normal cursor placement (the cursor lands inside the cell).
             if dispatch_table_click(
                 state,
                 snapshots,
@@ -657,15 +527,9 @@ pub fn apply(
                 state.drag_in_progress = false;
                 return;
             }
-            // Image block click: hit-test the click's rendered line
-            // directly against every image block's reserved rendered-
-            // line range — avoids `click_to_char_offset`'s boundary
-            // ambiguity at the very end of a placeholder line (where
-            // the offset can spill into the next block).  Skip
-            // interception when the cursor is already inside the
-            // matched image block AND the reveal has elapsed (the raw
-            // source is showing; the click should land on text
-            // normally).
+            // Image blocks are hit-tested by rendered line, not via `click_to_char_offset`,
+            // whose offset can spill into the next block at the end of a placeholder line.
+            // Once the block's raw source is revealed, clicks land on text normally.
             if let Some(block_idx) = image_block_at_click(state, row as usize, viewport_width) {
                 let already_revealed =
                     state.cursor_block_idx == Some(block_idx) && state.cursor_block_revealed();
@@ -690,14 +554,11 @@ pub fn apply(
                 state.selection = None;
                 let new_offset = offset.min(state.buffer.len_chars());
 
-                // A click landing on the same logical line as the cursor
-                // already occupies should not flip the cursor block out of
-                // its raw view — without this guard, setting
-                // `drag_in_progress` below makes `cursor_block_revealed()`
-                // return false until the mouse-up arrives, so the line
-                // re-renders raw → rendered → raw across the click.
-                // Tables are excluded: their cell-based reveal needs the
-                // suppression to track which cell the click landed in.
+                // Setting `drag_in_progress` makes `cursor_block_revealed()` false until
+                // mouse-up, so a click on the cursor's own line would flash raw → rendered →
+                // raw.  Skip the flag there — except in tables, whose cell-based reveal needs
+                // the suppression to track which cell was clicked — and within a mermaid block,
+                // which reveals as a unit and would flash its image back in.
                 let new_line = state.buffer.char_to_line(new_offset);
                 let same_logical_line = state.cursor_line_idx == Some(new_line);
                 let cursor_block_is_table = state
@@ -709,11 +570,6 @@ pub fn apply(
                         table_edit::is_table_block(&source[range.start..end])
                     })
                     .unwrap_or(false);
-                // Mermaid blocks reveal as a single unit — every line of
-                // the block already shows raw source — so a click that
-                // lands on another line inside the same mermaid block
-                // shouldn't drop drag suppression and let the image
-                // flash back in for the click-to-mouseup window.
                 let new_block_idx = state
                     .parsed
                     .source_map
@@ -724,34 +580,25 @@ pub fn apply(
                     (same_logical_line && !cursor_block_is_table) || same_mermaid_block;
 
                 state.cursor.offset = new_offset;
-                // Click target is a screen position — `preferred_col` must
-                // be the screen cell column (cell within visual sub-row +
-                // any hanging indent).  Plain `cell_col` would store the
-                // line-relative cell column, which on a wrapped continuation
-                // row is far past the line content's right edge and makes
-                // subsequent vertical nav clamp every row to its end.
+                // `preferred_col` must be the screen cell column, not the line-relative one:
+                // on a wrapped continuation row the latter is far past the content's right
+                // edge and makes vertical nav clamp every row to its end.
                 state.cursor.preferred_col = state.current_visual_col(viewport_width);
                 state.update_cursor_block();
                 state.ensure_cursor_visible(viewport_height, viewport_width);
                 *drag_target = Some(DragTarget::TextSelection {
                     anchor: state.cursor.offset,
-                    // A drag that begins inside a table cell stays confined
-                    // to that cell (Rendered mode only — Raw shows the
-                    // pipes, so free selection is correct there).
+                    // Raw shows the pipes, so free selection is correct there.
                     cell: if state.mode == Mode::Rendered {
                         table_cell_char_range_at(state, state.cursor.offset)
                     } else {
                         None
                     },
                 });
-                // Mouse button is down — suppress raw reveal for the block
-                // under the cursor so the user's click anchor stays visually
-                // aligned during any subsequent drag.
                 if !suppress_drag_flag {
                     state.drag_in_progress = true;
                 }
 
-                // detect clicks on Markdown link syntax so we can wire up URL opening
                 let source = state.buffer.contents();
                 let click_byte = state.buffer.rope().char_to_byte(state.cursor.offset);
                 if let Some(url) = link_at_offset(&source, click_byte) {
@@ -764,9 +611,6 @@ pub fn apply(
             row,
             modifiers: _,
         } => {
-            // A re-grab of a table handle arrives here (see
-            // `dispatch_table_click`); only a `Cell` hit falls through to
-            // word selection.
             if dispatch_table_click(
                 state,
                 snapshots,
@@ -822,9 +666,6 @@ pub fn apply(
                     click_to_char_offset(state, col as usize, row as usize, viewport_width)
                 {
                     let mut active = offset.min(state.buffer.len_chars());
-                    // A drag anchored in a table cell never leaves it: drags
-                    // onto other rows, other cells, or off the table clamp
-                    // to the cell's content range.
                     if let Some((lo, hi)) = cell {
                         active = active.clamp(lo, hi);
                     }
@@ -840,15 +681,9 @@ pub fn apply(
                 hover_row_idx,
                 ..
             }) => {
-                // Update `hover_row_idx` to the data row under the pointer
-                // so Release has a destination to swap toward.  Resolved
-                // from the pointer's *y* alone: a row drag is a vertical
-                // gesture, and asking `hit_test` for a `RowHandle` / `Cell`
-                // classification made the hover stall wherever the pointer
-                // strayed onto a `│` border (which classifies as
-                // `ColumnBorder`) or onto the `├─┼─┤` separator between two
-                // rows (which classifies as nothing at all) — so the drop
-                // indicator only tracked the pointer about half the time.
+                // Resolved from the pointer's y alone: a full `hit_test` classification stalled
+                // the hover whenever the pointer strayed onto a `│` border or a `├─┼─┤`
+                // separator, so the drop indicator tracked the pointer only half the time.
                 if let Some(snap) = snapshots
                     .iter()
                     .find(|s| s.table_byte_start == *table_byte_start)
@@ -882,10 +717,7 @@ pub fn apply(
                 hover_col_idx,
                 ..
             }) => {
-                // Mirror of the row case on the other axis: a column drag
-                // is a horizontal gesture, so the hover follows the
-                // pointer's *x* alone — including while it sits on a `│`
-                // border or on the `┬` vertices of the top border.
+                // Same rule as the row case, on the x axis.
                 if let Some(snap) = snapshots
                     .iter()
                     .find(|s| s.table_byte_start == *table_byte_start)
@@ -895,15 +727,12 @@ pub fn apply(
                     }
                 }
             }
-            // Scrollbar drags are driven by the App layer (which sees
-            // the gutter Rect in absolute terminal coords); ignore the
-            // dispatcher's doc-relative drag stream while one is in
-            // flight.
+            // Scrollbar drags are driven by the App layer, which sees the gutter Rect in
+            // absolute terminal coordinates.
             Some(DragTarget::Scrollbar { .. }) => {}
             None => {}
         },
         MouseAction::Release => {
-            // Commit per-target semantics, then clear the drag.
             match drag_target.take() {
                 Some(DragTarget::TextSelection { .. }) => {
                     if let Some(sel) = state.selection {
@@ -945,10 +774,8 @@ pub fn apply(
     }
 }
 
-/// Return the block index of the image block whose reserved rendered
-/// lines contain the rendered line under doc-relative `row` (with the
-/// current scroll applied).  Returns `None` when no image block covers
-/// that row, or when the buffer/parsed view has no image blocks at all.
+/// Index of the image block whose reserved rendered lines contain doc-relative `row` (scroll
+/// applied), if any.
 fn image_block_at_click(state: &EditorState, row: usize, viewport_width: usize) -> Option<usize> {
     if state.parsed.image_blocks.is_empty() {
         return None;
@@ -969,13 +796,8 @@ fn image_block_at_click(state: &EditorState, row: usize, viewport_width: usize) 
         .map(|info| info.block_idx)
 }
 
-/// Compute the cursor offset to use when a click lands anywhere on a
-/// rendered image block.  Returns the buffer char offset at the end of
-/// the block's source text — for regular images, the end of the
-/// `![alt](url)` line; for diagram (`mermaid`) blocks, the end of the
-/// last code line inside the fence (i.e. just before the closing
-/// ```` ``` ````).  Returns `None` when the block has no resolvable
-/// source range.
+/// Cursor offset for a click anywhere on a rendered image block: the end of the `![alt](url)`
+/// line, or for mermaid blocks the end of the last code line before the closing fence.
 fn image_block_cursor_target(state: &EditorState, block_idx: usize) -> Option<usize> {
     let range = state
         .parsed
@@ -987,9 +809,6 @@ fn image_block_cursor_target(state: &EditorState, block_idx: usize) -> Option<us
     let trimmed = block_text.trim_end_matches('\n');
 
     let target_in_block = if state.parsed.is_mermaid_block(block_idx) {
-        // Strip the closing fence line.  `\n```` ``` ```` ` is the
-        // newline immediately before the closing fence; the char before
-        // it is the last char of the last code line.
         trimmed.rfind("\n```").unwrap_or(trimmed.len())
     } else {
         trimmed.len()
@@ -1004,14 +823,10 @@ fn image_block_cursor_target(state: &EditorState, block_idx: usize) -> Option<us
     )
 }
 
-/// Set the scroll position absolutely from a scrollbar interaction.
-/// Clamped to `total - visible` so the thumb's bottom-most rendered
-/// position corresponds to the bottom-most reachable scroll value —
-/// matches the bound `position_for_click` / `position_for_drag` use,
-/// avoiding a one-frame drift between "clicked at gutter bottom" and
-/// "thumb is at gutter bottom".  Distinct from [`scroll_by_mouse`]
-/// which uses the looser `total - 1 + OVERSHOOT` bound for wheel
-/// kinetic feel.  Does not disturb the cursor.
+/// Set the scroll position from a scrollbar interaction.  Clamped to `total - visible`, the
+/// same bound `position_for_click` / `position_for_drag` use, so the thumb's bottom-most
+/// position matches the bottom-most reachable scroll; [`scroll_by_mouse`] uses the looser wheel
+/// bound.  Does not disturb the cursor.
 pub fn set_scroll_absolute(
     state: &mut EditorState,
     position: usize,
@@ -1023,9 +838,9 @@ pub fn set_scroll_absolute(
     state.scroll = position.min(max_scroll);
 }
 
-/// Scroll by `delta` lines using the mouse-specific bound that allows the
-/// last rendered line to sit at the very top of the viewport.  Does not
-/// disturb the cursor.
+/// Scroll by `delta` lines, allowing the last rendered line to sit at the top of the viewport.
+/// Does not disturb the cursor — re-implemented rather than calling `EditorState::scroll_down`
+/// to avoid its companion `clamp_cursor_to_viewport_top`.
 pub fn scroll_by_mouse(state: &mut EditorState, delta: i32, _viewport_width: usize) {
     if delta == 0 {
         return;
@@ -1035,10 +850,6 @@ pub fn scroll_by_mouse(state: &mut EditorState, delta: i32, _viewport_width: usi
         state.scroll = 0;
         return;
     }
-    // Mouse scroll allows the last line to sit at the TOP of the viewport:
-    // max_scroll = total - 1.  `EditorState::scroll_down` already uses the
-    // same bound, but we re-implement it here to avoid triggering keyboard's
-    // companion `clamp_cursor_to_viewport_top`.
     let max_scroll = total.saturating_sub(1) + MOUSE_SCROLL_OVERSHOOT;
     if delta > 0 {
         state.scroll = (state.scroll + delta as usize).min(max_scroll);
@@ -1058,7 +869,6 @@ mod tests {
         Box::leak(Box::new(Theme::default()))
     }
 
-    /// Convenience for tests: plain Click with no modifiers.
     fn click_plain(col: u16, row: u16) -> MouseAction {
         MouseAction::Click {
             col,
@@ -1072,7 +882,6 @@ mod tests {
         let mut state = EditorState::new(Buffer::from_str("a\nb\nc\nd\n"), theme());
         state.mode = Mode::Rendered;
         scroll_by_mouse(&mut state, 100, 80);
-        // Max scroll lands the last rendered line at the top.
         assert_eq!(state.scroll, state.parsed.line_count().saturating_sub(1));
     }
 
@@ -1092,7 +901,6 @@ mod tests {
         state.mode = Mode::Rendered;
         let mut target: Option<DragTarget> = None;
         apply(&mut state, click_plain(6, 0), &mut target, &[], 10, 80);
-        // "Hello world" — clicking col 6 lands on 'w'.
         assert_eq!(state.cursor.offset, 6);
         assert_eq!(state.selection, None);
         assert_eq!(
@@ -1158,9 +966,6 @@ mod tests {
         assert_eq!(state.mode, Mode::Preview);
         let mut target: Option<DragTarget> = None;
         apply(&mut state, click_plain(1, 0), &mut target, &[], 10, 80);
-        // Preview clicks must NOT transition to Rendered any more — users
-        // copy rendered text from Preview mode.  A zero-width visual
-        // selection is seeded as the drag anchor.
         assert_eq!(state.mode, Mode::Preview);
         let vs = state.visual_selection.expect("visual selection seeded");
         assert_eq!(vs.anchor, (0, 1));
@@ -1173,9 +978,7 @@ mod tests {
         let mut state = EditorState::new(Buffer::from_str(text), theme());
         state.mode = Mode::Rendered;
         let mut target: Option<DragTarget> = None;
-        // Task items render as `• [ ] todo` — bullet at col 0, checkbox at
-        // cols 2-4.  The whole prefix is a toggle hitbox; clicking on the
-        // bullet itself toggles the checkbox.
+        // Clicking the bullet itself (col 0 of `• [ ] todo`) is inside the toggle hitbox.
         apply(&mut state, click_plain(0, 0), &mut target, &[], 10, 80);
         assert!(state.buffer.contents().contains("[x]"));
     }
@@ -1187,19 +990,16 @@ mod tests {
         state.mode = Mode::Rendered;
         let mut target: Option<DragTarget> = None;
         apply(&mut state, click_plain(50, 0), &mut target, &[], 10, 80);
-        // Should land at end of "hi" (char 2) — clamped by line length.
         assert!(state.cursor.offset <= 2);
     }
 
     #[test]
     fn link_at_offset_detects_markdown_link() {
         let src = "See [the docs](https://example.com) for more.\n";
-        // Click inside the bracket text.
         assert_eq!(
             link_at_offset(src, 8),
             Some("https://example.com".to_owned())
         );
-        // Click inside the URL.
         assert_eq!(
             link_at_offset(src, 20),
             Some("https://example.com".to_owned())
@@ -1209,19 +1009,15 @@ mod tests {
     #[test]
     fn link_at_offset_returns_none_outside_link() {
         let src = "See [the docs](https://example.com) for more.\n";
-        // Click past the closing paren.
         assert_eq!(link_at_offset(src, 40), None);
-        // Click before the opening bracket.
         assert_eq!(link_at_offset(src, 1), None);
     }
 
     #[test]
     fn link_at_offset_ignores_escaped_bracket() {
-        // `\[text](url)` is escaped literal text — not a clickable link.
         let src = r"See \[the docs](https://example.com) for more.";
-        // Click inside what would have been the link text.
         assert_eq!(link_at_offset(src, 9), None);
-        // A doubled backslash leaves the link live (`\\` then a real `[`).
+        // A doubled backslash leaves the link live.
         let live = r"See \\[the docs](https://example.com) end";
         assert_eq!(
             link_at_offset(live, 9),
@@ -1232,7 +1028,6 @@ mod tests {
     #[test]
     fn link_at_offset_handles_nested_brackets() {
         let src = "[one [nested] two](https://ex.com)\n";
-        // Click inside the nested brackets still resolves to the outer URL.
         assert_eq!(link_at_offset(src, 7), Some("https://ex.com".to_owned()));
     }
 
@@ -1243,79 +1038,57 @@ mod tests {
         state.mode = Mode::Raw;
         let mut target: Option<DragTarget> = None;
         apply(&mut state, click_plain(2, 1), &mut target, &[], 10, 80);
-        // Line 1 = "second" starting at char 6, col 2 → char 8.
         assert_eq!(state.cursor.offset, 8);
     }
 
-    /// Clicking inside a `==highlight==` span should land on the correct
-    /// raw character rather than being off-by-two because of the markers.
+    // The click-mapping tests below put the cursor on a spacer line 0 so the clicked line
+    // stays rendered (the cursor's own line is revealed raw and would map against raw chars).
+
+    /// `==highlight==` markers must not make the click land off-by-two.
     #[test]
     fn click_in_highlight_places_cursor_correctly() {
-        // Cursor on the first line so the highlighted line stays
-        // rendered (the cursor's own line is de-rendered by reveal and
-        // would map clicks against raw chars instead).
         let text = "x\nalpha ==beta== gamma\n";
         let mut state = EditorState::new(Buffer::from_str(text), theme());
         state.mode = Mode::Rendered;
         let mut target: Option<DragTarget> = None;
-        // Rendered line 1: "alpha beta gamma"
-        // Click on the 't' in "beta" — rendered col 8.
+        // Rendered "alpha beta gamma", col 8 is the 't' of "beta": raw col 10.
         apply(&mut state, click_plain(8, 1), &mut target, &[], 10, 80);
-        // Line 1 starts at raw offset 2 (after "x\n").  Raw char 10 in
-        // line 1 is 't': 0 a,1 l,2 p,3 h,4 a,5 space,6 =,7 =,8 b,9 e,10 t.
         assert_eq!(state.cursor.offset, 2 + 10);
     }
 
-    /// Clicking inside a `**bold**` span of a list item lands on the
-    /// correct raw character: the rendered `• ` bullet replaces the raw
-    /// `- ` marker, and the `**` markers around `bold` have no rendered
-    /// counterpart — both must be accounted for when mapping the click's
-    /// rendered column back to a raw char.
+    /// Both the `• ` bullet replacing `- ` and the `**` markers must be accounted for.
     #[test]
     fn click_in_bold_inside_list_item_places_cursor_correctly() {
-        // Two lines so the second (the list item) keeps its formatted
-        // line rendered: cursor begins on line 0 (the spacer), so the
-        // list item's rendered line is what the click sees.
         let text = "x\n- **bold** text\n";
         let mut state = EditorState::new(Buffer::from_str(text), theme());
         state.mode = Mode::Rendered;
         let mut target: Option<DragTarget> = None;
-        // Rendered line 1: "• bold text".  Click the `o` in `bold` —
-        // rendered col 3 (0:• 1:space 2:b 3:o).
+        // Rendered "• bold text", col 3 is the `o`: raw col 5.
         apply(&mut state, click_plain(3, 1), &mut target, &[], 10, 80);
-        // Line 1 starts at raw offset 2.  Raw "- **bold** text": 0:- 1:space
-        // 2:* 3:* 4:b 5:o 6:l 7:d 8:* 9:* 10:space 11:t … — `o` is raw col 5.
         assert_eq!(state.cursor.offset, 2 + 5);
     }
 
-    /// Ordered-list variant: rendered `1. ` vs raw `1. ` happen to be
-    /// the same width, but the `**` markers inside the content still
-    /// must be skipped when mapping the click column.
+    /// Ordered-list variant: `1. ` keeps its width, but the `**` markers are still skipped.
     #[test]
     fn click_in_bold_inside_ordered_list_item_places_cursor_correctly() {
         let text = "x\n1. **bold** text\n";
         let mut state = EditorState::new(Buffer::from_str(text), theme());
         state.mode = Mode::Rendered;
         let mut target: Option<DragTarget> = None;
-        // Rendered line 1: "1. bold text".  Click `o` — col 4 (0:1 1:.
-        // 2:space 3:b 4:o).
+        // Rendered "1. bold text", col 4 is the `o`: raw col 6.
         apply(&mut state, click_plain(4, 1), &mut target, &[], 10, 80);
-        // Raw "1. **bold** text": 0:1 1:. 2:space 3:* 4:* 5:b 6:o …
         assert_eq!(state.cursor.offset, 2 + 6);
     }
 
-    /// Blockquote variant — the rendered `▎ ` bar is a renderer-emitted
-    /// prefix that has no Text-event counterpart in pulldown's parse of
-    /// the raw `> ` line.
+    /// Blockquote variant: the rendered `▎ ` bar has no Text-event counterpart in the parse.
     #[test]
     fn click_in_bold_inside_blockquote_places_cursor_correctly() {
         let text = "x\n> **bold** text\n";
         let mut state = EditorState::new(Buffer::from_str(text), theme());
         state.mode = Mode::Rendered;
         let mut target: Option<DragTarget> = None;
-        // Rendered line 1: "▎ bold text".  Click `o` — col 3.
+        // Rendered "▎ bold text", col 3 is the `o`: raw col 5.
         apply(&mut state, click_plain(3, 1), &mut target, &[], 10, 80);
-        // Raw "> **bold** text": 0:> 1:space 2:* 3:* 4:b 5:o …
         assert_eq!(state.cursor.offset, 2 + 5);
     }
 }

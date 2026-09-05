@@ -3,170 +3,85 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EditorConfig {
-    /// When true, code block lines that exceed the terminal width are wrapped.
-    /// Default: false (long lines extend beyond the visible area without wrapping).
+    /// Wrap code-block lines that exceed the terminal width.  Default: false.
     pub code_block_wrap: bool,
-    /// When true, long lines in the document wrap at the terminal width.
-    /// Default: true.
+    /// Wrap long document lines at the terminal width.  Default: true.
     pub line_wrap: bool,
-    /// When true, multiple consecutive blank lines in the source are rendered
-    /// as multiple blank lines in the output.  Standard Markdown collapses them
-    /// to a single blank line; this option preserves the author's intent.
-    /// Default: true.
+    /// Render consecutive blank lines verbatim rather than collapsing them the way CommonMark
+    /// does.  Default: true.
     pub preserve_blank_lines: bool,
-    /// When true (default), pressing Up/Down in rendered/hybrid mode moves the
-    /// cursor by **visual** lines (accounting for word-wrap), so the cursor
-    /// stays at the same horizontal column on the screen.  When false, movement
-    /// is by **logical** buffer lines (one `\n`-terminated line per step).
+    /// Up/Down move by **visual** (word-wrapped) lines rather than logical buffer lines.
     pub visual_line_nav: bool,
-    /// Fingerprints of terminals (TERM_PROGRAM + TERM + capability tuple)
-    /// the user has already seen the capabilities notice for.  The notice
-    /// fires once per new fingerprint and is silenced on dismiss; subsequent
-    /// launches in the same terminal stay quiet, while launches in a
-    /// previously-unseen terminal re-fire the notice.  Built by
-    /// [`crate::terminal::Capabilities::fingerprint`].
+    /// Terminals the capabilities notice has already fired for.  Built by
+    /// [`crate::terminal::Capabilities::fingerprint`]; an unseen fingerprint re-fires the notice.
     pub seen_terminal_fingerprints: Vec<String>,
-    /// When true, the first-run welcome modal is shown at startup.  Defaults
-    /// to `true` so a fresh install sees the welcome on first launch; the
-    /// modal's "Show again next time" toggle (default off) writes `false`
-    /// here when the user saves.  Also gates the four legacy startup prompts
-    /// (images-enabled, remote-image, diagrams, capabilities notice) — they
-    /// are suppressed while the welcome is still pending so the user is never
-    /// double-prompted.
+    /// Show the first-run welcome modal at startup.  Also gates the four legacy startup prompts
+    /// (images, remote images, diagrams, capabilities) so the user is never double-prompted.
     pub show_welcome: bool,
-    /// When true (the default), edamame checks GitHub for a newer
-    /// release at startup — at most once per 24 h, and silently unless
-    /// there is genuinely newer news the user hasn't been shown yet.
-    /// Turning it off suppresses only the *automatic* check: the About
-    /// page's "Check for updates" button and the command-palette action
-    /// always check on request.  See `docs/security.md` for the network
-    /// posture, and `app::update_check` for the mechanics.
+    /// Check GitHub for a newer release at startup.  Turning it off suppresses only the
+    /// *automatic* check; the explicit entry points always check on request.
     pub check_for_updates: bool,
-    /// Unix epoch seconds of the last automatic release check, stamped
-    /// when the check is *spawned* rather than when it resolves — a
-    /// worker that hangs, or a process killed before the result lands,
-    /// must not re-check on every launch.  `0` means never checked, so
-    /// a fresh install checks on first run.  Bookkeeping written by
-    /// edamame, not a knob to hand-edit.
+    /// Unix epoch seconds of the last automatic release check, stamped when the check is
+    /// *spawned*, so a hung worker or a killed process can't re-check on every launch.  `0` means
+    /// never checked.  Written by edamame, not a knob to hand-edit.
     pub last_update_check: u64,
-    /// The release tag the startup notice has already been shown for,
-    /// so a user who has seen (or explicitly looked up) a version isn't
-    /// told about it again on every launch.  Empty until the first
-    /// notice.  Bookkeeping written by edamame, not a knob to
-    /// hand-edit.
+    /// Release tag the startup notice has already fired for.  Written by edamame.
     pub update_notified_for: String,
-    /// The version that last ran, used to show the release notes once
-    /// after an upgrade (`app::post_upgrade`).  Read from the bundled
-    /// `CHANGELOG.md`, so this is unrelated to the release *check*
-    /// above and involves no network.
-    ///
-    /// Empty means no version has been recorded yet, which a fresh
-    /// install and an upgrade from a build predating this field share;
-    /// `show_welcome` is what tells them apart, since only a returning
-    /// user could have turned it off.  Bookkeeping written by edamame,
-    /// not a knob to hand-edit; the About page's `[ Release notes ]`
-    /// button is how the notes are read again, and it touches neither
-    /// this field nor the notice.
+    /// The version that last ran, driving the one-time post-upgrade notes (`app::post_upgrade`);
+    /// no network involved.  Empty covers both a fresh install and an upgrade from a build
+    /// predating the field — `show_welcome` tells them apart, since only a returning user could
+    /// have turned it off.  Written by edamame.
     pub last_version_seen: String,
-    /// When true, line numbers are displayed in a left gutter in all three
-    /// modes (Preview, Rendered, Raw).  Numbers are right-aligned and styled
-    /// with the theme's `line_number` style (derived from `text_muted`).
-    /// Default: false.
+    /// Show line numbers in a left gutter in all three modes.  Default: false.
     pub show_line_numbers: bool,
-    /// Lines advanced per mouse-wheel tick.  Default 1 — users can bump this
-    /// to 2 or 3 for a coarser, faster feel at the cost of fine-grained
-    /// control.  The keyboard `ScrollUp` / `ScrollDown` actions always step
-    /// by exactly one line and are not affected by this setting.
+    /// Lines advanced per mouse-wheel tick.  The keyboard scroll actions always step by one.
     pub mouse_scroll_lines: usize,
-    /// Duration (milliseconds) that a non-sticky transient message
-    /// overlays the hint line before auto-expiring.  Errors ignore this
-    /// and remain visible until the user dismisses them with Escape.
+    /// How long a non-sticky transient message overlays the hint line.  Errors ignore this and
+    /// stay until dismissed.
     pub transient_ms: u64,
-    /// When true, the editor content area is capped to `max_width_cols`
-    /// columns and centred horizontally inside the terminal, with the
-    /// surrounding gutters painted in `theme.normal`.  Off by default —
-    /// the editor uses the full terminal width.  When the terminal is
-    /// narrower than the cap the cap has no effect; the full terminal
-    /// width is used.  The bottom status / hint region always spans the
-    /// full terminal width regardless of this setting.
+    /// Cap the editor content area to `max_width_cols` and center it.  A terminal narrower than
+    /// the cap is unaffected, and the bottom status / hint region always spans the full width.
     pub max_width_enabled: bool,
-    /// Maximum content width in columns when `max_width_enabled` is
-    /// true.  Clamped to a floor of 20 at use sites to prevent
-    /// pathological narrow values that would break layout.  Default: 100.
+    /// Content width cap in columns; floored at [`MAX_WIDTH_COLS_MIN`] at every use site.
     pub max_width_cols: usize,
-    /// When true, H1 headings render as 4-row "big text" via the
-    /// `tui-big-text` widget (Quadrant pixel size — uses ▀▄▌▐ block
-    /// glyphs).  Falls back to the regular one-line styled rendering
-    /// when the title would exceed the viewport width or contains
-    /// non-ASCII characters (font8x8 only covers ASCII).  Default: false.
+    /// Render H1 headings as 4-row big text.  Falls back to the one-line form when the title
+    /// would overflow the viewport or contains non-ASCII (font8x8 covers ASCII only).
     pub big_h1: bool,
-    /// When true (the default), fenced code blocks are syntax
-    /// highlighted using the language named in the opening fence
-    /// (```` ```rust ````).  There is no auto-detection: a fence with
-    /// no language, or one naming a grammar we do not ship, renders as
-    /// plain code exactly as it did before this setting existed.
-    /// Default: true.
+    /// Syntax-highlight fenced code blocks by the language named in the fence.  There is no
+    /// auto-detection: an unlabeled or unknown fence renders as plain code.
     pub syntax_highlighting: bool,
-    /// When true, the buffer is silently written to disk after
-    /// `autosave_idle_ms` of typing inactivity.  Only fires for buffers
-    /// with an associated file path; an unnamed buffer never autosaves.
-    /// Default: false.
+    /// Autosave after `autosave_idle_ms` of typing inactivity.  Never fires for a buffer with no
+    /// file path.
     pub autosave_enabled: bool,
-    /// Idle window (ms) the user must stop editing for before the
-    /// pending dirty buffer is autosaved.  Every keystroke resets the
-    /// timer (debounce, not throttle), so a typing burst produces at
-    /// most one autosave at the end.  Default: 5000.
+    /// Autosave idle window (ms).  Debounce, not throttle: every keystroke resets the timer, so a
+    /// typing burst produces at most one save.
     pub autosave_idle_ms: u64,
-    /// When true (default), an external write detected while the
-    /// buffer is **clean** opens diff-review mode so the change is
-    /// surfaced hunk by hunk before it replaces what is on screen.
-    /// When false, a clean buffer is silently reloaded from disk
-    /// instead.  A **dirty** buffer always prompts the conflict modal
-    /// regardless of this setting (whose `[Merge]` button still enters
-    /// diff review on demand) — unsaved edits are never discarded
-    /// silently.
+    /// Open diff review when an external write is detected while the buffer is **clean**; when
+    /// false the buffer is silently reloaded.  A **dirty** buffer always prompts the conflict
+    /// modal regardless — unsaved edits are never discarded silently.
     pub diff_on_change: bool,
-    /// When true (default), the explanatory modal shown on entering
-    /// diff-review mode is displayed.  The modal's "Don't show this
-    /// again" checkbox flips this off so subsequent reviews open
-    /// straight into the diff view.
+    /// Show the explanatory modal on entering diff review.
     pub show_diff_intro: bool,
-    /// When true (default), the editor cursor blinks on a fixed
-    /// cadence (`cursor_blink_ms`); when false the cursor is drawn
-    /// solid and never hidden.  Exposed as an on/off toggle in the
-    /// settings overlay; the cadence itself stays file-only.
+    /// Blink the editor cursor on the `cursor_blink_ms` cadence.
     pub cursor_blink: bool,
-    /// Cursor blink half-period in milliseconds — the cursor toggles
-    /// between visible and hidden every `cursor_blink_ms`.  Only
-    /// consulted when `cursor_blink` is true.  Default: 530 (the
-    /// classic terminal cadence).  File-only; the overlay exposes the
-    /// on/off toggle but not this value.
+    /// Cursor blink half-period (ms); consulted only when `cursor_blink` is true.  File-only — the
+    /// settings overlay exposes the toggle but not this value.
     pub cursor_blink_ms: u64,
 }
 
-/// Floor applied to `EditorConfig::max_width_cols` at every use site so a
-/// stray `0` or single-digit value can't break layout.
+/// Floor applied to `EditorConfig::max_width_cols` so a stray small value can't break layout.
 pub const MAX_WIDTH_COLS_MIN: usize = 20;
 
-/// Exclusive lower bound for `EditorConfig::autosave_idle_ms`.  Values
-/// at or below this are rejected at load time with a warning so an
-/// accidental small / zero value can't autosave on every keystroke.
+/// Exclusive lower bound for `EditorConfig::autosave_idle_ms`, so a small or zero value can't
+/// autosave on every keystroke.  Enforced at load time with a warning.
 pub const AUTOSAVE_IDLE_MS_MIN_EXCLUSIVE: u64 = 1000;
-/// Exclusive upper bound for `EditorConfig::autosave_idle_ms` (10
-/// minutes).  Past this the feature is effectively off and the user
-/// almost certainly wants to disable autosave outright instead.
+/// Exclusive upper bound (10 minutes); past this the user wants autosave off outright.
 pub const AUTOSAVE_IDLE_MS_MAX_EXCLUSIVE: u64 = 600_000;
-/// Default debounce window used by `EditorConfig::default` and by the
-/// loader's out-of-range fallback in `validate_main_config`.  Kept
-/// alongside the bounds so all three numbers move together.
+/// Default debounce window, also the loader's out-of-range fallback.  Kept beside the bounds.
 pub const AUTOSAVE_IDLE_MS_DEFAULT: u64 = 5000;
 
-/// User-selected appearance mode.  Independent of `Config::theme`: the
-/// mode filters which themes appear in the picker and which counterpart
-/// is previewed when the user toggles modes, but does not directly
-/// dictate the active theme name.  The picker / settings overlay are
-/// responsible for keeping `theme` consistent with `appearance` when
-/// the user changes either.
+/// User-selected appearance mode.  Independent of `Config::theme` — it filters the picker's list
+/// rather than dictating the active theme; the picker keeps the two consistent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppearanceMode {
@@ -176,10 +91,7 @@ pub enum AppearanceMode {
 }
 
 impl AppearanceMode {
-    /// The mode on the other side of the toggle.  Used by the theme
-    /// picker's Tab / Left / Right / slider-click handlers.  (The
-    /// settings overlay has no Appearance row — the picker is the only
-    /// surface that changes this.)
+    /// The mode on the other side of the toggle.
     pub fn opposite(self) -> Self {
         match self {
             AppearanceMode::Dark => AppearanceMode::Light,
@@ -239,31 +151,16 @@ impl Default for ModalConfig {
 }
 
 /// Table-editing configuration.
-///
-/// `show_buttons` governs whether the row/column buttons — the `⠿`
-/// reorder grips, the `⇔` resize glyph, and the `✕` row/column delete
-/// glyphs — are rendered and hit-tested.  Defaults to `true`: the
-/// renderer still checks the terminal's detected `Capabilities::mouse`
-/// flag before enabling the feature at runtime, so setting this to
-/// `true` on a mouseless terminal is a no-op — `App::new` overrides it
-/// to `false` when `capabilities.mouse` is absent so persisted config
-/// stays faithful to what the user actually sees.
-///
-/// `row_striping`: when true (the default), alternating data rows are
-/// filled with `Theme::table_row_even` / `Theme::table_row_odd` to aid
-/// visual scanning on wide tables.
-///
-/// `warn_on_width_injection`: when true, the first column-border
-/// drag on a table without a `<!-- tui-columns: [...] -->` comment opens a
-/// modal warning that committing the resize will inject the comment into
-/// the Markdown source.  Set false (either via the modal's "Continue and
-/// don't ask again" button or directly in `config.toml`) to skip the
-/// warning on subsequent drags.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TableConfig {
+    /// Render and hit-test the row/column grip, resize, and delete glyphs.  `App::new` forces
+    /// this to `false` on a mouseless terminal so persisted config matches what the user sees.
     pub show_buttons: bool,
+    /// Fill alternating data rows with `Theme::table_row_even` / `table_row_odd`.
     pub row_striping: bool,
+    /// Warn before the first column-border drag injects a `<!-- tui-columns: [...] -->` comment
+    /// into the Markdown source.
     pub warn_on_width_injection: bool,
 }
 
@@ -281,48 +178,33 @@ impl Default for TableConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RemoteImagePolicy {
-    /// Prompt the user the first time a document with remote images is opened.
+    /// Prompt the first time a document with remote images is opened.
     #[default]
     Ask,
-    /// Always fetch remote images without prompting.
     Always,
-    /// Never fetch remote images; always fall back to the placeholder.
     Never,
 }
 
-/// Master switch for inline image rendering.  `Ask` prompts the user the
-/// first time a document with images is opened; `Always` renders without
-/// prompting; `Never` keeps the `[Image: alt]` placeholder.
+/// Master switch for inline image rendering; `Never` keeps the `[Image: alt]` placeholder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ImagesEnabled {
-    /// Prompt the user the first time a document with images is opened.
+    /// Prompt the first time a document with images is opened.
     #[default]
     Ask,
-    /// Always render images inline.
     Always,
-    /// Never render images — always fall back to the `[Image: alt]` placeholder.
     Never,
 }
 
-/// Image-rendering configuration.
-///
-/// `max_width` / `max_height` are ceilings in terminal cells; each image
-/// reserves at most this many rows, and the inline renderer clamps to this
-/// width so a single oversized image never takes over the viewport.  Values
-/// are applied verbatim by `ratatui_image`'s `Resize::Fit` path.
+/// Image-rendering configuration.  The two ceilings are in terminal cells and are applied
+/// verbatim by `ratatui_image`'s `Resize::Fit` path, so one oversized image can't take the
+/// viewport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImagesConfig {
-    /// Master switch — `"ask"` (default) prompts on first document with
-    /// images, `"always"` renders without prompting, `"never"` always
-    /// falls back to the placeholder.
     pub enabled: ImagesEnabled,
-    /// Maximum width (in terminal cells) for a single image.
     pub max_width: usize,
-    /// Maximum height (in terminal cells) for a single image.
     pub max_height: usize,
-    /// Policy for fetching `http(s)://` images.
     pub remote_policy: RemoteImagePolicy,
 }
 
@@ -337,30 +219,22 @@ impl Default for ImagesConfig {
     }
 }
 
-/// Master switch for inline diagram rendering (e.g. mermaid).  `Ask`
-/// prompts the user the first time a document with diagrams is opened;
-/// `Always` renders without prompting; `Never` keeps the placeholder.
+/// Master switch for inline diagram rendering (e.g. mermaid); `Never` keeps the placeholder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DiagramsEnabled {
-    /// Prompt the user the first time a document with diagrams is opened.
+    /// Prompt the first time a document with diagrams is opened.
     #[default]
     Ask,
-    /// Always render diagrams inline.
     Always,
-    /// Never render diagrams — always fall back to the placeholder.
     Never,
 }
 
-/// Diagram-rendering configuration.  Mirrors [`ImagesConfig::enabled`] —
-/// kept separate so a user can opt in to images but not diagrams (or
-/// vice-versa).
+/// Diagram-rendering configuration.  Mirrors [`ImagesConfig::enabled`], kept separate so a user
+/// can opt in to images but not diagrams.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiagramsConfig {
-    /// Master switch — `"ask"` (default) prompts on first document with
-    /// diagrams, `"always"` renders without prompting, `"never"` always
-    /// falls back to the placeholder.
     pub enabled: DiagramsEnabled,
 }
 
@@ -372,63 +246,39 @@ impl Default for DiagramsConfig {
     }
 }
 
-/// Export configuration.
-///
-/// HTML is the built-in target and also the intermediate format for the
-/// user-defined custom commands that produce PDF, DOCX, etc.
-/// ([`CustomExportEntry`], [`export::spawn_custom_export`]).
-///
-/// [`export::spawn_custom_export`]: crate::export::spawn_custom_export
+/// Export configuration.  HTML is the built-in target and the intermediate format for the
+/// user-defined custom commands ([`CustomExportEntry`]).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExportConfig {
     pub html: HtmlExportConfig,
-    /// User-defined extra export entries, in the order they appear in
-    /// `config.toml`.  **The palette carries no per-converter row and no
-    /// per-converter [`Action`]:** one `Export…` entry
-    /// ([`Action::ExportHtml`]) opens the export modal, whose Format list
-    /// offers HTML plus each entry here, in this order.
+    /// User-defined extra export entries, in `config.toml` order.  One palette entry opens the
+    /// export modal, whose Format list offers HTML plus each entry here — there is no
+    /// per-converter palette row or [`Action`].
     ///
-    /// The modal resolves that list *once, at open time*, cloning each
-    /// entry into an `ExportJob` — never storing an index into this
-    /// vector.  Returning from the external editor reloads config
-    /// wholesale, so an index captured when the modal opened could name a
-    /// different converter, or none, by the time `[ Export ]` is pressed.
+    /// The modal resolves that list *once, at open time*, cloning each entry rather than storing
+    /// an index: returning from the external editor reloads config wholesale, so a captured index
+    /// could name a different converter by the time `[ Export ]` is pressed.
     ///
-    /// Entries that could not produce a working command (no name, no
-    /// command, no usable extension) are reported at load time with a
-    /// [`WarningKind::InvalidValue`] warning and then *ignored* — they
-    /// stay in this vector (so a later save preserves the user's block)
-    /// but are left out of the Format list, so every format the modal
-    /// offers is runnable.  See [`CustomExportEntry::config_problem`].
+    /// Unrunnable entries are warned about at load and then *ignored* — they stay in this vector
+    /// so a later save preserves the user's block.  See [`CustomExportEntry::config_problem`].
     ///
     /// [`Action`]: crate::config::Action
-    /// [`Action::ExportHtml`]: crate::config::Action::ExportHtml
-    /// [`WarningKind::InvalidValue`]: crate::config::WarningKind::InvalidValue
     pub custom: Vec<CustomExportEntry>,
 }
 
-/// HTML export settings.  `stylesheet = "builtin"` (the default) uses the
-/// compiled-in CSS bundled with edamame.  Any other value is treated as a
-/// filesystem path to a user stylesheet.
+/// HTML export settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HtmlExportConfig {
-    /// Either the sentinel `"builtin"` or an absolute / home-relative path
-    /// to a user CSS file.  Read at export time; parse errors are surfaced
-    /// to the user via the export error message.
+    /// The sentinel `"builtin"` (compiled-in CSS) or a path to a user stylesheet, read at export
+    /// time.
     pub stylesheet: String,
-    /// When true, local `![alt](relative/path.png)` references are read
-    /// from disk at export time and embedded as `data:` URIs so the HTML
-    /// is fully self-contained.  Default: false (keeps output compact and
-    /// portable alongside the asset directory).
+    /// Embed local image references as `data:` URIs so the HTML is self-contained.
     pub inline_images: bool,
-    /// When true (the default), fenced ```mermaid code blocks
-    /// are rendered to inline SVG via `mermaid-rs-renderer` and wrapped
-    /// in a `<figure class="mermaid-diagram">`.  On render failure the
-    /// block falls back to `<pre><code class="language-mermaid">` so the
-    /// source is never lost.  Set false to force the code-block form
-    /// (e.g. for pipelines that ship their own client-side mermaid.js).
+    /// Render mermaid fences to inline SVG.  A render failure falls back to a `language-mermaid`
+    /// code block so the source is never lost; set false to force that form (e.g. for pipelines
+    /// shipping their own mermaid.js).
     pub diagrams: bool,
 }
 
@@ -442,79 +292,40 @@ impl Default for HtmlExportConfig {
     }
 }
 
-/// A single user-configured custom-export entry.
+/// A single user-configured custom-export entry.  The export modal renders the document to HTML,
+/// then runs `command` verbatim with two placeholders substituted:
 ///
-/// Each entry appears in the command palette as `Export <name>` and opens
-/// the shared export modal, which renders the document to HTML with the
-/// options on its form and then runs `command` over the result.
+/// * `{html}` — the just-generated HTML (a temp file, deleted after the command exits).
+/// * `{out}` — the final output file (source stem plus the configured `extension`).
 ///
-/// `command` is run verbatim with two placeholders substituted:
-///
-/// * `{html}` — path to the just-generated HTML file (temp file owned
-///   by the exporter; deleted after the command exits).
-/// * `{out}` — path to the final output file (source-stem with the
-///   configured `extension` appended).
-///
-/// [`export::spawn_custom_export`]: crate::export::spawn_custom_export
-/// **Every field defaults, and the validator is what enforces them.**  A
-/// missing `extension` used to be a hard `toml::de::Error`, and because
-/// the loader answers a parse failure by falling back to
-/// `Config::default()`, one typo inside an export entry silently reset
-/// the user's *entire* config — theme, keybindings, autosave and all —
-/// for that launch.  Defaulting here keeps the blast radius to the entry:
-/// `readers::validate_custom_exports` reports an unusable one with a
-/// warning naming its index, and everything else in `config.toml` still
-/// applies.
-///
-/// A reported entry is **ignored, not deleted** — it stays in this vector
-/// so the next `Config::save` writes the user's block back untouched
-/// (rather than erasing the very lines the warning asked them to fix).
-/// It is merely excluded from the palette; see [`Self::config_problem`].
-///
-/// It also makes the block in the shipped reference config checkable,
-/// since `shipped_reference_config_examples_are_all_uncommentable`
-/// uncomments one line at a time.
+/// **Every field defaults, and the validator is what enforces them.**  A required field would be
+/// a hard `toml::de::Error`, and the loader answers a parse failure with `Config::default()` — so
+/// one typo here used to silently reset the user's *entire* config for that launch.  Defaulting
+/// keeps the blast radius to the entry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CustomExportEntry {
-    /// Human-readable label, rendered as `Export <name>` in the command
-    /// palette.
+    /// Human-readable label, rendered as `Export <name>`.
     pub name: String,
-    /// argv-style command.  Element 0 is the executable; remaining
-    /// elements are arguments with `{html}` / `{out}` substitution.
+    /// argv-style command; element 0 is the executable.
     pub command: Vec<String>,
-    /// Extension for the output file.  A leading dot and surrounding
-    /// whitespace are tolerated in config but not part of the value used
-    /// — see [`Self::output_extension`].
+    /// Output-file extension; normalized by [`Self::output_extension`].
     pub extension: String,
 }
 
 impl CustomExportEntry {
-    /// The extension actually used to name the output file: `extension`
-    /// trimmed of surrounding whitespace and a single leading dot.  So
-    /// `"pdf"`, `" pdf "` and `".pdf"` all name a `.pdf` output, while
-    /// `""`, `"  "` and `"."` name *no* extension (which is why
-    /// [`Self::config_problem`] rejects them — otherwise the export would
-    /// overwrite the document's own neighbour instead of a sibling file).
+    /// `extension` trimmed of whitespace and a single leading dot, so `"pdf"`, `" pdf "` and
+    /// `".pdf"` agree.  `""` and `"."` yield *no* extension, which is why
+    /// [`Self::config_problem`] rejects them — the export would otherwise overwrite the document.
     pub fn output_extension(&self) -> &str {
         let trimmed = self.extension.trim();
         trimmed.strip_prefix('.').unwrap_or(trimmed)
     }
 
-    /// The reason this entry cannot produce a working palette command, or
-    /// `None` if it is runnable.  The single predicate behind two
-    /// decisions: `readers::validate_custom_exports` turns a `Some` into a
-    /// startup warning, and the command palette offers only the entries
-    /// that answer `None`.  Keeping both on one function is what stops a
-    /// warned-about entry from also appearing as a row that fails after
-    /// the user fills in the options form.
-    ///
-    /// The three rules are exactly the ones the runner and the palette
-    /// cannot recover from: an empty `name` has nothing to label the row
-    /// with; an empty `command` is
-    /// [`crate::export::CustomExportError::EmptyCommand`], discovered only
-    /// after the export is spawned; and an empty (or path-bearing)
-    /// [`Self::output_extension`] would move or unname the output.
+    /// Why this entry cannot produce a working export, or `None` if it is runnable.  One
+    /// predicate behind two decisions — the startup warning and the modal's Format list — so a
+    /// warned-about entry can never also be offered as a row that fails after the user fills in
+    /// the form.  The rules cover exactly what the runner cannot recover from.
     pub fn config_problem(&self) -> Option<&'static str> {
         if self.name.trim().is_empty() {
             Some("`name` is empty; it is what labels the command-palette entry")
@@ -530,12 +341,11 @@ impl CustomExportEntry {
     }
 }
 
-/// Developer/diagnostic settings.  Kept separate from `[editor]` because these
-/// knobs govern logging and debug tooling, not editing behaviour.
+/// Developer/diagnostic settings, kept out of `[editor]`: logging and debug tooling, not editing
+/// behavior.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DevConfig {
-    /// When true, `tracing` logs are written to the XDG data dir (e.g.
-    /// `~/.local/share/edamame/`).  Off by default so the TUI stays silent.
+    /// Write `tracing` logs to the XDG data dir.  Off by default so the TUI stays silent.
     pub logging: bool,
 }

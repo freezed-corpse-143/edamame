@@ -1,9 +1,6 @@
-//! "Create custom theme" modal: pick an existing theme, name a new
-//! one, write `<config_dir>/themes/<name>.toml`, then apply it.
-//!
-//! On success we push [`super::ExportSuccessModal`] on top of the
-//! stack so the user can immediately open the new file or its
-//! containing folder.
+//! "Create custom theme" modal: pick an existing theme, name a new one, write
+//! `<config_dir>/themes/<name>.toml`, apply it, then push
+//! [`super::ExportSuccessModal`] so the file can be opened straight away.
 
 use std::any::Any;
 use std::fs::OpenOptions;
@@ -74,8 +71,8 @@ impl Modal for ExportThemeModal {
         if super::types::esc_rect_hit(self.state.esc_button_rect, col, row) {
             return ModalOutcome::Close;
         }
-        // A click on a theme row selects it (and re-seeds the name); export is
-        // a deliberate second step via the button / Enter.
+        // Selecting a row re-seeds the name; export is a deliberate second
+        // step via the button or Enter.
         self.state.handle_click(col, row);
         ModalOutcome::Continue
     }
@@ -89,9 +86,8 @@ impl Modal for ExportThemeModal {
     }
 }
 
-/// Resolve `source` into a serialisable `ThemeFile`.  Built-ins
-/// resolve via the in-memory registry; user themes load through the
-/// same `Config::load_theme` path used elsewhere.
+/// Resolve `source` into a serializable `ThemeFile`, via the in-memory registry
+/// for built-ins and `Config::load_theme` for user themes.
 fn resolve_source_theme(source: &str, truecolor: bool) -> ThemeFile {
     if let Some(theme) = Theme::builtin(source) {
         (&theme).into()
@@ -101,8 +97,8 @@ fn resolve_source_theme(source: &str, truecolor: bool) -> ThemeFile {
     }
 }
 
-/// Errors produced by [`write_exported_theme`].  Carries a
-/// user-presentable message so the UI layer can flash it verbatim.
+/// Errors from [`write_exported_theme`].  `Display` is user-presentable, so the
+/// UI can flash it verbatim.
 #[derive(Debug)]
 pub(crate) enum ExportThemeError {
     AlreadyExists(PathBuf),
@@ -126,11 +122,9 @@ impl std::fmt::Display for ExportThemeError {
     }
 }
 
-/// Atomic-create write of `theme_file` to
-/// `<themes_dir>/<new_name>.toml`.  Uses `O_CREAT | O_EXCL` so a
-/// concurrent existing file is rejected in one syscall without a
-/// separate `exists()` race.  Pure I/O — no `App` dependency, so this
-/// is the unit-testable entry point.
+/// Write `theme_file` to `<themes_dir>/<new_name>.toml` with `O_CREAT | O_EXCL`,
+/// so an existing file is rejected in one syscall with no `exists()` race.  Pure
+/// I/O, hence the unit-testable entry point.
 pub(crate) fn write_exported_theme(
     themes_dir: &Path,
     new_name: &str,
@@ -156,22 +150,17 @@ pub(crate) fn write_exported_theme(
     Ok(path)
 }
 
-/// Serialise the chosen source theme to TOML, write it to
-/// `<config_dir>/themes/<new_name>.toml`, persist
-/// `config.theme = <new_name>`, reapply, and open the success modal.
+/// Serialize the source theme, write it under `<config_dir>/themes/`, persist
+/// `config.theme`, reapply, and open the success modal.
 ///
 /// The persist goes through [`Config::set_theme`], never a bare field
-/// assignment: while an indexed-color downgrade is in effect
-/// `Config::save` writes `theme_downgraded_from` in `theme`'s place, so
-/// a direct write would be discarded and the theme the user just
-/// created would silently fail to reach disk.  Creating a theme is an
-/// explicit choice and outranks our substitution.
+/// assignment: under an indexed-color downgrade `Config::save` writes
+/// `theme_downgraded_from` in `theme`'s place, so a direct write would be
+/// discarded.  Creating a theme is explicit and outranks our substitution.
 fn perform_export(app: &mut App, source: String, new_name: String) {
-    // Refused rather than done-in-memory: a custom theme *is* the file.
-    // With the write suppressed there would be nothing for
-    // `read_theme_named` to resolve, so `set_theme` + `apply` below would
-    // name a theme that doesn't exist and silently fall back — a worse
-    // outcome than saying plainly that this run can't create one.
+    // Refused rather than done in memory: a custom theme *is* the file, so with
+    // the write suppressed `set_theme` + `apply` would name a theme
+    // `read_theme_named` can't resolve and silently fall back.
     if !crate::config::config_writes_allowed() {
         app.notify(
             "Themes are not written to disk while --no-config is in effect",
@@ -212,9 +201,8 @@ fn perform_export(app: &mut App, source: String, new_name: String) {
 }
 
 impl App {
-    /// Push the export-theme modal.  Builds the available-theme list
-    /// from the live registry so the picker sees every built-in plus
-    /// any user-authored theme in `themes/`.
+    /// Push the export-theme modal, listing every built-in plus any
+    /// user-authored theme in `themes/`.
     pub fn open_export_theme_modal(&mut self) {
         let themes = list_theme_names();
         let active = self.config.theme.clone();
@@ -222,9 +210,7 @@ impl App {
             .push(Box::new(ExportThemeModal::new(themes, &active)));
     }
 
-    /// Push the "theme exported" success modal.  Public because the
-    /// export handler in this file constructs it after a successful
-    /// write.
+    /// Push the "theme exported" success modal.
     pub(super) fn push_export_success(&mut self, path: PathBuf) {
         self.modal_stack
             .push(Box::new(ExportSuccessModal::new(path)));
@@ -251,7 +237,6 @@ mod tests {
         assert!(path.exists(), "file should be written");
         let bytes = std::fs::read_to_string(&path).unwrap();
         assert!(!bytes.is_empty(), "file should have content");
-        // Round-trip parse to confirm valid TOML matching ThemeFile.
         toml::from_str::<ThemeFile>(&bytes).expect("written file parses back to ThemeFile");
     }
 
@@ -286,9 +271,8 @@ mod tests {
         let _round_trip = toml::to_string(&file).expect("builtin theme serialises");
     }
 
-    /// A `--no-config` run must leave no `themes/<name>.toml` behind,
-    /// and must say why rather than appearing to succeed with a theme
-    /// that has no file to resolve.
+    /// A `--no-config` run must leave no file behind and must say why, rather
+    /// than appear to succeed with a theme that has no file to resolve.
     #[test]
     fn export_is_refused_while_config_writes_are_suppressed() {
         let _lock = crate::test_env::env_lock();

@@ -1,46 +1,24 @@
-//! User-authorable theme file format.
+//! User-authorable theme file format: a [`ThemeFile`] that round-trips through
+//! TOML, parallel to the live [`super::theme::Theme`] the renderer uses.
 //!
-//! [`super::theme::Theme`] is the live in-memory style table used by the
-//! renderer.  It carries a [`super::theme::Palette`] (the named brand
-//! colors every style is derived from) plus a flat field per styled
-//! UI element.  Users cannot edit it directly.
+//! A theme file has a `[palette]` section — the brand colors every style derives
+//! from, and the cheapest way to retheme edamame end-to-end — plus optional
+//! per-element sections (`[h1]`, `[modal_input_focused]`, …) that win over the
+//! palette-derived default.
 //!
-//! This module supplies a parallel [`ThemeFile`] that round-trips
-//! through TOML.  A theme file has two sections:
+//! Loading is a three-stage merge: the default [`super::theme::Palette`], then
+//! the file's `[palette]` overrides, then a default `Theme` built from the
+//! merged palette with the file's per-element overrides applied.
 //!
-//! 1. `[palette]` — the bright/dim brand colors every style derives
-//!    from.  Editing only the palette is the cheapest way to retheme
-//!    edamame end-to-end: every style that hasn't been individually
-//!    overridden re-derives from the new palette on load.
-//! 2. `[h1]`, `[h2]`, …, `[modal_input_focused]`, etc. — per-element
-//!    overrides.  Anything you set here wins over the palette-derived
-//!    default.
-//!
-//! Authoring a new theme typically means rewriting the palette and
-//! letting every style fall through.  Power users can override
-//! individual fields (e.g. give H1 a setext rule color distinct from
-//! the H1 fg) without touching the rest.
-//!
-//! On load we run a three-stage merge:
-//!
-//! 1. Start from the default [`super::theme::Palette`].
-//! 2. Apply any `[palette]` overrides from the file.
-//! 3. Build a default [`super::theme::Theme`] from the merged palette,
-//!    then apply any per-element overrides that the file declares.
-//!
-//! `Color` accepts named colors (`"magenta"`), hex (`"#ff00aa"`), or a
-//! 256-color index either as a string (`"236"`) or a bare TOML integer
-//! (`236`) — the latter is friendlier in TOML.
+//! `Color` accepts named colors (`"magenta"`), hex (`"#ff00aa"`), or a 256-color
+//! index as either a string (`"236"`) or a bare TOML integer.
 
 mod color;
 mod palette;
 mod style_spec;
 
-// Re-exports through the facade.  `ColorField` is reachable via this path
-// (e.g. `theme_file::ColorField`) but compiles as "unused" in non-test
-// builds because no production caller references it directly — only the
-// test suite does.  Tagging the re-export keeps `cargo build` clean while
-// preserving the public path.
+// `ColorField` has no production caller, only tests, so the re-export is tagged
+// to keep `cargo build` clean while preserving the public path.
 #[allow(unused_imports)]
 pub use color::ColorField;
 pub use palette::PaletteFile;
@@ -50,28 +28,21 @@ use serde::{Deserialize, Serialize};
 
 use super::theme::Theme;
 
-/// Full set of theme entries as they appear in TOML.  One field per
-/// `Style` field on `Theme`, plus the `task_strikethrough` boolean
-/// flag.  The mirroring is total and deliberately so: this struct is
-/// also the *export* format (`ThemeFile::from(&Theme)` behind the
-/// "Create custom theme" flow), so a field missing here is a field a
-/// built-in silently loses the moment a user writes it to disk.
+/// Full set of theme entries as they appear in TOML: one field per `Style` field
+/// on `Theme`, plus `task_strikethrough`.  The mirroring is deliberately total,
+/// because this is also the *export* format behind "Create custom theme" — a
+/// field missing here is one a built-in loses the moment it is written to disk.
 ///
-/// `#[serde(default)]` (not `deny_unknown_fields`) — users may edit themes
-/// written by older binaries that didn't include a field, or newer binaries
-/// that added a field, without the file failing to parse.
+/// `#[serde(default)]` rather than `deny_unknown_fields`, so a file written by
+/// an older or newer binary still parses.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeFile {
-    /// When `true`, this theme is shown under "Light" in the theme
-    /// picker; when `false` (the default) it's shown under "Dark".
-    /// Authoring a light theme is a matter of setting `light = true` at
-    /// the top of the TOML and tuning the palette accordingly — the
-    /// flag has no rendering effect, only filter / picker effect.
+    /// Files the theme under "Light" rather than "Dark" in the picker.  No
+    /// rendering effect.
     pub light: bool,
 
-    /// Brand-color palette.  Edit this section to retheme edamame
-    /// end-to-end without touching individual style fields.
+    /// Brand-color palette; edit this to retheme end-to-end.
     pub palette: PaletteFile,
 
     // Headings
@@ -198,18 +169,13 @@ pub struct ThemeFile {
     pub scrollbar_thumb: StyleSpec,
     pub scrollbar_thumb_active: StyleSpec,
 
-    // Diff mode.
-    //
-    // `diff_add_line` / `diff_delete_line` are authorable like every
-    // other field, and must stay that way: `blend` is a no-op on non-RGB
-    // colors, so on an indexed palette the derived washes collapse onto
-    // `surface` and this section is the only way to give the focused
-    // hunk a fill.  The built-ins that hand-pick them (`dark_256`,
-    // `light_256`, `monochrome_dark`) round-trip through here.  They are
-    // reused at render time as the Accept / Reject chip backgrounds
-    // (`ui::diff_view::prompt_chip_style`), which therefore pins the
-    // chip's foreground unconditionally rather than trusting the washes
-    // to be background-only.
+    // Diff mode.  `diff_add_line` / `diff_delete_line` must stay authorable:
+    // `blend` is a no-op on non-RGB colors, so on an indexed palette the derived
+    // washes collapse onto `surface` and this section is the only way to give a
+    // focused hunk a fill (the built-ins hand-picking them round-trip through
+    // here).  They double as the Accept / Reject chip backgrounds, which is why
+    // `ui::diff_view::prompt_chip_style` pins the chip's foreground rather than
+    // trusting the washes to be background-only.
     pub diff_add_line: StyleSpec,
     pub diff_delete_line: StyleSpec,
     pub diff_add_line_unfocused: StyleSpec,
@@ -227,11 +193,8 @@ pub struct ThemeFile {
     pub hint_bar_diff: StyleSpec,
 }
 
-/// All theme-style fields, listed once.  Both `From<&ThemeFile> for Theme`
-/// (file → live theme, with empty-spec fall-through) and
-/// `From<&Theme> for ThemeFile` (live theme → file, full population)
-/// iterate this list, so adding a style means touching one line plus the
-/// `Theme` and `ThemeFile` struct definitions.
+/// All theme-style fields, listed once; both `From` impls iterate it, so adding
+/// a style means one line here plus the two struct definitions.
 macro_rules! style_fields {
     ($mac:ident) => {
         $mac! {
@@ -282,24 +245,15 @@ macro_rules! style_fields {
     };
 }
 
-/// Build a `Theme` from a `ThemeFile`.  Implements the three-stage
-/// merge documented at the module level:
-///
-/// 1. Resolve the palette section against [`super::theme::Palette::default`].
-/// 2. Build a default theme from that palette.
-/// 3. For each style spec that's non-empty in the file, override the
-///    corresponding theme field.  Empty specs fall through so the
-///    palette-derived default wins.
-///
-/// `task_strikethrough` is a plain bool, not a style — it always wins
-/// over the default because there's no "absent" sentinel to detect.
+/// The three-stage merge documented at the module level.  `task_strikethrough`
+/// always wins over the default: being a plain bool, it has no "absent"
+/// sentinel to detect.
 impl From<&ThemeFile> for Theme {
     fn from(f: &ThemeFile) -> Self {
         let palette = palette::PaletteFile::resolve(&f.palette, f.light);
         let mut theme = Theme::from_palette(&palette);
 
-        // Per-style overrides.  Empty specs fall through to keep the
-        // palette-derived default.
+        // Empty specs fall through, keeping the palette-derived default.
         macro_rules! apply_all {
             ($($field:ident),* $(,)?) => {{
                 $(
@@ -311,7 +265,6 @@ impl From<&ThemeFile> for Theme {
         }
         style_fields!(apply_all);
 
-        // task_strikethrough is a bare bool — always honoured.
         theme.task_strikethrough = f.task_strikethrough;
 
         theme
@@ -339,10 +292,8 @@ mod tests {
     use super::*;
     use ratatui::style::{Color, Modifier, Style};
 
-    // Helper: round-trip a `Theme` through the TOML serde layer and compare
-    // every `Style` field for equality.  Uses the actual Style `PartialEq`
-    // rather than a textual TOML diff so reordered fields don't cause spurious
-    // failures.
+    /// Round-trip a `Theme` through TOML and compare every `Style` field.
+    /// Compares values rather than TOML text, so field order doesn't matter.
     fn assert_theme_round_trip(original: &Theme) {
         let file: ThemeFile = original.into();
         let toml_str = toml::to_string(&file).expect("serialize ThemeFile");
@@ -462,13 +413,10 @@ mod tests {
         assert_theme_round_trip(&Theme::default());
     }
 
-    // No `monochrome_theme_round_trips` test: the monochrome theme is
-    // always built programmatically (`Theme::monochrome()`) when the
-    // terminal reports no color support — it never loads from a
-    // file.  Several of its styles are intentionally `Style::default()`
-    // (e.g. `h1_rule`), and the file format treats absent sections as
-    // "use the palette-derived default", so `Style::default()` is not
-    // a faithful round-trip target through TOML.
+    // No monochrome round-trip test: that theme is only ever built
+    // programmatically, and several of its styles are intentionally
+    // `Style::default()` — which the format reads as "absent", so it is not a
+    // faithful round-trip target.
 
     #[test]
     fn named_color_parses() {
@@ -496,7 +444,6 @@ underlined = true
 
     #[test]
     fn indexed_color_as_integer_parses() {
-        // Bare TOML integer for indexed palette entries.
         let toml = r#"[code_span]
 fg = "yellow"
 bg = 236
@@ -509,7 +456,7 @@ bg = 236
 
     #[test]
     fn indexed_color_as_string_parses() {
-        // Same palette entry expressed as a string (ratatui's native format).
+        // The same entry as a string — ratatui's native format.
         let toml = r#"[code_span]
 bg = "236"
 "#;
@@ -529,8 +476,8 @@ bg = "236"
 
     #[test]
     fn omitted_defaults_dont_serialize() {
-        // `skip_serializing_if` keeps emitted TOML tight: a fully-default style
-        // produces an empty table, not a noisy one with six `false` booleans.
+        // `skip_serializing_if` keeps a default style an empty table rather
+        // than six `false` booleans.
         let spec = StyleSpec::default();
         let toml_str = toml::to_string(&spec).unwrap();
         assert_eq!(toml_str.trim(), "");
@@ -538,8 +485,7 @@ bg = "236"
 
     #[test]
     fn unknown_fields_are_ignored() {
-        // Forward-compat: a theme file written by a future binary with extra
-        // fields should still load cleanly on older binaries.
+        // Forward-compat with files written by a future binary.
         let toml = r#"[h1]
 fg = "red"
 
@@ -552,8 +498,7 @@ fg = "blue"
 
     #[test]
     fn empty_section_falls_back_to_palette_default() {
-        // Empty `[h1]` section in the file must NOT clobber the
-        // palette-derived default — the merge step skips empty specs.
+        // The merge skips empty specs, so this must not clobber the default.
         let toml = "[h1]\n";
         let file: ThemeFile = toml::from_str(toml).unwrap();
         let theme: Theme = (&file).into();
@@ -562,13 +507,9 @@ fg = "blue"
 
     #[test]
     fn focused_diff_washes_are_user_authorable() {
-        // `themes::util::blend` is a no-op on non-RGB colors, so on an
-        // indexed palette the derived focused washes collapse onto
-        // `surface` and a hand-picked `bg` here is the only way to get a
-        // focused-hunk fill at all.  The section must therefore reach
-        // `Theme` — and the fill must not be forced bg-only at the
-        // format level: `ui::diff_view::prompt_chip_style` defends the
-        // chip by pinning its own fg, not by trusting the wash.
+        // On an indexed palette a hand-picked `bg` is the only way to get a
+        // focused-hunk fill, so the section must reach `Theme` — see the
+        // `diff_add_line` comment on `ThemeFile`.
         let toml = r##"[diff_add_line]
 bg = "#00ff00"
 
@@ -583,14 +524,10 @@ bg = "#ff0000"
 
     #[test]
     fn exporting_an_indexed_builtin_preserves_its_hand_picked_washes() {
-        // The export path ("Create custom theme") serialises through
-        // `ThemeFile`, so a field missing there is a field the exported
-        // copy silently loses.  `dark_256` / `light_256` /
-        // `monochrome_dark` hand-pick the focused washes precisely
-        // because the palette blend can't derive them on a non-RGB
-        // palette — dropping the section collapsed add and delete onto
-        // each other *and* onto `surface`, taking the focused-hunk fill
-        // and both decision-divider chips with them.
+        // The export path serializes through `ThemeFile`, so a field missing
+        // there is one the exported copy loses.  The indexed built-ins hand-pick
+        // the focused washes because the palette blend can't derive them, and
+        // dropping the section collapsed add, delete and `surface` together.
         for name in ["256 Dark", "256 Light", "Monochrome Dark", "Edamame"] {
             let original = Theme::builtin(name).expect("built-in name");
             let serialised = toml::to_string(&ThemeFile::from(&original)).unwrap();
@@ -608,9 +545,7 @@ bg = "#ff0000"
 
     #[test]
     fn palette_override_ripples_to_styles() {
-        // Override only the palette `primary` slot; the H1 fg should
-        // pick up the new color because the heading ramp derives
-        // from `primary` (h1) and `secondary` (h2).
+        // The heading ramp derives from `primary` and `secondary`.
         let toml = r##"
 [palette]
 primary = "#abcdef"
@@ -618,14 +553,12 @@ primary = "#abcdef"
         let file: ThemeFile = toml::from_str(toml).unwrap();
         let theme: Theme = (&file).into();
         assert_eq!(theme.h1.fg, Some(Color::Rgb(0xab, 0xcd, 0xef)));
-        // h1_rule shares the `primary` palette slot and should follow.
+        // `h1_rule` shares the `primary` slot and follows.
         assert_eq!(theme.h1_rule.fg, Some(Color::Rgb(0xab, 0xcd, 0xef)));
     }
 
     #[test]
     fn style_override_wins_over_palette() {
-        // Palette + an explicit style override on H1.  The style
-        // override should win.
         let toml = r##"
 [palette]
 primary = "#abcdef"
@@ -637,17 +570,14 @@ bold = true
         let file: ThemeFile = toml::from_str(toml).unwrap();
         let theme: Theme = (&file).into();
         assert_eq!(theme.h1.fg, Some(Color::Rgb(0x11, 0x22, 0x33)));
-        // h1_rule still picks up the palette override (no explicit
-        // override in the file).
+        // `h1_rule` has no explicit override, so it still follows the palette.
         assert_eq!(theme.h1_rule.fg, Some(Color::Rgb(0xab, 0xcd, 0xef)));
     }
 
     #[test]
     fn syntax_styles_derive_from_the_palette_and_accept_overrides() {
-        // The two halves of the syntax fields' contract: they ride the
-        // palette by default, so every built-in theme gets a coherent
-        // set without hand-authoring one, and a theme file can still
-        // name a token colour explicitly.
+        // Both halves of the contract: syntax fields ride the palette by
+        // default, and a theme file can still name a token color explicitly.
         let toml = r##"
 [palette]
 primary = "#abcdef"
@@ -658,18 +588,15 @@ italic = true
 "##;
         let file: ThemeFile = toml::from_str(toml).unwrap();
         let theme: Theme = (&file).into();
-        // Derived: keyword follows the `primary` slot it is built from.
         assert_eq!(theme.syntax_keyword.fg, Some(Color::Rgb(0xab, 0xcd, 0xef)));
-        // Overridden: the explicit section wins outright.
         assert_eq!(theme.syntax_string.fg, Some(Color::Rgb(0x11, 0x22, 0x33)));
         assert!(theme.syntax_string.add_modifier.contains(Modifier::ITALIC));
     }
 
     #[test]
     fn syntax_styles_carry_no_background_of_their_own() {
-        // They are patched over `code_block_text`, which owns the code
-        // surface's bg.  A syntax style that set one would paint a
-        // stale background wherever a theme moved the surface.
+        // They patch over `code_block_text`, which owns the code surface's bg;
+        // one of their own would paint stale wherever a theme moved it.
         let theme = Theme::default();
         for (name, style) in [
             ("syntax_keyword", theme.syntax_keyword),
@@ -686,20 +613,16 @@ italic = true
 
     #[test]
     fn palette_only_file_renders_identical_to_default_theme() {
-        // Lock in the contract that the shipped `default.toml` shape
-        // (palette + empty per-element sections) produces exactly the
-        // compiled-in default theme.  Catches regressions where a new
-        // style sneaks in with a hand-rolled default that doesn't fall
-        // out of the palette merge.
+        // The shipped `default.toml` shape must produce exactly the compiled-in
+        // default, catching a new style with a hand-rolled default that doesn't
+        // fall out of the palette merge.
         let default = Theme::default();
         let file = ThemeFile {
             palette: (&default.palette).into(),
             task_strikethrough: default.task_strikethrough,
             ..Default::default()
         };
-        // Round through TOML so we exercise the same path as a real
-        // load (serialize → parse → merge), not just the in-memory
-        // From impl.
+        // Through TOML, so this is the real load path, not just the `From`.
         let toml_str = toml::to_string_pretty(&file).expect("serialize");
         let parsed: ThemeFile = toml::from_str(&toml_str).expect("parse");
         let theme: Theme = (&parsed).into();
@@ -808,8 +731,7 @@ italic = true
         check!(scrollbar_track);
         check!(scrollbar_thumb);
         check!(scrollbar_thumb_active);
-        // `table_cell` and `active_line` are intentionally
-        // `Style::default()` in the compiled default and round-trip
-        // identically through both branches of the merge.
+        // `table_cell` and `active_line` are intentionally `Style::default()`,
+        // which round-trips identically through both merge branches.
     }
 }

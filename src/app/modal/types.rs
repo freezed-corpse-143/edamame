@@ -1,8 +1,5 @@
-//! Core trait, render context, and dispatch outcome for modals.
-//!
-//! The `Modal` trait abstracts every popup, prompt, and overlay that the
-//! App can layer on top of the editor view.  See [`super`] for the
-//! `ModalStack` that owns these as `Box<dyn Modal>` and dispatches input.
+//! The [`Modal`] trait, its render context, and dispatch outcomes.  See
+//! [`super::ModalStack`] for ownership and dispatch.
 
 use std::any::Any;
 use std::time::Instant;
@@ -16,9 +13,7 @@ use crate::config::{Config, Theme};
 
 pub use crate::ui::ModalKind;
 
-/// Pure hit-test for the cached `esc` close-affordance rect.  Shared by
-/// every modal's `handle_click` so the bounds check has a single
-/// definition.
+/// Hit-test for a cached `esc` close-affordance rect.
 pub fn esc_rect_hit(esc_rect: Option<ratatui::layout::Rect>, col: u16, row: u16) -> bool {
     match esc_rect {
         Some(r) => col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height,
@@ -26,9 +21,7 @@ pub fn esc_rect_hit(esc_rect: Option<ratatui::layout::Rect>, col: u16, row: u16)
     }
 }
 
-/// Helper: close a modal when `(col, row)` lands inside `esc_rect`,
-/// otherwise keep it open.  Concrete `Modal` impls call this from
-/// their `handle_click` after delegating to the state's hit-test.
+/// `Close` when `(col, row)` lands inside `esc_rect`, else `Continue`.
 pub fn close_if_esc_clicked(
     esc_rect: Option<ratatui::layout::Rect>,
     col: u16,
@@ -41,49 +34,31 @@ pub fn close_if_esc_clicked(
     }
 }
 
-/// Read-only context handed to [`Modal::render`].  Centralises the
-/// references every modal needs at draw time so individual modal
-/// implementations don't have to pull them off `App` themselves.
+/// Read-only context handed to [`Modal::render`].
 pub struct ModalRenderCtx<'a> {
     pub theme: &'a Theme,
     pub config: &'a Config,
     pub cursor_visible: bool,
 }
 
-/// Outcome of dispatching a key event to a modal.
-///
-/// Returned from [`Modal::handle_key`].  The dispatcher pops the modal
-/// off the stack before invoking the handler — `Continue` re-pushes it,
-/// `Close` drops it, `CloseAnd` drops it and runs the supplied callback
-/// against the now-unborrowed `App`.
+/// Outcome of dispatching input to a modal.  The dispatcher pops the modal before invoking
+/// the handler; `Continue*` re-pushes it, `Close*` drops it, and the `*And` callbacks run
+/// afterwards against the now-unborrowed `App`.
 pub enum ModalOutcome {
-    /// Modal stays on the stack, no follow-up action.
     Continue,
-    /// Modal stays on the stack; run the callback against `App` *after*
-    /// the modal is pushed back.  Used by handlers that want to keep the
-    /// modal open while running a follow-up against the now-unborrowed
-    /// `App` (e.g. opening another modal on top of this one).
+    /// Stay open; the callback runs after the modal is pushed back (e.g. to open another
+    /// modal on top).
     ContinueAnd(Box<dyn FnOnce(&mut App)>),
-    /// Modal is removed from the stack; no follow-up.
     Close,
-    /// Modal is removed from the stack; run the callback against `App`.
-    /// Used for the common "close + dispatch" pattern (e.g. dirty-guard
-    /// closes then triggers a navigation).
     CloseAnd(Box<dyn FnOnce(&mut App)>),
 }
 
-/// A modal popup or overlay that can sit on top of the editor view.
-///
-/// The topmost modal on the [`super::ModalStack`] absorbs all keyboard
-/// and wheel input and renders last.
+/// A popup or overlay on top of the editor view.  The topmost modal on the
+/// [`super::ModalStack`] absorbs all keyboard and wheel input and renders last.
 pub trait Modal {
-    /// Draw the modal into `area` of `frame`.
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &ModalRenderCtx<'_>);
 
-    /// Apply a keypress.  Receives `&mut App` so handlers can flash
-    /// messages, persist config, dispatch follow-up actions, etc.
-    /// `doc_height` and `doc_width` are the document area dimensions
-    /// — needed by overlays that dispatch `Action`s through the same
+    /// `doc_height` / `doc_width` serve overlays that dispatch `Action`s through the same
     /// pipeline as direct keystrokes.
     fn handle_key(
         &mut self,
@@ -93,79 +68,43 @@ pub trait Modal {
         doc_width: usize,
     ) -> ModalOutcome;
 
-    /// Apply a bracketed paste.  `text` is the raw clipboard payload as
-    /// crossterm delivered it; the modal is responsible for sanitizing
-    /// it (see [`crate::ui::sanitize_paste`]) and routing it to its
-    /// focused field.  Default: no-op — modals without a text field
-    /// silently ignore pastes, matching the editor-less behaviour before
-    /// paste routing existed.
+    /// Apply a bracketed paste.  `text` is raw; the modal sanitizes it
+    /// ([`crate::ui::sanitize_paste`]).  Default: ignore.
     fn handle_paste(&mut self, _text: &str) -> ModalOutcome {
         ModalOutcome::Continue
     }
 
-    /// Apply a mouse-wheel delta.  Default: no-op (modals without a
-    /// scrollable body ignore wheel events).
     fn handle_wheel(&mut self, _delta: i32) {}
 
-    /// Apply a left-button mouse click at terminal coordinates
-    /// `(col, row)`.  Receives `&mut App` (like [`Self::handle_key`]) so a
-    /// click can mutate config / flash / dispatch follow-ups directly — the
-    /// dispatcher pops the modal before calling this, so `self` and `app`
-    /// are disjoint borrows.  Default: no-op.  Modals that draw an `esc`
-    /// close button in their title bar override this to dismiss when the
-    /// click lands inside the cached hit-rect.
+    /// Left click at terminal `(col, row)`.  Default: ignore.
     fn handle_click(&mut self, _col: u16, _row: u16, _app: &mut App) -> ModalOutcome {
         ModalOutcome::Continue
     }
 
-    /// The modal's visual urgency — drives title color.  Default
-    /// [`ModalKind::Normal`].  Concrete modals store this as a field on
-    /// their struct and have this method, the `ModalView { kind }`
-    /// literal, and the constructor all read from `self.kind` so the
-    /// value can't drift between rendering and introspection.
+    /// Visual urgency; drives the title color.  Must read the same field the render path
+    /// uses so the two can't drift.
     #[allow(dead_code)]
     fn kind(&self) -> ModalKind {
         ModalKind::Normal
     }
 
-    /// Whether `Esc` (and the `esc` close button) may dismiss this
-    /// modal.  Returning `false` gates the modal: the user must
-    /// activate one of the explicit footer buttons.  Default `true`.
-    /// Concrete modals store this as a field and route it to all three
-    /// consumers — `ModalView { dismissable }`, the
-    /// `state.handle_key(.., self.dismissable)` call, and this trait
-    /// method — so the rendered close hint, click hit-test, and Esc
-    /// behaviour stay in sync.
+    /// Whether `Esc` / the `esc` button may dismiss this modal; `false` forces a footer
+    /// button.  Same single-field rule as [`Self::kind`].
     #[allow(dead_code)]
     fn dismissable(&self) -> bool {
         true
     }
 
-    /// Earliest wall-clock instant at which this modal needs a redraw
-    /// to advance time-driven content (a spinner, a rotating tagline).
-    /// Aggregated into the run loop's blocking deadline via
-    /// [`super::ModalStack::next_deadline`]; the loop wakes then,
-    /// redraws, and the modal derives its new frame from elapsed time.
-    /// Default `None` — static modals never force a wake-up.
+    /// When this modal next needs a redraw for time-driven content (spinner, rotating
+    /// tagline); aggregated by [`super::ModalStack::next_deadline`].
     fn next_deadline(&self) -> Option<Instant> {
         None
     }
 
-    /// Type-erased self-reference, used by [`super::ModalStack`] for
-    /// type-aware operations (`remove_first<T>`, `contains<T>`).  Every
-    /// implementation should be the trivial `fn as_any(&self) -> &dyn
-    /// Any { self }` — but the trait can't provide a default because
-    /// `Self: Any` isn't a supertrait bound (would force `'static` on
-    /// every implementor, which is true today but constrains future
-    /// adapter types).
+    /// Always the trivial `{ self }`; no default because an `Any` supertrait would force
+    /// `'static` on every implementor.
     fn as_any(&self) -> &dyn Any;
 
-    /// Mutable counterpart to [`Self::as_any`], used by
-    /// [`super::ModalStack::find_first_mut`] when a caller needs to
-    /// update a modal in place (e.g. refreshing the on-disk contents
-    /// carried by `DirtyConflictModal` after a new external write
-    /// arrives while a child reconciliation modal is open).  Same
-    /// trivial body as `as_any`; kept required for the same reason
-    /// (avoiding a `'static` supertrait bound on `Modal`).
+    /// Mutable counterpart to [`Self::as_any`], for [`super::ModalStack::find_first_mut`].
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }

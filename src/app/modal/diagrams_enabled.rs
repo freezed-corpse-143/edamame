@@ -1,12 +1,6 @@
-//! Master diagrams-enabled prompt.  Shown when `config.diagrams.enabled`
-//! is `Ask` and the open document contains at least one diagram code
-//! block (e.g. ```mermaid).  Four buttons (Yes / No / Always / Never)
-//! — the first two affect only the current session; the latter two
-//! persist to config.  Mirrors [`super::ImagesEnabledPromptModal`] —
-//! the two prompts are deliberately independent so a user can opt in
-//! to images without opting in to diagrams (or vice-versa).
-//! Escape (or the `esc` close hint) is equivalent to "No": diagrams
-//! are disabled for this session without persisting a preference.
+//! Diagrams-enabled prompt (Yes / No / Always / Never; Esc = No), shown when
+//! `config.diagrams.enabled` is `Ask` and the document has a diagram block.  Deliberately
+//! independent of [`super::ImagesEnabledPromptModal`] so the two opt-ins are separate.
 
 use std::any::Any;
 
@@ -29,8 +23,7 @@ pub struct DiagramsEnabledPromptModal {
 }
 
 impl DiagramsEnabledPromptModal {
-    /// Construct the modal when the policy is `Ask` and the document
-    /// has diagram blocks.  Returns `None` otherwise.
+    /// `None` unless the policy is `Ask` and the document has diagram blocks.
     pub fn from_state(editor: &EditorState, config: &Config) -> Option<Self> {
         if !matches!(config.diagrams.enabled, crate::config::DiagramsEnabled::Ask) {
             return None;
@@ -60,37 +53,28 @@ impl DiagramsEnabledPromptModal {
         })
     }
 
-    /// Map a resolved response to an outcome.  Shared by the key and
-    /// click paths so a mouse click on a button behaves exactly like
-    /// pressing it.
+    /// Map a chrome response to an outcome; shared by the key and click paths.
     fn resolve(&mut self, response: ModalResponse) -> ModalOutcome {
         match response {
             ModalResponse::Continue => ModalOutcome::Continue,
             ModalResponse::Cancelled => ModalOutcome::CloseAnd(Box::new(decline_for_session)),
-            ModalResponse::ButtonPressed(idx) => {
-                // Button order:
-                //   0 → Yes    (session-only show, no config change)
-                //   1 → No     (session-only hide, no config change)
-                //   2 → Always (persist `DiagramsEnabled::Always`)
-                //   3 → Never  (persist `DiagramsEnabled::Never`)
-                match idx {
-                    0 => ModalOutcome::CloseAnd(Box::new(|app| {
-                        app.session_diagrams_enabled = Some(true);
-                        app.dispatch_image_decodes();
-                    })),
-                    1 => ModalOutcome::CloseAnd(Box::new(decline_for_session)),
-                    2 => ModalOutcome::CloseAnd(Box::new(|app| {
-                        app.config.diagrams.enabled = crate::config::DiagramsEnabled::Always;
-                        app.save_config_with_flash("failed to persist diagrams.enabled=always");
-                        app.dispatch_image_decodes();
-                    })),
-                    _ => ModalOutcome::CloseAnd(Box::new(|app| {
-                        app.config.diagrams.enabled = crate::config::DiagramsEnabled::Never;
-                        app.save_config_with_flash("failed to persist diagrams.enabled=never");
-                        decline_for_session(app);
-                    })),
-                }
-            }
+            ModalResponse::ButtonPressed(idx) => match idx {
+                0 => ModalOutcome::CloseAnd(Box::new(|app| {
+                    app.session_diagrams_enabled = Some(true);
+                    app.dispatch_image_decodes();
+                })),
+                1 => ModalOutcome::CloseAnd(Box::new(decline_for_session)),
+                2 => ModalOutcome::CloseAnd(Box::new(|app| {
+                    app.config.diagrams.enabled = crate::config::DiagramsEnabled::Always;
+                    app.save_config_with_flash("failed to persist diagrams.enabled=always");
+                    app.dispatch_image_decodes();
+                })),
+                _ => ModalOutcome::CloseAnd(Box::new(|app| {
+                    app.config.diagrams.enabled = crate::config::DiagramsEnabled::Never;
+                    app.save_config_with_flash("failed to persist diagrams.enabled=never");
+                    decline_for_session(app);
+                })),
+            },
         }
     }
 }
@@ -138,9 +122,7 @@ impl Modal for DiagramsEnabledPromptModal {
     }
 }
 
-/// Common cleanup when the user opts out of diagrams this session:
-/// collapse diagram blocks to their one-line placeholders and refresh
-/// the parse so the layout reflects the change immediately.
+/// Session opt-out: collapse diagram blocks to placeholders and re-parse.
 fn decline_for_session(app: &mut App) {
     app.session_diagrams_enabled = Some(false);
     app.editor.diagrams_enabled = false;

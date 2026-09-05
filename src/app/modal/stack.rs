@@ -1,11 +1,6 @@
-//! `ModalStack`: ordered collection of [`super::Modal`] instances that
-//! the App layers on top of the editor view.
-//!
-//! Topmost modal absorbs input and renders last.  Pushes append; pops
-//! peel from the top.  The dispatcher pattern is "pop, dispatch, decide
-//! whether to push back" — this lets [`super::Modal::handle_key`] take
-//! both `&mut self` (the modal) and `&mut App` (the application state)
-//! without borrow conflicts, since the popped modal owns itself.
+//! `ModalStack`: the ordered [`super::Modal`] instances the App layers over the editor view.  The
+//! topmost absorbs input and renders last.  The dispatcher pattern is "pop, dispatch, decide whether
+//! to push back", which lets [`super::Modal::handle_key`] take `&mut self` and `&mut App` at once.
 
 use super::Modal;
 
@@ -25,16 +20,14 @@ impl ModalStack {
         self.inner.push(modal);
     }
 
-    /// Pop the topmost modal, if any.  The dispatcher calls this before
-    /// handing the event to the modal so the modal can take `&mut App`
-    /// without re-borrowing the stack.
+    /// Pop the topmost modal, if any.  The dispatcher pops before handing over the event so the
+    /// modal can take `&mut App` without re-borrowing the stack.
     pub fn pop(&mut self) -> Option<Box<dyn Modal>> {
         self.inner.pop()
     }
 
-    /// Borrow the topmost modal without removing it.  Used by the
-    /// render path and the wheel-scroll path, which don't need the
-    /// pop-and-replace dance because they don't call back into `App`.
+    /// Borrow the topmost modal without removing it — for the render and wheel-scroll paths, which
+    /// don't call back into `App`.
     pub fn top_mut(&mut self) -> Option<&mut dyn Modal> {
         match self.inner.last_mut() {
             Some(b) => Some(&mut **b),
@@ -46,10 +39,8 @@ impl ModalStack {
         self.inner.is_empty()
     }
 
-    /// Earliest [`Modal::next_deadline`] across the whole stack, for
-    /// the run loop's blocking-deadline aggregation.  Every modal is
-    /// consulted — not just the topmost — so an animated modal buried
-    /// under a transient overlay resumes seamlessly when revealed.
+    /// Earliest [`Modal::next_deadline`] across the whole stack.  Every modal is consulted, not
+    /// just the topmost, so an animated modal buried under an overlay resumes when revealed.
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
         self.inner.iter().filter_map(|m| m.next_deadline()).min()
     }
@@ -59,10 +50,8 @@ impl ModalStack {
         self.inner.len()
     }
 
-    /// Remove the topmost modal of type `T`, if any.  Returns whether a
-    /// matching modal was removed.  Used to drop a queued modal when
-    /// its precondition becomes unsatisfiable (e.g. dropping a queued
-    /// remote-image-prompt after the user opts out of images entirely).
+    /// Remove the topmost modal of type `T`, reporting whether one matched.  Used to drop a queued
+    /// modal whose precondition has become unsatisfiable.
     pub fn remove_first<T: Modal + 'static>(&mut self) -> bool {
         if let Some(idx) = self.inner.iter().position(|m| m.as_any().is::<T>()) {
             self.inner.remove(idx);
@@ -72,27 +61,21 @@ impl ModalStack {
         }
     }
 
-    /// True if any modal of type `T` is currently on the stack.
-    /// Used by tests in this module.
+    /// True if any modal of type `T` is on the stack.
     #[allow(dead_code)]
     pub fn contains<T: Modal + 'static>(&self) -> bool {
         self.inner.iter().any(|m| m.as_any().is::<T>())
     }
 
-    /// Number of modals of type `T` currently on the stack.  Used by
-    /// tests asserting that a modal is never stacked more than once.
+    /// Number of modals of type `T` on the stack — tests assert a modal is never stacked twice.
     #[allow(dead_code)]
     pub fn count<T: Modal + 'static>(&self) -> usize {
         self.inner.iter().filter(|m| m.as_any().is::<T>()).count()
     }
 
-    /// Mutable borrow of the first modal of type `T` on the stack, if
-    /// any.  Used by `App::handle_file_changed` to refresh the
-    /// `on_disk_contents` carried by a child reconciliation modal
-    /// (`DirtyConflictSaveCopyModal` / `DirtyConflictDiscardConfirmModal`)
-    /// when a fresh external write arrives before the user has
-    /// confirmed.  "First" is bottom-up — matches the order
-    /// [`Self::remove_first`] uses so the two methods pair naturally.
+    /// Mutable borrow of the first modal of type `T`, if any.  "First" is bottom-up, matching
+    /// [`Self::remove_first`].  Used to refresh a queued reconciliation modal's `on_disk_contents`
+    /// when a fresh external write arrives before the user has confirmed.
     pub fn find_first_mut<T: Modal + 'static>(&mut self) -> Option<&mut T> {
         self.inner
             .iter_mut()
@@ -100,10 +83,7 @@ impl ModalStack {
             .and_then(|m| m.as_any_mut().downcast_mut::<T>())
     }
 
-    /// Shared borrow of the first modal of type `T` on the stack, if any.
-    /// "First" is bottom-up, matching [`Self::find_first_mut`].  Used to
-    /// inspect a flag on an open modal (e.g. whether a `SaveAsModal` is the
-    /// file-deletion recovery flow) without mutating it.
+    /// Shared borrow of the first modal of type `T`, bottom-up like [`Self::find_first_mut`].
     pub fn find_first<T: Modal + 'static>(&self) -> Option<&T> {
         self.inner
             .iter()
@@ -201,7 +181,6 @@ mod tests {
         stack.push(Box::new(ModalA)); // top
         assert!(stack.remove_first::<ModalB>());
         assert_eq!(stack.len(), 1);
-        // ModalA stays on top
         assert!(stack.contains::<ModalA>());
         assert!(!stack.contains::<ModalB>());
     }

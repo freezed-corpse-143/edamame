@@ -1,20 +1,11 @@
-//! Update-check modal: the single surface that answers "is there a
-//! newer edamame, and what changed?".
+//! Update-check modal: one modal, five states, three entry points.  The startup check pushes it
+//! only in the `Available` state; the explicit entry points push whatever state is known and let
+//! the in-flight result replace it — which is why the up-to-date/uncomparable/failure states live
+//! on this same modal.
 //!
-//! One modal, five states, three entry points.  The startup check
-//! (`app::update_notice`) pushes it only in the `Available` state and
-//! only once nothing else is on screen; the About page's
-//! `[ Check for updates ]` button and the `CheckForUpdates` palette
-//! action push it in whatever state is known and let the in-flight
-//! result replace that.  Keeping the up-to-date, uncomparable and
-//! failure states on the *same* modal is what lets an explicit check
-//! answer honestly — the startup path simply never opens it for those.
-//!
-//! Like [`super::about`], time-driven content (the spinner) is derived
-//! from `opened_at.elapsed()` at render time rather than mutated by a
-//! tick; [`Modal::next_deadline`] tells the run loop when to redraw,
-//! and returns `None` once the status resolves so a settled modal
-//! costs no wakeups.
+//! Like [`super::about`], the spinner is derived from `opened_at.elapsed()` at render time rather
+//! than ticked; [`Modal::next_deadline`] returns `None` once the status resolves.  See
+//! `docs/dev/update-check.md`.
 
 use std::any::Any;
 use std::time::{Duration, Instant};
@@ -35,27 +26,18 @@ const SPINNER_TICK: Duration = Duration::from_millis(100);
 
 pub struct UpdateModal {
     chrome: ModalChrome,
-    /// Rebuilt by [`Self::set_status`] alongside the status, because
-    /// only the states naming a reachable release have anything to
-    /// press — see [`buttons_for`].
+    /// Rebuilt by [`Self::set_status`] alongside the status — see [`buttons_for`].
     buttons: Vec<ModalButton>,
     status: ReleaseStatus,
     opened_at: Instant,
 }
 
 impl UpdateModal {
-    /// `status` is whatever the session knows when the modal opens —
-    /// `Pending` when a fetch was just spawned with nothing useful
-    /// cached, otherwise the cached result, which the in-flight fetch
-    /// replaces via [`Self::set_status`] when it lands.
-    ///
-    /// `pub(crate)` to match `ReleaseStatus`, which is crate-private.
-    /// Nothing outside the crate constructs a modal.
+    /// `status` is whatever the session knows when the modal opens; an in-flight fetch replaces it
+    /// via [`Self::set_status`].
     pub(crate) fn new(status: ReleaseStatus) -> Self {
         Self {
-            // Prose body (the release notes are free text), so the
-            // content width is capped — an unwrapped-longest-line sizing
-            // would stretch the modal across the terminal.
+            // Free-text release notes: cap the width so sizing doesn't stretch to the terminal.
             chrome: ModalChrome::new(ModalKind::Normal, true)
                 .with_max_content_width(PROSE_CONTENT_WIDTH),
             buttons: buttons_for(&status),
@@ -64,15 +46,13 @@ impl UpdateModal {
         }
     }
 
-    /// Push a resolved check into the open modal.  Called by
-    /// `App::handle_release_check_result` when the worker reports back.
+    /// Push a resolved check into the open modal, from the fetch worker's result.
     pub(crate) fn set_status(&mut self, status: ReleaseStatus) {
         self.buttons = buttons_for(&status);
         self.status = status;
     }
 
-    /// The status currently on display.  Read by the App-level tests
-    /// that assert which state an entry point opened the modal in.
+    /// The status currently on display.
     #[cfg(test)]
     pub(crate) fn status(&self) -> &ReleaseStatus {
         &self.status
@@ -82,9 +62,8 @@ impl UpdateModal {
         (self.opened_at.elapsed().as_millis() / SPINNER_TICK.as_millis()) as usize
     }
 
-    /// Map the status onto the `ui` layer's own vocabulary.  This
-    /// translation is the whole reason `ui::update_check` needs no
-    /// `app` import.
+    /// Map the status onto the `ui` layer's vocabulary, so `ui::update_check` needs no `app`
+    /// import.
     fn report(&self) -> UpdateReport<'_> {
         match &self.status {
             ReleaseStatus::Pending => UpdateReport::Checking {
@@ -100,20 +79,15 @@ impl UpdateModal {
         }
     }
 
-    /// Resolve a response — shared by the key and click paths so mouse
-    /// and keyboard can't diverge.  `[ View on GitHub ]` keeps the modal
-    /// open (`ContinueAnd`), matching the About page's button of the
-    /// same name:
-    /// the user comes back from the browser to what they were reading,
-    /// not to a surprise dismissal.
+    /// Shared by the key and click paths.  `[ View on GitHub ]` keeps the modal open so the user
+    /// returns from the browser to what they were reading.
     fn resolve(&mut self, response: ModalResponse) -> ModalOutcome {
         match response {
             ModalResponse::Continue => ModalOutcome::Continue,
             ModalResponse::Cancelled => ModalOutcome::Close,
             ModalResponse::ButtonPressed(_) => {
                 let Some(tag) = self.status.tag() else {
-                    // No other state has a button; a stray press is
-                    // not a reason to act on a URL we don't have.
+                    // No tag: a stray press is not a reason to act on a URL we don't have.
                     return ModalOutcome::Continue;
                 };
                 let url = update_check::release_url(tag);
@@ -125,13 +99,9 @@ impl UpdateModal {
     }
 }
 
-/// A button for every state that names a release the user could go and
-/// look at — `Available`, and `Inconclusive` for the same reason it
-/// exists: the modal has just admitted it can't judge the tag, so the
-/// release page is exactly where the answer is.  It opens *that
-/// release's* page rather than the releases list, since the modal is
-/// talking about one version and that page carries its install
-/// instructions and downloads with no newer entries to scroll past.
+/// A button for every state naming a release the user could go and look at.  `Inconclusive`
+/// qualifies precisely because the modal can't judge the tag.  Links that release's own page, not
+/// the releases list.
 fn buttons_for(status: &ReleaseStatus) -> Vec<ModalButton> {
     match status {
         ReleaseStatus::Available(_) | ReleaseStatus::Inconclusive { .. } => {
@@ -144,9 +114,7 @@ fn buttons_for(status: &ReleaseStatus) -> Vec<ModalButton> {
 impl Modal for UpdateModal {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &ModalRenderCtx<'_>) {
         let body = ui_update::body_lines(ctx.theme, self.report(), INSTALLED_VERSION);
-        // One title for all five states: the body's first line is the
-        // verdict, and a frame captioned "Update available" above a
-        // line reading "Update available." says it twice.
+        // One title for all five states — the body's first line is already the verdict.
         self.chrome
             .render(frame, area, ctx, "Check for updates", &body, &self.buttons);
     }
@@ -180,11 +148,9 @@ impl Modal for UpdateModal {
     }
 
     fn next_deadline(&self) -> Option<Instant> {
-        // Only the spinner animates, so a resolved modal asks for no
-        // wakeups at all.  Saturating conversion: an absurdly long
-        // session pins the deadline in the far future rather than
-        // wrapping it into the past, where the run loop's `> now`
-        // filter would silently drop it.
+        // Only the spinner animates.  The saturating conversion pins an absurdly long session's
+        // deadline in the far future rather than wrapping it into the past, where the run loop's
+        // `> now` filter would drop it.
         if self.status != ReleaseStatus::Pending {
             return None;
         }
@@ -235,8 +201,7 @@ mod tests {
 
     #[test]
     fn an_uncomparable_tag_still_offers_the_release_page() {
-        // The modal has just said it can't judge the tag, so the one
-        // place that answers the question must be reachable from it.
+        // The modal just said it can't judge the tag; the release page must stay reachable.
         let status = ReleaseStatus::Inconclusive {
             tag: "v999.0.0-rc1".to_owned(),
         };
@@ -278,7 +243,6 @@ mod tests {
         let deadline = pending.next_deadline().expect("spinner deadline");
         assert!(deadline > now && deadline <= now + SPINNER_TICK + Duration::from_millis(50));
 
-        // Resolved: nothing animates, so no wakeup is requested.
         assert!(UpdateModal::new(available()).next_deadline().is_none());
         assert!(UpdateModal::new(ReleaseStatus::Failed)
             .next_deadline()

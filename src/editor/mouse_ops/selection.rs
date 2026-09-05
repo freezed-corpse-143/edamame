@@ -4,14 +4,10 @@ use crate::document::{Selection, VisualSelection};
 use crate::editor::table_edit;
 use crate::editor::EditorState;
 
-/// If the raw bytes immediately before `sel.start` and immediately after
-/// `sel.end` form a matching pair of inline formatting markers (`*…*`,
-/// `**…**`, `_…_`, `__…__`, `` `…` ``, `~~…~~`), expand the selection to
-/// include both markers so the highlight matches what the user sees when
-/// the element de-renders after the click-and-drag completes.
-///
-/// Only expands when the selection is entirely on a single source line —
-/// inline formatting doesn't span newlines in CommonMark.
+/// Expand `sel` over a matching pair of inline formatting markers (`*…*`, `**…**`, `_…_`,
+/// `__…__`, `` `…` ``, `~~…~~`) bracketing it, so the highlight matches what the user sees once
+/// the element de-renders.  Only when the selection is on a single source line — inline
+/// formatting doesn't span newlines in CommonMark.
 pub(super) fn expand_selection_to_inline_markers(
     buffer: &crate::document::Buffer,
     sel: Selection,
@@ -28,7 +24,6 @@ pub(super) fn expand_selection_to_inline_markers(
         return sel;
     }
 
-    // Same-line constraint.
     if source[start_byte..end_byte].contains('\n') {
         return sel;
     }
@@ -42,10 +37,8 @@ pub(super) fn expand_selection_to_inline_markers(
         if start_byte < len || end_byte + len > source.len() {
             continue;
         }
-        // Use `get` rather than direct slicing: the bytes adjacent to the
-        // selection may fall inside a multibyte char (e.g. `—`), which would
-        // panic on a `&source[..]` slice. All markers are ASCII, so a
-        // non-boundary range simply can't match and is safely skipped.
+        // `get` rather than slicing: the adjacent bytes may fall inside a multibyte char
+        // (e.g. `—`), which would panic.  Markers are ASCII, so a non-boundary range can't match.
         let (Some(before), Some(after)) = (
             source.get(start_byte - len..start_byte),
             source.get(end_byte..end_byte + len),
@@ -53,8 +46,6 @@ pub(super) fn expand_selection_to_inline_markers(
             continue;
         };
         if before == *m && after == *m {
-            // Don't cross a line boundary when expanding — redundant given
-            // the check above but cheap to verify.
             if before.contains('\n') || after.contains('\n') {
                 continue;
             }
@@ -74,16 +65,12 @@ pub(super) fn expand_selection_to_inline_markers(
     sel
 }
 
-/// Generic word-boundary scan around char index `at` in a sequence of
-/// length `len` whose chars are produced by `get_char`.  Mirrors the
-/// double-click word-selection rule: alphanumeric-or-`_` first, falling
-/// back to a punctuation run when the cursor is on neither a word char nor
-/// whitespace.  Returns `None` only when both passes collapse (cursor sits
-/// on whitespace with no adjacent word or punctuation).
+/// Word-boundary scan around char index `at` in a sequence of length `len` whose chars come from
+/// `get_char`: alphanumeric-or-`_` first, falling back to a punctuation run.  `None` when both
+/// passes collapse (whitespace with no adjacent word or punctuation).
 ///
-/// Used by both the rope-offset path (`select_word_at_cursor`) and the
-/// Preview rendered-line path (`mouse_ops::apply`'s DoubleClick arm) so a
-/// single definition of "word" governs both selection mechanisms.
+/// The single definition of "word" for both the rope-offset path (`select_word_at_cursor`) and
+/// the Preview rendered-line path (`mouse_ops::apply`'s DoubleClick arm).
 pub(super) fn word_range_around<F>(len: usize, at: usize, get_char: F) -> Option<(usize, usize)>
 where
     F: Fn(usize) -> char,
@@ -106,9 +93,7 @@ where
         return Some((start, end));
     }
 
-    // Punctuation fallback: expand across non-alphanumeric, non-whitespace
-    // chars so a double-click on `==` or `**` still produces a meaningful
-    // selection.
+    // Punctuation fallback, so a double-click on `==` or `**` still selects something.
     let mut s2 = at;
     while s2 > 0 {
         let c = get_char(s2 - 1);
@@ -159,12 +144,9 @@ pub(super) fn select_word_at_cursor(state: &mut EditorState) {
     }
 }
 
-/// Expand the selection to the whole line (triple-click).
-///
-/// Inside a table the whole buffer line is `| cell | cell | cell |` — selecting
-/// that pulls in the borders and neighbouring cells, which almost never matches
-/// what the user wants.  When the cursor is in a table cell, select just the
-/// trimmed content of that cell instead.
+/// Expand the selection to the whole line (triple-click) — or, inside a table, to just the
+/// trimmed content of the cursor's cell, since the buffer line would pull in borders and
+/// neighboring cells.
 pub(super) fn select_line_at_cursor(state: &mut EditorState) {
     let source = state.buffer.contents();
     let cursor_byte = state.buffer.rope().char_to_byte(state.cursor.offset);
@@ -212,17 +194,13 @@ pub(super) fn select_line_at_cursor(state: &mut EditorState) {
     state.cursor.preferred_col = state.cursor.cell_col(&state.buffer);
 }
 
-/// Extract the rendered text covered by `sel` from `lines`.  Lines between
-/// the anchor and active endpoints are fully included; the first and last
-/// lines are clipped to the selection's char columns.  A newline separates
-/// each rendered line so multi-line copies preserve structure.
+/// Extract the rendered text covered by `sel` from `lines`, clipping the first and last lines to
+/// the selection's char columns and joining with newlines.
 ///
-/// A cell-banded selection (started inside a table cell) clips every line
-/// to the cell's column band, drops the cell's trailing padding, and joins
-/// the lines with a single space instead of a newline: the banded lines are
-/// wrap chunks of one logical source cell and wrap points are always
-/// whitespace, so this reconstructs the cell text — matching what
-/// Rendered-mode cell selection copies.
+/// A cell-banded selection (started inside a table cell) instead clips every line to the cell's
+/// column band, drops trailing padding, and joins with a single space: the banded lines are wrap
+/// chunks of one logical cell and wrap points are always whitespace, so this reconstructs the
+/// cell text.
 pub fn visual_selection_to_rendered_text(sel: VisualSelection, lines: &[Line<'_>]) -> String {
     let (start, end) = sel.range();
     let (start_line, start_col) = start;
@@ -233,9 +211,7 @@ pub fn visual_selection_to_rendered_text(sel: VisualSelection, lines: &[Line<'_>
     let end_line = end_line.min(lines.len() - 1);
 
     let mut out = String::new();
-    // Iterate by index because the body needs to compare `idx` against
-    // both `start_line` and `end_line`; an `enumerate().skip(...)` shape
-    // is less direct.
+    // By index because the body compares `idx` against both `start_line` and `end_line`.
     #[allow(clippy::needless_range_loop)]
     for idx in start_line..=end_line {
         let line = &lines[idx];
@@ -272,19 +248,12 @@ mod marker_expansion_tests {
     use super::*;
     use crate::document::Buffer;
 
-    /// Regression: a marker check on the bytes adjacent to the selection
-    /// must not panic when those bytes fall inside a multibyte char (e.g.
-    /// the em-dash `—`, three bytes wide).
+    /// Regression: the marker probe must not panic when the adjacent bytes fall inside a
+    /// multibyte char.  Selecting `b` puts the 1-byte-marker probe at source[2..3], inside the
+    /// three-byte em-dash; selecting the em-dash itself would never reach the bug.
     #[test]
     fn no_panic_on_multibyte_char_adjacent_to_selection() {
-        // The selection must start immediately *after* the em-dash (not on
-        // it) and have a trailing char, so the `start_byte - len` probe for a
-        // 1-byte marker lands inside `—` (bytes 0..3) while the `end_byte +
-        // len` probe stays in bounds. Selecting the em-dash itself would only
-        // ever probe the ASCII chars on either side and never hit the bug.
         let buffer = Buffer::from_str("—bc");
-        // Select `b` (char index 1..2): `start_byte` is 3, so `before` probes
-        // source[2..3], which is inside the em-dash.
         let sel = Selection {
             anchor: 1,
             active: 2,
@@ -296,13 +265,11 @@ mod marker_expansion_tests {
     #[test]
     fn still_expands_real_markers() {
         let buffer = Buffer::from_str("a *foo* b");
-        // Select `foo` (char index 3..6).
         let sel = Selection {
             anchor: 3,
             active: 6,
         };
         let out = expand_selection_to_inline_markers(&buffer, sel);
-        // Expanded to include the surrounding `*` markers (char 2..7).
         assert_eq!((out.anchor, out.active), (2, 7));
     }
 }

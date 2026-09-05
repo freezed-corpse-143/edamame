@@ -1,46 +1,33 @@
 use crate::document::Buffer;
 
-/// A text selection: two char offsets forming an anchor and an active end.
-///
-/// The "anchor" is where the selection started; the "active" is the cursor
-/// (moving) end. The selected range is always `min(anchor, active)..max(anchor, active)`.
+/// A text selection as two char offsets; the selected range is `min..max` of the two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
-    /// Char offset where the selection was started (stays fixed during Shift+move).
+    /// Where the selection started (fixed during Shift+move).
     pub anchor: usize,
-    /// Char offset of the moveable end of the selection (typically the cursor).
+    /// The moving end (typically the cursor).
     pub active: usize,
 }
 
-/// The rendered-screen region of one table cell: the rendered-line range of
-/// its logical table row plus the char-column band of the cell's content
-/// area (between the padding spaces inside the cell's `│` borders).  Stored
-/// on a [`VisualSelection`] that began inside the cell so that painting,
-/// copy, and drag extension all stay confined to the cell.
+/// The rendered-screen region of one table cell: the rendered-line range of its logical row plus
+/// the char-column band of the cell's content area. Stored on a [`VisualSelection`] that began
+/// inside the cell so painting, copy, and drag extension stay confined to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellBand {
-    /// Inclusive rendered-line range covering every wrapped sub-line of the
-    /// logical table row the cell belongs to.
+    /// Inclusive rendered-line range of every wrapped sub-line of the logical table row.
     pub lines: (usize, usize),
-    /// Half-open `[start, end)` rendered char-column range of the cell's
-    /// content area.
+    /// Half-open rendered char-column range of the cell's content area.
     pub cols: (usize, usize),
 }
 
-/// A selection in the rendered (visible) view — stored as `(rendered_line,
-/// char_col)` tuples rather than raw buffer char offsets.  Used in Preview
-/// mode, where the user is selecting over the rendered output (no raw
-/// Markdown markers) and copy should produce the exact rendered text the
-/// user sees, not the underlying Markdown source.
+/// A selection over the rendered view in Preview mode, stored as `(rendered_line, char_col)`
+/// tuples so copy yields exactly the rendered text rather than the Markdown source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VisualSelection {
-    /// `(rendered_line_idx, char_col)` at which the selection was started.
     pub anchor: (usize, usize),
-    /// `(rendered_line_idx, char_col)` of the moveable end (mouse pointer).
+    /// The moving end (mouse pointer).
     pub active: (usize, usize),
-    /// `Some` when the selection began inside a table cell — painting, copy,
-    /// and drag extension are then limited to the cell's column band on each
-    /// line of the band's row range.
+    /// `Some` when the selection began inside a table cell; see [`CellBand`].
     pub band: Option<CellBand>,
 }
 
@@ -54,9 +41,7 @@ impl VisualSelection {
         }
     }
 
-    /// Normalized range `(start, end)` where `start <= end` in row-major
-    /// ordering.  Convenience helper for highlight + copy code that needs a
-    /// deterministic forward span.
+    /// Normalized `(start, end)` with `start <= end` in row-major order.
     pub fn range(&self) -> ((usize, usize), (usize, usize)) {
         if self.anchor <= self.active {
             (self.anchor, self.active)
@@ -65,15 +50,13 @@ impl VisualSelection {
         }
     }
 
-    /// True when anchor and active coincide (zero-width selection).
     pub fn is_empty(&self) -> bool {
         self.anchor == self.active
     }
 }
 
 impl Selection {
-    /// Create a selection starting at `anchor` with zero width. Used by
-    /// integration tests in `tests/` and unit tests in this module.
+    /// Zero-width selection at `anchor`; used by tests.
     #[allow(dead_code)]
     pub fn new(anchor: usize) -> Self {
         Self {
@@ -87,7 +70,6 @@ impl Selection {
         (self.anchor.min(self.active), self.anchor.max(self.active))
     }
 
-    /// Return the selected text as a `String`.
     pub fn selected_text(&self, buf: &Buffer) -> String {
         let (start, end) = self.range();
         let end = end.min(buf.len_chars());
@@ -97,7 +79,6 @@ impl Selection {
         buf.slice_to_string(start, end)
     }
 
-    /// Whether the selection is empty (zero width).
     pub fn is_empty(&self) -> bool {
         self.anchor == self.active
     }

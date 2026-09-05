@@ -11,28 +11,23 @@ use super::runner::{write_atomically, ExportOutcome};
 use crate::diagram;
 use crate::image::{rasterize_svg, SvgScaleMode, SvgSizing};
 
-/// The compiled-in stylesheet bundled with edamame.  Used when
-/// [`HtmlExportOptions::stylesheet`] is [`Stylesheet::Builtin`].
+/// The compiled-in stylesheet, used for [`Stylesheet::Builtin`].
 pub const BUILTIN_STYLESHEET: &str = include_str!("../../config/export/default.css");
 
 /// Source of the CSS embedded in the generated HTML document.
 #[derive(Debug, Clone)]
 pub enum Stylesheet {
-    /// Use the edamame-bundled stylesheet (`config/export/default.css`).
+    /// The bundled `config/export/default.css`.
     Builtin,
     /// Read a user CSS file at export time.
     Path(PathBuf),
-    /// Use the supplied CSS verbatim.  Primarily for tests and embeddings —
-    /// the binary only ever builds `Builtin` / `Path` (via
-    /// `from_config_value`), so this is lib-only surface in the bin build.
+    /// CSS verbatim.  Tests and embeddings only — the binary builds `Builtin` / `Path`.
     #[allow(dead_code)]
     Inline(String),
 }
 
 impl Stylesheet {
-    /// Parse the string form of `[export.html].stylesheet` from the
-    /// config.  The sentinel `"builtin"` maps to [`Stylesheet::Builtin`];
-    /// every other value is treated as a filesystem path.
+    /// Parse `[export.html].stylesheet`: the sentinel `"builtin"`, or a filesystem path.
     pub fn from_config_value(value: &str) -> Self {
         if value.eq_ignore_ascii_case("builtin") {
             Self::Builtin
@@ -56,26 +51,16 @@ impl Stylesheet {
 pub struct HtmlExportOptions {
     /// Source of the embedded CSS.
     pub stylesheet: Stylesheet,
-    /// When true, relative `![alt](path.png)` references are read from
-    /// disk and base64-embedded as `data:` URIs so the generated HTML
-    /// is self-contained.  Requires `source_dir` to be set.
-    ///
-    /// Remote URLs (`http://`, `https://`, `data:`) are left untouched
-    /// regardless of this flag.
+    /// Embed relative image references as `data:` URIs so the HTML is self-contained.  Requires
+    /// `source_dir`; remote and already-`data:` URLs are untouched either way.
     pub inline_images: bool,
-    /// Directory used to resolve relative image paths when
-    /// `inline_images` is true.  Typically the directory containing the
-    /// source `.md` file.  `None` disables the rewrite even if
-    /// `inline_images` is true.
+    /// Resolves relative image paths, and bounds them: see [`resolve_relative`].  `None`
+    /// disables the rewrite even when `inline_images` is true.
     pub source_dir: Option<PathBuf>,
-    /// Value inserted into the `<title>` element.  When `None`, a
-    /// sensible fallback (`"Document"`) is used.
+    /// `<title>` text; `None` falls back to `"Document"`.
     pub title: Option<String>,
-    /// When true (the default), fenced ```mermaid code blocks
-    /// are rendered to inline SVG and wrapped in
-    /// `<figure class="mermaid-diagram">`.  Falls back to the usual
-    /// `<pre><code class="language-mermaid">` on render failure so the
-    /// source is never lost.
+    /// Render mermaid fences to a `<figure class="mermaid-diagram">`, falling back to the usual
+    /// code block on failure so the source is never lost.
     pub render_diagrams: bool,
 }
 
@@ -91,16 +76,11 @@ impl Default for HtmlExportOptions {
     }
 }
 
-/// Render `markdown` to a standalone HTML document.
+/// Render `markdown` to a standalone HTML document, mirroring the in-app renderer's parser
+/// options so an export looks like the terminal preview.
 ///
-/// Mirrors the parser options used by the in-app renderer (tables, task
-/// lists, strikethrough, footnotes, smart punctuation, and — when this
-/// document opens with one — frontmatter) so exported documents look the
-/// same as the terminal preview.  Raw HTML events —
-/// both block-level (`Event::Html`) and inline (`Event::InlineHtml`) —
-/// are filtered out before serialization so attacker-controlled Markdown
-/// cannot inject `<script>` tags or other executable content into the
-/// exported file.
+/// **Raw HTML events are filtered out before serialization** — block *and* inline — so
+/// attacker-controlled Markdown cannot inject `<script>` or other executable content.
 pub fn render_html(markdown: &str, opts: &HtmlExportOptions) -> Result<String> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -108,28 +88,17 @@ pub fn render_html(markdown: &str, opts: &HtmlExportOptions) -> Result<String> {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_SMART_PUNCTUATION);
-    // Frontmatter must be recognised here for the same reason it is in the
-    // renderer: without it, a `---` block parses as a thematic break plus
-    // a setext H2 and the exported file opens with the file's YAML keys
-    // as its loudest heading.  pulldown-cmark's HTML writer emits nothing
-    // for a metadata block, which is the wanted behavior — the
-    // frontmatter is data *about* the document, not part of its body.
-    //
-    // The extension is enabled only when *this* document opens with the
-    // matching delimiter, and the decision comes from the shared
-    // `metadata_options_for` rather than a second copy of the rule: the
-    // extensions are not anchored to the start of the document on their
-    // own, so leaving them on unconditionally would let a mid-document
-    // `---` separator claim the section under it — and, because the
-    // writer emits nothing for a metadata block, drop that section from
-    // the export without a word.
+    // Without the frontmatter extension a `---` block parses as a thematic break plus a setext
+    // H2, and the export opens with the YAML keys as its loudest heading.  It is gated on *this*
+    // document's opening delimiter, through the shared `metadata_options_for`: the extensions are
+    // not anchored to the document start on their own, so leaving them on unconditionally would
+    // let a mid-document `---` claim the section under it — and the writer emits nothing for a
+    // metadata block, so that section would vanish from the export silently.
     options |= crate::markdown::parse_offsets::metadata_options_for(markdown);
 
     let parser = Parser::new_ext(markdown, options);
 
-    // Collect so the optional image-rewrite pass can mutate events in
-    // place.  The event stream for a document of any realistic size is
-    // small relative to the rope we start from, so this is fine.
+    // Collected so the image-rewrite pass can mutate events in place.
     let mut events: Vec<Event> = parser
         .filter(|e| !matches!(e, Event::Html(_) | Event::InlineHtml(_)))
         .collect();
@@ -144,11 +113,8 @@ pub fn render_html(markdown: &str, opts: &HtmlExportOptions) -> Result<String> {
         events = replace_mermaid_with_image(events);
     }
 
-    // Neutralize dangerous link schemes (`javascript:`, `vbscript:`,
-    // non-image `data:`, …) before serialization.  pulldown-cmark's HTML
-    // writer performs no URL sanitization, so without this a
-    // `[x](javascript:…)` link survives verbatim into the exported `<a
-    // href>` and runs on click in a browser.
+    // pulldown-cmark's HTML writer performs no URL sanitization, so without this a
+    // `[x](javascript:…)` link survives into the exported `<a href>` and runs on click.
     sanitize_link_urls(&mut events);
 
     let mut body = String::new();
@@ -176,13 +142,10 @@ pub fn render_html(markdown: &str, opts: &HtmlExportOptions) -> Result<String> {
     ))
 }
 
-/// Spawn a worker thread that renders `markdown` to `target`.  The
-/// provided closure is invoked on the worker thread once the write
-/// completes (or fails); callers typically forward the outcome to the
-/// App's mpsc channel so the UI thread can surface a transient message.
+/// Render `markdown` to `target` on a worker thread, invoking the closure there with the outcome.
 ///
-/// The caller is responsible for running [`crate::export::preflight`]
-/// first — this function will clobber `target` if it exists.
+/// **The caller must run [`crate::export::preflight`] first** — this clobbers an existing
+/// `target`.
 pub fn spawn_html_export(
     markdown: String,
     target: PathBuf,
@@ -204,13 +167,11 @@ fn render_and_write(markdown: &str, target: &Path, opts: &HtmlExportOptions) -> 
 
 // ── Link URL sanitization ─────────────────────────────────────────────────
 
-/// Schemes permitted on an exported link destination.  Everything else —
-/// notably `javascript:`, `vbscript:`, and `data:` — is neutralized.
+/// Schemes permitted on an exported link destination; everything else is neutralized.
 const SAFE_LINK_SCHEMES: &[&str] = &["http", "https", "mailto", "tel"];
 
-/// Rewrite the destination of every `Tag::Link` whose URL carries a scheme
-/// outside [`SAFE_LINK_SCHEMES`] to a harmless `#`.  Relative paths,
-/// anchors, and fragment targets carry no scheme and are left untouched.
+/// Rewrite every link destination outside [`SAFE_LINK_SCHEMES`] to a harmless `#`.  Relative
+/// paths and anchors carry no scheme and are untouched.
 fn sanitize_link_urls(events: &mut [Event<'_>]) {
     for event in events.iter_mut() {
         if let Event::Start(Tag::Link { dest_url, .. }) = event {
@@ -221,12 +182,9 @@ fn sanitize_link_urls(events: &mut [Event<'_>]) {
     }
 }
 
-/// True when `url` is safe to emit verbatim into an `<a href>`: either it
-/// has no URL scheme (relative path, `#anchor`, `?query`) or its scheme is
-/// on the allowlist.  A "scheme" is an RFC-3986 token — `alpha *( alpha /
-/// digit / "+" / "-" / "." )` — terminated by `:` *before* any `/`, `?`,
-/// or `#`; a colon that appears after one of those is part of the path
-/// (e.g. `foo/bar:baz`) and does not make a scheme.
+/// True when `url` has no scheme at all or an allowlisted one.  A "scheme" is an RFC-3986 token
+/// terminated by `:` *before* any `/`, `?`, or `#`; a later colon is part of the path
+/// (`foo/bar:baz`) and makes no scheme.
 fn is_safe_link_url(url: &str) -> bool {
     let url = url.trim();
     let Some(idx) = url.find([':', '/', '?', '#']) else {
@@ -244,8 +202,7 @@ fn is_safe_link_url(url: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
     if !scheme_shaped {
-        // The colon isn't part of a real scheme (e.g. a port-looking
-        // path segment) → treat as relative.
+        // Not a real scheme (a port-looking path segment) → relative.
         return true;
     }
     SAFE_LINK_SCHEMES
@@ -255,24 +212,15 @@ fn is_safe_link_url(url: &str) -> bool {
 
 // ── Mermaid diagrams ──────────────────────────────────────────────────────
 
-/// Walk the event stream; for every `Start(CodeBlock(Fenced("mermaid")))`
-/// ... `End(CodeBlock)` triple, try to render the enclosed text as a
-/// mermaid diagram and substitute a single `Event::Html` carrying
-/// `<figure class="mermaid-diagram"><img …></figure>`.  On render failure
-/// (or on non-mermaid code blocks) the original events are preserved so
-/// pulldown-cmark emits the usual `<pre><code class="language-mermaid">`
-/// — the diagram source is never lost.
+/// Replace each mermaid fence with a single `Event::Html` figure, preserving the original events
+/// on render failure so the diagram source is never lost.
 ///
-/// The diagram is **rasterized to a PNG** and embedded as a `data:` image
-/// rather than inlined as raw `<svg>`.  Inline SVG can carry `<script>`,
-/// `foreignObject`, and `on*=` event handlers that execute when the
-/// exported file is opened in a browser; rasterizing flattens the diagram
-/// to pixels, so no executable markup from the (document-controlled,
-/// third-party-rendered) SVG can survive into the export.
+/// **The diagram is rasterized to a PNG `data:` image, never inlined as `<svg>`.**  Inline SVG can
+/// carry `<script>`, `foreignObject`, and `on*=` handlers that execute when the export is opened
+/// in a browser; flattening to pixels means no executable markup from the document-controlled,
+/// third-party-rendered SVG can survive.
 ///
-/// Matching is case-insensitive on the language tag, same as the in-app
-/// `promote_diagram_code_blocks` pass, so round-tripping between the
-/// editor and the exported HTML is consistent.
+/// Language matching is case-insensitive, like the in-app `promote_diagram_code_blocks`.
 fn replace_mermaid_with_image(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
     let mut out: Vec<Event<'_>> = Vec::with_capacity(events.len());
     let mut iter = events.into_iter();
@@ -289,10 +237,8 @@ fn replace_mermaid_with_image(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
             out.push(event);
             continue;
         }
-        // Collect the Text events until the matching CodeBlock end, then
-        // decide — render succeeded → emit a single Event::Html, render
-        // failed → replay the original Start + Texts + End so the
-        // fallback `<pre><code>` is emitted by the default serialiser.
+        // Collect Text events to the matching end, then either emit one `Event::Html` or replay
+        // the originals for the default serializer's fallback.
         let mut buffered: Vec<Event<'_>> = vec![event];
         let mut source = String::new();
         for inner in iter.by_ref() {
@@ -306,10 +252,7 @@ fn replace_mermaid_with_image(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
                     buffered.push(inner);
                 }
                 other => {
-                    // pulldown-cmark should never emit other events
-                    // inside a fenced code block, but if it does we
-                    // treat it like text for the renderer and preserve
-                    // it for the fallback.
+                    // Shouldn't occur inside a fenced code block; treat as text and preserve.
                     buffered.push(other);
                 }
             }
@@ -324,12 +267,7 @@ fn replace_mermaid_with_image(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
                 out.push(Event::Html(CowStr::Boxed(html.into_boxed_str())));
             }
             None => {
-                // Falls back to the default code-block serialisation.
-                // The mermaid source is preserved verbatim so the user
-                // (or a downstream mermaid.js) can still see / render
-                // it.  We deliberately swallow the error here — the
-                // per-diagram failure is not fatal to the document
-                // export.
+                // Fall back to the code block; a per-diagram failure is not fatal to the export.
                 out.extend(buffered);
             }
         }
@@ -337,12 +275,9 @@ fn replace_mermaid_with_image(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
     out
 }
 
-/// Render mermaid `source` to a PNG `data:` URI, or `None` on any failure
-/// (so the caller falls back to the escaped code block).  The SVG produced
-/// by the renderer never reaches the HTML — it is rasterized to pixels
-/// first (white background, like the TUI path), which strips any script /
-/// `foreignObject` / event-handler payload a hostile node label might have
-/// smuggled through the renderer's escaping.
+/// Render mermaid `source` to a PNG `data:` URI, or `None` on any failure.  The intermediate SVG
+/// never reaches the HTML — rasterizing strips any script / `foreignObject` / event-handler
+/// payload a hostile node label smuggled through the renderer's escaping.
 fn render_mermaid_png_data_uri(source: &str) -> Option<String> {
     let svg = diagram::render_mermaid_svg(source).ok()?;
     let image = rasterize_svg(
@@ -375,10 +310,8 @@ fn rewrite_images_to_data_uris(events: &mut [Event<'_>], source_dir: &Path) {
     }
 }
 
-/// Return a `data:` URI for `url` if it resolves to a readable local
-/// image file.  `None` signals "leave as-is" — covers remote URLs
-/// (`http(s)://`), URIs already in `data:` form, and any path we cannot
-/// read or classify.
+/// A `data:` URI for `url` if it resolves to a readable local image.  `None` means "leave as-is":
+/// remote URLs, existing `data:` URIs, and anything unreadable or unclassifiable.
 fn inline_image_data_uri(url: &str, source_dir: &Path) -> Option<String> {
     if is_remote_url(url) {
         return None;
@@ -401,18 +334,14 @@ fn is_remote_url(url: &str) -> bool {
         || lower.starts_with("file://")
 }
 
-/// Resolve a relative image `url` against `source_dir`, returning the path
-/// **only if it stays within `source_dir`**.  A self-contained HTML export
-/// is an artifact the victim typically shares, so an out-of-tree path
-/// (absolute, `../` traversal, or a symlink escape) would let a hostile
-/// document exfiltrate arbitrary on-disk files by riding them base64-
-/// encoded into the shared output.  Absolute paths and explicit `..`
-/// components are rejected up front; the post-`canonicalize` containment
-/// check additionally defeats symlinks that point outside the tree.
+/// Resolve a relative image `url` against `source_dir`, **only if it stays within it**.  A
+/// self-contained export is an artifact the victim shares, so an out-of-tree path would let a
+/// hostile document exfiltrate arbitrary files base64-encoded into that output.  Absolute paths
+/// and `..` components are rejected up front; the post-`canonicalize` containment check defeats
+/// symlink escapes.
 ///
-/// An out-of-tree reference returns `None` → the caller leaves the
-/// original (non-inlined) reference in place, so the export simply doesn't
-/// embed it rather than leaking it.
+/// `None` leaves the original reference in place — the export doesn't embed it rather than leaking
+/// it.
 fn resolve_relative(url: &str, source_dir: &Path) -> Option<PathBuf> {
     let p = Path::new(url);
     if p.is_absolute() {
@@ -444,8 +373,8 @@ fn mime_from_extension(path: &Path) -> Option<&'static str> {
 
 // ── HTML escaping ─────────────────────────────────────────────────────────
 
-/// Escape the five XML metacharacters.  Used only for the `<title>`
-/// element; the document body is escaped by `pulldown_cmark::html`.
+/// Escape the five XML metacharacters.  Only for `<title>`; the body is escaped by
+/// `pulldown_cmark::html`.
 fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -481,10 +410,7 @@ mod tests {
         assert!(html.contains("<p>World</p>"));
     }
 
-    /// Frontmatter is data about the document, not part of its body:
-    /// pulldown-cmark's writer suppresses a metadata block entirely.  The
-    /// options have to be enabled here too, or the export would reproduce
-    /// the rule-plus-setext-H2 misparse the renderer no longer has.
+    /// Without the extension the export reproduces the rule-plus-setext-H2 misparse.
     #[test]
     fn frontmatter_is_omitted_from_the_export() {
         let md = "---\ntitle: Foo\ndate: 2026-01-01\n---\n\n# Heading\n";
@@ -494,10 +420,8 @@ mod tests {
         assert!(!html.contains("<h2>"), "got: {html}");
     }
 
-    /// The export must not drop a section a mid-document `---` separator
-    /// happens to bracket.  pulldown-cmark's writer emits *nothing* for a
-    /// metadata block, so an unanchored extension here loses content the
-    /// user wrote — silently, and only in the exported file.
+    /// The writer emits *nothing* for a metadata block, so an unanchored extension would drop a
+    /// section a mid-document `---` pair brackets — silently, and only in the export.
     #[test]
     fn a_mid_document_rule_pair_is_not_dropped_from_the_export() {
         let md = "Intro.\n\n---\n## Section 2\n\nText.\n\n---\n## Section 3\n";
@@ -507,8 +431,7 @@ mod tests {
         assert!(html.contains("Section 3"), "got: {html}");
     }
 
-    /// The export's gate must be the same one the renderer uses, or the
-    /// two disagree about whether a block is frontmatter at all.
+    /// The export's gate must be the renderer's, or the two disagree about what frontmatter is.
     #[test]
     fn a_toml_opening_file_does_not_drop_a_later_dash_pair() {
         let md = "+++\na = 1\n+++\n\n---\nSection\n---\n\nEnd.\n";
@@ -576,9 +499,7 @@ mod tests {
 
     #[test]
     fn footnotes_render_with_bracket_convention() {
-        // The reference markup is the `<sup class="footnote-reference">…`
-        // that the bundled CSS targets to add `[ ]` brackets, and the
-        // bracket pseudo-element rules ship in the builtin stylesheet.
+        // The bundled CSS adds the `[ ]` brackets by targeting this exact markup.
         let opts = HtmlExportOptions {
             stylesheet: Stylesheet::Builtin,
             ..HtmlExportOptions::default()
@@ -653,7 +574,6 @@ mod tests {
             html.contains("src=\"data:image/png;base64,"),
             "expected base64 data URI, got:\n{html}"
         );
-        // The original relative reference must be gone.
         assert!(!html.contains("src=\"pixel.png\""));
     }
 
@@ -709,7 +629,7 @@ mod tests {
         assert!(html.contains("href=\"mailto:x@y.z\""));
         assert!(html.contains("href=\"./page.md\""));
         assert!(html.contains("href=\"#anchor\""));
-        // A colon after a path segment is not a scheme → left intact.
+        // A colon after a path segment is not a scheme.
         assert!(html.contains("href=\"foo/bar:baz\""));
     }
 
@@ -734,10 +654,8 @@ mod tests {
 
     #[test]
     fn mermaid_export_never_emits_raw_svg_or_script() {
-        // Whether the live renderer is available or not, a hostile node
-        // label must never produce inline SVG or executable markup: a
-        // successful render is rasterized to a PNG data URI; a failed one
-        // falls back to an HTML-escaped code block.
+        // Holds whether or not the live renderer is available: a success rasterizes to PNG, a
+        // failure falls back to an escaped code block.
         let md = "```mermaid\nflowchart TD\n  A[\"<script>alert(1)</script>\"] --> B\n```";
         let opts = HtmlExportOptions {
             stylesheet: Stylesheet::Inline(String::new()),

@@ -4,12 +4,8 @@ use serde::{Deserialize, Serialize};
 use super::color::ColorField;
 use crate::config::theme::Palette;
 
-/// User-authorable palette section.  Every field is optional; missing
-/// entries fall through to [`Palette::default`] at load time.
-///
-/// Authoring a new theme that just re-tints the UI is usually a matter
-/// of editing this section and leaving the per-element style sections
-/// untouched.
+/// User-authorable palette section.  Every field is optional; missing entries fall
+/// through to [`Palette::default`] at load time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PaletteFile {
@@ -52,13 +48,9 @@ pub struct PaletteFile {
 }
 
 impl PaletteFile {
-    /// Resolve `self` against `Palette::default()`, returning a
-    /// fully-populated palette.  Missing fields fall through to the
-    /// compiled-in default so a partial `[palette]` section is valid.
-    /// `light` is passed in explicitly because the flag lives at the
-    /// top level of `ThemeFile`, not inside the palette table — taking
-    /// it as a parameter avoids the foot-gun of resolving to a default
-    /// here and patching it post-hoc.
+    /// Resolve `self` against `Palette::default()`, so a partial `[palette]` section is
+    /// valid.  `light` is a parameter because the flag lives at the top level of
+    /// `ThemeFile`, not inside the palette table.
     pub(super) fn resolve(&self, light: bool) -> Palette {
         let d = Palette::default();
         let pick = |opt: Option<ColorField>, fallback: Color| -> Color {

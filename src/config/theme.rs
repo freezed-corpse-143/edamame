@@ -7,36 +7,26 @@ use ratatui::style::{Color, Modifier, Style};
 use super::sections::AppearanceMode;
 use super::themes::util::{best_contrast, blend, legible_on};
 
-/// How heavily to mix `code` toward `bg` when deriving the code
-/// surface bg.  Closer to 1.0 = closer to `bg` (a barely-tinted
-/// neutral); closer to 0.0 = closer to the raw `code` shade.
+/// How heavily to mix `code` toward `bg` for the code surface bg.  1.0 = plain `bg`.
 const CODE_BG_MIX_TOWARD_BG: f32 = 0.92;
 
-/// How heavily to mix `secondary` toward `bg` when deriving the
-/// blockquote surface bg.  Mixed further toward `bg` than the code
-/// surface: a quote is *prose* — it carries emphasis, links and code
-/// spans of its own — so its wash has to stay quiet enough for those
-/// to read on top of it.
+/// How heavily to mix `secondary` toward `bg` for the blockquote surface bg.  Quieter
+/// than the code surface: a quote is prose, carrying emphasis, links and code spans that
+/// must stay readable on top of it.
 const QUOTE_BG_MIX_TOWARD_BG: f32 = 0.94;
 
-/// Contrast floor a `syntax_*` foreground must reach against the code
-/// surface, as a WCAG ratio.  4.5:1 is the body-text threshold rather
-/// than the 3:1 one used for large text and UI affordances, because a
-/// code token is read character by character — and because the plain
-/// `code_block_text` it replaces clears 4.5 in every built-in theme, so
-/// anything less would mean highlighting *lowered* legibility.
+/// WCAG contrast floor a `syntax_*` foreground must clear against the code surface.  The
+/// 4.5:1 body-text threshold, not the 3:1 UI one: a code token is read character by
+/// character, and the plain `code_block_text` it replaces already clears 4.5 everywhere,
+/// so less would mean highlighting *lowered* legibility.
 ///
-/// It applies only where it can be measured: `legible_on` returns
-/// non-RGB colours untouched, so the indexed built-ins answer for their
-/// own numbers.
+/// Enforced only where measurable — `legible_on` passes non-RGB colors through, so the
+/// indexed built-ins answer for their own numbers.
 const SYNTAX_MIN_CONTRAST: f32 = 4.5;
 
-/// Darken `base` by `level` steps for the heading ramp (0 = base,
-/// 1 = medium, 2 = dull).  RGB colors are scaled toward black via a
-/// fixed lightness factor per step.  Indexed and named colors can't
-/// be cleanly stepped without shifting hue, so they're returned
-/// unchanged — built-in indexed-color themes pin the ramp manually
-/// in their ctor (see [`BUILTIN_THEMES`]).
+/// Darken `base` by `level` steps for the heading ramp.  Indexed and named colors can't
+/// be stepped without shifting hue, so they pass through unchanged and the indexed
+/// built-ins pin `h1`–`h6` by hand.
 fn dim_color(base: Color, level: u8) -> Color {
     if level == 0 {
         return base;
@@ -51,28 +41,18 @@ fn dim_color(base: Color, level: u8) -> Color {
     }
 }
 
-/// Edamame's two-tier theming model.
+/// Every styled element in the UI, as a precomputed [`Style`] derived from a [`Palette`].
+/// User theme files may override the palette, individual styles, or both; see
+/// [`super::theme_file`] for the format and merge order, and `docs/dev/theming.md` for
+/// the conventions.
 ///
-/// 1. [`Palette`] — a small flat set of semantic colors (brand, accent,
-///    link, status colors, surface tones).  Each name maps to a single
-///    shade; focus / active / disabled affordances layer text modifiers
-///    (BOLD, REVERSED, DIM) on top rather than reaching for a second
-///    palette slot.
-/// 2. [`Theme`] — every styled element in the UI gets a precomputed
-///    [`Style`].  `Theme::default()` derives every style from the default
-///    palette, so any change to the palette ripples through the whole UI.
-///
-/// User theme files (`themes/<name>.toml`) may override the palette,
-/// individual styles, or both.  See [`super::theme_file`] for the on-disk
-/// format and the merge order.
-///
-/// No hardcoded colors exist outside [`Palette::default`] — every UI site
-/// reads from `theme.<field>`.
+/// No hardcoded colors exist outside [`Palette::default`] — every UI site reads
+/// `theme.<field>`.  Focus / active / disabled affordances layer modifiers (BOLD,
+/// REVERSED, DIM) rather than reaching for a second palette slot.
 #[derive(Debug, Clone)]
 pub struct Theme {
-    /// The named brand-color palette every style is derived from.
-    /// Stored on the theme so user code (e.g. modal selection rendering)
-    /// can reach for `bg` as a fg color against a colored bg.
+    /// The palette every style is derived from.  Kept on the theme so UI code can reach
+    /// for e.g. `bg` as a foreground against a colored fill.
     pub palette: Palette,
 
     // ── Headings ──────────────────────────────────────────────────
@@ -90,25 +70,17 @@ pub struct Theme {
     pub strikethrough: Style,
     pub highlight: Style,
     pub code_span: Style,
-    /// Dim variant of [`Self::code_span`] used for inline code that
-    /// appears inside strikethrough text (e.g. inside a `Strikethrough`
-    /// inline or a checked task item's text).  Derives from
-    /// [`Self::code_span`] + `Modifier::DIM` so the snippet reads as
-    /// struck-through without losing its code-span affordance.
+    /// Inline code inside strikethrough text: [`Self::code_span`] + DIM, so it reads as
+    /// struck through without losing the code-span affordance.
     pub code_span_dim: Style,
-    /// Web link (`http://`, `https://`, `mailto:`, etc.) — `link`
-    /// foreground + underline so the URL reads as actionable.
+    /// Web link — `link` fg + underline.
     pub link_text: Style,
-    /// File link (relative or absolute path) — same `link` color as
-    /// `link_text`; themes that want a quieter shade can override the
-    /// style directly in TOML.
+    /// File link.  Same shade as `link_text` by default; themes may override.
     pub link_file: Style,
     /// In-document heading link (`#section`) — `link` fg, no underline.
     pub link_heading: Style,
     pub image_placeholder: Style,
-    /// Footnote chrome — the bracketed reference marker (`[^1]` →
-    /// `[1]`) and a definition's leader / return glyph.  `secondary`
-    /// so the markers read as structure rather than prose.
+    /// Footnote chrome — the bracketed reference marker and a definition's leader glyph.
     pub footnote: Style,
 
     // ── Block elements ────────────────────────────────────────────
@@ -118,14 +90,11 @@ pub struct Theme {
 
     // ── Syntax highlighting (fenced code block bodies) ────────────
     //
-    // One field per `markdown::highlight::TokenClass`.  Each is
-    // *patched over* `code_block_text`, so a field only needs to say
-    // what differs from the code surface — it must not restate the
-    // background, or a theme that changes `code_block_text`'s bg gets
-    // a patchwork of stale ones.  Text no rule classified keeps
-    // `code_block_text` untouched, which is what makes an unknown
-    // language and a switched-off setting render identically to a
-    // code block from before highlighting existed.
+    // One field per `markdown::highlight::TokenClass`, each *patched over*
+    // `code_block_text`.  A field must say only what differs from the code surface and
+    // must not restate the background, or a theme that changes `code_block_text`'s bg
+    // gets a patchwork of stale ones.  Unclassified text keeps `code_block_text`, so an
+    // unknown language renders exactly as it did before highlighting existed.
     /// Control flow, declarations, storage modifiers (`fn`, `if`, `pub`).
     pub syntax_keyword: Style,
     /// String and character literals, including their delimiters.
@@ -134,8 +103,7 @@ pub struct Theme {
     pub syntax_comment: Style,
     /// Numeric literals and language constants (`42`, `true`, `nil`).
     pub syntax_number: Style,
-    /// Type, class, struct and interface *names* — not the keywords
-    /// that declare them, which are [`Self::syntax_keyword`].
+    /// Type, class and interface *names* — not the declaring keywords.
     pub syntax_type: Style,
     /// Function and method names, at definition and call sites.
     pub syntax_function: Style,
@@ -149,11 +117,9 @@ pub struct Theme {
     // ── Frontmatter (YAML / TOML metadata block) ──────────────────
     /// The `---` / `+++` delimiter lines around a metadata block.
     pub frontmatter_delimiter: Style,
-    /// The `key:` / `key =` half of a frontmatter line — structural, so
-    /// it reads as a field name rather than prose.
+    /// The `key:` / `key =` half of a frontmatter line.
     pub frontmatter_key: Style,
-    /// The value half of a frontmatter line, and any line the key/value
-    /// split doesn't apply to (a list entry, a nested block).
+    /// The value half, and any line the key/value split doesn't apply to.
     pub frontmatter_value: Style,
 
     // ── List markers ──────────────────────────────────────────────
@@ -162,13 +128,12 @@ pub struct Theme {
 
     // ── Task list ─────────────────────────────────────────────────
     pub task_unchecked: Style,
-    /// Style applied to the `[✓]` marker for checked items.
+    /// The `[✓]` marker for checked items.
     pub task_checked: Style,
-    /// Style applied to the *text* of completed tasks (the part after
-    /// the checkbox).  Distinct from `task_checked` so the marker can
-    /// stay green while the text fades to muted grey.
+    /// The *text* of a completed task.  Distinct from `task_checked` so the marker can
+    /// stay green while the text fades.
     pub task_complete_text: Style,
-    /// Whether to render checked item text with strikethrough (default: true).
+    /// Whether checked item text is struck through.
     pub task_strikethrough: bool,
 
     // ── Table ─────────────────────────────────────────────────────
@@ -176,148 +141,99 @@ pub struct Theme {
     pub table_header: Style,
     pub table_header_border: Style,
     pub table_cell: Style,
-    /// Background fill for even-numbered data rows (0-indexed: row 0 = first
-    /// data row).  Only applied when `config.table.row_striping` is true; the
-    /// default is `Style::default()` so no visible change is produced for
-    /// users who haven't opted in.
+    /// Fill for even-numbered data rows (row 0 = first data row).  Applied only under
+    /// `config.table.row_striping`; the default is bare so opting out changes nothing.
     pub table_row_even: Style,
-    /// Background fill for odd-numbered data rows.  See `table_row_even`.
+    /// Fill for odd-numbered data rows.  See `table_row_even`.
     pub table_row_odd: Style,
-    /// Highlight applied during a row / column drag to mark the destination
-    /// separator the cursor is currently hovering.  Painted as a post-pass
-    /// over the table border so no buffer mutation is required.
+    /// The drop separator the pointer is currently over during a row / column drag.
+    /// Painted as a post-pass over the border, so no buffer mutation is needed.
     pub table_drop_indicator: Style,
-    /// Style for the *inert* drop-target separators painted during a
-    /// row / column drag — every separator that's a valid drop site
-    /// gets this style; the one the pointer is currently over upgrades
-    /// to `table_drop_indicator`.  Defaults to `primary` + DIM so the
-    /// inert sites read as a set of possibilities with one
-    /// pointer-tracked highlight.
+    /// The *inert* drop-target separators during that drag — every valid site, with the
+    /// hovered one upgrading to `table_drop_indicator`.
     pub table_drop_target: Style,
-    /// Style for the row/column reorder (`⠿`) and column-resize (`⇔`)
-    /// button glyphs painted on top of the table border.  Distinct from
-    /// `table_border` so the affordances read as interactive rather
-    /// than chrome.
+    /// Reorder (`⠿`) and column-resize (`⇔`) glyphs on the table border.  Distinct from
+    /// `table_border` so they read as interactive rather than chrome.
     pub table_handle: Style,
-    /// Style for the row/column delete (`✕`) button glyphs painted on
-    /// top of the table border.  Distinct from `table_handle` so the
+    /// Delete (`✕`) glyphs on the table border; distinct from `table_handle` so the
     /// destructive affordance reads as a warning.
     pub table_handle_delete: Style,
 
     // ── Status bar ────────────────────────────────────────────────
     pub status_bar: Style,
-    /// Mode badge in Preview mode.  See also the Rendered/Raw variants.
     pub status_mode_preview: Style,
-    /// Mode badge in Rendered mode.
     pub status_mode_rendered: Style,
-    /// Mode badge in Raw mode.
     pub status_mode_raw: Style,
-    /// Vim NORMAL (and Operator-pending) sub-mode badge.  These three
-    /// `status_mode_vim_*` fields are the canonical per-vim-mode colors:
-    /// the status chip uses them directly, and the editor cursor mirrors
-    /// them (the cursor drops the badge's `BOLD`), so chip and cursor can
-    /// never drift.  RAW within INSERT is signalled by `status_mode_raw`
-    /// instead — the chip keeps its sub-mode label and shows no `(RAW)`.
+    /// Vim NORMAL (and Operator-pending) sub-mode badge.  These three `status_mode_vim_*`
+    /// fields are the canonical per-vim-mode colors: the status chip uses them directly
+    /// and the editor cursor mirrors them (dropping the BOLD), so the two cannot drift.
+    /// RAW within INSERT is signalled by `status_mode_raw` instead.
     pub status_mode_vim_normal: Style,
-    /// Vim INSERT sub-mode badge (and the cursor color in INSERT, except
-    /// in Raw view where `status_mode_raw` takes over).
+    /// Vim INSERT badge, and the INSERT cursor except in Raw view.
     pub status_mode_vim_insert: Style,
-    /// Vim VISUAL / V-LINE sub-mode badge (and cursor color).
+    /// Vim VISUAL / V-LINE badge (and cursor color).
     pub status_mode_vim_visual: Style,
     pub status_filename: Style,
     pub status_info: Style,
     pub status_modified: Style,
-    /// Style for the `›` separator between segments of the section-path
-    /// breadcrumb (`notes.md › Checkpoint 1 › Item 1`).  Dimmed so the
-    /// segment names read as the structure and the separators recede.
+    /// The `›` separator in the section-path breadcrumb.
     pub status_breadcrumb_sep: Style,
-    /// Style for ancestor segments of the section-path breadcrumb —
-    /// every segment except the deepest one (e.g. `Checkpoint 1` when
-    /// the cursor is under `Item 1`).  Dimmed so the deepest segment
-    /// (rendered with `status_breadcrumb_current`) stands out as the
+    /// Every breadcrumb segment except the deepest; dimmed so the deepest reads as the
     /// "you are here" anchor.
     pub status_breadcrumb_ancestor: Style,
-    /// Style for the deepest segment of the section-path breadcrumb —
-    /// the heading whose scope directly contains the cursor.  Bold +
-    /// accent color so it reads as the active location among the
-    /// dimmed ancestor chain.
+    /// The deepest breadcrumb segment — the heading directly containing the cursor.
     pub status_breadcrumb_current: Style,
 
     // ── Hint line ─────────────────────────────────────────────────
     /// Base background/foreground for the contextual hint line.
     pub hint_bar: Style,
-    /// Chord glyph style (e.g. the `^C` in `^C Copy`).  Contrasting
-    /// background distinguishes the keybind from its label.
+    /// Chord glyph (the `^C` in `^C Copy`).
     pub hint_chord: Style,
-    /// Label style (e.g. the `Copy` in `^C Copy`).  Blends into the
-    /// surrounding hint_bar fill.
+    /// Label (the `Copy` in `^C Copy`); blends into the hint_bar fill.
     pub hint_label: Style,
 
     // ── Transient messages ────────────────────────────────────────
-    /// Neutral notification style — e.g. `Copied`, `Saved`.
     pub transient_info: Style,
-    /// Success notification style — e.g. `Autosaved`.
     pub transient_success: Style,
-    /// Warning notification style — e.g. `Configuration updated`.
     pub transient_warning: Style,
-    /// Error notification style — sticky, dismissed with Escape.
+    /// Error notification — sticky, dismissed with Escape.
     pub transient_error: Style,
 
     // ── Modal popups ──────────────────────────────────────────────
-    /// Background fill for modal bodies (palette, settings, keybinds,
-    /// Save-Copy, Insert-Table, …).  Distinct field so themes can give
-    /// modals a different surface from the status bar even when the
-    /// default palette uses the same shade for both.
+    /// Background fill for modal bodies.  Its own field so themes can give modals a
+    /// surface distinct from the status bar.
     pub modal_bg: Style,
-    /// Title text style for `ModalKind::Normal` — neutral / informational
-    /// modals.  `primary` on the modal surface.
+    /// Title style for `ModalKind::Normal`.
     pub modal_title_normal: Style,
-    /// Title text style for `ModalKind::Warning` — yellow on the modal
-    /// surface.  Used by config / image / quit / dirty-guard prompts.
+    /// Title style for `ModalKind::Warning`.
     pub modal_title_warning: Style,
-    /// Title text style for `ModalKind::Error` — red on the modal surface.
+    /// Title style for `ModalKind::Error`.
     pub modal_title_error: Style,
-    /// `text_muted` close-hint label rendered as `esc` on the right edge
-    /// of the title row of dismissable modals.  Doubles as the visible
+    /// The `esc` close hint on a dismissable modal's title row; doubles as the visible
     /// affordance for the clickable close button.
     pub modal_close_hint: Style,
-    /// Default style for an unfocused row in a list-style modal.
+    /// Unfocused row in a list-style modal.
     pub modal_item: Style,
-    /// Right-aligned hint / sub-label on an *unfocused* row (e.g. the
-    /// chord shown next to a palette entry, or the value column in
-    /// settings / keybinds rows).  Mirrors `modal_item_selected_hint`
-    /// for the unfocused state.
+    /// Right-aligned hint / sub-label on an unfocused row.
     pub modal_item_hint: Style,
-    /// Selected row in a list-style modal (palette / settings /
-    /// keybinds).  Filled background so the row reads as the focus.
+    /// Selected row in a list-style modal; filled, so it reads as the focus.
     pub modal_item_selected: Style,
-    /// A persistent selection that does NOT currently have focus —
-    /// e.g. the active tri-state pill in a row whose label isn't
-    /// focused, or a checked toggle whose label isn't the active
-    /// element.  Rendered as `secondary` **foreground** (no fill) so
-    /// the focused affordance (which uses `primary` *fill*) reads
-    /// unambiguously, while the persistent selection still carries a
-    /// distinct outlined affordance.  See `docs/dev/theming.md`
-    /// §"Focus vs. persistent selection" for the three-tier
-    /// convention this field is part of, and the monochrome fallback.
-    /// For composite affordances (e.g. `[x] Label`), apply only to
-    /// the glyph that carries the selection, not the full row.
+    /// A persistent selection that does NOT have focus — an active pill or checked toggle
+    /// in an unfocused row.  Outlined (`secondary` fg, no fill) against the focused
+    /// affordance's `primary` fill; see `docs/dev/theming.md` §"Focus vs. persistent
+    /// selection" for the three-tier convention and the monochrome fallback.  On a
+    /// composite affordance apply it to the selection glyph only, not the whole row.
     pub modal_item_selected_unfocused: Style,
-    /// Right-aligned hint / sub-label on the focused row (e.g. the
-    /// chord shown next to a palette entry, or the value column on
-    /// settings / keybinds rows).
+    /// Right-aligned hint / sub-label on the focused row.
     pub modal_item_selected_hint: Style,
-    /// Pinned-footer description for the focused row (e.g. the
-    /// settings overlay's bottom line that explains the focused
-    /// setting).  Sits on the modal body's `surface_elevated` rather
-    /// than on the row's selection bg, so it gets its own field.
+    /// Pinned-footer description of the focused row.  Sits on the modal body's surface
+    /// rather than the row's selection fill, hence its own field.
     pub modal_description: Style,
-    /// Section heading inside a modal (e.g. `— Editor —` in the
-    /// keybinds overlay).  Slightly distinct from a document H2.
+    /// Section heading inside a modal (`— Editor —` in the keybinds overlay).
     pub modal_section_heading: Style,
-    /// Inline editor / text input in an unfocused state.
+    /// Text input, unfocused.
     pub modal_input_unfocused: Style,
-    /// Inline editor / text input while focused for typing.
+    /// Text input, focused for typing.
     pub modal_input_focused: Style,
     /// Modal button when focused for activation.
     pub modal_button_focused: Style,
@@ -325,161 +241,113 @@ pub struct Theme {
     // ── General text ──────────────────────────────────────────────
     pub normal: Style,
 
-    /// Background style applied to characters inside an active text selection.
-    /// Renders on top of the character's own style so color-coded content
-    /// stays legible.
+    /// Fill behind an active text selection.  Layers over the character's own style so
+    /// color-coded content stays legible.
     pub selection: Style,
 
-    /// Muted variant of `selection`: a washed-out version of the same
-    /// hue, used for non-focused search matches so the current match
-    /// (painted with `selection` itself) stands out among its
-    /// siblings.
+    /// Washed-out `selection`, for non-focused search matches so the current match stands
+    /// out among its siblings.
     pub selection_muted: Style,
 
-    /// Status-bar match counter (`i/n`) badge while a search flow is
-    /// active.  Mirrors `status_mode_diff`'s accent-badge shape.
+    /// Status-bar match counter (`i/n`) badge during a search flow.
     pub status_mode_search: Style,
 
-    /// Background style applied to the cursor's current line.  Default
-    /// is `Style::default()` (no tint) — the active-line highlight is a
-    /// deferred feature; the field exists so themes can opt in early.
+    /// Fill for the cursor's line.  Bare by default — the active-line highlight is
+    /// deferred; the field exists so themes can opt in early.
     pub active_line: Style,
 
-    /// Unified block cursor used by every modal text input.  Distinct from
-    /// the editor cursors because modal inputs aren't tied to editor mode; an
-    /// `accent`-colored block by default (monochrome themes fall back to
-    /// `REVERSED`).
+    /// Block cursor for every modal text input.  Distinct from the editor cursors, which
+    /// derive from the per-mode status chip.
     pub cursor: Style,
 
-    /// Line-number gutter — right-aligned numbers in `text_muted`.
+    /// Line-number gutter.
     pub line_number: Style,
 
-    /// Scrollbar track (the `│` glyph drawn down the gutter behind the
-    /// thumb).  The track is only painted when the content overflows.
+    /// Scrollbar track, painted only when the content overflows.
     pub scrollbar_track: Style,
-    /// Scrollbar thumb (the `█` glyph that indicates current position).
+    /// Scrollbar thumb.
     pub scrollbar_thumb: Style,
-    /// Scrollbar thumb while the user is hovering the gutter or
-    /// dragging the thumb.  RGB themes blend `primary` toward `text`.
+    /// Scrollbar thumb while hovering the gutter or dragging.
     pub scrollbar_thumb_active: Style,
 
     // ── Diff mode ─────────────────────────────────────────────────
-    /// Full-row bg fill on add-side diff lines.  Subtle (30 %-toward
-    /// `diff_add`) so the foreground text stays legible.
+    /// Full-row fill on add-side diff lines.
     ///
-    /// **Set a `bg` (and modifiers), not an `fg`.**  The wash is reused
-    /// at render time as the Accept chip's background on the decision
-    /// divider, and `ui::diff_view::prompt_chip_style` pins that chip's
-    /// foreground from `normal` — so a foreground set here reaches the
-    /// full-row fill but is dropped on the chip.  The rule is a
-    /// convention, not an invariant: the field is user-authorable
-    /// (`blend` is a no-op on non-RGB colors, so on an indexed palette a
-    /// hand-picked `bg` is the only way to get a focused fill at all),
-    /// and the built-ins that hand-pick it — `dark_256`, `light_256`,
-    /// `monochrome_dark` — honor it.
+    /// **Set a `bg` (and modifiers), not an `fg`.**  The wash is reused as the Accept
+    /// chip's background, and `ui::diff_view::prompt_chip_style` pins that chip's
+    /// foreground from `normal` — so an `fg` set here reaches the row but is dropped on
+    /// the chip.  A convention, not an invariant: the field is user-authorable, since
+    /// `blend` is a no-op on non-RGB colors and a hand-picked `bg` is an indexed palette's
+    /// only way to get a focused fill.
     pub diff_add_line: Style,
-    /// Full-row bg fill on delete-side diff lines.  Background-only by
-    /// the same convention as `diff_add_line`, and reused as the Reject
-    /// chip's background.
+    /// Full-row fill on delete-side diff lines.  Background-only by the same convention as
+    /// `diff_add_line`, and reused as the Reject chip's background.
     pub diff_delete_line: Style,
-    /// Add-side bg for hunks that are *not* the focused one — a weaker
-    /// tint than `diff_add_line` so the focused hunk's color stands out.
+    /// Add-side fill for non-focused hunks — weaker, so the focused hunk stands out.
     pub diff_add_line_unfocused: Style,
-    /// Delete-side bg for non-focused hunks.  Weaker than `diff_delete_line`.
+    /// Delete-side fill for non-focused hunks.
     pub diff_delete_line_unfocused: Style,
-    /// Darkened bg + bold for word-level highlights inside an add line.
-    /// Darker than `diff_add` so light text keeps enough contrast.
+    /// Word-level highlight inside a focused add line; darker than `diff_add` so light
+    /// text keeps contrast.
     pub diff_add_inline: Style,
-    /// Darkened bg + bold for word-level highlights inside a delete line.
+    /// Word-level highlight inside a focused delete line.
     pub diff_delete_inline: Style,
-    /// Word-level add highlight for hunks that are *not* focused — a
-    /// muted tint (no bold) so the within-line change matches the faint
-    /// `diff_add_line_unfocused` wash instead of popping at full
-    /// saturation.
+    /// Word-level add highlight in a non-focused hunk — a muted tint, no bold, so it
+    /// matches the faint line wash instead of popping at full saturation.
     pub diff_add_inline_unfocused: Style,
-    /// Word-level delete highlight for non-focused hunks.  See
-    /// `diff_add_inline_unfocused`.
+    /// Word-level delete highlight in a non-focused hunk.
     pub diff_delete_inline_unfocused: Style,
-    /// Decision divider for the focused hunk while still `Pending` —
-    /// the `> [ ] Reject [n] Accept [y]` prompt (reject first, mirroring
-    /// the old-above-new stacking).  A `secondary` foreground (plus the
-    /// caret and bold added at render time) makes the call to action
-    /// pop.  This is the only state the prompt renders in, which is why
-    /// the render-time Accept / Reject chips — washed in `diff_add_line`
-    /// / `diff_delete_line` — never land on a resolved divider's
-    /// green/red foreground.
+    /// Decision divider for the focused hunk while `Pending` — the `> [ ] Reject [n]
+    /// Accept [y]` prompt.  The only state the prompt renders in, which is why the
+    /// render-time Accept / Reject chips never land on a resolved divider's green/red
+    /// foreground.
     pub diff_decision_pending: Style,
-    /// Decision divider once the hunk is `Accepted` (`[Y] Accepted`).
+    /// Decision divider once `Accepted`.
     pub diff_decision_accepted: Style,
-    /// Decision divider once the hunk is `Rejected` (`[N] Rejected`).
+    /// Decision divider once `Rejected`.
     pub diff_decision_rejected: Style,
-    /// Decision divider for hunks that are *not* focused — a recessive
-    /// chrome strip (`surface` bg, muted fg, no bold).  Used as-is while
-    /// the hunk is `Pending`; for `Accepted` / `Rejected` hunks
-    /// `build_line` keeps this background but swaps in the per-state
-    /// green/red hue and adds `DIM` (see `ui::diff_view`), so a resolved
-    /// unfocused divider still signals its decision by color while
-    /// staying dimmer than the focused one.
+    /// Decision divider for non-focused hunks — a recessive chrome strip, used as-is while
+    /// `Pending`.  Once resolved, `build_line` keeps this background but swaps in the
+    /// per-state hue and adds DIM, so the decision still reads by color.
     pub diff_decision_unfocused: Style,
-    /// Mode badge for `Mode::Diff`.  Mirrors `status_mode_raw` shape
-    /// but on `warning` so the diff session reads as a distinct state.
+    /// Mode badge for `Mode::Diff`.
     pub status_mode_diff: Style,
-    /// Whole status bar shifts color in diff mode so the user never
-    /// misses the mode change.
+    /// The whole status bar shifts color in diff mode so the change can't be missed.
     pub status_bar_diff: Style,
-    /// Hint bar matches status-bar hue with a softer bg so the hint
-    /// text stays readable.
+    /// Hint bar in diff mode — the status-bar hue, softer so the text stays readable.
     pub hint_bar_diff: Style,
 }
 
-/// Edamame's semantic color palette.  Every theme is built from these
-/// eighteen colors plus six heading slots.
+/// The semantic color palette every theme is built from.
 ///
-/// `text` / `bg` are concrete colors rather than terminal defaults
-/// because they're used as foregrounds in inverse contexts (e.g. the
-/// Rendered-mode mode chip: `primary` bg with `bg` fg), where
-/// `Color::Reset` would not produce the right contrast.
-///
-/// `surface` is the lighter chrome surface (status bar); `surface_elevated`
-/// is the heavier chrome surface (hint line, transient messages, modal body)
-/// so those layers read as lifted from both the document area and the
-/// status bar.
-///
-/// `diff_add` / `diff_delete` are the base hues for diff review; the
-/// focused / unfocused line and inline-span washes are all derived from
-/// them in [`Theme::from_palette`] and consumed by `ui::diff_view`.
+/// `text` / `bg` are concrete colors rather than terminal defaults because they serve as
+/// *foregrounds* in inverse contexts (the Rendered mode chip is `primary` bg with `bg`
+/// fg), where `Color::Reset` would give the wrong contrast.
 #[derive(Debug, Clone)]
 pub struct Palette {
     /// Default document foreground.
     pub text: Color,
-    /// Peripheral / de-emphasized text — strikethrough body,
-    /// completed-task text, modal close hint, Preview-mode chip bg.
+    /// Peripheral / de-emphasized text.
     pub text_muted: Color,
     /// Default document background.
     pub bg: Color,
-    /// Muted surface for table-row stripes, scrollbar track,
-    /// Preview-mode cursor bg.  Inline / fenced code use a tinted
-    /// shade derived from [`Self::code`] instead, so a code span on
-    /// top of a striped row still reads as code.
+    /// Muted surface for table-row stripes and the scrollbar track.  Code uses a shade
+    /// derived from [`Self::code`] instead, so a code span on a striped row still reads
+    /// as code.
     pub bg_muted: Color,
     /// Lighter chrome surface (status bar).
     pub surface: Color,
-    /// Heavier chrome surface (hint line, transient messages, modal body).
+    /// Heavier chrome surface (hint line, transient messages, modal body), so those read
+    /// as lifted from both the document and the status bar.
     pub surface_elevated: Color,
 
-    /// Brand color.  Headings (Rendered-mode chip, status info,
-    /// modal titles), non-link focus affordances (selected modal
-    /// row, modal input fill, button focus, scrollbar thumb).
+    /// Brand color: headings, and non-link focus affordances.
     pub primary: Color,
-    /// Structural chrome color (section headings, search-highlight
-    /// bg, rules, blockquote bar, footnote marker, command-palette
-    /// divider).
+    /// Structural chrome: section headings, rules, blockquote bar, footnote markers.
     pub secondary: Color,
-    /// Accent — list markers, table header, modal description /
-    /// selected-row hint; also the bg for text selection.
+    /// Accent: list markers, table header, and the text-selection fill.
     pub accent: Color,
-    /// Link foreground (web link, file link, heading link, image
-    /// placeholder).  Reserved for link affordances only.
+    /// Link foreground.  Reserved for link affordances only.
     pub link: Color,
 
     pub success: Color,
@@ -489,26 +357,20 @@ pub struct Palette {
     /// Inline-code and code-block-language foreground.
     pub code: Color,
 
-    /// Reserved for a future diff view — added line gutter / fill.
+    /// Base hue for added diff lines; [`Theme::from_palette`] derives every focused /
+    /// unfocused line and inline wash from it.
     pub diff_add: Color,
-    /// Reserved for a future diff view — removed line gutter / fill.
+    /// Base hue for removed diff lines.
     pub diff_delete: Color,
 
-    /// `true` when this palette is intended as a light-mode theme; `false`
-    /// for dark themes (the common case).  Drives the theme picker's
-    /// light/dark filter — every built-in palette sets this explicitly in
-    /// its constructor, and user TOML themes opt in via `light = true`
-    /// at the top of their `.toml` file.  We don't infer from `bg`
-    /// luminance: the flag is the single source of truth so a theme with
-    /// a mid-grey bg or an indexed color still classifies unambiguously.
+    /// Whether this is a light-mode theme, driving the picker's filter.  Explicit rather
+    /// than inferred from `bg` luminance, so a mid-grey or indexed background still
+    /// classifies unambiguously.  User TOML themes opt in with `light = true`.
     pub light: bool,
 }
 
 impl Palette {
-    /// Classification used by the theme picker's light/dark filter.
-    /// Reads the explicit [`Palette::light`] flag — there is no
-    /// luminance heuristic, so a theme with an unconventional bg still
-    /// classifies unambiguously.
+    /// Classification for the theme picker's light/dark filter; reads [`Palette::light`].
     pub fn appearance(&self) -> AppearanceMode {
         if self.light {
             AppearanceMode::Light
@@ -524,23 +386,13 @@ impl Default for Palette {
     }
 }
 
-/// Constructor for a built-in theme.  Each entry in [`BUILTIN_THEMES`]
-/// pairs a reserved theme name with one of these.  Built-ins return a
-/// full [`Theme`] rather than just a [`Palette`] so they can pin the
-/// `h1`–`h6` heading ramp to curated shades — `Theme::from_palette`
-/// derives the ramp algorithmically from `primary` and `secondary`,
-/// which works well for RGB themes but produces poor results on
-/// indexed-color built-ins where stepping through the 6×6×6 cube
-/// shifts hue.
+/// Constructor for a built-in theme.  Returns a full [`Theme`] rather than a [`Palette`]
+/// so it can pin the `h1`–`h6` ramp to curated shades: [`Theme::from_palette`] derives the
+/// ramp algorithmically, which works for RGB but shifts hue on the 6×6×6 indexed cube.
 pub type ThemeCtor = fn() -> Theme;
 
-/// Registry of built-in themes shipped in the binary.  Names listed
-/// here are reserved: a user file `themes/<name>.toml` with one of
-/// these names is ignored at load time so the built-in always wins.
-/// Order is the user-facing cycle order in the settings overlay.
-///
-/// Each constructor lives in its own file under `src/config/themes/`
-/// so adding a theme is a single new file plus an entry here.
+/// Built-in themes, in the settings overlay's cycle order.  These names are reserved: a
+/// user `themes/<name>.toml` shadowing one is ignored at load time.
 pub const BUILTIN_THEMES: &[(&str, ThemeCtor)] = &[
     ("256 Dark", super::themes::dark_256::theme),
     ("256 Light", super::themes::light_256::theme),
@@ -571,14 +423,8 @@ pub const BUILTIN_THEMES: &[(&str, ThemeCtor)] = &[
     ("Zenburn", super::themes::zenburn::theme),
 ];
 
-/// Bidirectional pairings between dark and light variants of the same
-/// theme brand.  Used when the user flips appearance mode in the theme
-/// picker: if the currently-active theme appears in this table, its
-/// sibling is previewed; otherwise the default theme of the new mode
-/// (see [`DEFAULT_DARK_THEME`] / [`DEFAULT_LIGHT_THEME`]) is previewed.
-///
-/// Order is `(dark_name, light_name)` for readability — the lookup
-/// helper [`counterpart_theme`] checks both directions.
+/// `(dark, light)` pairings between variants of the same theme brand, consulted when the
+/// user flips appearance mode.  [`counterpart_theme`] checks both directions.
 pub const THEME_COUNTERPARTS: &[(&str, &str)] = &[
     ("256 Dark", "256 Light"),
     ("Catppuccin", "Catppuccin Latte"),
@@ -597,11 +443,9 @@ pub const DEFAULT_DARK_THEME: &str = "Edamame";
 /// previously-active theme has no counterpart.
 pub const DEFAULT_LIGHT_THEME: &str = "256 Light";
 
-/// The two built-in themes authored against the xterm-256 cube rather
-/// than in RGB.  Every other RGB built-in picks 24-bit colors that an
-/// indexed terminal quantizes — often to the point of illegibility
-/// (identical fg/bg after rounding) — so these are the substitution
-/// *targets* below truecolor.  See [`indexed_fallback_theme`].
+/// The two built-ins authored against the xterm-256 cube.  Every RGB built-in picks
+/// 24-bit colors an indexed terminal quantizes, often to identical fg/bg, so these are the
+/// substitution *targets* below truecolor.  See [`indexed_fallback_theme`].
 pub const INDEXED_DARK_THEME: &str = "256 Dark";
 pub const INDEXED_LIGHT_THEME: &str = "256 Light";
 
@@ -609,28 +453,20 @@ pub const INDEXED_LIGHT_THEME: &str = "256 Light";
 /// deferring entirely to the terminal's own colors.
 pub const MONOCHROME_THEME: &str = "Monochrome Dark";
 
-/// Built-ins that already render correctly without 24-bit color, so a
-/// terminal below truecolor must neither substitute them nor warn about
-/// them: the two `256 *` themes are authored against the xterm-256 cube,
-/// and [`MONOCHROME_THEME`] emits `Color::Reset` everywhere, which is
-/// safe at *every* depth including `NoColor`.
-///
-/// Membership is asserted against [`BUILTIN_THEMES`] by
-/// `indexed_safe_themes_are_registered` so a rename can't silently turn
-/// one of these back into a substitution candidate.
+/// Built-ins that render correctly without 24-bit color, so a sub-truecolor terminal must
+/// neither substitute nor warn about them.  [`MONOCHROME_THEME`] is safe at *every* depth
+/// including `NoColor`.  `indexed_safe_themes_are_registered` pins membership so a rename
+/// can't quietly make one substitutable again.
 pub const INDEXED_SAFE_THEMES: &[&str] =
     &[INDEXED_DARK_THEME, INDEXED_LIGHT_THEME, MONOCHROME_THEME];
 
-/// Pick the indexed-color theme to substitute on a terminal without
-/// 24-bit color, or `None` when `current` is already one of
-/// [`INDEXED_SAFE_THEMES`] (nothing to do) — which is also what makes
-/// the substitution idempotent across reloads.
+/// The indexed theme to substitute on a terminal without 24-bit color, or `None` when
+/// `current` is already [`INDEXED_SAFE_THEMES`] — which is what makes the substitution
+/// idempotent across reloads.
 ///
-/// The dark/light choice follows the *current theme's* appearance so
-/// a user on a light theme doesn't get flipped to a dark one by a
-/// capability downgrade; `configured` (the `appearance` config key) is
-/// the fallback for a theme that can't be classified, e.g. a user
-/// theme file that has since been deleted.
+/// The dark/light choice follows the *current theme's* appearance, so a capability
+/// downgrade never flips a light theme to a dark one; `configured` is the fallback for a
+/// theme that can't be classified (a deleted user theme file).
 pub fn indexed_fallback_theme(current: &str, configured: AppearanceMode) -> Option<&'static str> {
     if INDEXED_SAFE_THEMES.contains(&current) {
         return None;
@@ -641,9 +477,7 @@ pub fn indexed_fallback_theme(current: &str, configured: AppearanceMode) -> Opti
     })
 }
 
-/// Return the cross-mode sibling of `name`, if registered in
-/// [`THEME_COUNTERPARTS`].  Bidirectional: passing either half of a
-/// pair returns the other.
+/// The cross-mode sibling of `name` from [`THEME_COUNTERPARTS`], in either direction.
 pub fn counterpart_theme(name: &str) -> Option<&'static str> {
     for (a, b) in THEME_COUNTERPARTS {
         if *a == name {
@@ -656,16 +490,9 @@ pub fn counterpart_theme(name: &str) -> Option<&'static str> {
     None
 }
 
-/// Decide which theme to preview when the user toggles appearance mode
-/// to `target` while `current` is the active theme.  Strategy:
-///
-/// 1. If `current` has a counterpart in [`THEME_COUNTERPARTS`] and that
-///    counterpart classifies as `target`, return the counterpart.
-/// 2. Otherwise return the [`DEFAULT_DARK_THEME`] / [`DEFAULT_LIGHT_THEME`]
-///    for the target mode.
-///
-/// Used by both the theme-picker mode toggle and the settings-overlay
-/// Appearance row so the live preview is consistent across both UIs.
+/// The theme to preview when appearance mode flips to `target`: `current`'s counterpart
+/// if it classifies as `target`, else the mode's default.  Shared by the theme picker and
+/// the settings overlay so both previews agree.
 pub fn resolve_theme_for_mode_switch(current: &str, target: AppearanceMode) -> String {
     if let Some(sibling) = counterpart_theme(current) {
         if theme_appearance(sibling) == Some(target) {
@@ -678,25 +505,18 @@ pub fn resolve_theme_for_mode_switch(current: &str, target: AppearanceMode) -> S
     }
 }
 
-/// Cache entry for a user theme's classification: the file's mtime
-/// (so stale entries are detected when the user edits a theme file
-/// mid-session) and the resolved appearance mode.
+/// A user theme's cached classification, keyed on mtime so a mid-session edit invalidates.
 type AppearanceCacheEntry = (Option<SystemTime>, AppearanceMode);
 
-/// Cache of user-theme classifications, keyed by theme name.  Built-ins
-/// are resolved without consulting the cache.
+/// Keyed by theme name; built-ins never consult it.
 static USER_THEME_APPEARANCE_CACHE: Mutex<Option<HashMap<String, AppearanceCacheEntry>>> =
     Mutex::new(None);
 
-/// Resolve `name` to its [`AppearanceMode`] by loading the theme and
-/// reading [`Palette::light`].  Returns `None` if the theme can't be
-/// resolved (unknown name, malformed user TOML); callers default to
-/// `Dark` in that case so the theme stays visible in the dark list.
+/// Resolve `name` to its [`AppearanceMode`], or `None` for an unknown name or malformed
+/// user TOML (callers then default to `Dark`, so the theme stays visible somewhere).
 ///
-/// Built-in themes resolve in O(1) via [`Theme::builtin`].  User
-/// themes hit a process-wide mtime-keyed cache so repeated calls (the
-/// theme-picker filter invokes this once per theme on every mode flip)
-/// don't re-read + re-parse the TOML each time.
+/// User themes hit [`USER_THEME_APPEARANCE_CACHE`]: the picker's filter calls this once
+/// per theme on every mode flip, and re-parsing each TOML that often is not free.
 pub fn theme_appearance(name: &str) -> Option<AppearanceMode> {
     if let Some(t) = Theme::builtin(name) {
         return Some(t.palette.appearance());
@@ -712,8 +532,7 @@ pub fn theme_appearance(name: &str) -> Option<AppearanceMode> {
             return Some(*cached_mode);
         }
     }
-    // Cache miss / mtime mismatch — read the file.  We don't surface
-    // parse warnings here; classification is best-effort and silent.
+    // Classification is best-effort: parse warnings are not surfaced here.
     let text = std::fs::read_to_string(&path).ok()?;
     let file: super::theme_file::ThemeFile = toml::from_str(&text).ok()?;
     let theme: Theme = (&file).into();
@@ -722,10 +541,8 @@ pub fn theme_appearance(name: &str) -> Option<AppearanceMode> {
     Some(mode)
 }
 
-/// List theme names whose appearance matches `mode`.  Resolves each
-/// name from [`list_theme_names`] and filters by [`Palette::light`].
-/// Themes that fail to resolve are treated as `Dark` (so they remain
-/// visible in the dark list rather than silently disappearing).
+/// [`list_theme_names`] filtered to `mode`.  Unresolvable themes count as `Dark` so they
+/// remain visible somewhere rather than silently disappearing.
 pub fn list_theme_names_for_mode(mode: AppearanceMode) -> Vec<String> {
     list_theme_names()
         .into_iter()
@@ -733,23 +550,17 @@ pub fn list_theme_names_for_mode(mode: AppearanceMode) -> Vec<String> {
         .collect()
 }
 
-/// List every theme name available to the user: the compiled-in
-/// [`BUILTIN_THEMES`] (in their declared order) followed by any
-/// user-authored `<config_dir>/themes/*.toml` stems whose name doesn't
-/// shadow a built-in.  Built-ins are always present so the picker
-/// works even when the user has no custom themes installed.
+/// [`BUILTIN_THEMES`] in declared order, then any `<config_dir>/themes/*.toml` stems that
+/// don't shadow a built-in.
 pub fn list_theme_names() -> Vec<String> {
     let mut out: Vec<String> = BUILTIN_THEMES
         .iter()
         .map(|(n, _)| (*n).to_owned())
         .collect();
 
-    // A `--no-config` run offers built-ins only.  This list feeds the
-    // theme picker, the settings overlay's cycle, and the export-theme
-    // source list, so without the gate a session started specifically to
-    // rule the user's config out could still pick a `themes/*.toml` off
-    // disk and apply it — the read half of the flag, enforced at the
-    // read site.  See [`crate::config::persistence`].
+    // A `--no-config` run offers built-ins only: this list feeds the picker, the settings
+    // cycle, and the export-theme source list, so without the gate a session started to
+    // rule the user's config out could still load a `themes/*.toml`.
     let user_themes_dir = super::config::Config::config_dir()
         .filter(|_| super::persistence::config_reads_allowed())
         .map(|dir| dir.join("themes"));
@@ -782,9 +593,8 @@ pub fn list_theme_names() -> Vec<String> {
 }
 
 impl Theme {
-    /// Look up a built-in theme by name.  Returns `None` for names not
-    /// in [`BUILTIN_THEMES`], in which case the caller falls back to
-    /// reading `themes/<name>.toml` from the user's config directory.
+    /// `None` for names outside [`BUILTIN_THEMES`], where the caller falls back to
+    /// reading `themes/<name>.toml`.
     pub fn builtin(name: &str) -> Option<Theme> {
         BUILTIN_THEMES
             .iter()
@@ -794,41 +604,28 @@ impl Theme {
 }
 
 impl Theme {
-    /// Build a fully-populated [`Theme`] from `palette`.  Every style
-    /// is derived from a palette entry; this function is the single
-    /// source of truth for those assignments (`docs/dev/theming.md`
-    /// carries the conventions behind them, not the mapping itself).
-    /// Used both by [`Theme::default`] and by the on-disk theme loader
-    /// after applying user palette overrides.
+    /// The single source of truth for palette-slot → style assignments; `docs/dev/theming.md`
+    /// carries the conventions behind them.  Used by [`Theme::default`] and by the on-disk
+    /// loader after user palette overrides are applied.
     pub fn from_palette(palette: &Palette) -> Self {
         let bold = Modifier::BOLD;
         let italic = Modifier::ITALIC;
         let underline = Modifier::UNDERLINED;
         let p = palette.clone();
 
-        // Code surface: a desaturated, bg-tinted shade of `code` —
-        // distinguishable from `bg_muted` (striped-row bg) so a code
-        // span inside a stripe still reads as code.  `blend` returns
-        // `p.code` unchanged for non-RGB palettes; the 256-cube
-        // built-ins compensate by overriding the four code styles
-        // after `from_palette` returns.
+        // A bg-tinted shade of `code`, distinct from `bg_muted` so a code span inside a
+        // striped row still reads as code.  `blend` is a no-op on non-RGB palettes, so the
+        // 256-cube built-ins override the four code styles after this returns.
         let code_bg = blend(p.code, p.bg, CODE_BG_MIX_TOWARD_BG);
 
-        // Blockquote surface: the bar's own hue, mixed almost all the
-        // way to `bg`.  Same `blend` caveat as `code_bg` — it returns
-        // `p.secondary` unchanged for non-RGB palettes, so the
-        // indexed-cube built-ins pin `blockquote_text` by hand after
-        // `from_palette` returns.
+        // Same `blend` caveat as `code_bg`; the indexed built-ins pin `blockquote_text`.
         let quote_bg = blend(p.secondary, p.bg, QUOTE_BG_MIX_TOWARD_BG);
 
-        // Every `syntax_*` foreground goes through here — see the block
-        // comment on the fields themselves.
+        // Every `syntax_*` foreground goes through here — see the fields' block comment.
         let syntax_fg = |c: Color| legible_on(code_bg, c, p.text, SYNTAX_MIN_CONTRAST);
 
-        // Heading ramp alternates `primary` and `secondary`, getting
-        // progressively duller / darker with each level.  RGB themes
-        // get a tinted ramp; indexed / named colors fall back to the
-        // base shade and rely on built-ins to override h1–h6.
+        // Alternates `primary` and `secondary`, dulling with each level.  Indexed / named
+        // colors fall back to the base shade and rely on the built-ins to override h1–h6.
         let h1c = dim_color(p.primary, 0);
         let h2c = dim_color(p.secondary, 0);
         let h3c = dim_color(p.primary, 1);
@@ -839,7 +636,6 @@ impl Theme {
         Self {
             palette: p.clone(),
 
-            // Headings: bold + underline + alternating primary/secondary.
             h1: Style::default().fg(h1c).add_modifier(bold),
             h1_rule: Style::default().fg(h1c), // H1 has a rule instead of an underline
             h2: Style::default()
@@ -863,7 +659,6 @@ impl Theme {
                 .add_modifier(bold)
                 .add_modifier(underline),
 
-            // Inline
             bold: Style::default().add_modifier(bold),
             italic: Style::default().add_modifier(italic),
             strikethrough: Style::default()
@@ -881,8 +676,6 @@ impl Theme {
             image_placeholder: Style::default().fg(p.link).add_modifier(italic),
             footnote: Style::default().fg(p.secondary),
 
-            // Code block — surface_elevated background reads as a single
-            // unit across border, language label, and body.
             code_block_border: Style::default().fg(p.text).bg(code_bg),
             code_block_lang: Style::default()
                 .fg(p.code)
@@ -890,43 +683,22 @@ impl Theme {
                 .add_modifier(italic),
             code_block_text: Style::default().fg(p.text).bg(code_bg),
 
-            // Syntax highlighting.  Seven classes over the palette's
-            // seven *foreground* slots, so every built-in theme gets a
-            // coherent set for free and no new `Palette` slot is owed.
-            // Each sets `fg` only: these are patched over
-            // `code_block_text`, which owns the code surface's bg.
+            // Seven classes over the palette's seven *text-carrying* slots (`primary`,
+            // `text_muted`, `link`, `success`, `warning`, `error`, `code`), so no new
+            // `Palette` slot is owed.  Each sets `fg` only; `code_block_text` owns the bg.
             //
-            // Which slots is not a free choice.  A palette's slots split
-            // into ones that carry text (`primary`, `text_muted`,
-            // `link`, `success`, `warning`, `error`, `code`) and ones
-            // that are fills or chrome (`secondary`, `accent`, the
-            // `bg` / `surface` family).  Only the first group has ever
-            // had to be legible *as characters*, and the second group is
-            // where this went wrong: `syntax_type` was `secondary` and
-            // `syntax_function` was `accent` — the slot `dark_256`'s own
-            // comment describes as "selection bg, table header" — which
-            // measured 1.99:1 and 1.51:1 against that theme's code
-            // surface, against 6.97:1 for the plain code text they
-            // replaced.  Highlighting made code *less* readable, on the
-            // theme every indexed terminal is force-substituted into.
-            // `code` and `link` take their places: `code` is the
-            // inline-code foreground, so it is already required to be
-            // legible on this exact surface, and `link` is the brightest
-            // text slot a palette has.  `error` picks up `attribute`,
-            // which is semantic reuse of a colour rather than a claim
-            // that anything is wrong — the same way `success` for a
-            // string literal and `warning` for a number are.
+            // Drawing on the fill/chrome slots instead is the trap: `syntax_type` was once
+            // `secondary` and `syntax_function` `accent`, measuring 1.99:1 and 1.51:1 on
+            // `dark_256`'s code surface against 6.97:1 for the plain text they replaced —
+            // highlighting made code *less* readable, on the very theme every indexed
+            // terminal is substituted into.
             //
-            // `legible_on` is the backstop for the rest: a slot chosen
-            // for its role on the *page* background can still land too
-            // close to the code wash, so each colour is lifted toward
-            // `text` until it clears `SYNTAX_MIN_CONTRAST`, keeping its
-            // hue.  It is a no-op for non-RGB palettes, which is why the
-            // two 256-cube built-ins pin all seven by hand — exactly as
-            // they already pin the heading ramp, `code_bg`,
-            // `selection_muted` and the diff washes.
-            // `syntax_contrast_clears_the_floor_for_every_builtin_theme`
-            // holds the whole arrangement to account.
+            // `legible_on` is the backstop: a slot chosen for its role on the *page*
+            // background can still land too close to the code wash, so each color is
+            // lifted toward `text` until it clears `SYNTAX_MIN_CONTRAST`, keeping its hue.
+            // A no-op for non-RGB palettes, which is why the two 256-cube built-ins pin all
+            // seven by hand.  `syntax_contrast_clears_the_floor_for_every_builtin_theme`
+            // holds the arrangement to account.
             syntax_keyword: Style::default().fg(syntax_fg(p.primary)).add_modifier(bold),
             syntax_string: Style::default().fg(syntax_fg(p.success)),
             syntax_comment: Style::default()
@@ -937,33 +709,24 @@ impl Theme {
             syntax_function: Style::default().fg(syntax_fg(p.link)),
             syntax_attribute: Style::default().fg(syntax_fg(p.error)),
 
-            // Blockquote — a subtle background wash rather than a text
-            // attribute.  It used to be a blanket ITALIC, which left
-            // `*emphasis*` inside a quote with nothing to say (issue
-            // #33) and read as a claim about the quoted text's tone.  A
-            // wash marks the region instead, the way the code surface
-            // does, and leaves every inline style free.
+            // A wash, not a text attribute: the former blanket ITALIC left `*emphasis*`
+            // inside a quote with nothing to say (issue #33).
             blockquote_bar: Style::default().fg(p.secondary),
             blockquote_text: Style::default().bg(quote_bg),
 
-            // Horizontal rule
             rule: Style::default().fg(p.secondary),
 
-            // Frontmatter — quiet by design: it is data about the
-            // document rather than part of it, so it must not compete
-            // with the first heading below it.
+            // Frontmatter is data *about* the document, so it must not compete with the
+            // first heading below it.
             frontmatter_delimiter: Style::default()
                 .fg(p.text_muted)
                 .add_modifier(Modifier::DIM),
             frontmatter_key: Style::default().fg(p.secondary),
             frontmatter_value: Style::default().fg(p.text_muted),
 
-            // List markers — accent so bullets / numbers carry a hint
-            // of brand color without competing with body text.
             list_bullet: Style::default().fg(p.accent),
             list_number: Style::default().fg(p.accent),
 
-            // Task list
             task_unchecked: Style::default().fg(p.warning),
             task_checked: Style::default().fg(p.success),
             task_complete_text: Style::default()
@@ -971,7 +734,6 @@ impl Theme {
                 .add_modifier(Modifier::CROSSED_OUT),
             task_strikethrough: true,
 
-            // Table
             table_border: Style::default().fg(p.surface_elevated),
             table_header: Style::default().add_modifier(bold).fg(p.accent),
             table_header_border: Style::default().fg(p.surface_elevated),
@@ -983,8 +745,6 @@ impl Theme {
             table_handle: Style::default().fg(p.primary).add_modifier(Modifier::DIM),
             table_handle_delete: Style::default().fg(p.error),
 
-            // Status bar — surface fill.  Mode chip swaps fg/bg
-            // depending on Mode so each mode reads at a glance.
             status_bar: Style::default().bg(p.surface).fg(p.text),
             status_mode_preview: Style::default()
                 .bg(p.text_muted)
@@ -992,22 +752,15 @@ impl Theme {
                 .add_modifier(bold),
             status_mode_rendered: Style::default().bg(p.primary).fg(p.bg).add_modifier(bold),
             status_mode_raw: Style::default().bg(p.warning).fg(p.bg).add_modifier(bold),
-            // Per-vim-mode badge colors, mirrored by the editor cursor:
-            // NORMAL = primary (resting/navigation home), INSERT = success
-            // (the green-for-insert vim convention), VISUAL / V-LINE =
-            // secondary (selection).  `fg = bg` keeps the cursor's
-            // underlying glyph legible when the cursor reads these.
+            // Mirrored by the editor cursor; `fg = bg` keeps the glyph under the cursor
+            // legible.
             status_mode_vim_normal: Style::default().bg(p.primary).fg(p.bg).add_modifier(bold),
             status_mode_vim_insert: Style::default().bg(p.success).fg(p.bg).add_modifier(bold),
             status_mode_vim_visual: Style::default().bg(p.secondary).fg(p.bg).add_modifier(bold),
-            // Filename rendered bold so it anchors the left side of the
-            // status bar alongside the bold accented "current section"
-            // chip on its right; the two together frame the rest of the
-            // breadcrumb chain.
+            // Bold, so it and the accented current-section chip frame the breadcrumb chain.
             status_filename: Style::default().fg(p.text).bg(p.surface).add_modifier(bold),
-            // Positional reference data (cursor pos, line count, %).
-            // Muted on purpose so the lone primary accent on the bar is
-            // the current-section breadcrumb — the two no longer compete.
+            // Muted on purpose, so the bar's lone primary accent is the current-section
+            // breadcrumb.
             status_info: Style::default().fg(p.text_muted).bg(p.surface),
             status_modified: Style::default()
                 .fg(p.warning)
@@ -1020,8 +773,6 @@ impl Theme {
                 .bg(p.surface)
                 .add_modifier(bold),
 
-            // Hint line — surface_elevated background. Chord badges are
-            // primary on the hint surface for readability.
             hint_bar: Style::default().bg(p.surface_elevated).fg(p.text),
             hint_chord: Style::default()
                 .fg(p.primary)
@@ -1029,9 +780,7 @@ impl Theme {
                 .add_modifier(bold),
             hint_label: Style::default().fg(p.text).bg(p.surface_elevated),
 
-            // Transient messages — escalate in salience.  All sit on
-            // the hint_bar surface so they layer cleanly over the
-            // chord row.
+            // All sit on the hint_bar surface so they layer cleanly over the chord row.
             transient_info: Style::default()
                 .fg(p.text)
                 .bg(p.surface_elevated)
@@ -1049,7 +798,6 @@ impl Theme {
                 .bg(p.surface_elevated)
                 .add_modifier(bold),
 
-            // Modal popups
             modal_bg: Style::default().bg(p.surface_elevated).fg(p.text),
             modal_title_normal: Style::default()
                 .fg(p.primary)
@@ -1066,17 +814,11 @@ impl Theme {
             modal_close_hint: Style::default().fg(p.text_muted).bg(p.surface_elevated),
             modal_item: Style::default().fg(p.text).bg(p.surface_elevated),
             modal_item_hint: Style::default().fg(p.primary).bg(p.surface_elevated),
-            // Use `bg` (the document background) as the fg instead of
-            // `text`: most themes have a light `text` and a saturated /
-            // light `primary`, so a light-on-light row reads as washed
-            // out.  Dark text on the primary fill matches the inverse-
-            // text pattern already used by `modal_input_*`.
+            // `bg` as the fg, not `text`: most themes pair a light `text` with a light
+            // `primary`, and light-on-light reads as washed out.
             modal_item_selected: Style::default().bg(p.primary).fg(p.bg).add_modifier(bold),
-            // Persistent selection without focus.  `secondary` as a
-            // foreground (no fill) so the affordance reads "marked"
-            // without competing with the focused element, which uses
-            // a filled `primary` background.  Sits on the modal body's
-            // surface so it composes cleanly inside `modal_bg` rows.
+            // Outlined, not filled, so it reads "marked" without competing with the
+            // focused element's `primary` fill.
             modal_item_selected_unfocused: Style::default()
                 .fg(p.secondary)
                 .bg(p.surface_elevated)
@@ -1087,87 +829,54 @@ impl Theme {
                 .fg(p.secondary)
                 .bg(p.surface_elevated)
                 .add_modifier(bold),
-            // Focused input is filled (`primary` bg, inverse-text fg,
-            // bold) so it clearly reads as the active field.  Unfocused
-            // input is outlined (`primary` fg, no fill) — same
-            // "filled vs outlined" convention used for selected items
-            // (see `modal_item_selected_unfocused`).  Without this
-            // contrast, an unfocused input on first render is easily
-            // mistaken for a focused button.
+            // Filled vs. outlined, the same convention as
+            // `modal_item_selected_unfocused`: without the contrast an unfocused input on
+            // first render is easily mistaken for a focused button.
             modal_input_unfocused: Style::default().fg(p.primary).bg(p.surface_elevated),
             modal_input_focused: Style::default().fg(p.bg).bg(p.primary).add_modifier(bold),
             modal_button_focused: Style::default()
                 .fg(p.primary)
                 .add_modifier(Modifier::REVERSED | bold),
 
-            // General — concrete `text` / `bg` so the document area
-            // renders with the theme's "blank page" colors rather
-            // than letting the terminal's defaults show through.
-            // Themes that prefer the terminal's own bg can set
-            // `[normal] fg = "Reset"` and `bg = "Reset"` in their TOML.
+            // Concrete colors, so the document area is the theme's "blank page" rather
+            // than the terminal's default.  Themes wanting the terminal's own can set
+            // `[normal] fg = "Reset"` / `bg = "Reset"`.
             normal: Style::default().fg(p.text).bg(p.bg),
 
-            // Selection: `accent` bg with whichever of `text` / `bg`
-            // contrasts better against it, so a theme whose `accent`
-            // sits near its `text` luminance (e.g. GitHub's cyan on
-            // light-grey ink) doesn't render selected text as
-            // low-contrast mud.  Indexed / named colors can't be
-            // measured and fall back to `text` (the prior behavior).
+            // Whichever of `text` / `bg` contrasts better against `accent`, so a theme
+            // whose accent sits near its text luminance doesn't render selections as mud.
+            // Unmeasurable colors fall back to `text`.
             selection: Style::default()
                 .bg(p.accent)
                 .fg(best_contrast(p.accent, p.text, p.bg)),
 
-            // Muted selection: the selection hue washed toward the
-            // surface so non-focused search matches recede behind the
-            // `selection`-painted current match.  Same contrast pick
-            // against the washed bg.
             selection_muted: {
                 let bg = blend(p.surface, p.accent, 0.45);
                 Style::default().bg(bg).fg(best_contrast(bg, p.text, p.bg))
             },
 
-            // Search match-counter badge — secondary accent so it
-            // reads apart from the warning-hued diff badge.
+            // `secondary`, so it reads apart from the warning-hued diff badge.
             status_mode_search: Style::default()
                 .bg(p.secondary)
                 .fg(p.bg)
                 .add_modifier(Modifier::BOLD),
 
-            // Active-line highlight is deferred — leave the field in
-            // place so themes can opt in.
             active_line: Style::default(),
 
-            // Unified modal input cursor — a solid `accent` block shared by
-            // every modal text field, so typing in a prompt looks the same
-            // everywhere and reads as its own context, distinct from the
-            // editor cursor (which derives from the per-mode status chip).
             cursor: Style::default().bg(p.accent).fg(p.bg),
 
-            // Line-number gutter — muted fg on the document bg so
-            // numbers recede behind the content.
             line_number: Style::default().fg(p.text_muted),
 
-            // Scrollbar — track in muted bg, thumb in `primary`; the
-            // active state blends toward `text` so the thumb pops
-            // while the user hovers / drags the gutter.
             scrollbar_track: Style::default().fg(p.bg_muted),
             scrollbar_thumb: Style::default().fg(p.primary),
             scrollbar_thumb_active: Style::default().fg(blend(p.primary, p.text, 0.35)),
 
-            // Diff mode — line / inline / status bar / hint bar.
-            // Line bg is 30 % toward the saturated diff color, mixed
-            // with `surface` so it reads as a chrome tint rather than
-            // a saturated stripe.  Inline highlights use the
-            // saturated palette color + bold.  Falls back to plain
-            // styles on non-Rgb palettes — `blend` returns the
-            // first argument unchanged in that case, which is the
-            // best we can do without inventing a hue.
-            // Focused hunk: stronger fill so the active change stands
-            // out; non-focused hunks: a faint wash so they recede.  The
-            // focused fill is then pulled back toward `bg` so it sits a
-            // shade darker than the saturated inline-change highlight —
-            // that contrast is what makes within-line edits legible
-            // against the surrounding row.
+            // Diff washes mix the saturated diff hue with `surface` so a row reads as a
+            // chrome tint rather than a stripe.  The focused fill is then pulled toward
+            // `bg` so it sits a shade darker than the inline-change highlight — that gap
+            // is what makes within-line edits legible against their row.  On non-RGB
+            // palettes `blend` returns its first argument, which is the best available
+            // without inventing a hue.
             diff_add_line: Style::default().bg(blend(
                 blend(p.surface, p.diff_add, 0.42),
                 p.bg,
@@ -1180,36 +889,24 @@ impl Theme {
             )),
             diff_add_line_unfocused: Style::default().bg(blend(p.surface, p.diff_add, 0.07)),
             diff_delete_line_unfocused: Style::default().bg(blend(p.surface, p.diff_delete, 0.07)),
-            // Inline highlights darken the saturated diff color toward
-            // the bg so light foreground text keeps enough contrast.
             diff_add_inline: Style::default()
                 .bg(blend(p.diff_add, p.bg, 0.35))
                 .add_modifier(bold),
             diff_delete_inline: Style::default()
                 .bg(blend(p.diff_delete, p.bg, 0.35))
                 .add_modifier(bold),
-            // Unfocused inline highlights are a surface-derived tint
-            // (like the `_line_unfocused` washes) rather than the
-            // darkened-saturated focused style, and drop the bold — so a
-            // changed word reads as a slightly deeper patch within the
-            // faint hunk (0.20 vs. the 0.07 line wash) without competing
-            // with the focused hunk.
+            // A surface-derived tint like the `_line_unfocused` washes, no bold: a changed
+            // word is a slightly deeper patch (0.20 vs. the 0.07 line wash) within a faint
+            // hunk, not a competitor to the focused one.
             diff_add_inline_unfocused: Style::default().bg(blend(p.surface, p.diff_add, 0.20)),
             diff_delete_inline_unfocused: Style::default().bg(blend(
                 p.surface,
                 p.diff_delete,
                 0.20,
             )),
-            // Decision divider carries a full-width neutral chrome
-            // background so the accept/reject checkbox reads as the
-            // actionable strip between the delete and add sides rather
-            // than a bare gap.  The background is a plain surface (not a
-            // `secondary` tint) so the colored foregrounds keep full
-            // contrast: the focused divider uses the heavier
-            // `surface_elevated` and a `secondary` foreground on the
-            // pending prompt (the call to action pops); the resolved
-            // states keep their green/red hue so color still encodes the
-            // decision.
+            // A full-width neutral chrome strip, so the accept/reject prompt reads as
+            // actionable rather than a gap.  Plain surface, not a `secondary` tint, so the
+            // colored foregrounds keep full contrast.
             diff_decision_pending: Style::default().fg(p.secondary).bg(p.surface_elevated),
             diff_decision_accepted: Style::default()
                 .fg(p.diff_add)
@@ -1219,19 +916,13 @@ impl Theme {
                 .fg(p.diff_delete)
                 .bg(p.surface_elevated)
                 .add_modifier(bold),
-            // Unfocused divider: the lighter `surface` (vs. the focused
-            // `surface_elevated`) so it recedes a step while still
-            // reading as a chrome strip, with a muted fg and no bold.
-            // `build_line` derives the resolved unfocused styling from
-            // this plus the per-state hue + `DIM` (see `diff_view`).
+            // The lighter `surface`, so it recedes a step; `build_line` derives the
+            // resolved unfocused styling from this plus the per-state hue and DIM.
             diff_decision_unfocused: Style::default().fg(p.text_muted).bg(p.surface),
             status_mode_diff: Style::default().bg(p.warning).fg(p.bg).add_modifier(bold),
-            // Bottom region in diff mode: a muted red wash on the hint
-            // line (top) and a muted green wash on the status line
-            // (bottom) — mirroring the deletes-above / adds-below
-            // stacking in the document.  Tints, not fills, so the bars
-            // read as "diff" without being mistaken for an in-document
-            // hunk and without sacrificing text legibility.
+            // Red on the hint line (top), green on the status line (bottom), mirroring the
+            // document's deletes-above / adds-below stacking.  Tints, not fills, so a bar
+            // is never mistaken for an in-document hunk.
             status_bar_diff: Style::default()
                 .bg(blend(p.surface, p.diff_add, 0.22))
                 .fg(p.text),
@@ -1241,20 +932,17 @@ impl Theme {
         }
     }
 
-    /// The "blank page" background color — exposed so UI code that
-    /// blends or composites against the document surface (e.g. the
-    /// modal-dim pass) doesn't have to reach into `palette` directly.
+    /// The "blank page" background, for UI code compositing against the document surface.
     pub fn default_bg(&self) -> Color {
         self.palette.bg
     }
 
-    /// Foreground color for muted text — used as the Ansi256 fallback
-    /// foreground for the modal-dim sweep.
+    /// Muted text — the Ansi256 fallback foreground for the modal-dim sweep.
     pub fn text_muted(&self) -> Color {
         self.palette.text_muted
     }
 
-    /// Return the appropriate heading style for a heading level (1–6).
+    /// The heading style for a level (1–6).
     pub fn heading_style(&self, level: pulldown_cmark::HeadingLevel) -> Style {
         use pulldown_cmark::HeadingLevel::*;
         match level {
@@ -1267,7 +955,7 @@ impl Theme {
         }
     }
 
-    /// Pick the Mode-specific status mode chip style.
+    /// The status mode chip style for `mode`.
     pub fn status_mode_style(&self, mode: crate::editor::Mode) -> Style {
         use crate::editor::Mode::*;
         match mode {
@@ -1279,12 +967,9 @@ impl Theme {
     }
 
     /// Build a `Theme` from a user-authored [`crate::config::theme_file::ThemeFile`].
-    ///
-    /// When `monochrome` is true the file is ignored and the compiled-in
-    /// monochrome fallback ([`super::themes::monochrome_dark::theme`]) is
-    /// returned — preserves the contract that `ColorDepth::NoColor`
-    /// terminals never emit color escapes, even if a colorful theme file is
-    /// installed.
+    /// Under `monochrome` the file is ignored entirely, preserving the contract that a
+    /// `ColorDepth::NoColor` terminal emits no color escapes however colorful the
+    /// installed theme is.
     pub fn from_file(file: &super::theme_file::ThemeFile, monochrome: bool) -> Self {
         if monochrome {
             super::themes::monochrome_dark::theme()
@@ -1305,11 +990,9 @@ mod tests {
     use super::*;
     use crate::config::themes::util::contrast_ratio;
 
-    /// The picker, the settings cycle, and the export-theme source list
-    /// all build from this, so a `--no-config` run offering a user theme
-    /// here is how the flag's read half leaks: selecting it loads the
-    /// very `themes/*.toml` the run exists to rule out.  The second half
-    /// proves the omission came from the gate, not from a missed folder.
+    /// A user theme offered here is how the `--no-config` read half leaks: selecting it
+    /// loads the very file the run exists to rule out.  The second half proves the
+    /// omission came from the gate, not a missed folder.
     #[test]
     fn user_themes_are_not_listed_while_the_config_dir_is_disabled() {
         let _lock = crate::test_env::env_lock();
@@ -1331,13 +1014,8 @@ mod tests {
         assert!(list_theme_names().iter().any(|n| n == "mine"));
     }
 
-    /// The built-in theme registry, pinned with each theme's light/dark
-    /// classification.
-    ///
-    /// `docs/themes.md` lists these by name, split into Dark and Light
-    /// groups, and a user searching the picker for a theme the docs
-    /// promised is a bad first impression.  Accepting a change to this
-    /// snapshot is the reminder to update that list.
+    /// `docs/themes.md` lists these by name, split into Dark and Light groups; accepting
+    /// a change to this snapshot is the reminder to update that list.
     #[test]
     fn builtin_themes_are_pinned_for_the_docs() {
         let rows: Vec<String> = BUILTIN_THEMES
@@ -1354,8 +1032,7 @@ mod tests {
         insta::assert_snapshot!(rows.join("\n"));
     }
 
-    /// Every field on [`Palette`] in the order it appears in the struct
-    /// definition.  When you add a field to `Palette`, add it here so
+    /// Every color field on [`Palette`], in declaration order.  Add new ones here so
     /// `palette_fields_list_matches_struct` keeps the count honest.
     const PALETTE_FIELDS: &[&str] = &[
         "text",
@@ -1374,19 +1051,14 @@ mod tests {
         "code",
         "diff_add",
         "diff_delete",
-        // NOTE: the `_all` Color array below can't include the new
-        // `light: bool` field, so the length check still tracks only
-        // color-typed fields.  New color fields go here; new non-
-        // color fields are covered by every palette ctor needing to
-        // compile.
+        // The `light: bool` field is not color-typed and so is not listed; a new
+        // non-color field is covered by every palette ctor needing to compile.
     ];
 
     #[test]
     fn palette_fields_list_matches_struct() {
-        // Construct a Palette from defaults and read each field.  If a
-        // field is renamed or removed, this won't compile.  If a field
-        // is added without updating PALETTE_FIELDS, the length
-        // assertion at the bottom fails.
+        // A renamed or removed field fails to compile; an added one fails the length
+        // assertion below.
         let p = Palette::default();
         let _all = [
             p.text,
@@ -1411,9 +1083,6 @@ mod tests {
 
     #[test]
     fn light_palette_has_distinct_default_bg() {
-        // Sanity check that the light built-in is actually distinct
-        // from the dark default — otherwise we shipped two themes
-        // with the same color table.
         use super::super::themes::{dark_256, light_256};
         assert_ne!(dark_256::palette().bg, light_256::palette().bg);
     }
@@ -1427,12 +1096,8 @@ mod tests {
 
     #[test]
     fn only_light_256_is_classified_as_light() {
-        // Iterate every built-in and assert exactly the expected one(s)
-        // classify as light.  When new light themes ship this list
-        // becomes the central place to register the expectation —
-        // forgetting `light: true` in a new palette ctor will fail
-        // here (and forgetting `light: false` on a dark theme would
-        // too).
+        // The central registry of the expectation: a new palette ctor missing `light:
+        // true` (or carrying a stray one) fails here.
         let expected_light: &[&str] = &[
             "256 Light",
             "Catppuccin Latte",
@@ -1455,15 +1120,10 @@ mod tests {
 
     #[test]
     fn builtin_palettes_have_no_duplicate_slots() {
-        // No two color slots within a built-in palette should hold the
-        // same value — duplicates make a theme look monochromatic in the
-        // affected affordance pair (e.g. when `accent == error`, all
-        // text selections render in the error color).
+        // Duplicate slots make a theme monochromatic in the affected affordance pair —
+        // with `accent == error`, every text selection renders in the error color.
         for (name, ctor) in BUILTIN_THEMES {
-            // Monochrome intentionally collapses every palette slot to
-            // `Color::Reset` so any site that reads `palette.<x>`
-            // directly emits a terminal-default escape.  The duplicate
-            // check doesn't apply.
+            // Monochrome deliberately collapses every slot to `Color::Reset`.
             if *name == "Monochrome Dark" {
                 continue;
             }
@@ -1499,10 +1159,8 @@ mod tests {
 
     #[test]
     fn indexed_fallback_follows_the_current_theme_appearance() {
-        // A user on a light theme must not be flipped to a dark one by
-        // a capability downgrade, and vice versa.  The `configured`
-        // argument is deliberately the *opposite* of each theme's own
-        // appearance here to prove it isn't what's consulted.
+        // `configured` is deliberately the opposite of each theme's own appearance, to
+        // prove it isn't what gets consulted.
         assert_eq!(
             indexed_fallback_theme("Dracula", AppearanceMode::Light),
             Some("256 Dark"),
@@ -1515,8 +1173,6 @@ mod tests {
 
     #[test]
     fn indexed_fallback_uses_configured_appearance_for_unknown_themes() {
-        // An unresolvable name (deleted user theme file) can't be
-        // classified, so the `appearance` config key decides.
         assert_eq!(
             indexed_fallback_theme("no-such-theme", AppearanceMode::Light),
             Some("256 Light"),
@@ -1529,11 +1185,8 @@ mod tests {
 
     #[test]
     fn indexed_fallback_is_a_noop_for_the_indexed_safe_themes() {
-        // Idempotence for the two `256 *` targets: the substituted theme
-        // must not itself trigger a substitution, or a reload would fire
-        // the notice forever.  And `Monochrome Dark` is already correct
-        // at any depth, so swapping it — for a *less* safe palette, and
-        // with a modal to explain the swap — would be pure noise.
+        // Idempotence: a substituted theme must not itself trigger a substitution, or a
+        // reload would fire the notice forever.
         for name in INDEXED_SAFE_THEMES {
             assert_eq!(indexed_fallback_theme(name, AppearanceMode::Dark), None);
             assert_eq!(indexed_fallback_theme(name, AppearanceMode::Light), None);
@@ -1542,8 +1195,6 @@ mod tests {
 
     #[test]
     fn indexed_safe_themes_are_registered() {
-        // A rename in BUILTIN_THEMES that misses this list would leave a
-        // safe theme silently substitutable.
         for name in INDEXED_SAFE_THEMES {
             assert!(
                 BUILTIN_THEMES.iter().any(|(n, _)| n == name),
@@ -1574,8 +1225,6 @@ mod tests {
 
     #[test]
     fn resolve_theme_for_mode_switch_falls_back_to_default() {
-        // Themes with no registered counterpart fall back to the
-        // mode default.
         assert_eq!(
             resolve_theme_for_mode_switch("Edamame", AppearanceMode::Light),
             DEFAULT_LIGHT_THEME,
@@ -1598,15 +1247,10 @@ mod tests {
 
     // ── Syntax highlighting contrast ──────────────────────────────
 
-    /// Resolve an xterm-256 index to its standard RGB value.
-    ///
-    /// Indices 16–231 are the 6×6×6 cube and 232–255 the greyscale
-    /// ramp; both are fixed by the spec, so a built-in theme's indexed
-    /// choices really can be measured.  Indices 0–15 are the terminal's
-    /// user-configurable ANSI slots and have no fixed value — no
-    /// built-in picks one for a `syntax_*` field, and the test below
-    /// treats a hit there as a failure rather than skipping it, so a
-    /// future edit can't opt out of the floor by reaching for one.
+    /// Resolve an xterm-256 index to its spec-fixed RGB value, so an indexed theme's
+    /// choices can be measured.  Indices 0–15 are the terminal's user-configurable ANSI
+    /// slots and have no fixed value; the test below treats a hit there as a *failure*
+    /// rather than a skip, so a future edit can't opt out of the floor by reaching for one.
     fn xterm_rgb(i: u8) -> Option<(u8, u8, u8)> {
         const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
         match i {
@@ -1634,30 +1278,18 @@ mod tests {
         }
     }
 
-    /// The invariant behind `SYNTAX_MIN_CONTRAST`, the slot choices in
-    /// `from_palette`, and the two 256-cube themes' hand-picked syntax
-    /// colours.
+    /// The invariant behind `SYNTAX_MIN_CONTRAST`, the slot choices in `from_palette`,
+    /// and the 256-cube themes' hand-picked syntax colors.
     ///
-    /// The floor is `min(SYNTAX_MIN_CONTRAST, plain code text)`, not a
-    /// flat 4.5, because a theme cannot make a token more legible than
-    /// its own body text: `legible_on` lifts a colour toward `text` and
-    /// saturates there.  Solarized Light is the one theme that reaches
-    /// that ceiling — its plain code text measures 4.49:1 — so the
-    /// per-theme form states the real promise, which is that
-    /// highlighting never makes a code block *less* readable than
-    /// leaving it plain.
+    /// The floor is `min(SYNTAX_MIN_CONTRAST, plain code text)`, not a flat 4.5, because
+    /// `legible_on` lifts toward `text` and saturates there: a theme cannot make a token
+    /// more legible than its own body text (Solarized Light's plain code text is 4.49:1).
+    /// The real promise is that highlighting never makes a code block *less* readable
+    /// than leaving it plain.
     ///
-    /// `legible_on` enforces this for RGB palettes, but it is a no-op
-    /// for indexed ones — so without this test the indexed built-ins
-    /// are unguarded, which is exactly where the regression that
-    /// prompted it lived: `256 Dark`'s `syntax_function` measured
-    /// 1.51:1 against 6.97:1 for the plain code text it replaced, on
-    /// the theme `theme_fallback::apply` substitutes into whenever a
-    /// terminal lacks truecolor.  A theme whose colours can't be
-    /// resolved to RGB at all is skipped, which today is only
-    /// `Monochrome Dark`: every slot is `Color::Reset`, it sets no
-    /// syntax foreground, and it separates its two marked classes with
-    /// `BOLD` / `DIM` instead.
+    /// `legible_on` is a no-op for indexed palettes, which is where the regression that
+    /// prompted this lived.  A theme with no RGB-resolvable colors is skipped — today only
+    /// `Monochrome Dark`, which sets no syntax foreground at all.
     #[test]
     fn syntax_contrast_clears_the_floor_for_every_builtin_theme() {
         let mut failures = Vec::new();
@@ -1680,8 +1312,7 @@ mod tests {
                 ("syntax_function", theme.syntax_function),
                 ("syntax_attribute", theme.syntax_attribute),
             ] {
-                // A class that sets no foreground keeps `code_block_text`
-                // itself, which is the `plain` baseline by definition.
+                // No foreground means `code_block_text`, i.e. the `plain` baseline.
                 let Some(fg) = style.fg else { continue };
                 match as_rgb(fg).and_then(|fg| contrast_ratio(fg, bg)) {
                     Some(ratio) if ratio >= floor => {}

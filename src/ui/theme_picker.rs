@@ -1,14 +1,7 @@
-//! Fuzzy-searchable theme picker.
-//!
-//! Centred modal with an appearance toggle (Dark/Light) and a single-line
-//! search input on top of a scrollable list of available themes (the
-//! compiled-in [`BUILTIN_THEMES`](crate::config::theme) plus any user-authored
-//! `themes/*.toml`).  Built on the shared [`SearchableList`] component; this
-//! module supplies the theme rows (with a `current` suffix), the appearance
-//! toggle chrome, and the modal framing.
-//!
-//! UI-only: the adapter in `src/app/modal/theme_picker.rs` wires the
-//! component's [`ListEvent`](crate::ui::searchable_list::ListEvent) outcomes into live preview / selection.
+//! Fuzzy-searchable theme picker: an appearance toggle (Dark/Light) over a
+//! [`SearchableList`] of built-in and user themes.  UI-only; the adapter in
+//! `src/app/modal/theme_picker.rs` turns
+//! [`ListEvent`](crate::ui::searchable_list::ListEvent)s into preview / selection.
 
 use ratatui::{
     buffer::Buffer,
@@ -27,17 +20,13 @@ use crate::ui::searchable_list::{
     anchor_searchable_modal, FocusPolicy, ListChrome, RowCtx, SearchableList,
 };
 
-/// Placeholder shown in the empty search field.
 const PLACEHOLDER: &str = "Type to filter themes…";
 
 const NO_MATCHES_WIDTH: u16 = 12;
 const MAX_LIST_ROWS: u16 = 20;
 const CURRENT_SUFFIX_W: usize = "current".len();
-/// Label preceding the Dark-mode toggle slider on the appearance row.
 const MODE_LABEL: &str = "Dark mode";
-/// Gap (in cells) between the label and the toggle slider.
 const MODE_LABEL_GAP_W: u16 = 1;
-/// Muted, centred hint shown directly under the toggle.
 const MODE_HINT_LABEL: &str = "← →  to toggle";
 /// Pinned rows above the list: toggle, hint, spacer, input, divider.
 const PINNED_TOP: u16 = 5;
@@ -48,9 +37,8 @@ pub struct ThemePickerLayout {
     pub toggle_rect: Option<Rect>,
 }
 
-/// Build the theme list component, pre-focused on `current` and keeping focus
-/// on the same theme as the query is broadened (so the live preview is
-/// stable).
+/// Build the theme list, focused on `current`; `PreserveByIdentity` keeps the
+/// live preview stable as the query is broadened.
 pub fn build_theme_list(themes: Vec<String>, current: &str) -> SearchableList<String> {
     let mut list = SearchableList::new(themes, |s: &String| s.as_str())
         .with_focus_policy(FocusPolicy::PreserveByIdentity);
@@ -60,8 +48,7 @@ pub fn build_theme_list(themes: Vec<String>, current: &str) -> SearchableList<St
 }
 
 /// Render the theme-picker modal.  `current` is the theme active when the
-/// picker opened (drives the `current` suffix); `mode` is the live appearance
-/// mode.  Returns the cached esc / toggle hit-rects.
+/// picker opened (drives the `current` suffix); `mode` is the live appearance mode.
 pub fn render_theme_picker(
     list: &mut SearchableList<String>,
     area: Rect,
@@ -105,7 +92,6 @@ pub fn render_theme_picker(
         };
     }
 
-    // Toggle row — `Dark mode  ‹slider›`, centred.
     let toggle_y = inner.y;
     let dark_on = mode == AppearanceMode::Dark;
     let label_w = MODE_LABEL.chars().count() as u16;
@@ -138,7 +124,6 @@ pub fn render_theme_picker(
         height: 1,
     });
 
-    // Hint row.
     let hint_y = inner.y + 1;
     let hint_len = MODE_HINT_LABEL.chars().count() as u16;
     let hint_x = inner
@@ -160,11 +145,8 @@ pub fn render_theme_picker(
             buf,
         );
 
-    // Blank spacer separating the appearance affordance from the search field.
     fill_row(buf, inner, inner.y + 2, theme);
 
-    // Input + divider + list, rendered by the shared component starting at the
-    // input row.
     let list_area = Rect {
         x: inner.x,
         y: inner.y + 3,
@@ -211,8 +193,8 @@ pub fn render_theme_picker(
     }
 }
 
-/// Fill a full modal row with the elevated surface so centred controls read as
-/// part of one continuous chrome strip.
+/// Fill a full modal row with the elevated surface so centered controls read
+/// as one continuous chrome strip.
 fn fill_row(buf: &mut Buffer, inner: Rect, y: u16, theme: &Theme) {
     Paragraph::new("").style(theme.modal_bg).render(
         Rect {
@@ -225,7 +207,6 @@ fn fill_row(buf: &mut Buffer, inner: Rect, y: u16, theme: &Theme) {
     );
 }
 
-/// Total rendered width of the centred appearance row: label + gap + slider.
 fn toggle_row_width() -> u16 {
     MODE_LABEL.chars().count() as u16 + MODE_LABEL_GAP_W + controls::toggle_width() as u16
 }
@@ -296,8 +277,6 @@ mod tests {
 
     #[test]
     fn broadening_query_preserves_focus_identity() {
-        // Focus a theme, broaden the query so it still matches: focus should
-        // stay on the same theme (PreserveByIdentity) and emit no preview.
         let mut list = build_theme_list(themes(), "Ayu");
         for c in "drac".chars() {
             list.handle_key(&key(KeyCode::Char(c)));

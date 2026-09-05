@@ -1,11 +1,6 @@
-//! Path-entry modal pushed atop [`super::DirtyConflictModal`] when the
-//! user picks `[Save a copy]`.  Reuses the shared [`SaveCopyState`] +
-//! [`SaveCopyView`] path-entry widget (as [`super::SaveAsModal`] does)
-//! but its post-save effect is "save buffer to the
-//! chosen path, then reload the on-disk contents into the editor's
-//! buffer" — the in-flight conflict resolution flow.  Carries the
-//! on-disk contents already read by the watcher worker so the
-//! reload skips a disk re-read.
+//! `[Save a copy]` step of [`super::DirtyConflictModal`]: the [`SaveCopyState`] path entry,
+//! then save the buffer aside and reload the carried on-disk contents (already read by the
+//! watcher, so no re-read race).
 
 use std::any::Any;
 use std::path::Path;
@@ -33,12 +28,8 @@ impl DirtyConflictSaveCopyModal {
         }
     }
 
-    /// Replace the carried on-disk contents with the bytes from a
-    /// freshly-arrived external write.  Called from
-    /// `App::handle_file_changed` when a new change is observed while
-    /// this modal is open, so the user's eventual `Save` confirmation
-    /// reloads against the *current* disk state rather than the stale
-    /// snapshot that originally opened the modal.
+    /// Refresh the carried contents when another external write lands while the modal is
+    /// open, so the eventual reload uses the current disk state.
     pub fn set_on_disk_contents(&mut self, contents: String) {
         self.on_disk_contents = contents;
     }
@@ -63,38 +54,20 @@ impl Modal for DirtyConflictSaveCopyModal {
     ) -> ModalOutcome {
         match self.state.handle_key(&key) {
             SaveCopyResponse::Continue => ModalOutcome::Continue,
-            // Cancel returns to the underlying DirtyConflictModal —
-            // intact, so the user can pick a different action.
             SaveCopyResponse::Cancelled => ModalOutcome::Close,
             SaveCopyResponse::Save(path_str) => {
                 let path = Path::new(&path_str).to_owned();
                 match app.editor.buffer.save_copy(&path) {
                     Ok(()) => {
-                        // After the copy is on disk, replace the
-                        // in-memory buffer with the on-disk contents
-                        // that triggered the conflict.  The user
-                        // explicitly chose "save my edits aside and
-                        // load the disk version."
                         let contents = std::mem::take(&mut self.on_disk_contents);
                         let display = path_str.clone();
                         ModalOutcome::CloseAnd(Box::new(move |app| {
-                            // Close the parent DirtyConflictModal
-                            // underneath; the post-reload "Reloaded
-                            // from disk" flash from
-                            // `reload_buffer_from_disk` is the
-                            // primary signal, so we deliberately do
-                            // not double up with a "copy saved" toast
-                            // — keep the chrome quiet.  We do flash
-                            // the path so the user can find the file
-                            // they just wrote.
                             app.modal_stack.remove_first::<DirtyConflictModal>();
                             app.flash(format!("Buffer saved to {display}"), MessageKind::Success);
                             app.reload_buffer_from_disk(contents);
                         }))
                     }
                     Err(e) => {
-                        // Stay open so the user can correct the
-                        // path; show the validation error inline.
                         self.state.last_error = Some(format!("{e}"));
                         ModalOutcome::Continue
                     }

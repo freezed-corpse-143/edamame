@@ -1,34 +1,20 @@
-//! Terminal capability detection.
+//! Terminal capability detection: color depth, mouse, image protocol, UTF-8 locale, and
+//! the kitty keyboard enhancement protocol.
 //!
-//! Probes the terminal for features the editor uses: color depth, mouse
-//! support, the image protocol supported
-//! by the emulator (sixel / kitty / iterm2 / halfblocks), whether the locale
-//! advertises full Unicode support, and whether the kitty keyboard
-//! enhancement protocol is available.
-//!
-//! Detection uses three signals:
-//!
-//! * Environment variables (`$TERM`, `$COLORTERM`, `$TERM_PROGRAM`,
-//!   `$KITTY_WINDOW_ID`, `$LC_ALL`, `$LANG`, etc.).
-//! * Crossterm's `supports_keyboard_enhancement()` for keyboard protocol.
-//! * `ratatui_image::picker::Picker::from_query_stdio` for image protocol.
-//!
-//! The `detect` function is designed to never panic and never block the UI
-//! for noticeable time: all probes either complete in a few milliseconds or
-//! gracefully fall back to a conservative default.
+//! Three signals: environment variables, crossterm's `supports_keyboard_enhancement()`,
+//! and `Picker::from_query_stdio`.  [`Capabilities::detect`] must never panic and never
+//! block noticeably — every probe either finishes in milliseconds or falls back to a
+//! conservative default.
 
 use std::env;
 
 use ratatui_image::picker::{Picker, ProtocolType};
 
-/// Color bit-depth supported by the terminal.
-///
-/// Values are ordered from poorest to richest so comparisons like
-/// `depth >= ColorDepth::Ansi256` work as expected.
+/// Color bit-depth supported by the terminal.  Ordered poorest to richest, so
+/// `depth >= ColorDepth::Ansi256` works.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ColorDepth {
-    /// Terminal advertises no color support (e.g. `TERM=dumb`).  Rendering
-    /// falls back to plain text with no ANSI style escapes.
+    /// No color at all (`TERM=dumb`); rendering emits no ANSI style escapes.
     NoColor,
     /// Classic 8/16-color palette.
     Ansi16,
@@ -58,45 +44,31 @@ pub struct Capabilities {
     pub color_depth: ColorDepth,
     /// Whether the terminal appears to support mouse reporting.
     pub mouse: bool,
-    /// Image protocol detected by `ratatui-image`, or `None` when image display
-    /// is not supported.
+    /// `None` when image display is not supported.
     pub image_protocol: Option<ImageProtocol>,
-    /// The `Picker` instance returned by `ratatui_image`'s startup probe.
-    /// Retained so image rendering can reuse the already-probed
-    /// configuration instead of re-running `Picker::from_query_stdio` on
-    /// every cold image load.  `None` iff `image_protocol` is also `None`.
+    /// The startup probe's `Picker`, retained so cold image loads reuse the probed
+    /// configuration instead of re-running `Picker::from_query_stdio`.  `None` iff
+    /// `image_protocol` is.
     pub image_picker: Option<Picker>,
-    /// A second `Picker` forced to `ProtocolType::Halfblocks`, built from
-    /// the same font-size reported by the native picker (no extra stdin
-    /// probe).  Used by the halfblocks-fallback path: during
-    /// partial visibility or active scrolling on non-Kitty terminals, we
-    /// render via halfblocks (which is position-independent and cheap to
-    /// cell-copy) and upgrade back to the native protocol once the image
-    /// is fully visible and scroll has quiesced.  `None` iff image
-    /// support is absent altogether.
+    /// A second `Picker` pinned to halfblocks at the native picker's font size (no extra
+    /// probe).  The fallback path renders through it while an image is partly visible or
+    /// scrolling — halfblocks are position-independent and cheap to cell-copy — and
+    /// upgrades back once the view quiesces.  `None` iff image support is absent.
     pub halfblocks_picker: Option<Picker>,
-    /// Whether `$LC_ALL` / `$LC_CTYPE` / `$LANG` advertise a UTF-8 locale.
-    /// Used as a proxy for "full Unicode support".
+    /// Whether the locale env vars advertise UTF-8; a proxy for "full Unicode support".
     pub unicode_full: bool,
-    /// Whether the terminal answered `supports_keyboard_enhancement()`
-    /// affirmatively.  When `true`, `Ctrl-Shift-Z` is usable as a secondary
-    /// redo binding; when `false` the terminal is limited to the legacy
-    /// control-byte encoding — it cannot represent shifted modifier
-    /// combinations, nor `Ctrl` with a non-alphabetic key — and features
-    /// that rely on them must gracefully degrade.
+    /// Whether `supports_keyboard_enhancement()` answered affirmatively.  Without it the
+    /// terminal is limited to the legacy control-byte encoding, which can represent
+    /// neither shifted modifier combinations nor `Ctrl` with a non-alphabetic key, so
+    /// features relying on those (e.g. `Ctrl-Shift-Z` redo) must degrade.
     pub keyboard_enhancement: bool,
 }
 
 impl Capabilities {
-    /// Detect all capabilities.
-    ///
-    /// Must be called **after** the terminal has entered the alternate screen
-    /// and raw mode, because `ratatui_image`'s Picker probes stdout/stdin
-    /// with escape sequences.  The `kbd_enhancement` flag should be the
-    /// result of the `supports_keyboard_enhancement()` query in `setup()` —
-    /// we pass it in rather than re-querying here because both that query
-    /// and the Picker probe read replies off the tty, and running them
-    /// twice risks one consuming the other's response.
+    /// Detect all capabilities.  Must be called **after** the terminal enters the
+    /// alternate screen and raw mode, since the Picker probes stdout/stdin with escape
+    /// sequences.  `kbd_enhancement` is passed in rather than re-queried: both it and the
+    /// Picker probe read replies off the tty, and one could consume the other's.
     pub fn detect(kbd_enhancement: bool) -> Self {
         let term = env::var("TERM").unwrap_or_default();
         let color_depth = detect_color_depth(&term);
@@ -118,30 +90,22 @@ impl Capabilities {
         }
     }
 
-    /// Probe the terminal's color depth from environment variables
-    /// only — no escape-sequence I/O.  Safe to call before
-    /// [`terminal::setup()`](fn@crate::terminal::setup) (and therefore before the full
-    /// [`Self::detect`]), so the config loader can pick a
-    /// capability-appropriate fallback theme when the active theme
-    /// file is missing.  The full probe is the source of truth for
-    /// every other consumer.
+    /// Color depth from environment variables only, with no escape-sequence I/O, so it is
+    /// safe before [`terminal::setup()`](fn@crate::terminal::setup) — the config loader
+    /// needs it to pick a fallback theme.  [`Self::detect`] is the source of truth
+    /// everywhere else.
     pub fn detect_color_depth_from_env() -> ColorDepth {
         let term = env::var("TERM").unwrap_or_default();
         detect_color_depth(&term)
     }
 
-    /// Detect everything that can be known from the environment alone —
-    /// color depth, mouse, and locale — leaving the two probe-derived
-    /// facts at their [`Self::minimal`] values (no image protocol, no
-    /// keyboard enhancement).
+    /// Everything knowable from the environment alone, leaving the two probe-derived
+    /// facts at their [`Self::minimal`] values.
     ///
-    /// Used by `--doctor` when stdout or stdin is not a terminal.  The
-    /// image and keyboard probes both write escape sequences and read
-    /// the replies off the tty; with output redirected those sequences
-    /// would land in the user's file and the probe would report "no
-    /// support" for a terminal that has it.  Reporting the two facts as
-    /// *unknown* is the honest answer, and the caller
-    /// ([`crate::cli::doctor`]) prints them that way.
+    /// For `--doctor` when stdout or stdin is not a terminal: the image and keyboard
+    /// probes would write escape sequences into the user's redirected file and then report
+    /// "no support" for a terminal that has it.  [`crate::cli::doctor`] prints the two as
+    /// *unknown*.
     pub fn env_only() -> Self {
         let term = env::var("TERM").unwrap_or_default();
         Self {
@@ -152,19 +116,14 @@ impl Capabilities {
         }
     }
 
-    /// True iff the terminal advertises 24-bit color.  Anything below
-    /// truecolor (256-indexed, 16-color, none) quantizes the RGB values
-    /// every built-in theme and every rendered image is authored in, so
-    /// this one predicate gates the theme picker, the image / diagram
-    /// options in the welcome modal, and the first-run default theme.
+    /// True iff the terminal advertises 24-bit color.  Anything less quantizes the RGB
+    /// every theme and image is authored in, so this gates the theme picker, the welcome
+    /// modal's image / diagram options, and the first-run default theme.
     pub fn full_color(&self) -> bool {
         self.color_depth == ColorDepth::TrueColor
     }
 
-    /// Conservative default used by tests and when probing is impossible.
-    ///
-    /// Assumes the minimum-common-denominator terminal: 16 colors, no mouse,
-    /// no images, no kitty keyboard protocol.
+    /// Minimum-common-denominator terminal, for tests and when probing is impossible.
     pub fn minimal() -> Self {
         Self {
             color_depth: ColorDepth::Ansi16,
@@ -177,15 +136,10 @@ impl Capabilities {
         }
     }
 
-    /// Build a stable, debuggable fingerprint that identifies this terminal
-    /// "identity" for the new-terminal detection in the startup capabilities
-    /// notice.  Combines `$TERM_PROGRAM` and `$TERM` (the env-level identity)
-    /// with the detected capability tuple (so two environments that probe
-    /// differently are treated as different terminals) and a `tmux` marker
-    /// when running inside tmux.
-    ///
-    /// `$TERM_PROGRAM_VERSION` is deliberately excluded — every minor version
-    /// update would otherwise re-trigger the notice.
+    /// Stable terminal identity for the startup capabilities notice's new-terminal
+    /// detection: the env-level identity plus the detected capability tuple (so two
+    /// environments that probe differently count as different terminals) plus a tmux
+    /// marker.  `$TERM_PROGRAM_VERSION` is excluded, or every minor update would re-notify.
     pub fn fingerprint(&self) -> String {
         let term_program = env::var("TERM_PROGRAM").unwrap_or_default();
         let term = env::var("TERM").unwrap_or_default();
@@ -218,11 +172,8 @@ impl Default for Capabilities {
 
 // ── Probing helpers ──────────────────────────────────────────────────────────
 
-/// Infer color depth from environment variables.
-///
-/// `$COLORTERM` takes precedence when it names a true-color terminal; failing
-/// that we fall back to inspecting `$TERM` for the conventional `-256color`
-/// suffix, then to the built-in 8/16-color palette.
+/// Infer color depth from environment variables: `$COLORTERM` first, then `$TERM`'s
+/// conventional `-256color` suffix, then 8/16-color.
 fn detect_color_depth(term: &str) -> ColorDepth {
     if term == "dumb" || term.is_empty() {
         return ColorDepth::NoColor;
@@ -234,21 +185,17 @@ fn detect_color_depth(term: &str) -> ColorDepth {
         return ColorDepth::TrueColor;
     }
     if term.contains("direct") {
-        // e.g. `xterm-direct`, `tmux-direct`.
         return ColorDepth::TrueColor;
     }
-    // A handful of modern terminals are known to support truecolor even when
-    // `$COLORTERM` is unset (e.g. a remote session that stripped it).
+    // Some modern terminals support truecolor with `$COLORTERM` unset (e.g. a remote
+    // session that stripped it).
     if env::var("KITTY_WINDOW_ID").is_ok() || env::var("WEZTERM_PANE").is_ok() {
         return ColorDepth::TrueColor;
     }
     if let Ok(tp) = env::var("TERM_PROGRAM") {
         match tp.as_str() {
-            // Deliberately NOT `Apple_Terminal`: macOS Terminal.app tops out
-            // at the 256-color palette — it silently quantizes 24-bit SGR
-            // sequences, so claiming truecolor here would hand it themes and
-            // images it renders wrong.  It falls through to the
-            // `256color` check below.
+            // Deliberately NOT `Apple_Terminal`: it silently quantizes 24-bit SGR, so
+            // claiming truecolor would hand it themes and images it renders wrong.
             "iTerm.app" | "WezTerm" | "ghostty" | "Ghostty" => return ColorDepth::TrueColor,
             _ => {}
         }
@@ -259,11 +206,8 @@ fn detect_color_depth(term: &str) -> ColorDepth {
     ColorDepth::Ansi16
 }
 
-/// Infer mouse support from `$TERM`.
-///
-/// Essentially every post-1990s xterm-compatible terminal supports xterm
-/// mouse reporting.  The short list of exceptions is: `dumb`, empty, and
-/// `linux` (the Linux framebuffer console has no mouse by default).
+/// Infer mouse support from `$TERM`.  Essentially every xterm-compatible terminal has it;
+/// the exceptions are `dumb`, empty, and `linux` (the framebuffer console).
 fn detect_mouse(term: &str) -> bool {
     if term == "dumb" || term == "linux" || term.is_empty() {
         return false;
@@ -284,96 +228,51 @@ fn detect_unicode_full() -> bool {
     false
 }
 
-/// Build a picker that is **guaranteed** to encode halfblocks, at the
-/// terminal's real `font_size`.
+/// A picker **guaranteed** to encode halfblocks, at the terminal's real `font_size`.
+/// Neither ratatui-image constructor manages both, so take the font size from one and
+/// stamp the protocol onto it.
 ///
-/// Neither of ratatui-image's two constructors does this on its own:
-///
-/// * `Picker::halfblocks()` forces the protocol but hardcodes
-///   `font_size` to (10, 20), which is wrong for any terminal whose
-///   cells aren't 10×20 px — the halfblocks encoding would then use a
-///   different pixel-to-cell aspect ratio than the native protocol, and
-///   an image would change shape every time it crossed the
-///   native↔halfblocks boundary during scroll.
-/// * `Picker::from_fontsize()` keeps the font size but *infers a
-///   protocol from the environment*: `iterm2_from_env()` returns
-///   `Iterm2` whenever `$TERM_PROGRAM` names iTerm2, WezTerm, VS Code,
-///   Warp, Hyper, Tabby, rio, mintty or Bobcat (or `$LC_TERMINAL` names
-///   iTerm2, or we're in tmux under one of those).  On every one of
-///   those terminals the "halfblocks" picker silently produced an
-///   **iTerm2** picker instead, so the pre-rendered scratch buffer that
-///   `image::render_halfblocks_scratch` builds held a single cell
-///   carrying a base64 PNG escape sequence plus a field of `skip` cells,
-///   rather than position-independent halfblock cells.  That broke the
-///   entire partial-render fallback: `paint_halfblocks_partial` copies
-///   cells by row, so the image appeared only when the escape cell at
-///   row 0 happened to be copied (a full-fidelity flash) and vanished as
-///   soon as the top row scrolled off, and each flash re-transmitted the
-///   whole PNG to the terminal — the scroll stutter.
-///
-/// So: take the font size from one and stamp the protocol from the
-/// other.
+/// `Picker::halfblocks()` hardcodes a (10, 20) font size, which changes the image's aspect
+/// ratio every time it crosses the native↔halfblocks boundary.  `Picker::from_fontsize()`
+/// keeps the size but *infers* the protocol from `$TERM_PROGRAM`, yielding an iTerm2
+/// picker on many terminals — whose scratch buffer is one base64-PNG escape cell rather
+/// than position-independent halfblock cells, which the row-clipping partial painter
+/// cannot slice.
 fn halfblocks_from(font_size: ratatui_image::FontSize) -> Picker {
-    // `from_fontsize` is deprecated in ratatui-image 9+, but it is the
-    // only constructor that accepts a probed font size.
+    // Deprecated in ratatui-image 9+, but the only constructor taking a probed font size.
     #[allow(deprecated)]
     let mut picker = Picker::from_fontsize(font_size);
     picker.set_protocol_type(ProtocolType::Halfblocks);
     picker
 }
 
-/// True when we are (directly or over ssh) talking to iTerm2.app.
-///
-/// `$LC_TERMINAL` is iTerm2's own forwarded marker, so it stays correct
-/// across ssh — and in that case the terminal on the far end of the pipe
-/// really is iTerm2, which is what matters for protocol selection.
+/// True when we are talking to iTerm2.app, directly or over ssh — `$LC_TERMINAL` is
+/// iTerm2's own forwarded marker, and the far end of the pipe is what matters here.
 fn is_iterm2_app() -> bool {
     env::var("TERM_PROGRAM").is_ok_and(|v| v.contains("iTerm"))
         || env::var("LC_TERMINAL").is_ok_and(|v| v.contains("iTerm"))
 }
 
-/// Whether the iTerm2 env hint is trustworthy enough to override an
-/// affirmative Kitty capability probe (see [`resolve_protocol`]).
-///
-/// Under tmux it is not.  tmux's default `update-environment` covers
-/// neither `TERM_PROGRAM` nor `LC_TERMINAL`, so a pane keeps whatever
-/// the client that *created the server* exported: start tmux in iTerm2,
-/// detach, reattach from Ghostty or kitty, and `$LC_TERMINAL` still
-/// reads `iTerm2` while the terminal actually on the other end of the
-/// pipe speaks Kitty and not iTerm2 at all.  Pinning `Iterm2` there
-/// would break images on a terminal that had them working.
-///
-/// The stdio capability probe has no such staleness problem — it asks
-/// the live terminal, through tmux passthrough — which is exactly why
-/// ratatui-image treats it as authoritative over env hints.  So inside
-/// tmux we defer to it and leave the probe's answer alone.  The common
-/// case this gives up is tmux running *inside* iTerm2, where the probe
-/// says Kitty and we now believe it; that costs blank image rows, which
-/// is the same outcome the user already had before this override
-/// existed, and is recoverable by the halfblocks fallback in a way that
-/// a wrong-protocol pin on Ghostty is not.
+/// Whether the iTerm2 env hint may override an affirmative Kitty probe (see
+/// [`resolve_protocol`]).  Under tmux it may not: `update-environment` covers neither
+/// `TERM_PROGRAM` nor `LC_TERMINAL`, so a pane created from iTerm2 and reattached from
+/// Ghostty still advertises iTerm2 — and pinning `Iterm2` would break images on a terminal
+/// that had them working.  The stdio probe asks the live terminal, so inside tmux we defer
+/// to it.  The case given up is tmux *inside* iTerm2, which costs blank rows that the
+/// halfblocks fallback can recover; a wrong-protocol pin on Ghostty cannot be.
 fn iterm2_hint_is_trustworthy() -> bool {
     is_iterm2_app() && env::var_os("TMUX").is_none()
 }
 
-/// Resolve the protocol edamame will actually encode with from the one
-/// `Picker::from_query_stdio` probed.
+/// Resolve the protocol to encode with from the one `Picker::from_query_stdio` probed.
 ///
-/// iTerm2 3.5+ answers the Kitty graphics capability query
-/// (`ESC _Gi=31,…,a=q`) affirmatively, and ratatui-image treats that I/O
-/// probe as authoritative over its `$TERM_PROGRAM` hint — so in iTerm2
-/// the picker comes back as `Kitty`.  But ratatui-image's Kitty backend
-/// renders exclusively through the protocol's **unicode-placeholder**
-/// extension (transmit once with `U=1`, then paint U+10EEEE cells
-/// carrying the image id in diacritics), and that extension is one of
-/// the parts iTerm2 does *not* implement.  The image is transmitted and
-/// then never placed: the reserved rows stay blank.  ratatui-image's own
-/// compatibility matrix lists iTerm2's supported protocol as `iTerm2`,
-/// so pin it there.
+/// iTerm2 3.5+ answers the Kitty capability query affirmatively, so the picker comes back
+/// as `Kitty` — but ratatui-image's Kitty backend renders only through the
+/// unicode-placeholder extension, which iTerm2 does not implement, so the image is
+/// transmitted and never placed and the reserved rows stay blank.  Pin it to `Iterm2`.
 ///
-/// Only `Kitty` is overridden — a probe that lands on Sixel or
-/// Halfblocks is left alone.  `iterm2` should come from
-/// [`iterm2_hint_is_trustworthy`], not `is_iterm2_app` directly.
+/// Only `Kitty` is overridden.  `iterm2` must come from [`iterm2_hint_is_trustworthy`],
+/// not `is_iterm2_app` directly.
 fn resolve_protocol(probed: ProtocolType, iterm2: bool) -> ProtocolType {
     match probed {
         ProtocolType::Kitty if iterm2 => ProtocolType::Iterm2,
@@ -381,22 +280,13 @@ fn resolve_protocol(probed: ProtocolType, iterm2: bool) -> ProtocolType {
     }
 }
 
-/// Ask `ratatui_image` to probe for an image protocol.  Returns the detected
-/// protocol and the `Picker` instance; the Picker is retained and
-/// passed through to the image-rendering layer so cold image loads reuse
-/// the already-probed configuration.
-///
-/// Halfblocks are reported as `Some(ImageProtocol::Halfblocks)` — they are
-/// still a usable protocol, just lower-fidelity than sixel/kitty/iterm2.
+/// Probe for an image protocol, returning it alongside the `Picker` the rendering layer
+/// reuses.  Halfblocks count as support — lower fidelity, still usable.
 fn detect_image_protocol() -> (Option<ImageProtocol>, Option<Picker>) {
-    // Picker::from_query_stdio may write escape sequences; a panic here would
-    // be disastrous (corrupted terminal state), so we catch-and-swallow.
-    //
-    // The guard is scoped to the `catch_unwind` alone, and here that is
-    // load-bearing rather than tidiness: this runs on the *main* thread,
-    // after `main` installs the hook, so a guard still live over the
-    // code below would leave an uncaught panic unwinding out of `main`
-    // with the alternate screen up and nothing printed.
+    // A panic here would corrupt terminal state, so catch and swallow.  Scoping the guard
+    // to the `catch_unwind` alone is load-bearing: this runs on the main thread after the
+    // hook is installed, so a guard live over the code below would let a real panic unwind
+    // out of `main` with the alternate screen up and nothing printed.
     let result = {
         let _expected = super::ExpectedPanic::new();
         std::panic::catch_unwind(Picker::from_query_stdio)
@@ -424,22 +314,14 @@ fn detect_image_protocol() -> (Option<ImageProtocol>, Option<Picker>) {
 mod tests {
     use super::*;
 
-    // `EnvGuard` (save / set / restore-on-drop) and `env_lock` used to
-    // live here.  They moved to `crate::test_env` when a second module
-    // grew env-mutating tests: a lock private to this module cannot
-    // exclude `config::config`'s `XDG_CONFIG_HOME` writes or
-    // `cli::doctor`'s reads of the very variables set below, and the
-    // race those guard against is process-wide.
+    // `env_lock` is crate-wide because the race is process-wide: a lock private to this
+    // module could not exclude `cli::doctor`'s reads of the very variables set below.
     use crate::test_env::{env_lock, EnvGuard};
 
     // ── Image protocol ────────────────────────────────────────────────
 
-    /// The bug this pins: `Picker::from_fontsize` infers its protocol
-    /// from `$TERM_PROGRAM`, so on iTerm2 (and WezTerm / VS Code / Warp
-    /// / Hyper / Tabby / rio / mintty / Bobcat) the "halfblocks" picker
-    /// came back as an **iTerm2** picker.  Every scratch buffer built
-    /// from it held a base64 PNG escape instead of halfblock cells,
-    /// which the row-clipping partial painter cannot slice.
+    /// Regression: `Picker::from_fontsize` infers its protocol from `$TERM_PROGRAM`, so
+    /// the "halfblocks" picker came back as an iTerm2 one.  See [`halfblocks_from`].
     #[test]
     fn halfblocks_picker_is_halfblocks_even_under_iterm2() {
         let _lock = env_lock();
@@ -449,9 +331,7 @@ mod tests {
         assert_eq!(picker.protocol_type(), ProtocolType::Halfblocks);
     }
 
-    /// The probed font size must survive — `Picker::halfblocks()` would
-    /// hardcode (10, 20) and change the image's aspect ratio each time
-    /// it crossed the native↔halfblocks boundary.
+    /// The probed font size must survive; `Picker::halfblocks()` would hardcode (10, 20).
     #[test]
     fn halfblocks_picker_keeps_the_probed_font_size() {
         let _lock = env_lock();
@@ -470,7 +350,6 @@ mod tests {
             assert!(is_iterm2_app());
         }
         {
-            // ssh'd out of iTerm2: only the forwarded marker survives.
             let _g1 = EnvGuard::unset("TERM_PROGRAM");
             let _g2 = EnvGuard::set("LC_TERMINAL", "iTerm2");
             assert!(is_iterm2_app());
@@ -482,10 +361,7 @@ mod tests {
         }
     }
 
-    /// The headline override: iTerm2 answers the Kitty capability query
-    /// but can't place images via unicode placeholders, so a `Kitty`
-    /// probe under iTerm2 must be pinned to `Iterm2` or the reserved
-    /// rows stay blank.
+    /// The headline override — see [`resolve_protocol`].
     #[test]
     fn kitty_probe_under_iterm2_is_pinned_to_iterm2() {
         assert_eq!(
@@ -494,10 +370,7 @@ mod tests {
         );
     }
 
-    /// Only `Kitty` is overridden.  A terminal that probed Sixel or
-    /// Halfblocks is answering about a protocol iTerm2's Kitty quirk
-    /// says nothing about, and a real Kitty-family terminal (no iTerm2
-    /// hint) must keep its native protocol.
+    /// Only `Kitty` is overridden, and only under the iTerm2 hint.
     #[test]
     fn resolve_protocol_leaves_every_other_probe_alone() {
         for probed in [
@@ -525,12 +398,8 @@ mod tests {
         }
     }
 
-    /// Inside tmux the iTerm2 env hint is untrustworthy: `TERM_PROGRAM`
-    /// and `LC_TERMINAL` are not in tmux's default `update-environment`,
-    /// so a session created from iTerm2 and reattached from Ghostty
-    /// still advertises iTerm2 while the live terminal speaks Kitty.
-    /// The stdio capability probe has no such staleness, so we defer to
-    /// it rather than pin a protocol Ghostty cannot render.
+    /// See [`iterm2_hint_is_trustworthy`]: a stale forwarded marker inside tmux must not
+    /// pin a protocol the live terminal cannot render.
     #[test]
     fn iterm2_hint_is_distrusted_inside_tmux() {
         let _lock = env_lock();
@@ -554,8 +423,7 @@ mod tests {
         }
     }
 
-    /// A non-iTerm2 terminal outside tmux is trivially untrusted for the
-    /// pin — the guard must gate on the hint, not merely on tmux.
+    /// The guard must gate on the hint, not merely on tmux.
     #[test]
     fn iterm2_hint_is_absent_without_an_iterm2_marker() {
         let _lock = env_lock();
@@ -613,10 +481,8 @@ mod tests {
 
     #[test]
     fn color_depth_256_for_apple_terminal() {
-        // Terminal.app reports `TERM_PROGRAM=Apple_Terminal` with
-        // `TERM=xterm-256color` and no `COLORTERM`.  It must resolve to
-        // Ansi256 — it quantizes 24-bit SGR sequences, so treating it as
-        // truecolor mis-renders every theme and image.
+        // Terminal.app quantizes 24-bit SGR, so it must resolve to Ansi256 despite
+        // `TERM=xterm-256color`.
         let _lock = env_lock();
         let _g1 = EnvGuard::unset("COLORTERM");
         let _g2 = EnvGuard::unset("KITTY_WINDOW_ID");

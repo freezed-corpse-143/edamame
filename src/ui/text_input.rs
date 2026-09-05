@@ -1,29 +1,17 @@
 //! Shared paste policy for single-line modal text fields.
 //!
-//! Every text-input modal (search/replace, command palette, save-copy
-//! path, export-theme name, insert-table dimensions, theme/section
-//! filters, settings field editor) holds a *single line* of text.  A
-//! bracketed paste, however, can carry newlines and arbitrarily large
-//! content.  [`sanitize_paste`] is the single source of truth that
-//! flattens such a paste into something a one-line field can accept:
-//! control characters (newlines, tabs, …) are dropped so a multi-line
-//! clipboard collapses to one line, and the result is capped at
-//! [`PASTE_CHAR_CAP`] characters so pasting a whole document can't blow
-//! up a prompt.
-//!
-//! Field-specific filtering (e.g. the digits-only insert-table fields)
-//! is layered on top by each state's own `paste` method — this helper
-//! only owns the line-flattening and length cap that every field shares.
+//! Every text-input modal holds a *single line*, while a bracketed paste can
+//! carry newlines and arbitrarily large content.  [`sanitize_paste`] is the one
+//! place that flattens the two: control characters are dropped and the result is
+//! capped at [`PASTE_CHAR_CAP`].  Field-specific filtering (the digits-only
+//! insert-table fields, say) layers on top in each state's own `paste`.
 
-/// Maximum number of characters a single paste may contribute to a
-/// field.  Generous enough for long file paths (Linux `PATH_MAX` is
-/// 4096) and long search/replace terms, while still guarding against
-/// pasting an entire document into a one-line prompt.
+/// Maximum characters one paste may contribute to a field: room for long paths
+/// and search terms, but not a whole document.
 pub const PASTE_CHAR_CAP: usize = 1024;
 
-/// Flatten a bracketed paste for insertion into a single-line field:
-/// drop every control character (so newlines/tabs can't break the
-/// layout) and truncate to [`PASTE_CHAR_CAP`] characters.
+/// Flatten a bracketed paste for a single-line field: drop control characters,
+/// truncate to [`PASTE_CHAR_CAP`].
 pub fn sanitize_paste(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control())
@@ -53,8 +41,7 @@ mod tests {
 
     #[test]
     fn cap_counts_chars_not_bytes() {
-        // Multi-byte chars must not be truncated mid-codepoint, and the
-        // cap is a character count, not a byte count.
+        // The cap is a character count, so nothing truncates mid-codepoint.
         let huge = "é".repeat(PASTE_CHAR_CAP + 10);
         assert_eq!(sanitize_paste(&huge).chars().count(), PASTE_CHAR_CAP);
     }

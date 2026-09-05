@@ -1,53 +1,32 @@
-//! Vim modal state.
-//!
-//! `VimState` lives on `App` as `Option<VimState>` (`Some` iff
-//! `config.modal.handler == "vim"`).  It survives across keystrokes and
-//! is the single source of truth for the active sub-mode plus the
-//! accumulating multi-key parse (counts, pending operator, pending
-//! find, …).  It is deliberately orthogonal to `EditorState::mode`,
-//! which is the *rendering* axis (Rendered / Raw); the sub-mode here is
-//! the *interaction* axis (Normal / Insert / Visual).
-//!
-//! The full field set is laid down now even though CP1 only exercises a
-//! subset, so later checkpoints add behavior without re-shaping the
-//! struct.  See `docs/vim-implementation-plan.md` §2.2.
+//! Vim modal state. `VimState` lives on `App` as `Option<VimState>` (`Some` iff
+//! `config.modal.handler == "vim"`) and holds the active sub-mode plus the accumulating
+//! multi-key parse. The sub-mode is the *interaction* axis, orthogonal to
+//! `EditorState::mode` (the *rendering* axis).
 
 use crate::editor::vim_ops::{FindKind, VisualKind};
 
-/// Upper bound on a count used as a *repetition* — how many times `j`
-/// steps, how many copies `p` allocates — so a held digit key can't hang
-/// the UI or exhaust memory.
+/// Upper bound on a count used as a *repetition*, so a held digit key cannot hang the UI.
 ///
-/// **It is applied by the consumers, not by the accumulator.** `feed`'s
-/// `accumulate` deliberately saturates at `u32::MAX`, because a count is
-/// not always a repetition: `{count}G` reads it as a line number, and
-/// capping at the keystroke would put line 10 000 out of reach in a
-/// document that has one.  Every reader of `count` / `motion_count` that
-/// drives iteration therefore clamps to this bound itself — in practice
-/// they all funnel through `feed::count_of` or one of the three
-/// `[count1] op [count2]` products.  A new consumer that loops over a
-/// count owes the clamp; `feed::operand_count` is the one exemption, and
-/// only because it feeds a line number that gets clamped to the document
-/// instead.
+/// Applied by consumers, not the accumulator: `feed::accumulate` saturates at `u32::MAX`
+/// because `{count}G` reads the count as a line number. Every reader that drives iteration
+/// clamps itself (via `feed::count_of` or the `[count1] op [count2]` products); a new
+/// looping consumer owes the clamp. `feed::operand_count` is exempt only because its line
+/// number is clamped to the document instead.
 pub const COUNT_CAP: u32 = 9999;
 
-/// Vim sub-mode — orthogonal to `EditorState::mode` (the rendering axis).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VimSubMode {
     #[default]
     Normal,
-    /// `d`/`c`/`y`/`>`/`<` entered, awaiting a motion or text object.
+    /// An operator was entered and awaits a motion or text object.
     OperatorPending,
     Insert,
-    /// Charwise visual selection.
+    /// Charwise.
     Visual,
     VisualLine,
 }
 
-/// Operator awaiting a motion / text object (`d c y >> <<`).
-///
-/// `Delete` / `Change` / `Yank` are wired in CP3; `IndentRight` /
-/// `IndentLeft` (`>>` / `<<`) are wired in CP4.
+/// Operator awaiting a motion / text object (`d c y > <`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingOp {
     Delete,
@@ -57,27 +36,22 @@ pub enum PendingOp {
     IndentLeft,
 }
 
-/// Vim's unnamed register, with a charwise/linewise flag.  `dd`/`yy`/
-/// visual-line operations set `linewise = true`; `p`/`P` then open a new
-/// line for linewise content.  Kept entirely separate from the OS
-/// clipboard (which `Ctrl-C`/`Ctrl-V` use).
+/// Vim's unnamed register; `linewise` makes `p`/`P` open a new line. Separate from the OS
+/// clipboard.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VimRegister {
     pub text: String,
     pub linewise: bool,
 }
 
-/// Which command-line prompt is active (`:` / `/` / `?`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmdLineKind {
-    /// `:` ex command line (`:w`/`:q`/`:wq`/`:s`/`:%s`).
     Ex,
     SearchForward,
     SearchBackward,
 }
 
 impl CmdLineKind {
-    /// The leading glyph shown at the start of the command line.
     pub fn prefix(self) -> char {
         match self {
             CmdLineKind::Ex => ':',
@@ -86,8 +60,7 @@ impl CmdLineKind {
         }
     }
 
-    /// True for the `/` and `?` prompts, whose text is a search query
-    /// written in escape syntax rather than an ex command.
+    /// `/` and `?`, whose text is a search query in escape syntax rather than an ex command.
     pub fn is_search(self) -> bool {
         matches!(
             self,
@@ -96,10 +69,7 @@ impl CmdLineKind {
     }
 }
 
-/// Upper bound on the per-session `:` / search history; older entries are
-/// dropped once a kind's history grows past this. Vim's default `history` is
-/// 50 — 100 is comfortably more than a single editing session recalls while
-/// staying trivially cheap to keep in memory.
+/// Per-session `:` / search history cap (vim's default is 50).
 pub const HISTORY_CAP: usize = 100;
 
 /// The hint-line command-line buffer, active while typing `:` / `/` / `?`.
@@ -109,18 +79,13 @@ pub struct CmdLineState {
     pub input: String,
     /// Char index within `input`.
     pub cursor: usize,
-    /// History-recall position: `None` while editing the live draft, `Some(i)`
-    /// while showing `history[i]` after an Up. Down past the newest entry
-    /// returns to `None` (and restores [`draft`](Self::draft)).
+    /// `Some(i)` while showing `history[i]`; `None` while editing the live draft.
     pub history_idx: Option<usize>,
-    /// The in-progress text stashed when history recall begins, so stepping
-    /// Down past the newest entry restores what the user was typing.
+    /// The live text stashed when history recall begins, restored on Down past the newest.
     pub draft: String,
 }
 
 impl CmdLineState {
-    /// A fresh, empty command line of the given `kind` (cursor at 0, not
-    /// browsing history).
     pub fn new(kind: CmdLineKind) -> Self {
         Self {
             kind,
@@ -131,9 +96,7 @@ impl CmdLineState {
         }
     }
 
-    /// A command line pre-filled with `input`, cursor parked at its end — used
-    /// for the `'<,'>` range vim inserts when `:` opens from Visual mode, so
-    /// the user types the rest of the command after it.
+    /// Pre-filled with `input`, cursor at its end (the `'<,'>` range when `:` opens from Visual).
     pub fn with_input(kind: CmdLineKind, input: String) -> Self {
         let cursor = input.chars().count();
         Self {
@@ -150,18 +113,14 @@ impl CmdLineState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VimState {
     pub sub_mode: VimSubMode,
-    /// Leading count (the `3` in `3dw`).  Accumulates uncapped (saturating
-    /// at `u32::MAX`) — see [`COUNT_CAP`] for why, and for who applies the
-    /// bound instead.
+    /// Leading count (the `3` in `3dw`). Uncapped; see [`COUNT_CAP`].
     pub count: Option<u32>,
     pub pending_op: Option<PendingOp>,
     /// Count between operator and motion (the `2` in `d2w`).
     pub motion_count: Option<u32>,
     /// First `g` of a `gg` sequence.
     pub pending_g: bool,
-    /// `r` was pressed and is awaiting the replacement character (`r{c}`).
     pub pending_replace: bool,
-    /// `f`/`F`/`t`/`T` was pressed and is awaiting the target character.
     pub pending_find: Option<FindKind>,
     /// `Some(true)` = inner (`i`), `Some(false)` = around (`a`).
     pub pending_text_object: Option<bool>,
@@ -169,33 +128,23 @@ pub struct VimState {
     pub last_find: Option<(FindKind, char)>,
     /// Char offset of the visual anchor; `Some` in Visual / VisualLine.
     pub visual_anchor: Option<usize>,
-    /// Inclusive buffer-line span (`first`, `last`) of the most recent Visual
-    /// selection, captured when `:` opens the ex prompt from Visual mode — the
-    /// concrete bounds a `:'<,'>s` substitution runs over (vim's `'<`/`'>`
-    /// marks).  `None` until the first Visual `:`.
+    /// Inclusive line span of the last Visual selection, captured when `:` opens from Visual
+    /// mode: the bounds a `:'<,'>s` runs over (vim's `'<`/`'>` marks).
     pub last_visual_range: Option<(usize, usize)>,
     pub register: VimRegister,
-    /// Active while typing a `:` / `/` / `?` command line.
     pub cmdline: Option<CmdLineState>,
-    /// Live `/` / `?` incremental-search session (vim's `incsearch`):
-    /// `Some` from the first keystroke of an open search prompt until the
-    /// prompt closes.  Holds the pre-prompt view and any prior hlsearch
-    /// session for restore.  See `editor::vim_ops::incsearch`.
+    /// Live incremental-search session (vim `incsearch`), `Some` while a search prompt is
+    /// open. See `editor::vim_ops::incsearch`.
     pub incsearch: Option<crate::editor::vim_ops::IncsearchSession>,
-    /// Session-only `:` ex-command history, oldest first, newest last.
-    /// Recalled with Up/Down while the `:` prompt is open.
+    /// Session-only, oldest first.
     pub ex_history: Vec<String>,
-    /// Session-only search history (`/` and `?` share one register, as in
-    /// vim), oldest first.
+    /// Session-only, oldest first; `/` and `?` share it, as in vim.
     pub search_history: Vec<String>,
 }
 
 impl VimState {
-    /// Clear the in-progress multi-key parse (counts, pending operator,
-    /// pending `g`, pending `r`, pending find, pending text-object).  Leaves
-    /// `sub_mode`, the register, the last-find, and any visual anchor
-    /// untouched — those have lifetimes independent of a single command
-    /// sequence.
+    /// Clear the in-progress multi-key parse; `sub_mode`, register, last-find, and visual
+    /// anchor outlive a single command sequence and are untouched.
     pub fn reset_pending(&mut self) {
         self.count = None;
         self.pending_op = None;
@@ -206,8 +155,6 @@ impl VimState {
         self.pending_text_object = None;
     }
 
-    /// The session history list for a command-line `kind`. `/` and `?` share
-    /// the search history, as they do in vim.
     fn history_for(&mut self, kind: CmdLineKind) -> &mut Vec<String> {
         match kind {
             CmdLineKind::Ex => &mut self.ex_history,
@@ -215,10 +162,8 @@ impl VimState {
         }
     }
 
-    /// Record a submitted command line into the matching session history.
-    /// A repeat of an existing entry is moved to the end (so Up walks distinct
-    /// commands, newest first), and the list is capped at [`HISTORY_CAP`].
-    /// `cmd` is assumed non-empty — empty submits are not recorded.
+    /// Record a submitted (non-empty) command line: a repeat moves to the end, and the list
+    /// is capped at [`HISTORY_CAP`].
     pub fn record_command(&mut self, kind: CmdLineKind, cmd: &str) {
         let history = self.history_for(kind);
         if let Some(pos) = history.iter().position(|e| e == cmd) {
@@ -231,16 +176,12 @@ impl VimState {
         }
     }
 
-    /// Whether the active sub-mode is VisualLine — drives the App-layer
-    /// clipboard widening.
     pub fn is_visual_line(&self) -> bool {
         self.sub_mode == VimSubMode::VisualLine
     }
 
-    /// Which flavor of Visual selection is active, if any — the one input the
-    /// render path and the clipboard need to pick the matching
-    /// `vim_ops::visual` widening (inclusive charwise vs. whole lines).
-    /// `None` outside Visual, where `selection` is a plain half-open span.
+    /// The active Visual flavor, which picks the `vim_ops::visual` widening; `None` outside
+    /// Visual, where `selection` is a plain half-open span.
     pub fn visual_kind(&self) -> Option<VisualKind> {
         match self.sub_mode {
             VimSubMode::Visual => Some(VisualKind::Char),
@@ -303,7 +244,6 @@ mod tests {
         assert!(!v.pending_replace);
         assert_eq!(v.pending_find, None);
         assert_eq!(v.pending_text_object, None);
-        // Untouched.
         assert_eq!(v.sub_mode, VimSubMode::Insert);
         assert_eq!(v.register.text, "x");
     }
@@ -313,9 +253,8 @@ mod tests {
         let mut v = VimState::default();
         v.record_command(CmdLineKind::Ex, "w");
         v.record_command(CmdLineKind::Ex, "q");
-        v.record_command(CmdLineKind::Ex, "w"); // repeat moves to the end
+        v.record_command(CmdLineKind::Ex, "w");
         assert_eq!(v.ex_history, vec!["q".to_owned(), "w".to_owned()]);
-        // `/` and `?` share one history, separate from `:`.
         v.record_command(CmdLineKind::SearchForward, "foo");
         v.record_command(CmdLineKind::SearchBackward, "bar");
         assert_eq!(v.search_history, vec!["foo".to_owned(), "bar".to_owned()]);
@@ -329,8 +268,8 @@ mod tests {
             v.record_command(CmdLineKind::Ex, &format!("cmd{i}"));
         }
         assert_eq!(v.ex_history.len(), HISTORY_CAP);
-        // The five oldest were dropped from the front.
         assert_eq!(v.ex_history[0], "cmd5");
+
         assert_eq!(
             v.ex_history[HISTORY_CAP - 1],
             format!("cmd{}", HISTORY_CAP + 4)

@@ -1,20 +1,9 @@
-//! Shared focus navigation for the modal overlays.
-//!
-//! Settings, keybinds, and similar list-style overlays all need the
-//! same "advance focus by N, skipping non-focusable rows" loop.  The
-//! row types differ — settings has `RowDef { kind: { focusable } }`,
-//! keybinds has an enum with `Header` and `Binding` variants — so the
-//! helper takes a predicate.
-//!
-//! The walk is non-wrapping by design: bouncing past the first/last
-//! focusable row makes overlay navigation feel jumpy.  When no row in
-//! the requested direction is focusable, returns `None` so the caller
-//! can leave focus where it was.
+//! Shared "advance focus by N, skipping non-focusable rows" walk for the modal overlays.  Row
+//! types differ between overlays, so the helpers take a focusability predicate.
 
-/// Find the nearest row index reached by stepping `delta` from
-/// `current`, skipping any row for which `is_focusable` returns
-/// `false`.  Returns `None` when no focusable row exists in that
-/// direction.
+/// Nearest row index reached by stepping `delta` from `current`, skipping non-focusable rows.
+/// Non-wrapping by design (bouncing off the ends feels jumpy): returns `None` when no focusable
+/// row lies in that direction, so the caller can leave focus where it was.
 pub fn next_focusable<T>(
     rows: &[T],
     current: usize,
@@ -36,17 +25,10 @@ pub fn next_focusable<T>(
     None
 }
 
-/// Like [`next_focusable`], but *wrapping*: stepping past the last
-/// focusable row continues from the first (and vice versa).  Walks at most
-/// `rows.len()` steps so an all-non-focusable set terminates with `None`
-/// rather than looping forever.  The walk steps `delta` at a time starting
-/// one step from `current`, so when `current` is the only focusable row it
-/// is reached on the final wrap step and returned unchanged (a no-op move,
-/// matching the prior welcome behavior).
-///
-/// Used by the welcome and export-HTML modals, whose focus rings wrap (Tab
-/// off the last control returns to the first); the settings / keybinds
-/// overlays use the non-wrapping [`next_focusable`] instead.
+/// Like [`next_focusable`], but wrapping: past the last focusable row the walk continues from
+/// the first.  When `current` is the only focusable row it is reached on the final wrap step and
+/// returned unchanged (a no-op move).  Used by the welcome and export-HTML modals, whose focus
+/// rings wrap; settings / keybinds use the non-wrapping variant.
 pub fn next_focusable_wrapping<T>(
     rows: &[T],
     current: usize,
@@ -58,8 +40,7 @@ pub fn next_focusable_wrapping<T>(
     }
     let len = rows.len() as i32;
     let mut idx = current as i32;
-    // At most `len` steps: enough to visit every slot for a ±1 `delta`,
-    // and a hard bound so an all-disabled ring can't spin forever.
+    // Hard bound so an all-disabled ring can't spin forever.
     for _ in 0..len {
         idx = (idx + delta).rem_euclid(len);
         let i = idx as usize;
@@ -122,19 +103,14 @@ mod tests {
 
     #[test]
     fn wrapping_skips_non_focusable_then_wraps() {
-        // From the last focusable row, forward skips the trailing
-        // non-focusable tail and lands back on the first.
         let rows = [true, false, true, false, false];
         assert_eq!(next_focusable_wrapping(&rows, 2, 1, |r| *r), Some(0));
-        // Backward from the first focusable skips back over the head and
-        // wraps to the last focusable row.
         assert_eq!(next_focusable_wrapping(&rows, 0, -1, |r| *r), Some(2));
     }
 
     #[test]
     fn wrapping_lone_focusable_returns_itself() {
-        // Only `current` is focusable: the walk wraps all the way around
-        // and lands back on `current` (a no-op move, not a panic / None).
+        // Only `current` is focusable: it wraps back to itself, not None.
         let rows = [false, true, false];
         assert_eq!(next_focusable_wrapping(&rows, 1, 1, |r| *r), Some(1));
         assert_eq!(next_focusable_wrapping(&rows, 1, -1, |r| *r), Some(1));

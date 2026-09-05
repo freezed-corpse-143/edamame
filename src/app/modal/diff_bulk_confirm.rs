@@ -1,13 +1,6 @@
-//! Confirmation gate for the bulk decision actions `DiffAcceptAll` /
-//! `DiffRejectAll`.  Accept-all / reject-all override *every* hunk's
-//! decision in one keystroke, so an accidental `Shift-Y` / `Shift-N`
-//! would silently wipe out a mix of careful per-hunk choices.  Unlike
-//! a single-hunk mistake — recoverable by navigating back and
-//! re-deciding (or `DiffResetHunk`) — a bulk flip is the one case
-//! navigation can't undo, and decisions are deliberately not on an
-//! undo stack.  This modal is that guard: `[Yes]` applies the bulk
-//! decision (and then routes through the normal resolve-confirm flow);
-//! `[No]` (or `Esc`) dismisses with every prior decision intact.
+//! Confirmation gate for `DiffAcceptAll` / `DiffRejectAll`.  A bulk flip overrides every
+//! per-hunk decision and is the one diff mistake navigation can't undo (decisions are
+//! deliberately not on an undo stack), so it is guarded where single-hunk decisions aren't.
 
 use std::any::Any;
 
@@ -22,15 +15,12 @@ use crate::app::App;
 use crate::diff::Decision;
 use crate::ui::{ModalButton, ModalResponse};
 
-/// `[Yes, No]` — `Yes` is default-focused so the common case (the user
-/// meant to bulk-decide) is a single confirming Enter, while `Esc` /
-/// `No` still cancels an accidental flip.
+/// `Yes` is default-focused: the common case is a single confirming Enter.
 const YES_IDX: usize = 0;
 
 pub struct DiffBulkConfirmModal {
     chrome: ModalChrome,
     buttons: Vec<ModalButton>,
-    /// The decision to apply to every hunk on confirmation.
     decision: Decision,
     title: String,
     body_line: String,
@@ -47,9 +37,7 @@ impl DiffBulkConfirmModal {
                 "Reject every hunk?".to_owned(),
                 "Reject all changes, overriding your current decisions?".to_owned(),
             ),
-            // `DiffAcceptAll` / `DiffRejectAll` only ever construct this
-            // modal with a non-pending decision; guard defensively so a
-            // future caller can't render a blank prompt.
+            // Never constructed with `Pending` today; guards against a blank prompt.
             Decision::Pending => (
                 "Apply to every hunk?".to_owned(),
                 "Override your current decisions?".to_owned(),
@@ -64,9 +52,7 @@ impl DiffBulkConfirmModal {
         }
     }
 
-    /// Map a resolved response to an outcome.  Shared by the key and
-    /// click paths so a mouse click on a button behaves exactly like
-    /// pressing it.
+    /// Map a chrome response to an outcome; shared by the key and click paths.
     fn resolve(&self, response: ModalResponse) -> ModalOutcome {
         let decision = self.decision;
         match response {
@@ -75,7 +61,6 @@ impl DiffBulkConfirmModal {
             ModalResponse::ButtonPressed(YES_IDX) => {
                 ModalOutcome::CloseAnd(Box::new(move |app| app.apply_diff_bulk_decision(decision)))
             }
-            // `No` (or any stray index) just dismisses, decisions intact.
             ModalResponse::ButtonPressed(_) => ModalOutcome::Close,
         }
     }
@@ -140,7 +125,6 @@ mod tests {
     fn yes_closes_with_callback() {
         let mut app = make_app();
         let mut modal = DiffBulkConfirmModal::new(Decision::Accepted);
-        // `Yes` is default-focused, so a bare Enter confirms.
         let out = modal.handle_key(key(KeyCode::Enter), &mut app, 40, 80);
         assert!(matches!(out, ModalOutcome::CloseAnd(_)));
     }
@@ -149,7 +133,6 @@ mod tests {
     fn no_dismisses_without_callback() {
         let mut app = make_app();
         let mut modal = DiffBulkConfirmModal::new(Decision::Rejected);
-        // Tab onto `No` (index 1), then Enter.
         modal.handle_key(key(KeyCode::Tab), &mut app, 40, 80);
         let out = modal.handle_key(key(KeyCode::Enter), &mut app, 40, 80);
         assert!(matches!(out, ModalOutcome::Close));

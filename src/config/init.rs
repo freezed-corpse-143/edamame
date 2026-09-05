@@ -8,32 +8,20 @@ use super::readers::{INDEXED_FALLBACK_THEME, TRUECOLOR_FALLBACK_THEME};
 
 /// The annotated reference `config.toml` compiled into the binary.
 ///
-/// Seeded on first run by [`ensure_default_files_in`], and used again as
-/// the merge base by [`Config::save`](super::config::Config::save)'s
-/// private `save_merge` helper whenever the user's
-/// file is missing at save time — otherwise a save that raced a deleted
-/// `config.toml` would emit a bare serialization and strip every comment
-/// permanently (each later save then faithfully merges into the
-/// de-annotated file).
+/// Seeded on first run by [`ensure_default_files_in`], and reused as the merge base by
+/// [`Config::save`](super::config::Config::save) when the user's file is missing at save time —
+/// otherwise a save racing a deleted `config.toml` would strip every comment permanently.
 pub(super) const REFERENCE_CONFIG_TOML: &str = include_str!("../../config/config.toml");
 
-/// Testable core of [`super::config::Config::ensure_default_files`]:
-/// given the config directory (which may be a tempdir in tests), create
-/// it plus the `themes/` subdirectory and write the shipped default
-/// files if absent.  Never overwrites existing files.
+/// Testable core of [`super::config::Config::ensure_default_files`]: create the config
+/// directory and its `themes/` and `export/` subdirectories, then write the shipped defaults
+/// if absent.  Never overwrites an existing file.
 ///
-/// Built-in themes (see [`super::theme::BUILTIN_THEMES`]) are compiled
-/// into the binary and resolved before any disk read, so this function
-/// does NOT write `themes/<builtin>.toml` files.  The `themes/`
-/// directory is still created so an empty folder exists for users (or
-/// future export actions) to drop custom theme files into.
+/// Built-in themes are compiled in and resolved before any disk read, so no
+/// `themes/<builtin>.toml` is written; the empty directory exists for custom themes.
 ///
-/// `truecolor` selects the seeded `theme` value: the reference config
-/// ships [`TRUECOLOR_FALLBACK_THEME`], but on an indexed-color terminal
-/// that palette quantizes badly, so a first run there is seeded with
-/// [`INDEXED_FALLBACK_THEME`] instead — the same capability-appropriate
-/// pair [`super::readers::read_theme_named`] falls back to.  Only the
-/// first write is affected; an existing `config.toml` is never touched.
+/// `truecolor` selects the seeded `theme`: indexed-color terminals quantize
+/// [`TRUECOLOR_FALLBACK_THEME`] badly, so they are seeded with [`INDEXED_FALLBACK_THEME`].
 pub(super) fn ensure_default_files_in(dir: &Path, truecolor: bool) {
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, dir = %dir.display(), "failed to create config dir");
@@ -45,15 +33,9 @@ pub(super) fn ensure_default_files_in(dir: &Path, truecolor: bool) {
         return;
     }
 
-    // The export stylesheet folder mirrors `themes/`: an (initially empty)
-    // place for users to drop custom `.css` files, each of which becomes a
-    // pick in the Export HTML modal.  The single built-in default is the
-    // frozen compiled-in stylesheet (`export::html::BUILTIN_STYLESHEET`),
-    // so we deliberately do NOT write a selectable `default.css` here — that
-    // would surface a second, identical "default" in the picker.  Instead we
-    // seed a `.example` reference (excluded from the picker by
-    // `list_export_stylesheets`'s `.css` filter): a fork-able starting point
-    // the user copies to `<name>.css` and edits.
+    // A selectable `default.css` is deliberately NOT written: the built-in default is the
+    // compiled-in stylesheet, so a copy here would surface a duplicate in the Export HTML
+    // picker.  The `.example` seed is excluded by `list_export_stylesheets`'s `.css` filter.
     let export_dir = dir.join("export");
     if let Err(e) = std::fs::create_dir_all(&export_dir) {
         tracing::warn!(error = %e, dir = %export_dir.display(), "failed to create export dir");
@@ -71,11 +53,9 @@ pub(super) fn ensure_default_files_in(dir: &Path, truecolor: bool) {
     );
 }
 
-/// The `config.toml` body to seed on first run.  Truecolor terminals get
-/// the reference file verbatim; everything else gets it with the single
-/// `theme = "<truecolor default>"` assignment rewritten to the
-/// indexed-color built-in.  All comments and the rest of the file are
-/// untouched, so the seeded file still reads as the annotated reference.
+/// The `config.toml` body to seed on first run: the reference file verbatim, except that a
+/// non-truecolor terminal gets its single `theme = "…"` assignment rewritten.  Everything else,
+/// comments included, is untouched.
 fn seed_config_toml(truecolor: bool) -> String {
     if truecolor {
         return REFERENCE_CONFIG_TOML.to_owned();
@@ -107,9 +87,8 @@ mod tests {
 
     #[test]
     fn seed_swaps_theme_for_indexed_terminals() {
-        // Guards both the rewrite and the assumption it rests on: the
-        // reference config must keep spelling the truecolor default as a
-        // plain `theme = "…"` assignment, or the swap would silently no-op.
+        // The reference config must keep spelling the default as a plain `theme = "…"`
+        // assignment, or the swap would silently no-op.
         assert!(REFERENCE_CONFIG_TOML.contains(&format!("theme = \"{TRUECOLOR_FALLBACK_THEME}\"")));
         let seeded = seed_config_toml(false);
         assert!(seeded.contains(&format!("theme = \"{INDEXED_FALLBACK_THEME}\"")));

@@ -1,19 +1,10 @@
-//! `ImageView` — per-frame layout snapshot and post-render overlay for
-//! image blocks.
+//! Per-frame layout snapshot and post-render overlay for image blocks.
 //!
-//! Analogous to `ui::table_view`: the renderer still emits plain rendered
-//! lines for each `Block::ImageBlock` (an `[Image: alt]` placeholder on
-//! row 0 plus NBSP padding for the reserved area), and this module adds
-//! two passes on top of the normal line-render loop:
-//!
-//!   1. **`build_snapshots`** — walks the visible rendered lines and
-//!      returns one snapshot per visible image block, recording the
-//!      screen rect the image will paint into.
-//!   2. **`paint_images`** — for each snapshot, builds or reuses the
-//!      cached `StatefulProtocol` from `EditorState::images` and calls
-//!      `StatefulImage::render` onto the rect.  No-op for terminals
-//!      without a detected image protocol — the `[Image: alt]`
-//!      placeholder from the renderer stays visible in that case.
+//! The renderer still emits plain lines for each `Block::ImageBlock` — an `[Image: alt]`
+//! placeholder plus NBSP padding — and this module adds two passes on top:
+//! [`build_snapshots`] records the screen rect each visible image will paint into, and
+//! [`paint_images`] renders the cached protocol onto it.  Without a detected image protocol the
+//! second pass is a no-op and the placeholder stays visible.
 
 use std::ops::Range;
 
@@ -27,40 +18,29 @@ use crate::editor::EditorState;
 use crate::image::{paint_halfblocks_partial, ImageCache, NativePaint};
 use crate::terminal::ImageProtocol;
 
-/// Per-frame geometry for one visible image block.  Screen coordinates
-/// are in terminal cells, relative to the document area's origin.  Only
-/// valid for the frame on which the snapshot was built.
+/// Per-frame geometry for one visible image block, in terminal cells relative to the document
+/// area's origin.  Valid only for the frame it was built on.
 #[derive(Debug, Clone)]
 pub struct ImageLayoutSnapshot {
     /// Virtual-block index in the current `ParsedDoc::source_map`.
     pub block_idx: usize,
-    /// Alt text, used for the fallback placeholder when the image can't
-    /// be rendered. Currently consumed only by tests; the live placeholder
+    /// Alt text for the fallback placeholder.  Consumed only by tests; the live placeholder
     /// path is in `ui::rendered_view`.
     #[allow(dead_code)]
     pub alt: String,
-    /// URL as it appears in the Markdown source.  The key into
-    /// `EditorState::images`.
+    /// URL as written in the source; the key into `EditorState::images`.
     pub url: String,
-    /// Screen rect (viewport-relative) occupied by the reserved image
-    /// area.  Size is **stable** across scrolls: `width = area.width`,
-    /// `height = image_max_height`.  Position (`y`) moves with scroll;
-    /// the rect may overflow the viewport bounds — callers should check
-    /// against the document area before painting so the image doesn't
-    /// overwrite neighbouring widgets.
+    /// The reserved image area, viewport-relative.  Its size is **stable** across scrolls
+    /// (`image_max_height` rows × `area.width`) while `y` moves, so the rect may overflow the
+    /// viewport — check it against the document area before painting.
     pub rect: Rect,
-    /// Intended top of the image in document-area-relative coordinates,
-    /// including any negative offset for an image whose top has scrolled
-    /// past the viewport.  Used by `paint_images` to decide whether the
-    /// full rect is within the area.
+    /// Intended top, document-area-relative, staying *negative* for an image scrolled off the
+    /// top so `paint_images` can tell partial visibility from full.
     pub natural_top: isize,
 }
 
-/// What a `(col, row)` click falls on inside an image block.
-///
-/// Used by tests in this module; production code uses other hit-test
-/// routines.  Kept as a concrete type so the surface is stable for when
-/// click-on-image affordances land.
+/// What a `(col, row)` click falls on inside an image block.  Used only by this module's
+/// tests today; kept for when click-on-image affordances land.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageHit {
@@ -68,8 +48,7 @@ pub enum ImageHit {
 }
 
 impl ImageLayoutSnapshot {
-    /// Return the visible byte range of the image block's source (the
-    /// `![alt](url)` line).  Used by tests in this module.
+    /// Visible byte range of the image block's `![alt](url)` source line.  Tests only.
     #[allow(dead_code)]
     pub fn source_range(&self, state: &EditorState) -> Option<Range<usize>> {
         state
@@ -95,26 +74,15 @@ impl ImageLayoutSnapshot {
     }
 }
 
-/// Scan the visible lines for `Block::ImageBlock`s and produce one
-/// snapshot per image whose reserved rows intersect the viewport.
+/// One snapshot per `Block::ImageBlock` whose reserved rows intersect the viewport.
 ///
-/// `scroll` is the number of visual rows skipped at the top; matches
-/// `state.scroll` in rendered-edit mode or the preview's own scroll
-/// offset.  `area` is the document area (editor content region — not
-/// including status/hint bars).
+/// `scroll` is the visual rows skipped at the top; `area` is the document area, excluding the
+/// status / hint bars.  The returned `rect` always carries the image's **full** reserved size
+/// even when partly scrolled off, keeping the dimensions stable across scrolls so
+/// `paint_images` can reuse the cached `StatefulProtocol` encoding.
 ///
-/// The returned `rect` always has the image's **full** reserved size
-/// (`image_max_height` rows × `area.width` cols), regardless of whether
-/// part of it is scrolled off-screen.  This keeps the rect dimensions
-/// stable across scrolls so `paint_images` can reuse the cached
-/// `StatefulProtocol` encoding.  The rect's `y` may be negative
-/// (represented as saturating to 0 within `area.y` bounds); callers
-/// should check `rect` fits fully inside `area` before painting.
-/// Refresh `snapshots` in place when the cache key (`scroll`, `area`,
-/// `parsed_version`) differs from the previous frame's, otherwise leave
-/// both the vector and the key untouched.  Caches the geometry scan so
-/// idle redraws and non-layout-affecting events don't pay the
-/// O(lines × images) cost every frame.
+/// The cached wrapper refreshes `snapshots` in place only when the key (`scroll`, `area`,
+/// `parsed_version`) changes, so idle redraws don't pay the O(lines × images) scan.
 pub fn build_snapshots_cached(
     state: &EditorState,
     area: Rect,
@@ -149,13 +117,8 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Im
         if rendered_range.is_empty() {
             continue;
         }
-        // Sum visual rows for lines `[scroll, rendered_range.start)` —
-        // that's where the block's top row lands on screen.  Lines may
-        // wrap; short placeholder-only lines do not, but preceding
-        // content might.  Resolved via `ParsedDoc::visual_rows_before`
-        // which is O(1) after the per-frame cache is populated; the
-        // historical loop here re-invoked `visual_rows_for_line` for
-        // every preceding line on every scroll tick.
+        // Where the block's top row lands on screen.  `visual_rows_before` is O(1) once the
+        // per-frame cache is warm; a loop here would re-measure every preceding line per tick.
         let block_top = state.parsed.visual_rows_before(rendered_range.start, width);
         let y_offset: isize = block_top as isize - scroll as isize;
 
@@ -164,13 +127,12 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Im
         let image_bottom = image_top + reserved;
         let viewport_top = area.y as isize;
         let viewport_bottom = (area.y as isize) + area.height as isize;
-        // Skip entirely when not even a single row intersects the viewport.
+        // Not even one row intersects the viewport.
         if image_bottom <= viewport_top || image_top >= viewport_bottom {
             continue;
         }
 
-        // Clamp y to u16 for the Rect; paint_images will refuse to
-        // render if the (uncropped) rect doesn't fully fit.
+        // Clamp y to u16; `paint_images` refuses an uncropped rect that doesn't fully fit.
         let rect_y = image_top.max(0).min(u16::MAX as isize) as u16;
         out.push(ImageLayoutSnapshot {
             block_idx: info.block_idx,
@@ -190,9 +152,8 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Im
 
 /// Diff-mode counterpart of [`build_snapshots_cached`].
 ///
-/// Keys on `DiffState::layout_version` rather than
-/// `EditorState::parsed_version`: the geometry here comes from the diff
-/// layout, and the editor's parse tracks a different document.
+/// Keys on `DiffState::layout_version`, not `EditorState::parsed_version`: the geometry comes
+/// from the diff layout, and the editor's parse tracks a different document.
 pub fn build_diff_snapshots_cached(
     diff: &DiffState,
     area: Rect,
@@ -210,20 +171,12 @@ pub fn build_diff_snapshots_cached(
 
 /// Geometry for the images visible in a diff review's *clean* regions.
 ///
-/// Mirrors [`build_snapshots`], but takes its row arithmetic from the
-/// diff layout's `VisualRowCache` instead of `ParsedDoc::visual_rows_before`
-/// — in diff mode `scroll` counts diff visual rows, and a block's rows
-/// are preceded by raw hunk rows the editor's parse knows nothing about.
+/// Mirrors [`build_snapshots`] but takes its row arithmetic from the diff layout's
+/// `VisualRowCache`: in diff mode `scroll` counts diff visual rows, preceded by raw hunk rows
+/// the editor's parse knows nothing about.  An image in a *changed* region has no
+/// `ContextRendered` row, so it yields no snapshot and reserves nothing — as intended.
 ///
-/// An image inside a *changed* region has no `ContextRendered` row at
-/// all (it is shown as raw `![alt](url)` source), so it yields no
-/// snapshot and reserves nothing — which is exactly the wanted
-/// behavior.
-///
-/// The `isize` arithmetic is load-bearing, as it is in `build_snapshots`:
-/// an image scrolled partly off the top must keep a *negative*
-/// `natural_top` rather than saturating at 0, or `paint_images` treats a
-/// half-visible image as fully visible.
+/// The `isize` arithmetic is load-bearing for the same reason as in [`build_snapshots`].
 pub fn build_diff_snapshots(
     diff: &DiffState,
     area: Rect,
@@ -246,8 +199,7 @@ pub fn build_diff_snapshots(
             if rendered_range.is_empty() {
                 continue;
             }
-            // No `ContextRendered` entry for the block's first rendered
-            // row ⇒ it sits in a raw region.
+            // No `ContextRendered` entry ⇒ the block sits in a raw region.
             let (Some(&first), Some(&last)) = (
                 index.get(&rendered_range.start),
                 index.get(&(rendered_range.end - 1)),
@@ -256,8 +208,7 @@ pub fn build_diff_snapshots(
             };
             let block_top = rc.before(first);
             let y_offset: isize = block_top as isize - scroll as isize;
-            // Reserved height measured the way the row cache measures it,
-            // so the rect matches the rows the layout actually set aside.
+            // Measured the way the row cache does, so the rect matches the reserved rows.
             let reserved = rc.before(last + 1).saturating_sub(block_top) as isize;
             let image_top = area.y as isize + y_offset;
             let image_bottom = image_top + reserved;
@@ -284,9 +235,7 @@ pub fn build_diff_snapshots(
     out
 }
 
-/// Bundle of inputs the `paint_images` pass needs.  Grouped into a
-/// struct so the function signature stays readable — everything here is
-/// already held by the App or the `EditorView` at call time.
+/// Inputs for the [`paint_images`] pass, grouped so the signature stays readable.
 pub struct PaintContext<'a> {
     /// Document area that image rects are relative to.
     pub area: Rect,
@@ -296,47 +245,29 @@ pub struct PaintContext<'a> {
     pub images: &'a mut ImageCache,
     /// Native-protocol picker (e.g. Kitty / Sixel / iTerm2 / Halfblocks).
     pub native_picker: Option<&'a ratatui_image::picker::Picker>,
-    /// Halfblocks-only picker — built from the same font-size as
-    /// `native_picker`; used for the position-independent partial-render
+    /// Halfblocks-only picker, same font size as `native_picker`; the position-independent
     /// fallback.
     pub halfblocks_picker: Option<&'a ratatui_image::picker::Picker>,
-    /// Detected native protocol (used to short-circuit the halfblocks
-    /// fallback when the native is Kitty, which handles scrolling
-    /// without re-encode).
+    /// Detected native protocol.
     pub native_protocol: Option<ImageProtocol>,
-    /// True while the scroll position has changed within the quiesce
-    /// window (`App::is_scrolling`).  During this window, non-Kitty
-    /// protocols fall back to halfblocks even when the image is fully
-    /// visible — avoids per-frame re-encode flicker on scroll.
+    /// Inside the post-scroll quiesce window, during which every protocol falls back to
+    /// halfblocks to avoid per-frame re-encode flicker.
     pub is_scrolling: bool,
-    /// True while a modal is open over the editor.  Forces every image
-    /// to render via halfblocks so the buffer-based dim sweep
-    /// (`ui::dim::dim_area`) actually recesses the image alongside the
-    /// rest of the document — native graphics protocols (Sixel / Kitty
-    /// / iTerm2) write past the ratatui cell buffer and would otherwise
-    /// stay at full brightness behind the modal.
+    /// A modal is open: force halfblocks so the buffer-based dim sweep recesses the image too.
+    /// Native protocols write past the ratatui cell buffer and would stay at full brightness.
     pub modal_open: bool,
     /// Block index to skip (cursor's block during raw-reveal).
     pub suppress_block_idx: Option<usize>,
-    /// Theme background color used (a) to clear the reserved rect
-    /// before the protocol paints over it and (b) to substitute for
-    /// `Color::Reset` cells produced by the halfblocks renderer.
-    /// Without (b), letter-box cells in the scratch buffer would punch
-    /// through to the terminal's own background — visible as `Reset`
-    /// bands while scrolling and around any partially-visible image.
+    /// Theme background: clears the reserved rect before painting, and substitutes for the
+    /// halfblocks renderer's `Color::Reset` cells — without which letter-box cells punch
+    /// through to the terminal's own background as visible bands.
     pub bg: Color,
 }
 
-/// Render each image onto its reserved rect, overlaying the `[Image: alt]`
-/// placeholder emitted by the text renderer.
+/// Render each image onto its reserved rect, over the `[Image: alt]` placeholder.
 ///
-/// The cache builds the halfblocks scratch synchronously on cold path,
-/// so a halfblocks rendering of every decoded image is always available
-/// as a fallback.  `native` (Kitty / Sixel / iTerm2) is encoded off-
-/// thread by the worker and gated on `pair.native_ready`; until that
-/// flag flips, we render halfblocks.
-///
-/// Decision per snapshot:
+/// The cache builds the halfblocks scratch synchronously, so a fallback is always available;
+/// `native` is encoded off-thread and gated on `pair.native_ready`.  Per snapshot:
 ///
 /// | Image state                                       | Rendering  |
 /// |---------------------------------------------------|------------|
@@ -347,9 +278,8 @@ pub struct PaintContext<'a> {
 /// | Fully visible, scrolling, native is Sixel/iTerm2  | scratch    |
 /// | Partially visible (any state)                     | scratch    |
 ///
-/// The halfblocks scratch path is a cell-copy from the pre-rendered
-/// `Buffer` held on the pair, so per-frame cost is O(rect area) with no
-/// encoding work.
+/// The scratch path is a cell-copy from the pre-rendered `Buffer` on the pair, so it costs
+/// O(rect area) with no encoding.
 pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
     if ctx.native_picker.is_none() || ctx.native_protocol.is_none() {
         return;
@@ -363,15 +293,14 @@ pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
         }
         let top = snap.natural_top;
         let bottom = top + snap.rect.height as isize;
-        // Skip anything that has no overlap with the viewport at all.
+        // No overlap with the viewport at all.
         if bottom <= viewport_top || top >= viewport_bottom {
             continue;
         }
         let fully_visible = top >= viewport_top && bottom <= viewport_bottom;
 
-        // Ensure the protocol pair exists for this (url, w, h).  Cold
-        // path builds the halfblocks scratch synchronously and a
-        // ThreadProtocol for the native encode that is still in flight.
+        // Cold path builds the scratch synchronously plus a ThreadProtocol for the in-flight
+        // native encode.
         if ctx
             .images
             .get_protocol_pair(
@@ -386,28 +315,16 @@ pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
             continue;
         }
 
-        // Clear the visible portion of the reserved rect before the
-        // protocol paints over it.  The text renderer emits an
-        // `[Image: alt]` placeholder on row 0 plus NBSP padding; without
-        // this clear, any cell of the reserved rect that the image
-        // doesn't write to (letter-boxed area for non-square aspect,
-        // halfblocks' position-dependent cell data, the trailing
-        // padding right of a narrow image on row 0) keeps the
-        // placeholder text visible behind the image — a "label
-        // peeking out from behind the image" bug.  The clear is a
-        // no-op for rows already blank.
+        // Without this, any reserved cell the image doesn't write to — letter-boxing, the
+        // padding right of a narrow image — keeps the `[Image: alt]` placeholder visible
+        // behind the image.
         clear_visible_reserved_rect(snap, &ctx.area, ctx.buf, ctx.bg);
 
-        // During active scroll, ALL protocols fall back to halfblocks.
-        // Earlier revisions exempted Kitty here on the theory that its
-        // virtual-placement protocol handles scroll without re-encoding,
-        // but Ghostty (and apparently other Kitty-compatible terminals)
-        // still re-composites the image at each new cell position — the
-        // dominant source of scroll lag on image-heavy documents.
-        // Halfblocks are position-independent cell content; ratatui's
-        // diff emits only the changed cells, and the terminal treats them
-        // like any other text.  The native protocol re-engages once
-        // `SCROLL_QUIESCE` elapses (150 ms of no scroll input).
+        // During scroll ALL protocols fall back to halfblocks, Kitty included: Ghostty and
+        // other Kitty-compatible terminals still re-composite at each new cell position, the
+        // dominant source of scroll lag on image-heavy documents.  Halfblocks are
+        // position-independent, so ratatui's diff emits only changed cells.  Native re-engages
+        // once `SCROLL_QUIESCE` elapses.
         let use_native = fully_visible && !ctx.is_scrolling && !ctx.modal_open;
 
         if use_native {
@@ -418,20 +335,13 @@ pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
     }
 }
 
-/// Overwrite every cell of the on-screen slice of `snap.rect` with a
-/// default (blank) cell, so any `[Image: alt]` placeholder text emitted
-/// by the line renderer does not bleed through letter-box or trailing
-/// cells left untouched by the image protocol.
+/// Blank the on-screen slice of `snap.rect` so the `[Image: alt]` placeholder can't bleed
+/// through letter-box or trailing cells the protocol leaves untouched.
 ///
-/// Correctness constraints:
-/// * Must be called AFTER the protocol-pair existence check — we only
-///   want to clear when we're actually about to paint an image.  A
-///   cleared rect with no overlay would leave a blank square instead of
-///   the loading-state `[Image: alt]` placeholder.
-/// * Clears only cells that overlap the document `area` — cells outside
-///   belong to other widgets (status bar, hint line) and must be left
-///   alone.  The vertical intersection matters because a snap whose top
-///   is scrolled off-screen has `natural_top < area.y`.
+/// Two constraints: call it only AFTER the protocol-pair check, or a cleared rect with no
+/// overlay leaves a blank square instead of the loading placeholder; and clear only cells
+/// overlapping `area`, since a snap scrolled off the top has `natural_top < area.y` and the
+/// cells above belong to other widgets.
 fn clear_visible_reserved_rect(
     snap: &ImageLayoutSnapshot,
     area: &Rect,
@@ -459,15 +369,12 @@ fn clear_visible_reserved_rect(
     }
 }
 
-/// Render the pair's native `ThreadProtocol` into `buf`, shipping a
-/// resize-encode request to the worker on the cold path and tracking it
-/// on the cache's pending FIFO.  If the native protocol isn't yet
-/// encoded (`native_ready == false`), falls back to the halfblocks
-/// scratch so the user never sees a placeholder flash.
+/// Render the pair's native `ThreadProtocol` into `buf`, shipping a resize-encode to the worker
+/// on the cold path.  Falls back to the halfblocks scratch while `native_ready` is false, so
+/// the user never sees a placeholder flash.
 ///
-/// When the previous frame already transmitted this exact image at this
-/// exact rect, the rect is marked `skip` instead of re-rendered so the
-/// payload isn't sent again — see [`NativePaint`] for why that matters.
+/// When the previous frame already transmitted this exact image at this exact rect, the rect is
+/// marked `skip` rather than re-rendered — see [`NativePaint`] for why that matters.
 fn paint_native(images: &mut ImageCache, snap: &ImageLayoutSnapshot, buf: &mut TuiBuf, bg: Color) {
     let resize = Resize::Fit(None);
     let frame = images.frame_seq();
@@ -478,10 +385,8 @@ fn paint_native(images: &mut ImageCache, snap: &ImageLayoutSnapshot, buf: &mut T
         };
         let full_rect = Rect::new(0, 0, snap.rect.width, snap.rect.height);
         let generation = pair.native_generation;
-        // Reusable only if the previous frame left this exact encoding
-        // at this exact rect on screen.  A one-frame gap means something
-        // else painted here (scratch, a suppressed block, nothing at
-        // all), so the terminal no longer holds the image.
+        // Reusable only if the *previous* frame left this exact encoding at this exact rect.
+        // A one-frame gap means something else painted here, so the terminal lost the image.
         let already_on_screen = pair.last_native_paint
             == Some(NativePaint {
                 rect: snap.rect,
@@ -489,8 +394,7 @@ fn paint_native(images: &mut ImageCache, snap: &ImageLayoutSnapshot, buf: &mut T
                 frame: frame.wrapping_sub(1),
             });
 
-        // No native (terminal's preferred protocol IS halfblocks) —
-        // scratch IS the rendering.
+        // The terminal's preferred protocol IS halfblocks, so scratch is the rendering.
         let Some(native) = pair.native.as_mut() else {
             pair.last_native_paint = None;
             if let Some(scratch) = pair.halfblocks_scratch.as_ref() {
@@ -499,25 +403,18 @@ fn paint_native(images: &mut ImageCache, snap: &ImageLayoutSnapshot, buf: &mut T
             return;
         };
 
-        // Ship an encode request if needed.  ThreadProtocol::resize_encode
-        // *takes* the inner StatefulProtocol and sends it to the worker;
-        // render() is a silent no-op for as long as the response is in
-        // flight.  ratatui-image 11 takes a `Size` (size-without-position)
-        // here rather than a `Rect`; `Rect: Into<Size>` drops the origin.
+        // `resize_encode` *takes* the inner StatefulProtocol and sends it to the worker, so
+        // `render` is a silent no-op while the response is in flight.  ratatui-image 11 wants
+        // a `Size` here, not a `Rect`; `Rect: Into<Size>` drops the origin.
         let new_size = native.needs_resize(&resize, snap.rect.into());
         let needs = new_size.is_some();
         if let Some(new_size) = new_size {
             native.resize_encode(&resize, new_size);
         }
-        // `native_ready` alone is not enough to license a native render:
-        // it latches on the first successful encode and is never cleared,
-        // so on any frame that dispatches a *re*-encode (terminal resize,
-        // a changed reserved height) the inner protocol has just been
-        // moved to the worker and `render` would draw nothing at all —
-        // over a rect `clear_visible_reserved_rect` just blanked, leaving
-        // an empty hole until the response lands.  `protocol_type()`
-        // returns `None` exactly when the inner protocol is away, so it
-        // is the precise test for "can render right now".
+        // `native_ready` latches on the first encode and is never cleared, so on a frame that
+        // dispatches a *re*-encode the inner protocol is away at the worker and `render` would
+        // draw nothing over a just-blanked rect.  `protocol_type()` is `None` exactly when the
+        // protocol is away, so it is the precise "can render right now" test.
         let inner_present = native.protocol_type().is_some();
         if pair.native_ready && inner_present {
             if already_on_screen {
@@ -543,24 +440,15 @@ fn paint_native(images: &mut ImageCache, snap: &ImageLayoutSnapshot, buf: &mut T
     }
 }
 
-/// Mark every cell of `rect` as skipped so `ratatui` emits nothing for
-/// the region on this frame, leaving whatever the terminal already has
-/// there — the previous frame's native image — undisturbed.
+/// Mark every cell of `rect` skipped so ratatui emits nothing there this frame, leaving the
+/// previous frame's native image on screen.  The cells underneath are already blanked by
+/// `clear_visible_reserved_rect`, so a later unskipped frame diffs blank-vs-payload.
 ///
-/// `clear_visible_reserved_rect` has already blanked these cells, which
-/// is what a `skip` cell should carry: if a later frame stops skipping,
-/// the diff sees a blank-vs-payload change and re-transmits.
-///
-/// **This makes the frame buffer deliberately lie** — it records blanks
-/// over a region the terminal is actually showing an image in.  What
-/// keeps that from stranding a ghost image is a property of ratatui's
-/// hand-written `impl PartialEq for Cell`: it compares the `diff_option`
-/// alongside symbol and style.  So the moment a frame stops skipping
-/// these cells, they compare unequal to the skipped ones and are emitted
-/// — even when both are blank.  That is what erases the image when its
-/// rows scroll away into empty space, where a symbol-and-style-only
-/// comparison would diff clean and leave the picture on screen.  The
-/// dependency is load-bearing and lives upstream, so
+/// **This makes the frame buffer deliberately lie** about a region the terminal is showing an
+/// image in.  What stops a ghost image is that ratatui's hand-written `impl PartialEq for Cell`
+/// compares `skip` alongside symbol and style: the moment a frame stops skipping, blank-skipped
+/// and blank-unskipped cells compare unequal and the blanks are emitted, erasing the image when
+/// it scrolls away into empty space.  That upstream detail is load-bearing, so
 /// `skipped_rect_still_diffs_against_the_same_cells_unskipped` pins it.
 fn mark_rect_skipped(rect: Rect, buf: &mut TuiBuf) {
     for y in rect.y..rect.y.saturating_add(rect.height) {
@@ -572,10 +460,8 @@ fn mark_rect_skipped(rect: Rect, buf: &mut TuiBuf) {
     }
 }
 
-/// Cell-copy the halfblocks scratch into `buf`, clipping to the visible
-/// portion of `area`.  Used whenever native isn't appropriate for this
-/// frame (scrolling + non-Kitty, partial visibility, or native still
-/// pre-encoding).
+/// Cell-copy the halfblocks scratch into `buf`, clipped to `area`.  Used whenever native isn't
+/// appropriate this frame.
 fn paint_scratch_partial(
     images: &mut ImageCache,
     snap: &ImageLayoutSnapshot,
@@ -587,8 +473,7 @@ fn paint_scratch_partial(
         Some(p) => p,
         None => return,
     };
-    // Halfblock cells land on top of whatever native transmission was
-    // there; the terminal no longer holds the image.
+    // These cells land over any native transmission, so the terminal no longer holds it.
     pair.last_native_paint = None;
     let Some(scratch) = pair.halfblocks_scratch.as_ref() else {
         return;
@@ -633,12 +518,10 @@ mod tests {
 
     // ── Native re-transmission suppression ───────────────────────────
     //
-    // The iTerm2 and Sixel protocols put the whole base64 PNG in one
-    // cell's `symbol`, and `Buffer::diff` treats that symbol's display
-    // width as an invalidation run — so one image forces every later
-    // cell, including a second image's payload, back into the diff on
-    // every frame.  These tests pin the suppression that stops it; see
-    // `image::cache::NativePaint`.
+    // iTerm2 and Sixel put the whole base64 PNG in one cell's `symbol`, and `Buffer::diff`
+    // treats that symbol's display width as an invalidation run — so one image forces every
+    // later cell, a second image's payload included, back into the diff every frame.  These
+    // tests pin the suppression that stops it; see `image::cache::NativePaint`.
 
     mod native_reuse {
         use std::sync::mpsc;
@@ -657,9 +540,8 @@ mod tests {
             height: 20,
         };
 
-        /// An iTerm2 picker — the protocol whose `render` delivers the
-        /// full PNG every time.  Constructed by stamping the protocol
-        /// rather than probing, so the test is terminal-independent.
+        /// An iTerm2 picker — the protocol whose `render` delivers the full PNG every time.
+        /// Stamped rather than probed, so the test is terminal-independent.
         #[allow(deprecated)]
         fn iterm2_picker() -> Picker {
             let mut picker = Picker::from_fontsize((1, 2).into());
@@ -715,8 +597,7 @@ mod tests {
                 }
             }
 
-            /// Stand in for the encoder worker: perform every queued
-            /// resize-encode synchronously and route the responses back.
+            /// Stand in for the encoder worker: run every queued resize-encode synchronously.
             fn drain_encoder(&mut self) {
                 while let Ok(req) = self.rx.try_recv() {
                     let resp = req.resize_encode().expect("encode succeeds");
@@ -729,9 +610,8 @@ mod tests {
                 self.frame_suppressing(snaps, scrolling, None)
             }
 
-            /// As [`Self::frame`], but with `suppress_block_idx` set —
-            /// the raw-reveal path, which skips the block entirely
-            /// rather than painting anything over its rect.
+            /// [`Self::frame`] with `suppress_block_idx` set — the raw-reveal path, which
+            /// paints nothing over the block's rect.
             fn frame_suppressing(
                 &mut self,
                 snaps: &[ImageLayoutSnapshot],
@@ -757,9 +637,8 @@ mod tests {
             }
         }
 
-        /// True when the cell at `rect`'s origin carries an iTerm2
-        /// inline-image escape — i.e. the whole PNG was just handed to
-        /// the terminal on this frame.
+        /// True when the cell at `rect`'s origin carries an iTerm2 inline-image escape — the
+        /// whole PNG was handed to the terminal this frame.
         fn transmitted(buf: &TuiBuf, rect: Rect) -> bool {
             buf.cell((rect.x, rect.y))
                 .is_some_and(|c| c.symbol().contains("]1337;File="))
@@ -770,14 +649,11 @@ mod tests {
             let snaps = vec![snap("a.png", 0, 6), snap("b.png", 8, 6)];
             let mut h = Harness::new(&["a.png", "b.png"]);
 
-            // Frame 1 builds the pairs and ships the encodes; the
-            // protocols are away at the worker, so this frame paints
-            // halfblocks.
+            // Frame 1 ships the encodes; the protocols are away, so it paints halfblocks.
             h.frame(&snaps, false);
             h.drain_encoder();
 
-            // Frame 2 is the transmission: both payloads land in the
-            // buffer.
+            // Frame 2 transmits: both payloads land in the buffer.
             let transmit = h.frame(&snaps, false);
             assert!(
                 transmitted(&transmit, snaps[0].rect),
@@ -788,9 +664,8 @@ mod tests {
                 "second image should carry its base64 payload"
             );
 
-            // Frames 3 and 4 are idle redraws — a cursor blink, say.
-            // Nothing may be re-sent, or iTerm2 blanks and repaints each
-            // image (the ~2 Hz flicker this guards).
+            // Idle redraws: nothing may be re-sent, or iTerm2 blanks and repaints each image
+            // (the ~2 Hz flicker this guards).
             let idle_a = h.frame(&snaps, false);
             let idle_b = h.frame(&snaps, false);
             for s in &snaps {
@@ -815,13 +690,11 @@ mod tests {
             let transmit = h.frame(&snaps, false);
             assert!(transmitted(&transmit, snaps[0].rect));
 
-            // A scroll frame paints halfblock cells over the region, so
-            // the terminal no longer holds the image…
+            // A scroll frame paints halfblocks over the region, so the terminal loses it…
             let scratch = h.frame(&snaps, true);
             assert!(!transmitted(&scratch, snaps[0].rect));
 
-            // …and the next settled frame must send it again rather than
-            // skip onto a rect that now shows halfblocks.
+            // …and the next settled frame must send it again.
             let resent = h.frame(&snaps, false);
             assert!(
                 transmitted(&resent, snaps[0].rect),
@@ -829,18 +702,11 @@ mod tests {
             );
         }
 
-        /// The suppression relies on the frame-adjacency rule alone for
-        /// any path that leaves the rect *unpainted* — `paint_images`
-        /// `continue`s past a suppressed block without touching the
-        /// record, and an off-screen image never reaches `paint_native`
-        /// at all.  The renderer's `[Image: alt]` placeholder lands over
-        /// the region on such a frame, so the terminal no longer holds
-        /// the image and the next native frame must send it again.
-        ///
-        /// Distinct from the scratch case above, which
-        /// `paint_scratch_partial` clears explicitly — this one would
-        /// still pass if the `frame` field were dropped from the
-        /// comparison, so it is pinned separately.
+        /// For paths that leave the rect *unpainted* — a suppressed block, an off-screen image
+        /// — the suppression rests on frame adjacency alone: the `[Image: alt]` placeholder
+        /// lands there instead, so the next native frame must re-send.  Pinned separately from
+        /// the scratch case, which `paint_scratch_partial` clears explicitly and which would
+        /// still pass without the `frame` field.
         #[test]
         fn a_suppressed_frame_forces_the_next_native_frame_to_retransmit() {
             let snaps = vec![snap("a.png", 0, 6)];
@@ -851,8 +717,7 @@ mod tests {
             // Settled: the next frame skips rather than re-sending.
             assert!(!transmitted(&h.frame(&snaps, false), snaps[0].rect));
 
-            // Raw-reveal on the image's own block: nothing is painted
-            // over the rect, and the record is left untouched.
+            // Raw-reveal on the image's own block paints nothing and leaves the record.
             let suppressed = h.frame_suppressing(&snaps, false, Some(snaps[0].block_idx));
             assert!(!transmitted(&suppressed, snaps[0].rect));
 
@@ -862,18 +727,11 @@ mod tests {
             );
         }
 
-        /// The skip marking makes the frame buffer claim the image's
-        /// rows are blank while the terminal is still showing the image.
-        /// Nothing would ever erase that image if a later blank frame
-        /// diffed clean against the skipped one — which is exactly what
-        /// happens when the image scrolls away into empty space below
-        /// the end of the document.
-        ///
-        /// What saves it is that ratatui's `impl PartialEq for Cell`
-        /// compares `skip` as a field, so blank-skipped and
-        /// blank-unskipped cells are unequal and the blanks are emitted.
-        /// That is an upstream implementation detail this module depends
-        /// on, so assert it directly.
+        /// The skip marking makes the buffer claim blank rows while the terminal shows an
+        /// image; nothing would erase it if a later blank frame diffed clean against the
+        /// skipped one — exactly what happens when the image scrolls into empty space.  What
+        /// saves it is that ratatui's `impl PartialEq for Cell` compares `skip`, so the blanks
+        /// are emitted.  An upstream detail, asserted directly.
         #[test]
         fn skipped_rect_still_diffs_against_the_same_cells_unskipped() {
             let snaps = vec![snap("a.png", 0, 6)];
@@ -884,8 +742,7 @@ mod tests {
             let skipped = h.frame(&snaps, false);
             assert!(!transmitted(&skipped, snaps[0].rect));
 
-            // The image is gone and its rows are now empty document
-            // space: no snapshots, so nothing paints over the rect.
+            // The image is gone and its rows are empty space: no snapshots, nothing painted.
             let mut blank = TuiBuf::empty(AREA);
             for y in 0..AREA.height {
                 for x in 0..AREA.width {
@@ -916,8 +773,7 @@ mod tests {
             h.frame(&snaps, false);
             assert!(!transmitted(&h.frame(&snaps, false), snaps[0].rect));
 
-            // A resize / `terminal.clear()` wipes the screen behind our
-            // back; the record must not survive it.
+            // A resize / `terminal.clear()` wipes the screen; the record must not survive it.
             h.images.invalidate_native_paints();
             assert!(transmitted(&h.frame(&snaps, false), snaps[0].rect));
         }
@@ -952,12 +808,12 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         let populated_key = key;
 
-        // Identical inputs → key preserved, snapshots still one entry.
+        // Identical inputs preserve the key.
         build_snapshots_cached(&state, area, 0, &mut snapshots, &mut key);
         assert_eq!(key, populated_key);
         assert_eq!(snapshots.len(), 1);
 
-        // Scroll change → cache invalidates and repopulates.
+        // A scroll change invalidates and repopulates.
         build_snapshots_cached(&state, area, 10, &mut snapshots, &mut key);
         assert_ne!(key, populated_key);
     }
@@ -975,11 +831,8 @@ mod tests {
 
     #[test]
     fn build_snapshots_keeps_full_reserved_height_for_overflow() {
-        // Post-fix invariant: snap.rect.height is ALWAYS the full reserved
-        // size (image_max_height), regardless of what fits in the
-        // viewport.  paint_images then refuses to paint when the full
-        // reserved rect doesn't fit, which is what keeps the cached
-        // StatefulProtocol encoding stable across scrolls.
+        // `rect.height` is ALWAYS the full reserved size regardless of what fits;
+        // `paint_images` refuses when it doesn't, which keeps the cached encoding stable.
         let src = "![big](big.png)\n";
         let state = state_from(src, 20);
         let area = Rect::new(0, 0, 20, 5);
@@ -990,8 +843,7 @@ mod tests {
 
     // ── Diff-mode snapshots ──────────────────────────────────────────
 
-    /// A review of `old` → `new` with the rendered new-side parse
-    /// installed, built at the same width the tests query at.
+    /// A review of `old` → `new` with the new-side parse installed, at the query width.
     fn diff_from(old: &str, new: &str, image_max_height: usize) -> DiffState {
         let mut diff = DiffState::new(old, new).expect("non-empty diff");
         let parsed = crate::document::ParsedDoc::build(new, theme(), true, image_max_height);
@@ -1001,8 +853,7 @@ mod tests {
 
     #[test]
     fn diff_snapshot_matches_the_rows_the_layout_reserved() {
-        // The image is untouched; the change is in the paragraph below
-        // it, so the image block stays clean and renders.
+        // The change is in the paragraph below, so the image block stays clean and renders.
         let old = "Intro.\n\n![cat](cat.png)\n\nTail.\n";
         let new = "Intro.\n\n![cat](cat.png)\n\nTAIL!\n";
         let diff = diff_from(old, new, 4);
@@ -1011,8 +862,7 @@ mod tests {
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].url, "cat.png");
         assert_eq!(snaps[0].rect.height, 4);
-        // `rect.y` is the diff visual row the layout put the block's
-        // first rendered line on.
+        // `rect.y` is the diff visual row of the block's first rendered line.
         let expected = diff.with_layout_index(area.width as usize, |_lines, rc, index| {
             let parsed = diff.parsed_new.as_ref().expect("parse installed");
             let block = parsed
@@ -1028,8 +878,7 @@ mod tests {
 
     #[test]
     fn a_changed_image_block_yields_no_diff_snapshot() {
-        // The image itself changed, so its block is in a raw region and
-        // shows as `![alt](url)` source — no rows are reserved for it.
+        // A changed image is in a raw region and reserves no rows.
         let old = "Intro.\n\n![cat](cat.png)\n\nTail.\n";
         let new = "Intro.\n\n![cat](other.png)\n\nTail.\n";
         let diff = diff_from(old, new, 4);
@@ -1039,8 +888,7 @@ mod tests {
 
     #[test]
     fn a_partly_scrolled_diff_snapshot_keeps_a_negative_natural_top() {
-        // `isize` regression: saturating at 0 would make `paint_images`
-        // treat a half-scrolled image as fully visible.
+        // Saturating at 0 would make `paint_images` treat a half-scrolled image as full.
         let old = "Intro.\n\n![cat](cat.png)\n\nTail.\n";
         let new = "Intro.\n\n![cat](cat.png)\n\nTAIL!\n";
         let diff = diff_from(old, new, 6);
@@ -1121,9 +969,7 @@ mod tests {
         }
     }
 
-    /// Stand-in for the `[Image: alt]` placeholder text the line renderer
-    /// emits on row 0 of an image block.  Pre-populates every cell in
-    /// `area` with `placeholder_ch` so the clear's effect is observable.
+    /// Stand-in for the `[Image: alt]` placeholder: fills `area` so the clear is observable.
     fn pre_populate_buf(area: Rect, placeholder_ch: char) -> TuiBuf {
         let mut buf = TuiBuf::empty(area);
         for y in area.y..area.y + area.height {
@@ -1138,11 +984,7 @@ mod tests {
 
     #[test]
     fn clear_rect_blanks_every_cell_of_visible_reserved_area() {
-        // Reserved rect fully inside the area — every cell should become
-        // default (space).  This is the regression test for the "label
-        // peeking out from behind the image" bug: without the clear, a
-        // narrow image protocol leaves the placeholder text visible
-        // where the image doesn't paint.
+        // The regression test for placeholder text peeking out from behind a narrow image.
         let area = Rect::new(0, 0, 30, 20);
         let mut buf = pre_populate_buf(area, 'X');
         let snap = snap_with_top(2, 30, 4);
@@ -1161,15 +1003,11 @@ mod tests {
 
     #[test]
     fn clear_rect_clips_to_area_when_scrolled_off_top() {
-        // natural_top = -2: the top two rows of the reserved rect are
-        // above the viewport.  The clear must only touch in-viewport
-        // cells, leaving buf cells outside the area untouched (in this
-        // test they're simulated by a smaller area).
+        // natural_top = -2, so the top two reserved rows are above the viewport; the clear
+        // must touch only in-viewport cells.
         let area = Rect::new(0, 5, 30, 10);
-        // Pre-populate the buf with Xs at every cell the buf knows about.
         let mut buf = pre_populate_buf(area, 'X');
-        // snap top at row 3 (two above area.y=5); reserved height 6 →
-        // visible rows 5..9.
+        // Top at row 3 (two above area.y=5), height 6 → visible rows 5..9.
         let snap = snap_with_top(3, 30, 6);
         clear_visible_reserved_rect(&snap, &area, &mut buf, Color::Reset);
         for y in 5..15u16 {
@@ -1186,8 +1024,7 @@ mod tests {
 
     #[test]
     fn clear_rect_noop_when_snap_fully_above_area() {
-        // natural_top = -10, height = 4 → reserved rows [-10, -6), no
-        // overlap with area at y=0.  Nothing should be cleared.
+        // Reserved rows [-10, -6) don't overlap the area, so nothing is cleared.
         let area = Rect::new(0, 0, 10, 5);
         let mut buf = pre_populate_buf(area, 'X');
         let snap = snap_with_top(-10, 10, 4);

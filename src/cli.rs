@@ -1,17 +1,9 @@
-//! Command-line front end — everything edamame can do *without* starting
-//! the TUI.
+//! Command-line front end — everything edamame can do *without* starting the TUI.
 //!
-//! The flag surface is deliberately tiny (`--help`, `--version`,
-//! `--doctor`, `--no-config`, `--log`) and hand-parsed rather than routed
-//! through `clap`: the dependency graph is kept narrow on purpose
-//! (see `Cargo.toml`'s note on `mermaid-rs-renderer`'s `cli` feature,
-//! which is disabled for exactly this reason), and a few dozen lines of
-//! matching cost less than a derive macro plus four crates.
-//!
-//! `main` is a dispatcher over [`Invocation`]: parse first, then either
-//! print and exit or hand a [`RunOpts`] to the normal startup path.  All
-//! of it lives in the library crate — not in `main.rs` — so the parser's
-//! unit tests are reachable from `cargo test --lib` (see `lib.rs`).
+//! The tiny flag surface is hand-parsed rather than routed through `clap` to keep the dependency
+//! graph narrow.  `main` dispatches over [`Invocation`]: print and exit, or hand a [`RunOpts`] to
+//! the normal startup path.  Lives in the library crate so the parser's unit tests are reachable
+//! from `cargo test --lib`.  See `docs/dev/cli.md`.
 
 pub mod args;
 pub mod doctor;

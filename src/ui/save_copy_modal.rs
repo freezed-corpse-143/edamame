@@ -1,19 +1,7 @@
-//! Shared path-entry widget ([`SaveCopyState`] + [`SaveCopyView`]) used by
-//! the path-input modals — Save As, the file-deleted recovery prompt, and
-//! the dirty-conflict "save aside" flow.  Each modal supplies its own frame
-//! title and decides what the entered path does on submit.
-//!
-//! A single text field ("Path") above a Save / Cancel button row.  Tab
-//! / Shift-Tab and Up / Down move between the three focus targets;
-//! while focus is on the field, character keys insert at the cursor,
-//! Left / Right move the cursor through the text, Home / End jump to
-//! the ends, Backspace / Delete remove characters around the cursor,
-//! and Enter submits.  Left / Right switch between buttons when focus
-//! is on a button.
-//!
-//! The widget is UI-only: the App layer reads the entered path when
-//! [`SaveCopyResponse::Save`] fires and decides whether to re-point the
-//! buffer (Save As) or write a detached copy.
+//! Shared path-entry widget ([`SaveCopyState`] + [`SaveCopyView`]): one "Path" field above a
+//! Save / Cancel row, used by Save As, the file-deleted recovery prompt, and the dirty-conflict
+//! "save aside" flow.  Each modal supplies its own title and decides what the path does when
+//! [`SaveCopyResponse::Save`] fires; this widget is UI-only.
 
 use std::path::{Path, PathBuf};
 
@@ -35,7 +23,6 @@ use crate::ui::scroll_container::{
 
 const BUTTON_LABELS: &[&str] = &["Save", "Cancel"];
 
-/// One of the three focus targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveCopyField {
     Path,
@@ -65,38 +52,24 @@ impl SaveCopyField {
     }
 }
 
-/// Outcome of dispatching a key event to the modal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaveCopyResponse {
-    /// Modal stays open; the caller just redraws.
     Continue,
-    /// User dismissed (Escape or the Cancel button).
     Cancelled,
-    /// User pressed Save with a non-empty path.  The caller writes the
-    /// buffer to this path via `Buffer::save_copy`.
+    /// Save pressed with a non-empty (trimmed) path.
     Save(String),
 }
 
-/// Mutable state for an open Save Copy modal.
 #[derive(Debug, Clone)]
 pub struct SaveCopyState {
-    /// The path the user is editing.  Seeded by the App with a sensible
-    /// default derived from the current buffer's filename
-    /// (see [`default_save_as_path`]).
+    /// Seeded by the App via [`default_save_as_path`].
     pub path: String,
-    /// Cursor position into [`Self::path`] expressed as a Unicode-scalar
-    /// (char) index, so paths containing multi-byte characters behave
-    /// the way the user expects when navigating with Left / Right.
-    /// Initialized to the end of `path` so the user can immediately
-    /// backspace / type to rename without first jumping past the
-    /// pre-filled default.
+    /// Char index into [`Self::path`]; starts at the end so the default can be edited at once.
     pub cursor: usize,
-    /// Which focus target receives keystrokes.
     pub focus: SaveCopyField,
-    /// Last validation message, e.g. "Path required".  Cleared when the
-    /// user mutates the field.
+    /// Last validation message; cleared when the field changes.
     pub last_error: Option<String>,
-    /// Absolute terminal rect of the rendered `esc` close hint.
+    /// Absolute rect of the rendered `esc` close hint.
     pub esc_button_rect: Option<Rect>,
 }
 
@@ -112,13 +85,9 @@ impl SaveCopyState {
         }
     }
 
-    /// Apply a key event.  When focus is on the path field: characters
-    /// insert at the cursor, Left / Right / Home / End move the cursor,
-    /// Backspace / Delete remove characters.  Tab / Shift-Tab / Up /
-    /// Down cycle focus; Enter submits.
+    /// Apply a key event: field editing on the path, Tab / Shift-Tab / Up / Down cycle focus,
+    /// Enter submits.  Ctrl / Alt chords are ignored so they never pollute the field.
     pub fn handle_key(&mut self, key: &KeyEvent) -> SaveCopyResponse {
-        // Modifier-augmented chords (Ctrl-foo, Alt-foo) are ignored so
-        // chords don't pollute the path field.
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -130,9 +99,7 @@ impl SaveCopyState {
             KeyCode::Esc => return SaveCopyResponse::Cancelled,
             KeyCode::Tab | KeyCode::Down => self.focus = self.focus.next(),
             KeyCode::BackTab | KeyCode::Up => self.focus = self.focus.prev(),
-            // On the path field, Left / Right move the in-field cursor.
-            // On a button, they swap between Save and Cancel so the
-            // arrow keys remain useful no matter where focus sits.
+            // Left / Right move the field cursor, or swap buttons when focus is on one.
             KeyCode::Left => {
                 if self.focus.is_path() {
                     self.cursor = self.cursor.saturating_sub(1);
@@ -181,10 +148,8 @@ impl SaveCopyState {
                     SaveCopyField::Save | SaveCopyField::Path => self.try_save(),
                 };
             }
-            // Space activates a focused button (mirrors the
-            // InsertTable modal).  On the path field, Space falls
-            // through to the `Char` arm above and inserts a literal
-            // space — paths with spaces are valid.
+            // Space activates a focused button; on the path field the `Char` arm above
+            // already inserted a literal space.
             KeyCode::Char(' ') if !self.focus.is_path() => {
                 return match self.focus {
                     SaveCopyField::Cancel => SaveCopyResponse::Cancelled,
@@ -197,9 +162,8 @@ impl SaveCopyState {
         SaveCopyResponse::Continue
     }
 
-    /// Insert a bracketed paste into the path field at the cursor.
-    /// No-op when focus is on a button.  The paste is flattened to one
-    /// line and length-capped by [`crate::ui::sanitize_paste`].
+    /// Insert a bracketed paste at the cursor (no-op on a button), flattened and capped by
+    /// [`crate::ui::sanitize_paste`].
     pub fn paste(&mut self, text: &str) {
         if !self.focus.is_path() {
             return;
@@ -226,8 +190,7 @@ impl SaveCopyState {
     }
 }
 
-/// Insert `ch` at char-index `cursor` in `s`.  When `cursor` is past
-/// the end, the char is appended.
+/// Insert `ch` at char index `cursor` (appends when past the end).
 fn insert_char_at(s: &mut String, cursor: usize, ch: char) {
     let byte_idx = s
         .char_indices()
@@ -237,19 +200,15 @@ fn insert_char_at(s: &mut String, cursor: usize, ch: char) {
     s.insert(byte_idx, ch);
 }
 
-/// Remove the char at char-index `cursor` from `s`.  No-op when the
-/// index is out of bounds.
+/// Remove the char at char index `cursor`; no-op when out of bounds.
 fn remove_char_at(s: &mut String, cursor: usize) {
     if let Some((byte_idx, ch)) = s.char_indices().nth(cursor) {
         s.replace_range(byte_idx..byte_idx + ch.len_utf8(), "");
     }
 }
 
-/// Build the default destination shown in the Save As field: the buffer's
-/// current path resolved to an absolute path (so the directory is visible
-/// and the user can retarget it), or `<cwd>/untitled.md` for an unnamed
-/// buffer.  The filename is left unchanged — Save As re-points the buffer
-/// to the same name (possibly in a different directory).
+/// Default Save As destination: the buffer's path made absolute (so the directory is visible
+/// and editable), or `untitled.md` under the cwd for an unnamed buffer.
 pub fn default_save_as_path(original: Option<&Path>) -> String {
     let path = original
         .map(Path::to_owned)
@@ -257,9 +216,6 @@ pub fn default_save_as_path(original: Option<&Path>) -> String {
     absolutize(path)
 }
 
-/// Resolve `path` to an absolute path against the current working
-/// directory (leaving an already-absolute path untouched) and render it
-/// for display in a path field.
 fn absolutize(path: PathBuf) -> String {
     let absolute = if path.is_absolute() {
         path
@@ -271,13 +227,10 @@ fn absolutize(path: PathBuf) -> String {
     absolute.display().to_string()
 }
 
-/// View-only widget that renders the modal over the editor.  The same
-/// path-entry widget backs several modals (Save a Copy, Save As, the
-/// file-conflict copy), so the frame title is supplied by the caller.
 pub struct SaveCopyView<'a> {
     pub theme: &'a Theme,
     pub cursor_visible: bool,
-    /// Frame title, e.g. `"Save a Copy"` or `"Save As"`.
+    /// Frame title, supplied by the owning modal.
     pub title: &'static str,
 }
 
@@ -285,21 +238,14 @@ impl<'a> StatefulWidget for SaveCopyView<'a> {
     type State = SaveCopyState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        // Layout: 1 path row + (optional) 1 error row + 1 spacer + the
-        // buttons, which take more than one row in a terminal too narrow
-        // for the pair.
+        // 1 path row + optional error row + 1 spacer, then the footer.
         let base_rows = if state.last_error.is_some() { 3 } else { 2 };
-        // A path can be long; size the modal generously but cap so we
-        // don't fill the whole screen.  `centered_rect_for_content`
-        // clamps to the terminal width on its own.
         let label_w = "Path".chars().count() as u16;
         let path_w = (state.path.chars().count() as u16 + 4).max(40);
         let buttons_w = button_row_width(BUTTON_LABELS);
         let content_width = (label_w + 2 + path_w).max(buttons_w);
-        // The footer wraps rather than clipping, so its height is a
-        // function of the width the frame will give it.  Reserving a
-        // flat row instead leaves a wrapped button unpainted but still
-        // focusable and still carrying a click rect.
+        // The footer wraps rather than clipping; a flat one-row reservation would leave a
+        // wrapped button unpainted but still focusable.
         let footer_rows = footer_row_count(BUTTON_LABELS, content_width, area.width, MAX_PAD_H);
         let content = ContentSize {
             width: content_width,
@@ -327,7 +273,6 @@ impl<'a> StatefulWidget for SaveCopyView<'a> {
         }
 
         let mut row_y = inner.y;
-        // Path row.
         render_path_row(
             buf,
             inner,
@@ -340,7 +285,6 @@ impl<'a> StatefulWidget for SaveCopyView<'a> {
         );
         row_y = row_y.saturating_add(1);
 
-        // Error row (optional, between field and buttons).
         if let Some(err) = state.last_error.as_deref() {
             if row_y < inner.y + inner.height {
                 let err_area = Rect {
@@ -360,14 +304,12 @@ impl<'a> StatefulWidget for SaveCopyView<'a> {
             }
         }
 
-        // Spacer between field/error and buttons.
         if row_y < inner.y + inner.height {
             row_y = row_y.saturating_add(1);
         }
         if row_y >= inner.y + inner.height {
             return;
         }
-        // Buttons row.
         let button_area = Rect {
             x: inner.x,
             y: row_y,
@@ -400,11 +342,8 @@ fn render_path_row(
     let mut spans: Vec<Span<'_>> = Vec::with_capacity(6);
     spans.push(Span::styled("Path", theme.modal_item));
     spans.push(Span::raw("  "));
-    // Leading pad so the value sits one cell off the label.
     spans.push(Span::styled(" ", value_style));
     if focused {
-        // Shared cursor renderer: a blink-stable `▏` insertion-point bar at
-        // the cursor, so the field width never changes between blink phases.
         spans.extend(text_field_spans(
             value,
             cursor,
@@ -412,7 +351,6 @@ fn render_path_row(
             value_style,
             theme.cursor,
         ));
-        // Trailing pad mirrors the unfocused branch's right-side pad.
         spans.push(Span::styled(" ", value_style));
     } else {
         spans.push(Span::styled(value.to_owned(), value_style));
@@ -448,11 +386,7 @@ mod tests {
 
     #[test]
     fn save_as_default_keeps_name_and_shows_absolute_directory() {
-        // Save As keeps the filename (no "… copy") but resolves to an
-        // absolute path so the destination directory is visible/editable.
-        // A real directory, not `/tmp/notes.md`: a `/`-rooted literal is
-        // not absolute on Windows (no drive letter) and would be
-        // re-rooted at the cwd.
+        // A real tempdir rather than a `/`-rooted literal: that is not absolute on Windows.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("notes.md");
         assert_eq!(default_save_as_path(Some(&p)), p.display().to_string());
@@ -461,7 +395,6 @@ mod tests {
         let rel = default_save_as_path(Some(Path::new("notes.md")));
         assert_eq!(rel, cwd.join("notes.md").display().to_string());
 
-        // An unnamed buffer defaults to <cwd>/untitled.md.
         let unnamed = default_save_as_path(None);
         assert_eq!(unnamed, cwd.join("untitled.md").display().to_string());
     }
@@ -478,7 +411,6 @@ mod tests {
         assert_eq!(s.cursor, 3);
         s.handle_key(&key(KeyCode::Left));
         assert_eq!(s.cursor, 2);
-        // Focus must not change.
         assert_eq!(s.focus, SaveCopyField::Path);
     }
 
@@ -551,7 +483,6 @@ mod tests {
     #[test]
     fn delete_at_end_is_noop() {
         let mut s = SaveCopyState::new("abc".to_owned());
-        // Cursor starts at end.
         s.handle_key(&key(KeyCode::Delete));
         assert_eq!(s.path, "abc");
         assert_eq!(s.cursor, 3);
@@ -559,8 +490,6 @@ mod tests {
 
     #[test]
     fn cursor_handles_multibyte_chars() {
-        // "naïve" is 5 chars, but the 'ï' is 2 bytes.  Inserting at
-        // char-index 3 should split between 'ï' and 'v'.
         let mut s = SaveCopyState::new("naïve".to_owned());
         assert_eq!(s.cursor, 5);
         s.cursor = 3;
@@ -677,9 +606,7 @@ mod tests {
 
     #[test]
     fn a_narrow_terminal_wraps_the_footer_and_still_paints_both_buttons() {
-        // The footer wraps rather than clipping, so the modal has to
-        // reserve the rows it wrapped onto.  A flat one-row reservation
-        // leaves Cancel unpainted while Tab still focuses it.
+        // Regression: a flat one-row footer reservation left Cancel unpainted but focusable.
         let backend = TestBackend::new(18, 14);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = SaveCopyState::new("/tmp/a.md".to_owned());

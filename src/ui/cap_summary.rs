@@ -1,16 +1,9 @@
-//! Shared terminal-capability summary, rendered both inside the welcome
-//! modal's capabilities section and as the entire body of the new-terminal
-//! capabilities notice modal.  Captures one `CapRow` per capability the
-//! editor cares about, each tagged with an `ok` flag the renderer uses to
-//! pick a success/warning style and a ✓/✗ glyph.
+//! Terminal-capability summary shared by the welcome modal and the new-terminal capabilities
+//! notice: one `CapRow` per capability, with an `ok` flag driving the ✓/✗ styling.
 //!
-//! Rows are **descriptive**: each states what was detected, never what
-//! edamame does about it.  The consequence belongs to the consuming modal,
-//! because it differs between them — the capabilities notice is purely
-//! informational (it only records the terminal fingerprint), while the
-//! welcome modal actually writes `images` / `diagrams` on save.  Each owns
-//! its own sentence for that (`"Items marked ✗ will be disabled…"` and
-//! `welcome::NO_TRUECOLOR_HINT` respectively).
+//! Rows are **descriptive**: they state what was detected, never what edamame does about it.
+//! The consequence differs per consuming modal (the notice is informational; the welcome modal
+//! writes `images` / `diagrams` on save), so each modal owns its own sentence for that.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -21,8 +14,7 @@ use ratatui::widgets::{Paragraph, Widget, Wrap};
 use crate::config::Theme;
 use crate::terminal::{Capabilities, ColorDepth, ImageProtocol};
 
-/// One row in the capability summary — a label, a human-readable value
-/// describing what was detected, and an `ok` flag for styling.
+/// One capability row: label, detected value, and an `ok` flag for styling.
 #[derive(Debug, Clone)]
 pub struct CapRow {
     pub label: &'static str,
@@ -30,47 +22,27 @@ pub struct CapRow {
     pub ok: bool,
 }
 
-/// Pre-built capability summary captured at modal construction.  The
-/// `Vec<CapRow>` is in display order; iterate to render rows.
+/// Capability summary captured at modal construction, rows in display order.
 #[derive(Debug, Clone)]
 pub struct CapSummary {
     pub rows: Vec<CapRow>,
 }
 
 impl CapSummary {
-    /// Build the full capability summary from a `Capabilities` snapshot.
-    /// Includes color, images, mouse, keyboard enhancement, and unicode —
-    /// the five capabilities that meaningfully affect what the editor can
-    /// show or how it behaves.
+    /// Build the summary (color, images, mouse, keyboard, unicode) from a snapshot.
     pub fn from_caps(caps: &Capabilities) -> Self {
         let (color, color_ok) = match caps.color_depth {
             ColorDepth::TrueColor => ("truecolor (24-bit)".to_owned(), true),
-            // Anything short of 24-bit is a warning, not an "ok": the
-            // built-in themes and every decoded image are authored in RGB,
-            // and an indexed terminal quantizes both.
+            // Anything short of 24-bit is a warning: themes and images are authored in RGB.
             ColorDepth::Ansi256 => ("256 colors (no 24-bit color)".to_owned(), false),
             ColorDepth::Ansi16 => ("16 colors (no 24-bit color)".to_owned(), false),
             ColorDepth::NoColor => ("none — plain text only".to_owned(), false),
         };
-        // Below 24-bit color a native protocol is present but unusable —
-        // every decoded pixel would quantize into the 256-color cube — so
-        // the row reports the gate rather than the protocol.  Keying off
-        // `full_color` here is what keeps this row from contradicting the
-        // Color row above it (a green ✓ under a ✗ color warning).
-        //
-        // `Halfblocks` must be matched *before* that gate, because it is
-        // not a detection at all: it is `Picker::from_query_stdio`'s
-        // universal fallback for "the terminal answered no graphics
-        // capability query" (and what its `DEFAULT_PICKER` carries on
-        // every probe-error path).  Reporting it through the `Some(_)`
-        // gate arm told a terminal with no image support whatsoever —
-        // Terminal.app is the common case — that a protocol had been
-        // found and only the color depth stood in the way, implying
-        // inline images would appear on a truecolor build of the same
-        // emulator.  They would not; half-blocks are all there is.  And
-        // without 24-bit color even those can't be displayed, so below
-        // truecolor a halfblocks-only terminal reads exactly like one
-        // with no image support, which is what it is.
+        // Below 24-bit color a native protocol is unusable, so the row reports the color gate
+        // rather than the protocol (and never contradicts the Color row with a ✓ under a ✗).
+        // `Halfblocks` must be matched *before* that gate: it is `Picker`'s fallback for "no
+        // protocol detected", not a detection, so reporting it as "protocol detected" would
+        // promise a terminal like Terminal.app images it can never show.
         let (images, images_ok) = match (caps.image_protocol, caps.full_color()) {
             (None, _) | (Some(ImageProtocol::Halfblocks), false) => {
                 ("not supported — placeholders only".to_owned(), false)
@@ -94,15 +66,8 @@ impl CapSummary {
         let (kbd, kbd_ok) = if caps.keyboard_enhancement {
             ("Kitty keyboard protocol".to_owned(), true)
         } else {
-            // Deliberately not a list of chords.  The legacy control-byte
-            // encoding can carry neither a shifted modifier combination nor
-            // `Ctrl` with a non-alphabetic key, which takes out Ctrl-`,
-            // Ctrl-Enter, Ctrl-Backspace / Delete, Ctrl-Shift-Z / -T,
-            // Shift-Enter and the Alt-Shift-Arrow table ops — too many to
-            // enumerate without going stale, and the shape of the limit is
-            // the useful part.  Affected chords never reach the app at all
-            // (the terminal itself beeps); all of them stay reachable from
-            // the command palette.
+            // Deliberately not a list of chords: too many to enumerate without going stale.
+            // Affected chords never reach the app; all stay reachable from the command palette.
             (
                 "legacy encoding — some Ctrl / Alt / Shift chords can't be sent".to_owned(),
                 false,
@@ -154,20 +119,10 @@ impl CapSummary {
     }
 }
 
-/// The prose explaining that edamame substituted an indexed-color
-/// theme for this session, as one wrapped paragraph.
-///
-/// Shared verbatim by the two modals that can deliver it — the
-/// new-terminal capabilities notice (when the substitution and a
-/// first-visit both happen on the same launch, the notice absorbs this
-/// text and the standalone modal is suppressed, so the user reads one
-/// explanation rather than two) and
-/// [`crate::app::modal::ThemeDowngradeModal`] (every other case).
-///
-/// Emitted as *paragraph* `Line`s, not pre-broken display lines:
-/// `ModalView` wraps its body with `Wrap { trim: false }` and sizes it
-/// with `wrapped_rows`, so hand-splitting would double-wrap at narrow
-/// widths and leave ragged short rows at wide ones.
+/// The paragraph explaining that an indexed-color theme was substituted for this session.
+/// Shared by the capabilities notice (which absorbs it on a first visit) and
+/// [`crate::app::modal::ThemeDowngradeModal`].  Emitted as one paragraph `Line`, not
+/// pre-broken rows: `ModalView` wraps and sizes it itself.
 pub fn theme_downgrade_lines(
     configured: &str,
     substituted: &str,
@@ -185,10 +140,7 @@ pub fn theme_downgrade_lines(
     ])]
 }
 
-/// Build one body `Line` per capability row, themed for inclusion in a
-/// `ModalView` body slice.  Used by the standalone capabilities-notice
-/// modal, which doesn't drive the welcome modal's bespoke scroll
-/// container.
+/// One `ModalView` body `Line` per capability row (the capabilities-notice form).
 pub fn build_cap_lines(rows: &[CapRow], theme: &Theme) -> Vec<Line<'static>> {
     let ok_style = Style::default().fg(theme.palette.success);
     let warn_style = Style::default().fg(theme.palette.warning);
@@ -206,10 +158,8 @@ pub fn build_cap_lines(rows: &[CapRow], theme: &Theme) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Build the welcome-modal form of a capability row.  The single
-/// derivation of the row's text, shared by [`render_cap_row`] and
-/// [`cap_row_height`] so the height a caller reserves and the height the
-/// painter fills can never disagree.
+/// The welcome-modal form of a row; the single derivation shared by [`render_cap_row`] and
+/// [`cap_row_height`] so reserved and painted heights agree.
 fn cap_row_line(row: &CapRow, label_style: Style, value_style: Style) -> Line<'static> {
     let mark = if row.ok { "✓" } else { "✗" };
     Line::from(vec![
@@ -221,22 +171,15 @@ fn cap_row_line(row: &CapRow, label_style: Style, value_style: Style) -> Line<'s
     ])
 }
 
-/// How many terminal rows [`render_cap_row`] needs for `row` at `width`.
-///
-/// A row value is prose of unbounded length (the Keyboard row's degraded
-/// text is the long one), so it wraps rather than truncating — which means
-/// the welcome modal's body-height trace has to ask rather than assume one
-/// row per capability.  Styling cannot change the wrap, so this measures
-/// with plain styles.
+/// Rows [`render_cap_row`] needs for `row` at `width`.  Values wrap rather than truncate, so
+/// the welcome modal's height trace must ask rather than assume one row per capability.
 pub fn cap_row_height(row: &CapRow, width: u16) -> u16 {
     let line = cap_row_line(row, Style::default(), Style::default());
     crate::ui::scroll_container::wrapped_rows(std::slice::from_ref(&line), width).max(1)
 }
 
-/// Render a single capability row at `(x, y)` using the supplied
-/// `ok_style` / `warn_style` for the value+mark span.  Wraps within
-/// `width`; returns the number of rows consumed, which is always
-/// [`cap_row_height`] for the same `row` and `width`.
+/// Render one row at `(x, y)`, wrapping within `width`; returns the rows consumed, always
+/// equal to [`cap_row_height`].
 #[allow(clippy::too_many_arguments)]
 pub fn render_cap_row(
     buf: &mut Buffer,
@@ -288,8 +231,6 @@ mod tests {
 
     #[test]
     fn images_row_reports_the_color_gate_below_truecolor() {
-        // The contradiction guard: a native protocol on an indexed
-        // terminal must not read as a green ✓ underneath a ✗ Color row.
         for depth in [ColorDepth::Ansi256, ColorDepth::Ansi16, ColorDepth::NoColor] {
             let summary = CapSummary::from_caps(&caps(depth, Some(ImageProtocol::KittyGraphics)));
             let images = row(&summary, "Images");
@@ -299,11 +240,8 @@ mod tests {
         }
     }
 
-    /// Terminal.app: no graphics protocol at all, and `Halfblocks` is
-    /// what `Picker::from_query_stdio` falls back to when nothing was
-    /// detected — so the row must not claim a protocol was found, and
-    /// must not claim half-blocks are available on a terminal that has
-    /// no 24-bit color to display them in.
+    /// `Halfblocks` is the picker's "nothing detected" fallback (Terminal.app), so the row
+    /// must read like a terminal with no image support.
     #[test]
     fn halfblocks_below_truecolor_reads_as_no_image_support() {
         for depth in [ColorDepth::Ansi256, ColorDepth::Ansi16, ColorDepth::NoColor] {
@@ -341,8 +279,6 @@ mod tests {
 
     #[test]
     fn halfblocks_stay_degraded_on_truecolor() {
-        // Halfblocks were already a ✗ before the color gate existed;
-        // folding `full_color` into the match must not upgrade them.
         let summary = CapSummary::from_caps(&caps(
             ColorDepth::TrueColor,
             Some(ImageProtocol::Halfblocks),
@@ -354,11 +290,7 @@ mod tests {
 
     #[test]
     fn a_long_row_value_wraps_instead_of_truncating() {
-        // The welcome modal renders cap rows at a fixed CONTENT_WIDTH, so
-        // a value longer than the remaining budget used to be silently
-        // clipped mid-word (the degraded Keyboard row lost its tail).
-        // `render_cap_row` wraps and reports its height; the painter and
-        // the modal's height trace both key off `cap_row_height`.
+        // Regression: the degraded Keyboard row used to be clipped mid-word at CONTENT_WIDTH.
         let row = CapRow {
             label: "Keyboard",
             value: "x".repeat(120),
@@ -386,7 +318,6 @@ mod tests {
             cap_row_height(&row, 64),
             "painter height must match the height callers reserve"
         );
-        // Every `x` survived somewhere in the painted band.
         let painted: String = (0..used)
             .flat_map(|r| (0..64).map(move |c| (c, r)))
             .map(|(c, r)| buf[(c, r)].symbol().to_owned())
@@ -400,11 +331,7 @@ mod tests {
 
     #[test]
     fn no_row_states_a_consequence() {
-        // Rows are descriptive; "disabled"/"turned off" belongs to the
-        // consuming modal, which is the only layer that knows whether it
-        // acts on the capability.  The Keyboard row used to be exempt
-        // because it said "disabled"; it now describes the encoding limit
-        // ("can't be sent"), so the invariant covers every row.
+        // The consequence belongs to the consuming modal (see the module doc).
         for depth in [
             ColorDepth::TrueColor,
             ColorDepth::Ansi256,

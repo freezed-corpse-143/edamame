@@ -3,26 +3,19 @@ use std::fmt;
 /// The editor's rendering and interaction mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
-    /// Read-only preview. No cursor shown, no raw Markdown visible.
-    /// Files open in this mode.
+    /// Read-only preview; no cursor, no raw Markdown. Files open here.
     #[default]
     Preview,
 
-    /// Hybrid rendered/raw editing. Cursor visible; the active line (or active
-    /// table cell) is shown as raw Markdown while the rest is rendered.
-    /// Entered on click or first keystroke (not scroll).
+    /// Hybrid editing: the active line (or table cell) shows raw Markdown, the rest renders.
     Rendered,
 
-    /// Entire document shown as plain Markdown text. Standard text editing.
+    /// Whole document as plain Markdown text.
     Raw,
 
-    /// Inline diff review.  The buffer is replaced by a stacked diff
-    /// of the pre-change rope vs. the on-disk content; the user
-    /// accepts / rejects each hunk before the merged result becomes
-    /// the new buffer.  Invariant: `state.mode == Mode::Diff ⟺
-    /// state.diff.is_some()`, maintained by
-    /// [`super::EditorState::enter_diff_mode`] /
-    /// [`super::EditorState::exit_diff_mode`].
+    /// Inline diff review of the pre-change rope vs. on-disk content.
+    /// Invariant: `state.mode == Mode::Diff ⟺ state.diff.is_some()`, maintained by
+    /// [`super::EditorState::enter_diff_mode`] / [`super::EditorState::exit_diff_mode`].
     Diff,
 }
 

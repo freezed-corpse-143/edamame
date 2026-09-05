@@ -1,59 +1,20 @@
-//! Halfblocks partial-render helper for the progressive-enhancement
-//! scheme.
-//!
-//! Native terminal-graphics protocols (Sixel, Kitty, iTerm2) encode the
-//! whole image into a single escape sequence; partial rendering (clipping
-//! top/bottom rows when the image scrolls through the viewport) requires
-//! re-encoding, which is slow enough to cause visible lag on every
-//! scrolled frame.  Halfblocks, by contrast, encodes each cell as a
-//! single `(upper, lower, char)` triple with no absolute coordinates —
-//! cells are **position-independent** and can be cell-copied from one
-//! buffer to another without any encoding work.
-//!
-//! `paint_halfblocks_partial` exploits this: it takes a pre-rendered
-//! scratch `Buffer` (built synchronously by `ImageCache` when the pair
-//! is first constructed) and copies only the visible rows into the
-//! destination buffer.  The encoding work has already been done by the
-//! time this function is called — each frame is only cell-copies.
+//! Halfblocks partial-render helper. Native protocols (Sixel, Kitty, iTerm2) must re-encode
+//! the whole image to clip it, which lags on every scrolled frame; halfblocks cells are
+//! position-independent, so a pre-rendered scratch `Buffer` (built once by `ImageCache`) can
+//! be cell-copied into the visible rows with no encoding work per frame.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
-/// Copy a pre-rendered halfblocks `scratch` buffer into `buf`, clipped
-/// to the visible `dst_rect` and offset vertically by `src_y_offset`
-/// image rows.
+/// Copy a pre-rendered halfblocks `scratch` (sized to `full_rect`, origin `(0, 0)`) into
+/// `buf` at `dst_rect`, starting `src_y_offset` image rows down. Cells outside `buf` or past
+/// the image's bottom are silently dropped — the latter is exactly what an image scrolling
+/// off the bottom wants.
 ///
-/// Parameters:
-///
-/// * `scratch` — a `Buffer` containing the halfblocks cells for the
-///   full image at `full_rect`'s dimensions.  Built by `ImageCache` on
-///   cold path; reused across every frame.
-/// * `full_rect` — the image's natural rectangle (stable across frames):
-///   `width = image_max_width`, `height = image_max_height`, origin
-///   `(0, 0)`.
-/// * `src_y_offset` — how many image rows have scrolled past the top.
-///   When the image's top is above the viewport, this is positive;
-///   when fully visible, it's zero.
-/// * `dst_rect` — the on-screen region to paint into.  Cells outside
-///   `buf`'s own area are silently dropped (ratatui's `cell_mut` returns
-///   `None` on out-of-bounds positions).
-/// * `buf` — the destination `Buffer` (the frame buffer supplied to
-///   every `render` call).
-/// * `bg` — theme background color used wherever the scratch cell has
-///   `Color::Reset` for its background.  ratatui_image's halfblocks
-///   renderer leaves `Reset` for letter-box cells around an
-///   aspect-mismatched image and for fully transparent input pixels;
-///   without this substitution those cells would punch through to the
-///   terminal's own background instead of the document's themed
-///   background — visible as dark bands while scrolling and around any
-///   partially-visible image.
-///
-/// This function does **not** bounds-check `src_y_offset` against
-/// `full_rect.height`; passing an offset that leaves fewer rows than
-/// `dst_rect.height` produces blank cells at the bottom, which is the
-/// desired behaviour when an image is scrolling off the bottom of the
-/// viewport.
+/// `bg` replaces `Color::Reset` backgrounds: ratatui_image leaves `Reset` on letter-box
+/// cells and transparent pixels, which would otherwise punch through to the terminal's own
+/// background as dark bands around any partially visible image.
 pub fn paint_halfblocks_partial(
     scratch: &Buffer,
     full_rect: Rect,
@@ -67,10 +28,6 @@ pub fn paint_halfblocks_partial(
         return;
     }
 
-    // Cell-copy the clipped portion into the destination.  Bounds on
-    // `scratch` clip when `src_y_offset + dy` exceeds `full_rect.height`
-    // (returns `None` from `cell`); bounds on `buf` clip when `dst_rect`
-    // extends past the frame edge — both are safe no-ops.
     for dy in 0..dst_rect.height {
         let src_y = src_y_offset.saturating_add(dy);
         if src_y >= full_rect.height {
@@ -84,11 +41,7 @@ pub fn paint_halfblocks_partial(
                 continue;
             };
             let mut copied = src_cell.clone();
-            // Substitute the theme bg wherever the scratch cell carries
-            // `Reset` (letter-box, transparent pixels, the lower half of
-            // an `▀` cell whose bottom pixel was transparent).  The fg is
-            // left alone — the halfblocks glyph's `▀` color is the image's
-            // top-pixel color and must be preserved.
+            // fg is the `▀` glyph's top-pixel color and must be preserved.
             if copied.bg == Color::Reset {
                 copied.bg = bg;
             }
@@ -100,9 +53,7 @@ pub fn paint_halfblocks_partial(
 }
 
 #[cfg(test)]
-// `Picker::from_fontsize` is deprecated in ratatui-image 9; we use it
-// here because `Picker::halfblocks()` hardcodes a font size that
-// produces different cell counts from what these tests pin.
+// `Picker::halfblocks()` hardcodes a font size that changes the cell counts these tests pin.
 #[allow(deprecated)]
 mod tests {
     use super::*;
@@ -112,15 +63,9 @@ mod tests {
     use ratatui_image::picker::Picker;
     use ratatui_image::{Resize, StatefulImage};
 
-    /// Build a halfblocks scratch buffer the same way `ImageCache` does
-    /// on cold path — render a uniform image through a halfblocks
-    /// picker into a Buffer sized to `rect`.
-    ///
-    /// The protocol is forced rather than taken from `from_fontsize`,
-    /// which infers it from `$TERM_PROGRAM` and hands back an iTerm2
-    /// picker in iTerm2, WezTerm, VS Code, Warp and friends.  Without
-    /// the override these tests still pass on those terminals, but
-    /// vacuously: they'd be clipping a buffer of `skip` cells.
+    /// A halfblocks scratch buffer built the way `ImageCache` does. The protocol is forced:
+    /// `from_fontsize` infers it from `$TERM_PROGRAM`, and an iTerm2 picker would make these
+    /// tests pass vacuously on a buffer of `skip` cells.
     fn halfblocks_scratch(rect: Rect) -> Buffer {
         let mut picker = Picker::from_fontsize((1, 2).into());
         picker.set_protocol_type(ratatui_image::picker::ProtocolType::Halfblocks);
@@ -137,9 +82,6 @@ mod tests {
         buf
     }
 
-    /// `src_y_offset = k` should map destination row `dy` to source row
-    /// `k + dy`.  This is the core invariant the scroll-clipping path
-    /// depends on.
     #[test]
     fn positive_src_offset_shifts_source_rows() {
         let full = Rect::new(0, 0, 8, 6);
@@ -164,15 +106,10 @@ mod tests {
         }
     }
 
-    /// When the destination rect extends past the destination buffer's
-    /// own area, cells outside the buffer are silently dropped (ratatui
-    /// returns `None` from `cell_mut`).  The helper must not panic.
     #[test]
     fn destination_clipping_silently_drops_out_of_bounds_cells() {
         let full = Rect::new(0, 0, 8, 4);
         let scratch = halfblocks_scratch(full);
-        // A 4×2 destination buffer with a 6×3 write rect at origin — the
-        // extra 2 cols + 1 row must not panic.
         let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
         paint_halfblocks_partial(
             &scratch,
@@ -184,8 +121,6 @@ mod tests {
         );
     }
 
-    /// When `src_y_offset` leaves fewer image rows than the destination
-    /// needs, the trailing rows are left untouched (still default).
     #[test]
     fn src_offset_past_image_leaves_dst_default() {
         let full = Rect::new(0, 0, 8, 4);
@@ -199,8 +134,6 @@ mod tests {
             &mut buf,
             Color::Reset,
         );
-        // src_y_offset 5 > full.height 4 → nothing should have been
-        // written; every cell stays default.
         for y in 0..6u16 {
             for x in 0..8u16 {
                 let c = buf.cell((x, y)).unwrap();
@@ -209,7 +142,6 @@ mod tests {
         }
     }
 
-    /// Zero-area inputs are a no-op.
     #[test]
     fn zero_area_is_noop() {
         let scratch = halfblocks_scratch(Rect::new(0, 0, 4, 4));
@@ -230,7 +162,6 @@ mod tests {
             &mut buf,
             Color::Reset,
         );
-        // No panic, buf still default.
         for y in 0..4u16 {
             for x in 0..4u16 {
                 assert_eq!(buf.cell((x, y)).unwrap().symbol(), " ");

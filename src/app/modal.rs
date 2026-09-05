@@ -1,10 +1,5 @@
-//! Modal subsystem: trait, dispatch stack, and individual modal
-//! implementations.
-//!
-//! The App's only handle to a modal is a [`Box<dyn Modal>`] on the
-//! [`ModalStack`]; pushing a modal makes it the topmost overlay,
-//! popping returns it.  Each modal implementation lives in its own
-//! file under `src/app/modal/`.
+//! Modal subsystem: the [`Modal`] trait, the [`ModalStack`] the App dispatches through,
+//! and one adapter per modal under `src/app/modal/`.
 
 pub mod chrome;
 pub(crate) mod docs_link;

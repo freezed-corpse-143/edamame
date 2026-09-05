@@ -1,7 +1,5 @@
-//! Confirmation gate shown when every diff hunk has been decided.
-//! `[Apply]` swaps the merged rope into the editor buffer and exits
-//! diff mode; `[Keep reviewing]` (or Esc) dismisses the modal with
-//! every decision intact so the user can change their mind.
+//! Confirmation gate shown when every diff hunk has been decided; `[Keep reviewing]` / Esc
+//! dismisses with every decision intact.
 
 use std::any::Any;
 
@@ -34,9 +32,7 @@ impl DiffResolveConfirmModal {
         }
     }
 
-    /// Map a resolved response to an outcome.  Shared by the key and
-    /// click paths so a mouse click on a button behaves exactly like
-    /// pressing it.
+    /// Map a chrome response to an outcome; shared by the key and click paths.
     fn resolve(&self, response: ModalResponse) -> ModalOutcome {
         match response {
             ModalResponse::Continue => ModalOutcome::Continue,

@@ -1,21 +1,16 @@
-//! Vim-pattern → `fancy-regex` translation for `:s` / `:%s` (CP9 follow-up).
+//! Vim-pattern → `fancy-regex` translation for `:s` / `:%s`, plus the matching replacement
+//! expander.
 //!
-//! Vim's regex *syntax* is its own dialect — magic levels (`\m \v \M \V`),
-//! backslashed grouping/quantifiers (`\( \) \+ \|`), `\<`/`\>` word
-//! boundaries, `\a`/`\x`/… character classes — that no Rust regex engine
-//! speaks natively.  So a vim user's pattern must be translated before it
-//! reaches the engine.  This module is that translator, plus the matching
-//! replacement expander (`\1`, `&`, `\U…\E` case modifiers — applied by us,
-//! since the engine's `$1` replacement syntax can't do vim case folding).
+//! Vim's regex syntax is its own dialect — magic levels (`\m \v \M \V`), backslashed
+//! grouping/quantifiers, `\<`/`\>` word boundaries, `\a`/`\x` classes — that no Rust engine
+//! speaks, so a pattern must be translated first.  Replacement expansion (`\1`, `&`, `\U…\E`) is
+//! likewise done by hand, since no engine's `$1` syntax does vim case folding.
 //!
-//! We compile the translated pattern with `fancy-regex` (not the `regex`
-//! crate) so backreferences and lookaround survive the round-trip — `\<`/`\>`
-//! become lookaround, and `\1` in a pattern passes straight through.
+//! `fancy-regex` rather than `regex` so backreferences and lookaround survive the round-trip:
+//! `\<`/`\>` become lookaround and a pattern's `\1` passes straight through.
 //!
-//! Coverage is the common-to-moderately-advanced surface; a handful of rare
-//! atoms (`\zs \ze`, postfix `\@=` lookaround, `\%[…]`/`\%^`/…) are rejected
-//! with an explanatory [`ExError::UnsupportedPattern`] rather than
-//! mistranslated.  See `docs/vim-implementation-plan.md` §1, CP9.
+//! Coverage is the common-to-moderately-advanced surface; rare atoms (`\zs \ze`, postfix `\@=`,
+//! `\%[…]`) are rejected with [`ExError::UnsupportedPattern`] rather than mistranslated.
 
 use fancy_regex::Captures;
 
@@ -36,19 +31,15 @@ enum MagicLevel {
     VeryNo,
 }
 
-/// Translate a vim regex pattern into `fancy-regex` syntax.
-///
-/// Returns [`ExError::UnsupportedPattern`] for the rare atoms we decline to
-/// translate (so the user gets a clear message instead of a silent
-/// mismatch).  A genuinely malformed regex surfaces later, when the
-/// translated string fails to compile.
+/// Translate a vim regex pattern into `fancy-regex` syntax.  Rare untranslatable atoms yield
+/// [`ExError::UnsupportedPattern`] rather than a silent mismatch; a malformed regex surfaces later
+/// when the translated string fails to compile.
 pub fn translate_pattern(input: &str) -> Result<String, ExError> {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::new();
     let mut magic = MagicLevel::Magic;
-    // True at the start of a branch (pattern start, after `(` or `|`), where a
-    // leading quantifier (`*`/`+`/`?`) is a literal, not an operator — vim's
-    // rule, and also what keeps `regex` from erroring on a leading `*`.
+    // At a branch start (pattern start, after `(` or `|`) a leading quantifier is a literal —
+    // vim's rule, and also what keeps `regex` from erroring on a leading `*`.
     let mut branch_start = true;
     let mut i = 0;
 
@@ -78,12 +69,9 @@ pub fn translate_pattern(input: &str) -> Result<String, ExError> {
     Ok(out)
 }
 
-/// Handle a `\<x>` escape (the char after the backslash is already consumed,
-/// `*i` points at the next input char).  Mode switches, character-class
-/// escapes, backreferences, and the literal `\t`/`\n`/`\r` are
-/// mode-independent; the grouping / quantifier / boundary set flips meaning
-/// between very-magic (where the backslash makes it *literal*) and the other
-/// modes (where the backslash makes it *special*).
+/// Handle a `\<x>` escape; the char after the backslash is already consumed and `*i` points at the
+/// next input char.  Most escapes are mode-independent, but the grouping / quantifier / boundary
+/// set inverts: in very-magic the backslash makes it *literal*, elsewhere *special*.
 fn translate_escape(
     d: char,
     chars: &[char],
@@ -176,9 +164,8 @@ fn translate_escape(
         // Keyword / identifier chars are iskeyword-dependent; approximate.
         'k' | 'i' => push_class(out, "\\w", branch_start),
         't' => push_class(out, "\\t", branch_start),
-        // Vim's pattern `\n` matches a newline, and so does ours: the
-        // substitution runs over the whole range at once (see
-        // `ex::region_haystack`), so `:%s/  \n/ /g` really does join lines.
+        // A pattern `\n` really matches a newline: the substitution runs over the whole range at
+        // once (see `ex::region_haystack`), so `:%s/ \n/ /g` joins lines.
         'n' => push_class(out, "\\n", branch_start),
         'r' => push_class(out, "\\r", branch_start),
         // Any other escaped char is a literal (`\.`, `\*`, `\/`, `\~`, …).
@@ -190,9 +177,8 @@ fn translate_escape(
     Ok(())
 }
 
-/// Emit the *special* form of a grouping / quantifier / boundary atom
-/// (`( ) + ? = | { < >`), updating `branch_start`.  Used for the backslashed
-/// form in magic modes and the bare form in very-magic.
+/// Emit the *special* form of a grouping / quantifier / boundary atom, updating `branch_start`:
+/// the backslashed form in magic modes, the bare form in very-magic.
 fn emit_group_atom(
     d: char,
     chars: &[char],
@@ -240,8 +226,7 @@ fn emit_group_atom(
     Ok(())
 }
 
-/// Bare-char dispatch in very-magic (`\v`): grouping / quantifiers are special
-/// without a backslash; only word chars and whitespace are literal.
+/// Bare-char dispatch in very-magic: only word chars and whitespace are literal.
 fn emit_very_magic(
     chars: &[char],
     i: &mut usize,
@@ -307,8 +292,7 @@ fn emit_very_magic(
     Ok(())
 }
 
-/// Bare-char dispatch in magic (`\m`, the default): `. * [ ] ^ $` are special;
-/// grouping / quantifiers need a backslash (so bare ones are literal).
+/// Bare-char dispatch in magic (the default): `. * [ ] ^ $` special, grouping needs a backslash.
 fn emit_magic(
     chars: &[char],
     i: &mut usize,
@@ -355,8 +339,7 @@ fn emit_magic(
     Ok(())
 }
 
-/// Bare-char dispatch in nomagic (`\M`): only `^ $` special; everything else
-/// (`. * [` …) literal.  Backslash forms (`\(`, `\+`, …) still work.
+/// Bare-char dispatch in nomagic: only `^ $` special; the backslash forms still work.
 fn emit_nomagic(chars: &[char], i: &mut usize, out: &mut String, branch_start: &mut bool) {
     let c = chars[*i];
     match c {
@@ -373,8 +356,7 @@ fn emit_nomagic(chars: &[char], i: &mut usize, out: &mut String, branch_start: &
     *i += 1;
 }
 
-/// Push `$` as an anchor when it ends the pattern (or precedes a branch close
-/// `\)` / `\|`, or bare `)` / `|` in very-magic); otherwise as a literal.
+/// `$` is an anchor at the end of a pattern or before a branch close, and a literal elsewhere.
 fn push_dollar(chars: &[char], i: usize, very: bool, out: &mut String) {
     let rest = &chars[i + 1..];
     let anchor = match rest.first() {
@@ -396,9 +378,8 @@ fn push_class(out: &mut String, s: &str, branch_start: &mut bool) {
     *branch_start = false;
 }
 
-/// Copy a bracket expression `[…]` verbatim (POSIX `[:alpha:]` classes and
-/// most ranges are identical between vim and `regex`).  `*i` points at the
-/// opening `[`; on return it points just past the closing `]`.
+/// Copy a bracket expression verbatim — POSIX classes and most ranges are spelled identically.
+/// `*i` enters at the `[` and leaves just past the `]`.
 fn copy_class(
     chars: &[char],
     i: &mut usize,
@@ -437,9 +418,8 @@ fn copy_class(
     Err(ExError::UnsupportedPattern("unterminated [ ]".to_owned()))
 }
 
-/// Read a `{…}` quantifier body (`*i` points just after the `{`) and emit the
-/// `regex` form.  Handles vim's lazy `\{-…}`, open-ended `\{n,}` / `\{,m}`,
-/// and `\{}` / `\{-}` (= `*` / `*?`).  `*i` ends just past the `}`.
+/// Read a `{…}` quantifier body and emit the `regex` form, covering vim's lazy `\{-…}`,
+/// open-ended `\{n,}` / `\{,m}`, and `\{}` / `\{-}`.  `*i` enters after the `{`, leaves past `}`.
 fn take_brace(chars: &[char], i: &mut usize) -> String {
     let mut inner = String::new();
     while let Some(&c) = chars.get(*i) {
@@ -473,8 +453,7 @@ fn take_brace(chars: &[char], i: &mut usize) -> String {
     }
 }
 
-/// Push `c` to `out`, backslash-escaping it when it is a `regex`
-/// metacharacter so it matches literally.
+/// Push `c`, escaped if it is a `regex` metacharacter, so it matches literally.
 fn escape_literal(c: char, out: &mut String) {
     if matches!(
         c,
@@ -487,15 +466,12 @@ fn escape_literal(c: char, out: &mut String) {
 
 // ── Replacement expansion ───────────────────────────────────────────────────
 
-/// Expand a vim replacement `template` against the match `caps`, applying
-/// backreferences (`\1`–`\9`), the whole match (`&` / `\0`), and the case
-/// modifiers (`\u \U \l \L \e \E`).  Done by hand rather than via the engine's
-/// `$1` syntax because no Rust regex engine implements vim's case folding.
+/// Expand a vim replacement `template` against `caps`: backreferences, the whole match (`&` /
+/// `\0`), and the case modifiers `\u \U \l \L \e \E`.
 pub fn expand_replacement(template: &str, caps: &Captures<'_, str>) -> String {
     let chars: Vec<char> = template.chars().collect();
     let mut out = String::new();
-    // `one` upper/lowercases the next single output char (`\u` / `\l`);
-    // `region` does so until `\e` / `\E` (`\U` / `\L`).
+    // `one` maps the next single char (`\u` / `\l`); `region` maps until `\e` / `\E`.
     let mut one: Option<bool> = None;
     let mut region: Option<bool> = None;
     let mut i = 0;
@@ -536,8 +512,7 @@ pub fn expand_replacement(template: &str, caps: &Captures<'_, str>) -> String {
     out
 }
 
-/// Append capture group `n` (empty when it did not participate), applying the
-/// active case state to each character.
+/// Append capture group `n` (empty when it did not participate), under the active case state.
 fn push_group(
     caps: &Captures<'_, str>,
     n: usize,
@@ -552,9 +527,8 @@ fn push_group(
     }
 }
 
-/// Append `ch`, applying a pending one-shot case (`\u`/`\l`, consumed) or the
-/// active region case (`\U`/`\L`).  An uppercase/lowercase mapping may expand
-/// to several chars (e.g. `ß` → `SS`).
+/// Append `ch` under a pending one-shot case (consumed) or the active region case.  A case
+/// mapping can expand to several chars (`ß` → `SS`).
 fn push_cased(ch: char, out: &mut String, one: &mut Option<bool>, region: Option<bool>) {
     match one.take().or(region) {
         Some(true) => out.extend(ch.to_uppercase()),
@@ -604,8 +578,7 @@ mod tests {
 
     #[test]
     fn leading_star_is_literal() {
-        // Nothing precedes `*`, so it is a literal (and `regex` would error
-        // on a bare leading `*`).
+        // Nothing precedes `*`, so it is a literal (`regex` would error on a bare leading `*`).
         assert_eq!(tr("*x"), r"\*x");
     }
 

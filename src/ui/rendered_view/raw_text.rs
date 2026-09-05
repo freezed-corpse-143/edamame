@@ -1,41 +1,25 @@
 use crate::editor::EditorState;
 
-/// Split raw block source into lines, keeping any content before the final
-/// trailing newline (which ropey line indexing includes).
+/// Split raw block source into lines, dropping the phantom empty entry a trailing
+/// newline produces.
 pub(crate) fn raw_source_lines(source: &str) -> Vec<&str> {
     if source.is_empty() {
         return vec![""];
     }
-    // Split on newlines. If source ends with '\n', the last element would be
-    // empty — we include it as an empty line so cursor positioning still works.
     let mut lines: Vec<&str> = source.split('\n').collect();
-    // Remove the trailing empty string only if there are multiple lines and
-    // the source ends with '\n' (the split always produces an extra empty entry
-    // at the end for trailing newlines, which we don't want to display as an
-    // extra blank).
     if lines.last() == Some(&"") && lines.len() > 1 {
         lines.pop();
     }
     lines
 }
 
-/// How many lines [`raw_source_lines`] would yield, without building the
-/// `Vec`.
-///
-/// The image reveal wants only the count, and asks for it on every run
-/// of the event loop while the cursor rests in an image block (see
-/// [`EditorState::sync_image_reveal`]) — allocating a `Vec` of slices
-/// per iteration to read `.len()` off it is pure waste.  Kept beside
-/// `raw_source_lines`, and pinned against it by
-/// `raw_source_line_count_agrees_with_raw_source_lines`, so the reserved
-/// row count and the painted lines can't drift apart.
+/// [`raw_source_lines`]`.len()` without building the `Vec`; the image reveal asks for it
+/// every event-loop iteration. Pinned against `raw_source_lines` by a test.
 pub(crate) fn raw_source_line_count(source: &str) -> usize {
     if source.is_empty() {
         return 1;
     }
     let count = source.split('\n').count();
-    // Mirror the trailing-empty pop above: on a non-empty source that last
-    // element is empty exactly when the source ends with a newline.
     if count > 1 && source.ends_with('\n') {
         count - 1
     } else {
@@ -43,23 +27,14 @@ pub(crate) fn raw_source_line_count(source: &str) -> usize {
     }
 }
 
-/// Rows the raw-source reveal should reserve for a block whose source is
-/// `source`: [`raw_source_line_count`] with any *trailing blank* lines
-/// dropped, and never less than one.
+/// Rows the raw-source reveal reserves for a block: [`raw_source_line_count`] minus trailing
+/// blank lines, never below one.
 ///
-/// A block's byte range is the *extended* one, which for a paragraph — and
-/// so for the `![alt](url)` paragraph promoted into a `Block::ImageBlock` —
-/// absorbs the blank line that follows it.  That blank already has a
-/// rendered row of its own (`ParsedDoc::build` synthesises a virtual block
-/// per blank source line), so counting it here would reserve one row too
-/// many and shift the rest of the document down by a line for exactly as
-/// long as the reveal lasts.  A mermaid fence's range stops at its closing
-/// fence and is unaffected, which is why the diagram reveal never had to
-/// care.
+/// A paragraph's extended byte range absorbs the blank line after it, and that blank already
+/// has a rendered row of its own (a virtual block), so counting it would shift the document
+/// down by a row for the duration of the reveal.
 pub(crate) fn revealed_source_line_count(source: &str) -> usize {
     let total = raw_source_line_count(source);
-    // Drop the one trailing newline `raw_source_line_count` already
-    // discounted, then walk back over whatever blank lines remain.
     let body = source.strip_suffix('\n').unwrap_or(source);
     let trailing = body
         .rsplit('\n')
@@ -80,18 +55,12 @@ pub(super) fn raw_line_byte_start(block_source: &str, line_idx: usize) -> usize 
     block_source.len()
 }
 
-/// Raw source of the cursor's block, plus where the cursor sits inside it.
+/// Raw source of the cursor's block, plus where the cursor sits inside it — the single
+/// derivation shared by `RenderedView` and `editor::state::cursor_rendered_line_idx`, which
+/// used to drift when computed twice.
 ///
-/// This is the shared derivation behind the hybrid-edit reveal: both
-/// `RenderedView` (deciding which rendered row to paint raw source onto) and
-/// `editor::state::cursor_rendered_line_idx` (reporting where the cursor
-/// appears, which the mouse hit-test then keys its revealed-line shortcut
-/// off) need the same `(source, raw_line, col)` triple.  Deriving it twice is
-/// how the two used to drift.
-///
-/// `RenderedView` has one extra path this does *not* cover: when the parse is
-/// stale it rebuilds the block source from `cursor_block_line_range` so the
-/// just-typed characters are visible.  That branch stays in the view.
+/// Does not cover `RenderedView`'s stale-parse path, which rebuilds the source from
+/// `cursor_block_line_range`.
 pub(crate) struct RawBlockCursor {
     /// Raw source text of the block, as `original_range_for_byte` bounds it.
     pub source: String,
@@ -121,12 +90,8 @@ pub(crate) fn raw_block_cursor(state: &EditorState, cursor_byte: usize) -> RawBl
     }
 }
 
-/// Find which raw line of the block the cursor is on, and its column offset.
-///
-/// Returns `(raw_line_index, col)` where col is the char count from the start
-/// of the raw line.  The index is into [`raw_source_lines`], not a bare
-/// `split('\n')` — a cursor at or past the end clamps to the last *real*
-/// line rather than the phantom empty entry a trailing newline produces.
+/// `(raw_line_index, col)` of the cursor within the block; col is in chars. The index is into
+/// [`raw_source_lines`], so a cursor at or past the end clamps to the last real line.
 fn cursor_position_in_block(
     state: &EditorState,
     cursor_byte: usize,
@@ -136,8 +101,6 @@ fn cursor_position_in_block(
         return (0, 0);
     }
 
-    // Get the original byte range of the block to find where cursor_byte falls
-    // within the raw source text.
     let block_start_byte = state
         .parsed
         .source_map
@@ -147,13 +110,11 @@ fn cursor_position_in_block(
 
     let cursor_offset_in_block = cursor_byte.saturating_sub(block_start_byte);
 
-    // Walk through the raw source in bytes to find which line and col.
     let lines = raw_source_lines(raw_source);
     let mut byte_pos = 0usize;
     for (line_idx, line) in lines.iter().enumerate() {
         let line_end = byte_pos + line.len();
         if cursor_offset_in_block <= line_end {
-            // Cursor is on this line. Convert byte offset within line to char count.
             let col_bytes = cursor_offset_in_block.saturating_sub(byte_pos);
             let col = line[..col_bytes.min(line.len())].chars().count();
             return (line_idx, col);
@@ -161,7 +122,6 @@ fn cursor_position_in_block(
         byte_pos = line_end + 1; // +1 for the '\n'
     }
 
-    // Cursor is at or past the end.
     let last_line = lines.last().copied().unwrap_or("");
     (lines.len().saturating_sub(1), last_line.chars().count())
 }
@@ -194,37 +154,26 @@ mod tests {
         assert_eq!(lines, vec![""]);
     }
 
-    /// The reveal reserves `revealed_source_line_count` rows, which is the
-    /// line count minus any trailing blank the block's extended range
-    /// absorbed — those blanks are virtual blocks with rendered rows of
-    /// their own, so counting them here shifts the document down by a line
-    /// for as long as the cursor rests in the block.
+    /// Trailing blanks absorbed by a block's extended range are virtual blocks with rows of
+    /// their own; counting them shifts the document down during the reveal.
     #[test]
     fn revealed_count_drops_trailing_blank_lines() {
-        // A promoted `![alt](url)` paragraph: one source line, plus the
-        // blank line the paragraph's range absorbed.
         assert_eq!(revealed_source_line_count("![cat](cat.png)\n\n"), 1);
         assert_eq!(revealed_source_line_count("![cat](cat.png)\n"), 1);
         assert_eq!(revealed_source_line_count("![cat](cat.png)"), 1);
-        // A mermaid fence's range stops at the closing fence, so nothing is
-        // dropped — including a blank line *inside* the fence.
+        // A mermaid fence's range stops at the closing fence, so interior blanks stay.
         assert_eq!(
             revealed_source_line_count("```mermaid\nflowchart LR\n\n    A --> B\n```\n"),
             5
         );
-        // Multiple absorbed blanks, and the never-below-one floor.
         assert_eq!(revealed_source_line_count("text\n\n\n"), 1);
         assert_eq!(revealed_source_line_count(""), 1);
         assert_eq!(revealed_source_line_count("\n"), 1);
         assert_eq!(revealed_source_line_count("\n\n"), 1);
     }
 
-    /// The reveal reserves rows counted off `raw_source_line_count` and
-    /// `RenderedView` paints `raw_source_lines` onto them, so the two must
-    /// agree for every shape of block source — a drift here clips the
-    /// reveal or pads it with blank rows.  Covers the cases that separate
-    /// them: empty, no trailing newline, trailing newline, a lone newline,
-    /// interior blanks, and a blank line before the terminating newline.
+    /// Rows are reserved off `raw_source_line_count` and painted from `raw_source_lines`;
+    /// a drift clips the reveal or pads it with blank rows.
     #[test]
     fn raw_source_line_count_agrees_with_raw_source_lines() {
         for source in [
