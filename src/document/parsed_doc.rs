@@ -590,6 +590,31 @@ impl ParsedDoc {
         })
     }
 
+    /// True when `block_idx` is a synthetic image block promoted from a
+    /// `$$...$$` display-math paragraph (see `promote_display_math_paragraphs`).
+    pub fn is_latex_block(&self, block_idx: usize) -> bool {
+        self.image_blocks.iter().any(|info| {
+            info.block_idx == block_idx && matches!(info.source, Some(DiagramSource::Latex(_)))
+        })
+    }
+
+    /// True when `block_idx` is a *diagram-derived* image block whose raw
+    /// source spans many lines — mermaid fences and `$$...$$` math both.
+    /// Such blocks reveal as a single unit: every reserved rendered row
+    /// swaps to its matching raw-source line (1:1, cursor included), so
+    /// the raw-reveal bookkeeping (timer, drag suppression, click/row
+    /// mapping) treats them alike.  Ordinary `![alt](url)` images are a
+    /// single source line and stay on the generic image path.
+    pub fn is_diagram_reveal_block(&self, block_idx: usize) -> bool {
+        self.image_blocks.iter().any(|info| {
+            info.block_idx == block_idx
+                && matches!(
+                    info.source,
+                    Some(DiagramSource::Mermaid(_)) | Some(DiagramSource::Latex(_))
+                )
+        })
+    }
+
     /// True when `block_idx` is a `Block::ImageBlock` (a real image *or* a
     /// promoted diagram).  Such a block has a single source line — the
     /// `![alt](url)` / fenced-diagram opener — but reserves *many* rendered
@@ -1034,6 +1059,48 @@ mod tests {
         let doc = ParsedDoc::build(src, theme(), false, 24);
         let block = doc.source_map.block_for_byte(0).unwrap();
         assert_eq!(doc.block_own_line_count(block), 2);
+    }
+
+    /// The reveal classification: mermaid and `$$...$$` math blocks are
+    /// both multi-line diagram images whose raw source must paint 1:1
+    /// over the reserved rows on cursor reveal — ordinary `![alt](url)`
+    /// images are single-line and stay on the generic image path.
+    #[test]
+    fn diagram_reveal_classification_covers_latex_and_mermaid_only() {
+        let src = "![logo](logo.png)\n\n\
+                   ```mermaid\ngraph TD\nA-->B\n```\n\n\
+                   $$\nE = mc^2\n$$\n";
+        let doc = ParsedDoc::build(src, theme(), true, 24);
+        let latex = doc
+            .image_blocks
+            .iter()
+            .find(|i| matches!(i.source, Some(crate::diagram::DiagramSource::Latex(_))))
+            .expect("latex block")
+            .block_idx;
+        let mermaid = doc
+            .image_blocks
+            .iter()
+            .find(|i| matches!(i.source, Some(crate::diagram::DiagramSource::Mermaid(_))))
+            .expect("mermaid block")
+            .block_idx;
+        let plain = doc
+            .image_blocks
+            .iter()
+            .find(|i| i.source.is_none())
+            .expect("plain image block")
+            .block_idx;
+
+        assert!(doc.is_latex_block(latex));
+        assert!(doc.is_diagram_reveal_block(latex));
+        assert!(!doc.is_mermaid_block(latex));
+
+        assert!(doc.is_mermaid_block(mermaid));
+        assert!(doc.is_diagram_reveal_block(mermaid));
+        assert!(!doc.is_latex_block(mermaid));
+
+        assert!(!doc.is_latex_block(plain));
+        assert!(!doc.is_mermaid_block(plain));
+        assert!(!doc.is_diagram_reveal_block(plain));
     }
 
     /// Two `$$...$$` blocks stacked with no blank line between them (the

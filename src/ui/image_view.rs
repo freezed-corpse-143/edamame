@@ -141,7 +141,7 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Im
         return out;
     }
 
-    for info in &state.parsed.image_blocks {
+    for (ordinal, info) in state.parsed.image_blocks.iter().enumerate() {
         let rendered_range = state
             .parsed
             .source_map
@@ -160,8 +160,24 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Im
         let y_offset: isize = block_top as isize - scroll as isize;
 
         let reserved = rendered_range.end.saturating_sub(rendered_range.start) as isize;
-        let image_top = area.y as isize + y_offset;
-        let image_bottom = image_top + reserved;
+        // A `$$...$$` block mid raw-reveal reserves `raw_rows` source
+        // lines PLUS a live-preview band for the formula (see
+        // `ImageReveal::preview_rows`).  The image must paint only inside
+        // that band, below the raw source: shift the rect down by the
+        // raw rows and shrink it to the band.  The renderer paints the
+        // source lines above; `image_view` overlays the formula beneath.
+        let reveal_raw_offset = match state.image_reveal.as_ref() {
+            Some(reveal)
+                if reveal.preview_rows > 0
+                    && reveal.ordinal == ordinal
+                    && reveal.url == info.url =>
+            {
+                reveal.rows as isize
+            }
+            _ => 0,
+        };
+        let image_top = area.y as isize + y_offset + reveal_raw_offset;
+        let image_bottom = image_top + reserved - reveal_raw_offset;
         let viewport_top = area.y as isize;
         let viewport_bottom = (area.y as isize) + area.height as isize;
         // Skip entirely when not even a single row intersects the viewport.
@@ -180,7 +196,7 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Im
                 x: area.x,
                 y: rect_y,
                 width: area.width,
-                height: reserved.max(0).min(u16::MAX as isize) as u16,
+                height: (reserved - reveal_raw_offset).max(0).min(u16::MAX as isize) as u16,
             },
             natural_top: image_top,
         });

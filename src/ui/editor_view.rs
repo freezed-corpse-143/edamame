@@ -404,7 +404,14 @@ impl<'a> StatefulWidget for EditorView<'a> {
         // raw-reveal in diff mode, so nothing to suppress there.
         if matches!(mode, Mode::Preview | Mode::Rendered | Mode::Diff) {
             let suppress = if mode == Mode::Rendered && self.state.cursor_block_revealed() {
-                self.state.cursor_block_idx
+                // `$$...$$` blocks keep their image during the reveal: it
+                // is the live preview painted below the raw source (the
+                // snapshot rect already excludes the source rows).  Other
+                // revealed blocks (mermaid fences, plain images) suppress
+                // their image so the raw source is all the user sees.
+                self.state
+                    .cursor_block_idx
+                    .filter(|&idx| !self.state.parsed.is_latex_block(idx))
             } else {
                 None
             };

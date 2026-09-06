@@ -48,19 +48,20 @@ impl EditorState {
         // logical buffer line — this makes scrolling through a large table feel
         // uniform: each row gets the same delay, not the whole table at once.
         //
-        // Exception: a mermaid diagram block reveals as a single unit (every
-        // rendered row swaps to raw source), so re-arming the timer on every
-        // intra-block line move would flash the image placeholder back in
-        // between line moves.  Keep the existing reveal time once the cursor
-        // is inside a mermaid block until it leaves.
+        // Exception: a diagram block (mermaid fence or `$$...$$` math)
+        // reveals as a single unit — every rendered row swaps to raw
+        // source — so re-arming the timer on every intra-block line move
+        // would flash the image placeholder back in between line moves.
+        // Keep the existing reveal time once the cursor is inside such a
+        // block until it leaves.
         let (current_line, _) = self.cursor.line_col(&self.buffer);
         if Some(current_line) != self.cursor_line_idx {
-            let staying_in_mermaid = previous_block_idx == self.cursor_block_idx
+            let staying_in_diagram = previous_block_idx == self.cursor_block_idx
                 && self
                     .cursor_block_idx
-                    .is_some_and(|idx| self.parsed.is_mermaid_block(idx));
+                    .is_some_and(|idx| self.parsed.is_diagram_reveal_block(idx));
             self.cursor_line_idx = Some(current_line);
-            if !staying_in_mermaid {
+            if !staying_in_diagram {
                 self.cursor_block_entered_at = Some(Instant::now());
             }
         }
@@ -123,8 +124,11 @@ impl EditorState {
         // `String`.
         let target = self.image_reveal_target();
         let unchanged = match (target, self.image_reveal.as_ref()) {
-            (Some((ordinal, url, rows)), Some(cur)) => {
-                ordinal == cur.ordinal && url == cur.url.as_str() && rows == cur.rows
+            (Some((ordinal, url, rows, preview_rows)), Some(cur)) => {
+                ordinal == cur.ordinal
+                    && url == cur.url.as_str()
+                    && rows == cur.rows
+                    && preview_rows == cur.preview_rows
             }
             (None, None) => true,
             _ => false,
@@ -132,10 +136,11 @@ impl EditorState {
         if unchanged {
             return false;
         }
-        self.image_reveal = target.map(|(ordinal, url, rows)| ImageReveal {
+        self.image_reveal = target.map(|(ordinal, url, rows, preview_rows)| ImageReveal {
             ordinal,
             url: url.to_owned(),
             rows,
+            preview_rows,
         });
         // Only the block's *rendered* row count changed — the source is
         // untouched, so every byte range (and with it the cached cursor
@@ -145,9 +150,9 @@ impl EditorState {
     }
 
     /// The reservation the image reveal wants for the current cursor
-    /// position: `(image-block ordinal, image URL, one row per raw source
-    /// line)`, or `None` when the cursor isn't resting inside a revealed
-    /// image block.  The ordinal is the block's index into
+    /// position: `(image-block ordinal, image URL, raw-source rows,
+    /// preview rows)`, or `None` when the cursor isn't resting inside a
+    /// revealed image block.  The ordinal is the block's index into
     /// `ParsedDoc::image_blocks`, which is the index space the renderer's
     /// row override counts in — see [`ImageReveal`] for why the URL alone
     /// is not enough to name a block.
@@ -155,7 +160,7 @@ impl EditorState {
     /// The URL is borrowed out of `self.parsed` rather than cloned: the
     /// caller runs this per event-loop pass purely to compare against the
     /// stashed reservation, and owns the result only when they differ.
-    fn image_reveal_target(&self) -> Option<(usize, &str, usize)> {
+    fn image_reveal_target(&self) -> Option<(usize, &str, usize, usize)> {
         // Preview is browse-only and Raw already shows the source, so the
         // reveal — and its reflow — belongs to Rendered mode alone.
         if self.mode != Mode::Rendered {
@@ -170,7 +175,7 @@ impl EditorState {
             return self
                 .image_reveal
                 .as_ref()
-                .map(|r| (r.ordinal, r.url.as_str(), r.rows));
+                .map(|r| (r.ordinal, r.url.as_str(), r.rows, r.preview_rows));
         }
         if !self.cursor_block_revealed() {
             return None;
@@ -206,7 +211,23 @@ impl EditorState {
         // same split the painter uses, so the reserved rows and the raw
         // lines painted onto them can't disagree, and without allocating
         // the `Vec` of slices just to read its length.
-        let rows = crate::ui::rendered_view::revealed_source_line_count(source);
-        Some((ordinal, url, rows))
+        let raw_rows = crate::ui::rendered_view::revealed_source_line_count(source);
+        // `$$...$$` math blocks reserve a live-preview band below the raw
+        // source: the decoded formula renders there while the user edits
+        // (its URL hashes the source, so every keystroke re-renders).
+        // Same row count the renderer's override would give the image
+        // outside the reveal — decoded → aspect rows, still decoding →
+        // the `image_max_height` placeholder reservation, so the layout
+        // doesn't jump when the reveal opens.
+        let preview_rows = if self.parsed.is_latex_block(block_idx) {
+            let max_w = self.image_max_width.min(u16::MAX as usize) as u16;
+            let max_h = self.image_max_height.min(u16::MAX as usize) as u16;
+            self.images
+                .reserved_rows(url, max_w, max_h, self.image_font_size)
+                .unwrap_or(self.image_max_height)
+        } else {
+            0
+        };
+        Some((ordinal, url, raw_rows, preview_rows))
     }
 }

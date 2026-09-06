@@ -145,8 +145,19 @@ pub(crate) struct ImageReveal {
     /// The block's image URL: a `![alt](url)` target, or a diagram's
     /// synthetic `diagram-mermaid-<sha256>` key.
     pub(crate) url: String,
-    /// Rendered rows to reserve: one per revealed raw source line.
+    /// Rendered rows to reserve for the raw-source reveal: one per
+    /// revealed raw source line.
     pub(crate) rows: usize,
+    /// Extra rows reserved *below* the raw source for a live rendering of
+    /// the image while the cursor edits it.  Non-zero only for `$$...$$`
+    /// math blocks (a preview image is useless mid-reveal for mermaid —
+    /// the whole point of its reveal is seeing the source — and ordinary
+    /// images have a single source line).  Math formulas re-render on
+    /// every keystroke, so this is how the user watches the formula take
+    /// shape while typing.  The editor override reserves
+    /// `rows + preview_rows`; image layout skips `rows` before painting
+    /// the preview.
+    pub(crate) preview_rows: usize,
 }
 
 /// All mutable state owned by the editor.
@@ -1089,7 +1100,11 @@ impl EditorState {
         let override_fn = |url: &str, ordinal: usize| {
             if let Some(reveal) = image_reveal {
                 if reveal.ordinal == ordinal && reveal.url == url {
-                    return Some(reveal.rows);
+                    // The raw-source reveal replaces the image's reserved
+                    // rows; a `$$...$$` block additionally reserves a
+                    // live-preview band below the source (see
+                    // `ImageReveal::preview_rows`).
+                    return Some(reveal.rows + reveal.preview_rows);
                 }
             }
             if !images_enabled {
@@ -1560,14 +1575,15 @@ pub(crate) fn sub_lines_in_block(
             .collect();
     }
 
-    // Mermaid blocks reserve `image_max_height` rendered rows and the reveal
-    // overlay paints raw source onto them 1:1.  Code blocks render every body
-    // line — including blank ones, emitted as NBSP-padded rows — so they too
-    // map 1:1; counting only rendered-producing lines (below) would drift the
-    // cursor up by one row per blank.  A metadata block renders verbatim for
-    // the same reason: a blank line inside frontmatter is data, and the
-    // renderer emits a row for it.
-    let is_mermaid = parsed.is_mermaid_block(block_idx);
+    // Diagram blocks (mermaid fences, `$$...$$` math) reserve rendered
+    // rows and the reveal overlay paints raw source onto them 1:1.  Code
+    // blocks render every body line — including blank ones, emitted as
+    // NBSP-padded rows — so they too map 1:1; counting only
+    // rendered-producing lines (below) would drift the cursor up by one
+    // row per blank.  A metadata block renders verbatim for the same
+    // reason: a blank line inside frontmatter is data, and the renderer
+    // emits a row for it.
+    let is_mermaid = parsed.is_diagram_reveal_block(block_idx);
     let is_verbatim = matches!(
         parsed.real_block_for_byte(classify_byte),
         Some(
@@ -2174,5 +2190,58 @@ mod tests {
         state.enter_diff_mode(diff);
         state.scroll_focused_hunk_into_view(20, 80);
         assert_eq!(state.scroll, 0);
+    }
+
+    /// A `$$...$$` block under the cursor reserves its raw source lines
+    /// PLUS a live-preview band (the formula rendering below the source
+    /// while the user edits).  The band is the same row count the image
+    /// would occupy outside the reveal — decoding still in flight → the
+    /// `image_max_height` placeholder reservation, so the layout doesn't
+    /// jump when the reveal opens.
+    #[test]
+    fn latex_reveal_reserves_source_rows_plus_a_preview_band() {
+        let mut state = EditorState::new(Buffer::from_str("$$\nE = mc^2\n$$\n"), theme());
+        state.mode = crate::editor::Mode::Rendered;
+        state.refresh_parsed();
+        let latex_idx = state
+            .parsed
+            .image_blocks
+            .iter()
+            .find(|i| matches!(i.source, Some(crate::diagram::DiagramSource::Latex(_))))
+            .expect("latex block")
+            .block_idx;
+        // Park the cursor inside the block and let the reveal fire.
+        state.cursor.offset = "$$\n".chars().count() + 1;
+        state.cursor_block_entered_at = None;
+        state.update_cursor_block();
+        assert_eq!(state.cursor_block_idx, Some(latex_idx));
+        assert!(state.cursor_block_revealed());
+        assert!(state.sync_image_reveal());
+        let reveal = state.image_reveal.as_ref().expect("reveal active");
+        // Source: `$$` / body / `$$` → 3 rows.  Preview: image not yet
+        // decoded → placeholder reservation `image_max_height` (24).
+        assert_eq!(reveal.rows, 3);
+        assert_eq!(reveal.preview_rows, 24);
+    }
+
+    /// Ordinary images and mermaid blocks reveal with no preview band —
+    /// their reveal is the source itself.
+    #[test]
+    fn non_latex_reveals_reserve_no_preview_band() {
+        let mut state = EditorState::new(Buffer::from_str("![logo](logo.png)\n"), theme());
+        state.mode = crate::editor::Mode::Rendered;
+        state.refresh_parsed();
+        state.cursor.offset = 2;
+        state.cursor_block_entered_at = None;
+        state.update_cursor_block();
+        // The reveal timer re-arms on any intra-block line move for a
+        // plain image (unlike diagram blocks, which keep their reveal
+        // time); simulate the 120 ms jitter window having elapsed.
+        state.cursor_block_entered_at = None;
+        assert!(state.cursor_block_revealed());
+        assert!(state.sync_image_reveal());
+        let reveal = state.image_reveal.as_ref().expect("reveal active");
+        assert_eq!(reveal.preview_rows, 0, "plain image: no preview band");
+        assert_eq!(reveal.rows, 1, "single source line");
     }
 }

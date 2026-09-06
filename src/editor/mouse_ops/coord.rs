@@ -328,16 +328,19 @@ pub fn rendered_sub_line_to_offset(
         let (raw_idx, sub) = table_raw_line_idx(state, &block, block_text);
         table_sub = sub;
         raw_idx
-    } else if state.parsed.is_image_block(block.idx) && !state.parsed.is_mermaid_block(block.idx) {
+    } else if state.parsed.is_image_block(block.idx)
+        && !state.parsed.is_diagram_reveal_block(block.idx)
+    {
         // A real `![alt](url)` image reserves many rendered rows for its
         // single source line, but only the placeholder row carries text.
         // Mapping a reserved row through `sub_idx` would index a phantom
         // empty raw line (the block range can absorb a trailing blank) and
         // poison the inline-map cache for an unrelated buffer line, so pin
-        // every reserved row to raw line 0.  Mermaid blocks are excluded:
-        // their reveal overlay paints the raw source 1:1 onto the reserved
-        // rows, so `sub_idx` IS the correct source line there — and the
-        // mermaid branch below consumes `line_text` derived from it.
+        // every reserved row to raw line 0.  Diagram blocks (mermaid
+        // fences, `$$...$$` math) are excluded: their reveal overlay
+        // paints the raw source 1:1 onto the reserved rows, so `sub_idx`
+        // IS the correct source line there — and the diagram branch below
+        // consumes `line_text` derived from it.
         0
     } else {
         block.sub_idx
@@ -389,7 +392,7 @@ pub fn rendered_sub_line_to_offset(
         && line_reveals
         && state.cursor_block_revealed()
         && rendered_line_idx == crate::editor::state::cursor_rendered_line_idx(state);
-    if state.parsed.is_mermaid_block(block.idx) || revealed_cursor_line {
+    if state.parsed.is_diagram_reveal_block(block.idx) || revealed_cursor_line {
         let (rows, indent) = revealed_raw_rows(line_text, viewport_width);
         let sub = sub_row_within_line.min(rows.len().saturating_sub(1));
         let row = rows.get(sub).copied().unwrap_or((0, 0, 0));
@@ -607,13 +610,13 @@ fn revealed_raw_row_count(
         .get(block_range.start..block_range.end.min(source.len()))
         .unwrap_or("");
 
-    if state.parsed.is_mermaid_block(cursor_block_idx) {
+    if state.parsed.is_diagram_reveal_block(cursor_block_idx) {
         let sub = rendered_line_idx - block_lines.start;
         let raw_line = block_text.split('\n').nth(sub).unwrap_or("");
         return Some(revealed_raw_rows(raw_line, viewport_width).0.len().max(1));
     }
 
-    // Non-mermaid: only the cursor's own rendered line gets replaced with
+    // Non-diagram: only the cursor's own rendered line gets replaced with
     // raw text.  Tables keep their rendered chrome, so skip them.
     let is_table = table_edit::is_table_block(block_text);
     if is_table {

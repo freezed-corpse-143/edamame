@@ -217,13 +217,15 @@ impl<'a> StatefulWidget for RenderedView<'a> {
             .iter()
             .position(|r| r.start <= cursor_byte && cursor_byte < r.end)
             .and_then(|i| editor.parsed.blocks.get(i));
-        // Mermaid code blocks are post-processed into synthetic
-        // `Block::ImageBlock`s.  When the cursor enters one, every
-        // rendered row of the block (where the image placeholder
+        // Mermaid code blocks and `$$...$$` math are post-processed into
+        // synthetic `Block::ImageBlock`s.  When the cursor enters one,
+        // every rendered row of the block (where the image placeholder
         // otherwise sits) is replaced with the corresponding raw-source
-        // line so the user can see and edit the mermaid source — same
-        // affordance as a fenced code block.
+        // line so the user can see and edit the source — same affordance
+        // as a fenced code block.
+        let is_diagram_block = editor.parsed.is_diagram_reveal_block(cursor_block_idx);
         let is_mermaid_block = editor.parsed.is_mermaid_block(cursor_block_idx);
+        let is_latex_block = editor.parsed.is_latex_block(cursor_block_idx);
         // Big-text H1: `Renderer::try_render_h1_big` emits 4 big-text rows
         // plus the `─` rule (5 own lines), versus the plain 2-line H1.
         // While the cursor is inside the block we collapse the big-text
@@ -524,6 +526,44 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                     cursor_override,
                     skip_rows,
                 ) as usize;
+            } else if reveal_raw && is_latex_block && in_cursor_block {
+                // `$$...$$` math blocks reveal as plain raw text — the
+                // full formula source (`$$` delimiters included) paints
+                // 1:1 over the reserved rows, one line per row, exactly
+                // like the mermaid fence case but without code-block
+                // chrome.  The user edits the formula in place; moving
+                // the cursor out collapses it back to the rendered image
+                // (whose URL hashes the edited source, so the image
+                // updates live).
+                let sub = virtual_idx - cursor_block_lines.start;
+                let raw_text = raw_lines.get(sub).copied().unwrap_or("");
+                let cursor_on_this = cursor_raw_line == sub;
+                let sel_cols = selection_bytes.and_then(|(sa, sb)| {
+                    let block_start = block_range_for_cursor.as_ref()?.start;
+                    let raw_line_start_in_block = raw_line_byte_start(&raw_block_source, sub);
+                    let raw_line_start_abs = block_start + raw_line_start_in_block;
+                    let raw_line_end_abs = raw_line_start_abs + raw_text.len();
+                    let start_byte = sa.max(raw_line_start_abs).min(raw_line_end_abs);
+                    let end_byte = sb.max(raw_line_start_abs).min(raw_line_end_abs);
+                    if start_byte >= end_byte {
+                        return None;
+                    }
+                    let start_col = raw_text[..start_byte - raw_line_start_abs].chars().count();
+                    let end_col = raw_text[..end_byte - raw_line_start_abs].chars().count();
+                    Some((start_col, end_col))
+                });
+                let styled = make_raw_line_with_selection(raw_text, sel_cols, self.theme);
+                let cursor_override = (cursor_on_this && cursor_visible)
+                    .then_some((cursor_col, cursor_indicator_style));
+                rows_used = render_line_with_cursor_from_visual(
+                    &styled,
+                    area,
+                    buf,
+                    vis_y as u16,
+                    wrap,
+                    cursor_override,
+                    skip_rows,
+                ) as usize;
             } else if let (true, Some(sub_idx)) = (reveal_raw, wrapped_sub_idx_opt) {
                 // Multi-sub wrapped-cell overlay: paint the rendered row
                 // first (so neighbouring cells and borders stay), then
@@ -790,14 +830,14 @@ impl<'a> StatefulWidget for RenderedView<'a> {
             // selection highlighting per chunk).
             if let Some((sa, sb)) = selection_bytes {
                 let setext_revealed = reveal_raw && is_setext && in_cursor_block;
-                let mermaid_revealed = reveal_raw && is_mermaid_block && in_cursor_block;
+                let diagram_revealed = reveal_raw && is_diagram_block && in_cursor_block;
                 let wrapped_revealed = reveal_raw && wrapped_sub_idx_opt.is_some();
                 // Reads as three separate suppression cases; clippy's
                 // collapse hides which condition gates which.
                 #[allow(clippy::nonminimal_bool)]
                 if !(reveal_raw && virtual_idx == cursor_rendered_line && code_block_allows_reveal)
                     && !setext_revealed
-                    && !mermaid_revealed
+                    && !diagram_revealed
                     && !wrapped_revealed
                 {
                     paint_byte_range_overlay(
