@@ -18,5 +18,6 @@ pub mod mermaid;
 // `src/config.rs`.
 #[allow(unused_imports)]
 pub use mermaid::{
-    is_diagram_url, render_mermaid_svg, resolve_mermaid, synthetic_url, warm_fontdb, DiagramSource,
+    is_diagram_url, render_mermaid_svg, resolve_latex, resolve_mermaid, synthetic_url, warm_fontdb,
+    DiagramSource,
 };

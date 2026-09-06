@@ -47,12 +47,14 @@ pub fn warm_fontdb() {
     });
 }
 
-/// Source for a diagram block.  Only `Mermaid` currently ships; the
-/// enum exists so future backends (PlantUML, Graphviz/DOT, D2) can be
-/// added without rewiring `ImageBlockInfo`.
+/// Source for a diagram block.  The enum exists so future backends
+/// (PlantUML, Graphviz/DOT, D2, LaTeX math) can be added without
+/// rewiring `ImageBlockInfo`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DiagramSource {
     Mermaid(String),
+    /// LaTeX display math promoted from a `$$...$$`-only paragraph.
+    Latex(String),
 }
 
 /// Errors reported by the diagram pipeline.  The renderer / rasterizer /
@@ -85,30 +87,36 @@ impl From<SvgError> for DiagramError {
     }
 }
 
-/// Prefix shared by every URL produced by [`synthetic_url`]; the
+/// Prefix shared by mermaid URLs produced by [`synthetic_url`]; the
 /// counterpart predicate is [`is_diagram_url`].
 const SYNTHETIC_URL_PREFIX: &str = "diagram-mermaid-";
 
-/// Synthetic cache-key URL for a mermaid source.  Stable across process
-/// invocations — two runs of edamame see the same URL for the same
-/// diagram text.
+/// Prefix shared by LaTeX-math URLs produced by [`synthetic_url`].
+const SYNTHETIC_LATEX_URL_PREFIX: &str = "diagram-math-";
+
+/// Synthetic cache-key URL for a diagram/math source.  Stable across
+/// process invocations — two runs of edamame see the same URL for the
+/// same source text.
 pub fn synthetic_url(source: &DiagramSource) -> String {
-    match source {
-        DiagramSource::Mermaid(src) => {
-            let digest = Sha256::digest(src.as_bytes());
-            let mut hex = String::with_capacity(digest.len() * 2);
-            for byte in digest {
-                write!(hex, "{byte:02x}").expect("writing to a String is infallible");
-            }
-            format!("{SYNTHETIC_URL_PREFIX}{hex}")
-        }
+    let (prefix, src) = match source {
+        DiagramSource::Mermaid(src) => (SYNTHETIC_URL_PREFIX, src),
+        DiagramSource::Latex(src) => (SYNTHETIC_LATEX_URL_PREFIX, src),
+    };
+    let digest = Sha256::digest(src.as_bytes());
+    // Lowercase hex by hand: `{digest:x}` is not guaranteed lowercase on
+    // every Rust version, and the cache keys must be stable across
+    // compilers (same source → same URL).
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(hex, "{byte:02x}").expect("writing to a String is infallible");
     }
+    format!("{prefix}{hex}")
 }
 
 /// True for a synthetic diagram cache key produced by [`synthetic_url`],
 /// as opposed to a document-authored image URL / path.
 pub fn is_diagram_url(url: &str) -> bool {
-    url.starts_with(SYNTHETIC_URL_PREFIX)
+    url.starts_with(SYNTHETIC_URL_PREFIX) || url.starts_with(SYNTHETIC_LATEX_URL_PREFIX)
 }
 
 /// Maximum mermaid source length we will attempt to render.  The renderer
@@ -119,6 +127,27 @@ pub fn is_diagram_url(url: &str) -> bool {
 /// to the plain code block — a placeholder in the TUI, an escaped `<pre>`
 /// in HTML export.
 const MAX_MERMAID_SOURCE_BYTES: usize = 64 * 1024;
+
+/// Same defence for LaTeX display math: RaTeX also has no internal bound,
+/// so an over-cap formula gets the same clean failure → placeholder path.
+const MAX_LATEX_SOURCE_BYTES: usize = 64 * 1024;
+
+/// Cell-height → RaTeX `font_size` conversion factor.
+///
+/// Two unit mismatches stand between the terminal's cell *height* (pixels)
+/// and the value RaTeX expects (user units per em):
+///
+/// * RaTeX emits its SVG labelled in `pt`, and usvg rasterizes CSS `pt` at
+///   96 dpi — one `pt` becomes 96/72 px.
+/// * A terminal cell spans more than one text em: ascent + descent plus
+///   the terminal's configured line height ≈ 1.2–1.4 em in practice.
+///
+/// Multiplying the cell height by `1 / (96/72 × 1.25)` ≈ 0.6 makes the
+/// formula's x-height land on the surrounding body text's, instead of one
+/// full cell.  Exactness is impossible without font metrics from the
+/// terminal; 1.25 is the middle of the common 1.2–1.4 range, so the
+/// formula reads within ±10% of body text across terminals.
+const LATEX_EM_TO_CELL: f64 = 1.0 / (96.0 / 72.0 * 1.25);
 
 /// Render a mermaid source to SVG, wrapping any panic or error in a
 /// `DiagramError`.  Used by both the raster path below and the HTML
@@ -182,6 +211,129 @@ pub fn resolve_mermaid(
     })
 }
 
+/// Render a LaTeX display-math source all the way to a `LoadedImage`,
+/// suitable for dropping straight into the image cache — same contract as
+/// [`resolve_mermaid`].
+///
+/// Pipeline (pure Rust, no node / system TeX): RaTeX parses the LaTeX into
+/// an AST, lays it out in display style, flattens it to a display list,
+/// and serializes a self-contained SVG with glyphs embedded as `<path>`
+/// outlines (`standalone` + `embed-fonts` features) — which the shared
+/// `crate::image::rasterize_svg` then rasterizes, exactly like a mermaid
+/// render.  RaTeX 0.1.x is pre-1.0 with known panic bugs, so the render is
+/// wrapped in `catch_unwind` like `render_mermaid_svg_core`.
+///
+/// Sizing: the SVG's user-unit scale is RaTeX's `font_size` (em units).
+/// We derive it from the terminal's cell pixel height via [`LATEX_EM_TO_CELL`]
+/// so the formula's x-height matches body text (not one full cell), drop
+/// RaTeX's default padding (a fixed frame dwarfing the glyphs), then
+/// rasterize with `SvgScaleMode::Natural` (downscale only) so a formula
+/// wider than the column shrinks to fit but never balloons — unlike
+/// Mermaid, a formula has a meaningful natural size.
+/// The image stays **transparent** (`background: None`) so it composites
+/// over the document background, and the glyphs are painted in `fg`
+/// (the theme's text colour) so dark themes stay legible.
+pub fn resolve_latex(
+    url: String,
+    source: &str,
+    max_cells: Option<(u16, u16)>,
+    font_size: Option<(u16, u16)>,
+    fg: [u8; 4],
+) -> Result<LoadedImage, DiagramError> {
+    let svg = render_latex_svg(source, fg, font_size)?;
+    let image = rasterize_svg(
+        &svg,
+        SvgSizing {
+            envelope: max_cells,
+            font_size,
+            mode: SvgScaleMode::Natural,
+        },
+        None, // transparent — composite over the document background
+    )
+    .map_err(DiagramError::from)?;
+    Ok(LoadedImage {
+        url,
+        image,
+        scratch: None,
+    })
+}
+
+/// Render a LaTeX display-math source to a self-contained SVG string,
+/// wrapping any panic in a [`DiagramError`] (RaTeX 0.1.x can panic on
+/// pathological input — same defence as the mermaid renderer).
+///
+/// * `fg` — glyph colour as RGBA, taken from the theme's text colour.
+/// * `font_size` — the terminal cell's `(width, height)` in pixels; the
+///   cell *height* drives RaTeX's `font_size` through [`LATEX_EM_TO_CELL`]
+///   so the formula's x-height matches the surrounding body text.
+fn render_latex_svg(
+    source: &str,
+    fg: [u8; 4],
+    font_size: Option<(u16, u16)>,
+) -> Result<String, DiagramError> {
+    if source.len() > MAX_LATEX_SOURCE_BYTES {
+        return Err(DiagramError::RenderFailed(format!(
+            "latex source too large: {} bytes (max {MAX_LATEX_SOURCE_BYTES})",
+            source.len()
+        )));
+    }
+    let outcome = {
+        let _expected = crate::terminal::ExpectedPanic::new();
+        catch_unwind(AssertUnwindSafe(|| {
+            render_latex_svg_inner(source, fg, font_size)
+        }))
+    }
+    .map_err(|payload| {
+        DiagramError::RenderFailed(format!("latex render panic: {}", panic_message(&payload)))
+    })?;
+    outcome.map_err(|e| DiagramError::RenderFailed(format!("{e:#}")))
+}
+
+/// Unwrapped RaTeX four-step pipeline (see module docs for the phases):
+/// parse → layout (display style) → display list → standalone SVG.
+fn render_latex_svg_inner(
+    source: &str,
+    fg: [u8; 4],
+    font_size: Option<(u16, u16)>,
+) -> Result<String, ratex_parser::error::ParseError> {
+    use ratex_layout::layout_options::LayoutOptions;
+    use ratex_layout::{layout, to_display_list};
+    use ratex_parser::parse;
+    use ratex_svg::{render_to_svg, SvgOptions};
+    use ratex_types::color::Color;
+
+    let ast = parse(source)?;
+    let [r, g, b, a] = fg;
+    let options = LayoutOptions::default().with_color(Color::new(
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+        f32::from(a) / 255.0,
+    ));
+    let lbox = layout(&ast, &options);
+    let display_list = to_display_list(&lbox);
+    // One RaTeX em per ~0.6 cell-height pixel (see `LATEX_EM_TO_CELL`): the
+    // formula's x-height then matches the surrounding body text.  Fall back
+    // to a 16 px cell (a common terminal default) when unknown.
+    let em = font_size.map_or(16.0, |(_, h)| f64::from(h.max(1))) * LATEX_EM_TO_CELL;
+    let svg = render_to_svg(
+        &display_list,
+        &SvgOptions {
+            embed_glyphs: true,
+            font_size: em,
+            // RaTeX's default padding (10 user units per side) would add a
+            // fixed ~27 px frame around every formula — large next to body
+            // text.  The formula's own bounding box already includes
+            // ascenders, descenders and stretchy delimiters, so no padding
+            // is needed: transparent background composites straight onto
+            // the document.
+            padding: 0.0,
+            ..SvgOptions::default()
+        },
+    );
+    Ok(svg)
+}
+
 /// Best-effort extraction of a message from a `catch_unwind` payload.
 /// Panics in Rust are usually `String` or `&'static str`; anything else
 /// falls back to a generic marker so the cache entry still reports a
@@ -222,6 +374,26 @@ mod tests {
         assert_eq!(a.len(), "diagram-mermaid-".len() + 64);
     }
 
+    /// LaTeX display math gets its own content-addressed URL family so
+    /// the image cache reuses renders across reparses without colliding
+    /// with mermaid diagrams or document images.
+    #[test]
+    fn latex_synthetic_url_is_stable_and_distinct() {
+        let a = synthetic_url(&DiagramSource::Latex("x^2 + y^2 = z^2".into()));
+        let b = synthetic_url(&DiagramSource::Latex("x^2 + y^2 = z^2".into()));
+        assert_eq!(a, b);
+        assert!(a.starts_with("diagram-math-"), "url was {a}");
+        assert_eq!(a.len(), "diagram-math-".len() + 64);
+
+        // Different source → different URL; same source under Mermaid vs
+        // Latex must never share a cache entry.
+        let other = synthetic_url(&DiagramSource::Latex("x^3".into()));
+        assert_ne!(a, other);
+        let as_mermaid = synthetic_url(&DiagramSource::Mermaid("x^2 + y^2 = z^2".into()));
+        assert_ne!(a, as_mermaid);
+        assert!(is_diagram_url(&a));
+    }
+
     #[test]
     fn oversized_mermaid_source_is_rejected_before_render() {
         // Comfortably over the 64 KiB cap; must error out *without*
@@ -258,6 +430,53 @@ mod tests {
         .expect("trivial flowchart should render");
         assert!(loaded.image.width() > 0);
         assert!(loaded.image.height() > 0);
+    }
+
+    /// Display math must rasterize to a real image through the same
+    /// LoadedImage contract as mermaid — the phase-1 block-math goal.
+    /// RaTeX embeds KaTeX fonts in the binary, so this should work
+    /// without system fonts; kept `#[ignore]` like the mermaid live
+    /// test because upstream 0.1.x may still panic on some inputs.
+    #[test]
+    #[ignore = "upstream ratex 0.1.x may panic; run with --ignored latex_display_math"]
+    fn latex_display_math_renders_to_loaded_image() {
+        let loaded = resolve_latex(
+            "test".into(),
+            r"x^2 + y^2 = z^2",
+            Some((80, 24)),
+            Some((8, 16)),
+            [0xcc, 0xcc, 0xcc, 255],
+        )
+        .expect("trivial display math should render");
+        assert!(loaded.image.width() > 0);
+        assert!(loaded.image.height() > 0);
+    }
+
+    /// The rendered formula's pixel height must track the terminal cell
+    /// font size (16 px cell → roughly one text line), not balloon to the
+    /// whole image envelope — the bug where display math rendered huge.
+    #[test]
+    #[ignore = "upstream ratex 0.1.x may panic; run with --ignored latex_size"]
+    fn latex_image_height_tracks_cell_font_size() {
+        // Envelope is 40 cells tall but a single-line formula must come
+        // out near one cell (16 px) tall — Natural mode, no fill.
+        let loaded = resolve_latex(
+            "test".into(),
+            r"x^2 + y^2 = z^2",
+            Some((80, 40)),
+            Some((8, 16)),
+            [0xcc, 0xcc, 0xcc, 255],
+        )
+        .expect("display math should render");
+        // Natural-mode raster keeps the SVG's own size.  With RaTeX em =
+        // 16 × LATEX_EM_TO_CELL ≈ 9.6 user units and no padding, a single
+        // line of math rasterizes to ≈ 1.06 em × 1.333 px/pt ≈ 13.6 px —
+        // one cell, not the 640 px a full-envelope fill would produce.
+        let h = loaded.image.height();
+        assert!(
+            (8..=24).contains(&h),
+            "single-line formula should be ~1 cell tall (16 px), got {h}px"
+        );
     }
 
     // The envelope scaling itself (small upscales, large downscales,

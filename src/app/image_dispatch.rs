@@ -538,6 +538,15 @@ impl App {
             None
         };
 
+        // Glyph colour for display math: the theme's text colour, so
+        // formulas stay legible in the active theme (light or dark) when
+        // composited transparently over the document background.
+        // Falls back to a mid-grey when the theme's text colour is the
+        // terminal default (`Reset`), whose RGB we cannot know.
+        let latex_fg = crate::ui::dim::color_to_rgb(self.editor.theme().palette.text)
+            .map(|[r, g, b]| [r, g, b, 255])
+            .unwrap_or([0xcc, 0xcc, 0xcc, 255]);
+
         for info in infos {
             // Route each block to its respective enabled flag.  Skip
             // blocks whose class is currently declined so a user who
@@ -585,6 +594,16 @@ impl App {
                         Some(crate::diagram::DiagramSource::Mermaid(src)) => {
                             crate::diagram::resolve_mermaid(url.clone(), src, max_cells, font_size)
                                 .map_err(|e| (url.clone(), e.to_string()))
+                        }
+                        Some(crate::diagram::DiagramSource::Latex(src)) => {
+                            crate::diagram::resolve_latex(
+                                url.clone(),
+                                src,
+                                max_cells,
+                                font_size,
+                                latex_fg,
+                            )
+                            .map_err(|e| (url.clone(), e.to_string()))
                         }
                         None => crate::image::resolve(
                             &url,

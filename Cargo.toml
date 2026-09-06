@@ -194,6 +194,27 @@ usvg = "0.46"
 # elsewhere in the document triggers one.
 sha2 = "0.11"
 
+# LaTeX display math ($$...$$ blocks).  RaTeX is the pure-Rust KaTeX engine:
+# parser → layout → display list → self-contained SVG (glyphs as <path>
+# outlines).  No node, no system TeX — consistent with the crate's zero
+# system-runtime-dependency stance (the reason mermaid uses
+# `mermaid-rs-renderer` rather than mermaid-cli).  `standalone` makes
+# `render_to_svg` emit glyph outlines instead of `<text>` font references;
+# `embed-fonts` compiles the KaTeX TTFs from `ratex-katex-fonts` into the
+# binary so rendering needs no external font files.  Pinned to the 0.1.x
+# line because it is pre-1.0 with API churn — deliberate, like the
+# mermaid-rs-renderer pin; the SVG output is rasterized by the shared
+# `resvg`/`usvg` pipeline above (ratex-svg's own golden tests do the same).
+ratex-parser = "0.1.14"
+ratex-layout = "0.1.14"
+ratex-svg = { version = "0.1.14", features = ["standalone", "embed-fonts"] }
+# `ratex_layout::layout_options::LayoutOptions::with_color` takes
+# `ratex_types::color::Color`, so we reach the type directly to tint
+# formula glyphs with the theme's text colour.  Transitive via
+# ratex-layout but declared explicitly — same convention as `resvg` /
+# `usvg` above.
+ratex-types = "0.1.14"
+
 # Big-text H1 headings.  Tracks the ratatui 0.30 line via 0.8+; `font8x8`
 # glyphs painted as Octant blocks, 4 cells wide × 2 tall per glyph.
 tui-big-text = "0.8"
