@@ -164,6 +164,14 @@ pub enum Inline {
     FootnoteReference {
         label: String,
     },
+    /// `$...$` inline or `$$...$$` display math, raw LaTeX source.
+    /// Rendered as source-equivalent text in phase 1 (inline beautification
+    /// is phase 2); a paragraph holding exactly one `display: true` Math is
+    /// promoted to a `Block::ImageBlock` by the post-pass.
+    Math {
+        source: String,
+        display: bool,
+    },
     SoftBreak,
     HardBreak,
 }
@@ -197,6 +205,14 @@ pub fn inlines_to_plain(inlines: &[Inline]) -> String {
             // Footnote markers are chrome, not prose — omit them from plain
             // text so they don't pollute heading slugs or breadcrumbs.
             Inline::FootnoteReference { .. } => {}
+            // Math renders as its source in phase 1 (delimiters included,
+            // width-equivalent to the source text).
+            Inline::Math { source, display } => {
+                let delim = if *display { "$$" } else { "$" };
+                out.push_str(delim);
+                out.push_str(source);
+                out.push_str(delim);
+            }
             Inline::SoftBreak => out.push(' '),
             Inline::HardBreak => out.push('\n'),
         }

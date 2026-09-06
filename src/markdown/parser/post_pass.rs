@@ -78,6 +78,146 @@ pub fn promote_diagram_code_blocks(blocks: &mut [Block]) -> HashMap<String, Diag
     sources
 }
 
+/// Post-pass: replace every paragraph whose sole inline is a
+/// `Inline::Math { display: true }` with a synthetic `Block::ImageBlock`
+/// whose URL is `diagram-math-<sha256(source)>`.  Returns the
+/// `url → DiagramSource` map, to be merged into the same map
+/// [`promote_diagram_code_blocks`] returns so `ParsedDoc` can attach the
+/// source to `ImageBlockInfo` (the decode worker renders the formula PNG).
+///
+/// Display math emitted by pulldown-cmark inside a paragraph (`$$...$$`)
+/// only gets block semantics through this promotion; paragraphs that mix
+/// math with other inlines are left alone and keep their
+/// source-equivalent text rendering (phase 1 scope).  `\[...\]` is not
+/// parsed by pulldown-cmark 0.13 and never reaches here.
+///
+/// Called from [`crate::document::ParsedDoc::build_with_overrides`] only —
+/// not from [`super::parse`] — for the same reason as
+/// [`promote_diagram_code_blocks`]: other `parse` consumers (help
+/// preview, link scans, renderer tests) must keep seeing the paragraph.
+/// Post-pass: replace every paragraph whose inlines are *only* display
+/// math (one or more `Inline::Math { display: true }`, separated by soft
+/// or hard breaks and optional whitespace-only text) with one synthetic
+/// `Block::ImageBlock` **per formula**, whose URLs are
+/// `diagram-math-<sha256(source)>`.  Returns the `url → DiagramSource`
+/// map, to be merged into the same map [`promote_diagram_code_blocks`]
+/// returns so `ParsedDoc` can attach the source to `ImageBlockInfo` (the
+/// decode worker renders the formula PNG).
+///
+/// pulldown-cmark folds two stacked `$$...$$` blocks (no blank line
+/// between) into a single paragraph of `[Math, SoftBreak, Math]`; this
+/// pass re-splits that paragraph into one image block per formula so each
+/// renders independently, exactly as if they had been separated by a
+/// blank line.  `real_ranges` is rewritten to stay 1:1 with `blocks`,
+/// with each formula's range carved from the paragraph's source text.
+///
+/// Paragraphs mixing math with other inlines are left alone and keep
+/// their source-equivalent text rendering (phase 1 scope).  `\[...\]` is
+/// not parsed by pulldown-cmark 0.13 and never reaches here.
+///
+/// Called from [`crate::document::ParsedDoc::build_with_overrides`] only —
+/// not from [`super::parse`] — for the same reason as
+/// [`promote_diagram_code_blocks`]: other `parse` consumers (help
+/// preview, link scans, renderer tests) must keep seeing the paragraph.
+pub fn promote_display_math_paragraphs(
+    blocks: &mut Vec<Block>,
+    real_ranges: &mut Vec<Range<usize>>,
+    source: &str,
+) -> HashMap<String, DiagramSource> {
+    let mut sources = HashMap::new();
+    let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
+    let mut out_ranges: Vec<Range<usize>> = Vec::with_capacity(real_ranges.len());
+    for (block, range) in blocks.drain(..).zip(real_ranges.drain(..)) {
+        let Block::Paragraph { inlines } = &block else {
+            out.push(block);
+            out_ranges.push(range);
+            continue;
+        };
+        let Some(math_sources) = collect_display_math_only(inlines) else {
+            out.push(block);
+            out_ranges.push(range);
+            continue;
+        };
+        if math_sources.is_empty() {
+            out.push(block);
+            out_ranges.push(range);
+            continue;
+        }
+        // Carve each formula's byte range from the paragraph's source
+        // text.  `split_math_ranges` walks the paragraph body locating
+        // `$$` delimiter pairs; a failure to locate them (shouldn't
+        // happen — pulldown already parsed them) falls back to keeping
+        // the paragraph as-is.
+        let Some(piece_ranges) = split_math_ranges(source, &range, math_sources.len()) else {
+            out.push(block);
+            out_ranges.push(range);
+            continue;
+        };
+        for (i, formula) in math_sources.iter().enumerate() {
+            let diagram_source = DiagramSource::Latex(formula.clone());
+            let url = crate::diagram::synthetic_url(&diagram_source);
+            sources.insert(url.clone(), diagram_source);
+            out.push(Block::ImageBlock {
+                alt: "math".to_string(),
+                url,
+            });
+            out_ranges.push(piece_ranges[i].clone());
+        }
+    }
+    *blocks = out;
+    *real_ranges = out_ranges;
+    sources
+}
+
+/// If `inlines` contains only display-math inlines (plus soft/hard breaks
+/// and whitespace-only text between them), return each formula's LaTeX
+/// source in order.  Returns `None` for mixed paragraphs, lone inline
+/// (`$...$`) math, or a paragraph with no display math at all.
+fn collect_display_math_only(inlines: &[Inline]) -> Option<Vec<String>> {
+    let mut formulas: Vec<String> = Vec::new();
+    for inline in inlines {
+        match inline {
+            Inline::Math {
+                source,
+                display: true,
+            } => formulas.push(source.clone()),
+            Inline::Math { .. } => return None, // lone inline $...$
+            Inline::Text(t) if t.trim().is_empty() => {}
+            Inline::SoftBreak | Inline::HardBreak => {}
+            _ => return None,
+        }
+    }
+    (!formulas.is_empty()).then_some(formulas)
+}
+
+/// Split the source text of a display-math paragraph into `count`
+/// contiguous byte ranges, one per `$$...$$` formula.  Walks the
+/// paragraph's text locating `$$` delimiter pairs; soft breaks and
+/// whitespace between formulas are absorbed into the preceding formula's
+/// range.  Returns `None` when the delimiters cannot be matched (the
+/// paragraph is then left as-is).
+fn split_math_ranges(source: &str, para: &Range<usize>, count: usize) -> Option<Vec<Range<usize>>> {
+    let body = source.get(para.clone())?;
+    let mut ranges = Vec::with_capacity(count);
+    let mut search_from = 0usize;
+    for i in 0..count {
+        let open = body[search_from..].find("$$")? + search_from;
+        // Closing `$$`: find the next occurrence after the opening.
+        let close_rel = body[open + 2..].find("$$")?;
+        let close = open + 2 + close_rel;
+        // If this is the last formula, the range extends to the end of
+        // the paragraph (absorbing trailing soft break / whitespace).
+        let end = if i + 1 == count {
+            body.len()
+        } else {
+            close + 2
+        };
+        ranges.push(para.start + open..para.start + end);
+        search_from = close + 2;
+    }
+    Some(ranges)
+}
+
 /// Return `Some((alt, url))` iff `inlines` contains exactly one
 /// `Inline::Image` plus optional whitespace-only `Inline::Text` and break
 /// inlines surrounding it.  Returns `None` for paragraphs with mixed

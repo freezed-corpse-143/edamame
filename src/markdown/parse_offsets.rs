@@ -68,7 +68,8 @@ const BASE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_FOOTNOTES)
     .union(Options::ENABLE_STRIKETHROUGH)
     .union(Options::ENABLE_TASKLISTS)
-    .union(Options::ENABLE_SMART_PUNCTUATION);
+    .union(Options::ENABLE_SMART_PUNCTUATION)
+    .union(Options::ENABLE_MATH);
 
 /// The option set to parse `source` with: [`BASE_OPTIONS`], plus the
 /// metadata-block extension matching `source`'s *own first line* — and

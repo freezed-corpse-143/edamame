@@ -2,8 +2,8 @@ pub mod post_pass;
 
 pub use post_pass::{
     annotate_list_blanks, attach_trailing_tui_columns_comments, is_closing_fence,
-    parse_opening_fence, promote_diagram_code_blocks, promote_html_comments,
-    promote_image_paragraphs,
+    parse_opening_fence, promote_diagram_code_blocks, promote_display_math_paragraphs,
+    promote_html_comments, promote_image_paragraphs,
 };
 
 use std::ops::Range;
@@ -606,6 +606,22 @@ where
                 });
             }
 
+            // Math environments — `$...$` inline and `$$...$$` display,
+            // raw LaTeX source kept verbatim.  Requires ENABLE_MATH in the
+            // shared parse options (parse_offsets::BASE_OPTIONS).
+            Event::InlineMath(source) => {
+                inlines.push(Inline::Math {
+                    source: source.into_string(),
+                    display: false,
+                });
+            }
+            Event::DisplayMath(source) => {
+                inlines.push(Inline::Math {
+                    source: source.into_string(),
+                    display: true,
+                });
+            }
+
             // Task list marker inside a list item paragraph — skip here.
             Event::TaskListMarker(_) => {}
 
@@ -703,6 +719,25 @@ mod tests {
     fn parse_paragraph() {
         let blocks = parse("Hello world\n");
         assert!(matches!(&blocks[0], Block::Paragraph { inlines } if !inlines.is_empty()));
+    }
+
+    /// A `$$...$$` math block standing alone in a paragraph must parse as a
+    /// single `Inline::Math { display: true }` so the post-pass can promote
+    /// it to a block-level rendered image (see docs/dev design, phase 1).
+    /// Requires `Options::ENABLE_MATH` in the shared parse options.
+    #[test]
+    fn parse_display_math_paragraph() {
+        let blocks = parse("$$\nx^2 + y^2 = z^2\n$$\n");
+        assert_eq!(
+            blocks,
+            vec![Block::Paragraph {
+                inlines: vec![Inline::Math {
+                    source: "\nx^2 + y^2 = z^2\n".into(),
+                    display: true,
+                }],
+            }],
+            "a paragraph holding only $$...$$ should parse as one display-math inline"
+        );
     }
 
     #[test]
@@ -1288,5 +1323,75 @@ mod tests {
     fn an_unclosed_frontmatter_delimiter_stays_a_rule() {
         let blocks = parse("---\ntitle: Foo\n\nBody.\n");
         assert_eq!(blocks[0], Block::HorizontalRule);
+    }
+}
+
+#[cfg(test)]
+mod math_regression_tests {
+    use super::*;
+    use crate::markdown::ast::{Block, Inline};
+
+    /// Dollar amounts in prose must not be swallowed as math: an unclosed
+    /// `$` (only one delimiter) stays literal text.
+    #[test]
+    fn dollar_amount_stays_text() {
+        let blocks = parse("Cost: $5 and $10 total.\n");
+        assert!(
+            matches!(&blocks[0], Block::Paragraph { inlines } if inlines.iter().all(|i| !matches!(i, Inline::Math { .. }))),
+            "unclosed $ must not parse as math: {:?}",
+            blocks
+        );
+    }
+
+    /// Inline `$x$` parses as non-display math inside a mixed paragraph.
+    #[test]
+    fn inline_math_parses_non_display() {
+        let blocks = parse("Solve $x^2$ for x.\n");
+        assert!(
+            matches!(&blocks[0], Block::Paragraph { inlines } if inlines.iter().any(|i| matches!(i, Inline::Math { display: false, .. }))),
+            "expected inline math: {:?}",
+            blocks
+        );
+    }
+
+    /// Escaped `\$` stays literal text (pulldown backslash-escape).
+    #[test]
+    fn escaped_dollar_stays_text() {
+        let blocks = parse(r"Price: \$5.\n");
+        assert!(
+            matches!(&blocks[0], Block::Paragraph { inlines } if !inlines.iter().any(|i| matches!(i, Inline::Math { .. }))),
+            "escaped $ must stay text: {:?}",
+            blocks
+        );
+    }
+}
+
+#[cfg(test)]
+mod math_bracket_tests {
+    use super::*;
+    use crate::markdown::ast::{Block, Inline};
+
+    /// LaTeX `\[ ... \]` display math: pulldown-cmark 0.13 does not parse
+    /// it (only `$` / `$$`), so today it arrives as literal text.  Phase 1
+    /// keeps this behaviour — `\[..\]` is NOT promoted — until a custom
+    /// pre-scan exists.  This test pins that decision so a future change
+    /// is deliberate.
+    #[test]
+    fn bracket_math_is_not_parsed_yet() {
+        let blocks = parse(
+            r"\[
+x^2
+\]
+",
+        );
+        assert!(
+            matches!(&blocks[0], Block::Paragraph { inlines } if inlines.iter().all(|i| !matches!(i, Inline::Math { .. }))),
+            r"\[..\] must stay literal until custom pre-scan lands: {:?}",
+            blocks
+        );
+        // Sanity: the paragraph is NOT a lone display-math paragraph.
+        assert!(
+            !matches!(&blocks[0], Block::Paragraph { inlines } if inlines.len() == 1 && matches!(&inlines[0], Inline::Math { display: true, .. }))
+        );
     }
 }

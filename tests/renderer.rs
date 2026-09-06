@@ -900,3 +900,33 @@ fn highlighting_off_is_indistinguishable_from_before_the_feature() {
     // One span per row: the single-span line the renderer always emitted.
     assert!(plain[1].spans.len() == 1, "got {:?}", plain[1].spans);
 }
+
+// ── Math (phase 1: source-equivalent rendering) ─────────────────────────────
+
+/// Inline `$...$` mixed into a paragraph renders as its delimited source —
+/// width-identical to the raw text, so wrap and cursor columns stay aligned.
+/// (Beautification is phase 2; the parser-level guarantee that `$5` prices
+/// are not swallowed is covered in the lib parser tests.)
+#[test]
+fn inline_math_renders_source_equivalently() {
+    let lines = render("Solve $x^2$ for x.\n");
+    let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+    assert!(
+        text.contains("$x^2$"),
+        "inline math must render its delimited source, got: {text:?}"
+    );
+}
+
+/// A `$$...$$`-only paragraph renders as the delimited source through the
+/// bare `parse` path (used by help preview and link scans, which never
+/// promote to image blocks) — the promotion to an image block happens in
+/// `ParsedDoc`, covered by its own test.
+#[test]
+fn display_math_paragraph_renders_source_without_promotion() {
+    let lines = render("$$\nx^2\n$$\n");
+    let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+    assert!(
+        text.contains("$$") && text.contains("x^2"),
+        "display math must stay readable as source in non-promoting paths, got: {text:?}"
+    );
+}

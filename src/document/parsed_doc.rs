@@ -10,8 +10,8 @@ use crate::document::visual_cache::VisualRowCache;
 use crate::document::SourceMap;
 use crate::markdown::{
     annotate_list_blanks, inlines_to_plain, parse_raw_with_ranges, promote_diagram_code_blocks,
-    promote_html_comments, promote_image_paragraphs, Block, ImageRowOverride, InlineColMap,
-    RenderCache, Renderer,
+    promote_display_math_paragraphs, promote_html_comments, promote_image_paragraphs, Block,
+    ImageRowOverride, InlineColMap, RenderCache, Renderer,
 };
 
 /// Setext heading style detected from raw block source.  `None` for ATX
@@ -279,15 +279,21 @@ impl ParsedDoc {
         // keeps blocks:real_ranges alignment 1:1 (no blocks are removed).
         promote_image_paragraphs(&mut blocks, Some(&mut real_ranges));
         // Promote fenced ```mermaid blocks to synthetic `Block::ImageBlock`
-        // so the same renderer path reserves overlay rows for them.  Returns
-        // a `url → DiagramSource` map — attached to `ImageBlockInfo.source`
-        // below so the App decode worker can find the mermaid text without
-        // re-walking `blocks`.
-        let diagram_sources = if promote_diagrams {
+        // so the same renderer path reserves overlay rows for them, and
+        // promote `$$...$$`-only paragraphs to display-math image blocks
+        // the same way.  Each returns a `url → DiagramSource` map — merged
+        // and attached to `ImageBlockInfo.source` below so the App decode
+        // worker can find the source text without re-walking `blocks`.
+        let mut diagram_sources = if promote_diagrams {
             promote_diagram_code_blocks(&mut blocks)
         } else {
             HashMap::new()
         };
+        diagram_sources.extend(promote_display_math_paragraphs(
+            &mut blocks,
+            &mut real_ranges,
+            source,
+        ));
         if let Some((override_start, widths)) = live_table_widths {
             apply_live_table_widths(&mut blocks, &real_ranges, *override_start, widths);
         }
@@ -976,12 +982,91 @@ mod tests {
         assert_eq!(doc.block_own_line_count(image_block), 10);
     }
 
+    /// A paragraph holding only `$$...$$` display math must be promoted to
+    /// an image block (phase 1 block-math design), so the renderer can
+    /// reserve multi-row space for the rasterized formula exactly like a
+    /// diagram or image block.
+    #[test]
+    fn display_math_paragraph_promotes_to_image_block() {
+        let src = "Above.\n\n$$\nx^2 + y^2 = z^2\n$$\n\nBelow.\n";
+        let doc = ParsedDoc::build(src, theme(), true, 10);
+        let math_byte = src.find("$$").expect("math exists");
+        let math_block = doc
+            .source_map
+            .block_for_byte(math_byte)
+            .expect("math block exists in source map");
+        assert!(
+            doc.is_image_block(math_block),
+            "a $$...$$-only paragraph must promote to an image block (block {}); blocks: {:?}",
+            math_block,
+            doc.blocks
+        );
+    }
+
+    /// The promotion must carry the LaTeX source through to
+    /// `ImageBlockInfo` (via the diagram-sources map) so the decode worker
+    /// can render the formula — same contract mermaid blocks rely on.
+    #[test]
+    fn promoted_math_block_carries_latex_source() {
+        let src = "$$\nE = mc^2\n$$\n";
+        let doc = ParsedDoc::build(src, theme(), true, 10);
+        let math_blocks: Vec<_> = doc
+            .image_blocks
+            .iter()
+            .filter(|info| matches!(info.source, Some(crate::diagram::DiagramSource::Latex(_))))
+            .collect();
+        assert_eq!(math_blocks.len(), 1, "image_blocks: {:?}", doc.image_blocks);
+        assert!(
+            matches!(&math_blocks[0].source, Some(crate::diagram::DiagramSource::Latex(s)) if s.trim() == "E = mc^2"),
+            "latex source must be preserved: {:?}",
+            math_blocks[0].source
+        );
+        assert!(
+            math_blocks[0].url.starts_with("diagram-math-"),
+            "synthetic math url expected: {}",
+            math_blocks[0].url
+        );
+    }
+
     #[test]
     fn setext_h2_has_two_rendered_lines() {
         let src = "Heading\n-------\n";
         let doc = ParsedDoc::build(src, theme(), false, 24);
         let block = doc.source_map.block_for_byte(0).unwrap();
         assert_eq!(doc.block_own_line_count(block), 2);
+    }
+
+    /// Two `$$...$$` blocks stacked with no blank line between them (the
+    /// common pattern in math documents) must each promote to their own
+    /// image block.  pulldown-cmark may fold them into one paragraph with
+    /// two DisplayMath events plus a soft break — the promotion must
+    /// handle that shape, not only a paragraph holding a single math.
+    #[test]
+    fn adjacent_display_math_paragraphs_each_promote() {
+        let src = "$$\nX = \\begin{bmatrix} 1 & 2 \\end{bmatrix}\n$$\n\
+                   $$\nA = \\begin{bmatrix} 1 & 2 & 3 & 4 \\end{bmatrix}\n$$\n";
+        let doc = ParsedDoc::build(src, theme(), true, 10);
+        let math_blocks: Vec<_> = doc
+            .image_blocks
+            .iter()
+            .filter(|info| matches!(info.source, Some(crate::diagram::DiagramSource::Latex(_))))
+            .collect();
+        assert_eq!(
+            math_blocks.len(),
+            2,
+            "each stacked $$...$$ block must promote; blocks: {:?}",
+            doc.blocks
+        );
+        // Sources preserved in document order.
+        let sources: Vec<&str> = math_blocks
+            .iter()
+            .map(|info| match &info.source {
+                Some(crate::diagram::DiagramSource::Latex(s)) => s.trim(),
+                _ => "",
+            })
+            .collect();
+        assert!(sources[0].contains("X ="), "first source: {sources:?}");
+        assert!(sources[1].contains("A ="), "second source: {sources:?}");
     }
 
     #[test]
