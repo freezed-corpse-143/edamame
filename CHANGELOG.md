@@ -14,7 +14,8 @@ Each released version's section is also what ships as the GitHub release notes: 
 
 ### Fixed
 
-- Now maps a click to the correct character in table cells with formatting.
+- Clicks now map to the correct character in table cells with formatting.
+- Mermaid diagrams no longer have missing text when rendered on some systems.
 
 ## [0.1.3] - 2026-09-02
 

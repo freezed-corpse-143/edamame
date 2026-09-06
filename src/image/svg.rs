@@ -28,9 +28,48 @@ fn shared_fontdb() -> Arc<fontdb::Database> {
         .get_or_init(|| {
             let mut db = fontdb::Database::new();
             db.load_system_fonts();
+            pin_generic_families(&mut db);
             Arc::new(db)
         })
         .clone()
+}
+
+/// Point the CSS generic families at a face that is actually loaded.
+///
+/// `fontdb::Database::new()` seeds the generics with Windows/macOS names ("Arial", "Times New
+/// Roman", …), and `load_system_fonts` only overrides them when fontdb's partial fontconfig parser
+/// resolves the config's `<alias>` blocks — which on some distros (Debian 13) it does not, leaving
+/// `sans-serif` pointing at the absent "Arial".  Mermaid emits
+/// `font-family="trebuchet ms,verdana,arial,sans-serif"`; when none of those resolve, generic
+/// included, usvg drops every glyph and the diagram renders as shapes with no text.  Pinning each
+/// generic to the first candidate present in the db closes that gap; a missing list is a no-op.
+fn pin_generic_families(db: &mut fontdb::Database) {
+    fn first_present<'a>(db: &fontdb::Database, candidates: &[&'a str]) -> Option<&'a str> {
+        candidates.iter().copied().find(|name| {
+            db.query(&fontdb::Query {
+                families: &[fontdb::Family::Name(name)],
+                ..Default::default()
+            })
+            .is_some()
+        })
+    }
+    if let Some(f) =
+        first_present(db, &["DejaVu Sans", "Noto Sans", "Liberation Sans", "Arial", "Helvetica"])
+    {
+        db.set_sans_serif_family(f);
+    }
+    if let Some(f) = first_present(
+        db,
+        &["DejaVu Serif", "Noto Serif", "Liberation Serif", "Times New Roman"],
+    ) {
+        db.set_serif_family(f);
+    }
+    if let Some(f) = first_present(
+        db,
+        &["DejaVu Sans Mono", "Noto Sans Mono", "Liberation Mono", "Courier New"],
+    ) {
+        db.set_monospace_family(f);
+    }
 }
 
 /// Pre-populate the shared fontdb off the hot path.  Idempotent and thread-safe.
