@@ -254,9 +254,57 @@ pub fn resolve_latex(
     .map_err(DiagramError::from)?;
     Ok(LoadedImage {
         url,
-        image: flatten_to_background(add_formula_breathing_room(image, font_size), bg),
+        image: fit_latex_to_cell_grid(image, font_size, bg),
         scratch: None,
     })
+}
+
+/// Prepare a formula image for the terminal's cell grid: symmetric
+/// breathing room, opaque flatten onto the document background, then
+/// vertical centring to an exact whole number of cells.
+///
+/// The editor reserves image rows in whole cells (`aspect_rows_of` =
+/// `ceil(pixels / cell_height)`), and `paint_images` fits the image into
+/// the reserved rect **downward-only, flush to the top**.  Without the
+/// centring step, the rounding slack between the image's pixel height
+/// and the reserved whole-cell height would land entirely below the
+/// image as a letter-box gap — the "only blank below the formula" look.
+/// Padding up to `rows × cell_height` with the background colour and
+/// centring the content in it turns that slack into symmetric top/bottom
+/// margins instead, so a formula's vertical rhythm reads like a text
+/// line's.
+fn fit_latex_to_cell_grid(
+    image: image::DynamicImage,
+    font_size: Option<(u16, u16)>,
+    bg: [u8; 4],
+) -> image::DynamicImage {
+    let image = add_formula_breathing_room(image, font_size);
+    let image = flatten_to_background(image, bg);
+    center_on_cell_grid(image, font_size, bg)
+}
+
+/// Pad `image` (already opaque, background-coloured) vertically so its
+/// height is an exact multiple of the terminal cell height, content
+/// centred: `extra = rows × cell_h - height` split equally above and
+/// below.
+fn center_on_cell_grid(
+    image: image::DynamicImage,
+    font_size: Option<(u16, u16)>,
+    bg: [u8; 4],
+) -> image::DynamicImage {
+    use image::{GenericImageView, ImageBuffer, Rgba};
+    let cell_h = u32::from(font_size.map_or(16, |(_, h)| h.max(1)));
+    let (w, h) = image.dimensions();
+    let rows = h.div_ceil(cell_h).max(1);
+    let total = rows * cell_h;
+    if total <= h {
+        return image;
+    }
+    let extra = total - h;
+    let top = extra / 2;
+    let mut canvas = ImageBuffer::from_pixel(w, total, Rgba([bg[0], bg[1], bg[2], 255]));
+    image::imageops::overlay(&mut canvas, &image, 0, i64::from(top));
+    image::DynamicImage::ImageRgba8(canvas)
 }
 
 /// Composite a formula image onto the document background colour,
@@ -591,6 +639,55 @@ mod tests {
         );
         assert_eq!(rgba.get_pixel(0, 0).0[3], 255, "output fully opaque");
         assert_eq!(out.dimensions(), (2, 1), "dimensions unchanged");
+    }
+
+    /// Rounding slack between a formula's pixel height and the reserved
+    /// whole-cell rows must split above AND below the content (vertical
+    /// centring) — never all below, which would read as a gap only under
+    /// the formula.
+    #[test]
+    fn cell_grid_centring_splits_rounding_slack_evenly() {
+        use image::{GenericImageView, Rgba};
+        // 2×10 opaque red; cell height 30 → ceil(10/30)=1 row = 30px →
+        // extra 20px, 10 above and 10 below.
+        let img = image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+            2,
+            10,
+            Rgba([200, 0, 0, 255]),
+        ));
+        let out = center_on_cell_grid(img, Some((8, 30)), [10, 20, 30, 255]);
+        assert_eq!(out.dimensions(), (2, 30));
+        let rgba = out.to_rgba8();
+        assert_eq!(rgba.get_pixel(0, 0).0, [10, 20, 30, 255], "top pad = bg");
+        assert_eq!(rgba.get_pixel(0, 9).0, [10, 20, 30, 255], "top half slack");
+        assert_eq!(
+            rgba.get_pixel(0, 10).0,
+            [200, 0, 0, 255],
+            "content starts at 10"
+        );
+        assert_eq!(
+            rgba.get_pixel(0, 19).0,
+            [200, 0, 0, 255],
+            "content ends at 19"
+        );
+        assert_eq!(
+            rgba.get_pixel(0, 20).0,
+            [10, 20, 30, 255],
+            "bottom pad = bg"
+        );
+        assert_eq!(
+            rgba.get_pixel(0, 29).0,
+            [10, 20, 30, 255],
+            "bottom half slack"
+        );
+    }
+
+    /// An image that already fills its cells exactly is untouched.
+    #[test]
+    fn cell_grid_centring_is_a_noop_on_exact_multiples() {
+        let img = image::DynamicImage::new_rgba8(4, 60); // 2 rows of 30
+        let out = center_on_cell_grid(img, Some((8, 30)), [0, 0, 0, 255]);
+        assert_eq!(out.height(), 60);
     }
 
     /// The rendered formula's pixel height must track the terminal cell
