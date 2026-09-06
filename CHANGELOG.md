@@ -8,6 +8,10 @@ Each released version's section is also what ships as the GitHub release notes: 
 
 ## [Unreleased]
 
+### Changed
+
+- The editor is now capped at 100 columns by default, for more comfortable reading on wide terminals. Turn it off with the "Limit editor width" toggle in settings (Ctrl-P → Open settings). You can also change the character limit there.
+
 ### Fixed
 
 - Now maps a click to the correct character in table cells with formatting.

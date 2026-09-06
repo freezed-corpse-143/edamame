@@ -72,7 +72,7 @@ Change both from the theme picker: `Ctrl-P` → "Switch theme". There is no defa
 | `show_line_numbers` | bool | `false` | overlay, palette |
 | `big_h1` | bool | `false` | overlay, palette |
 | `syntax_highlighting` | bool | `true` | overlay |
-| `max_width_enabled` | bool | `false` | overlay, palette |
+| `max_width_enabled` | bool | `true` | overlay, palette |
 | `max_width_cols` | integer | `100` | overlay |
 
 `line_wrap` wraps long lines at the terminal width. `code_block_wrap` is separate because wrapped code is often harder to read than clipped code.

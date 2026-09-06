@@ -116,7 +116,7 @@ impl Default for EditorConfig {
             show_line_numbers: false,
             mouse_scroll_lines: 1,
             transient_ms: 1500,
-            max_width_enabled: false,
+            max_width_enabled: true,
             max_width_cols: 100,
             big_h1: false,
             syntax_highlighting: true,
