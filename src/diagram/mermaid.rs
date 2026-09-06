@@ -253,9 +253,37 @@ pub fn resolve_latex(
     .map_err(DiagramError::from)?;
     Ok(LoadedImage {
         url,
-        image,
+        image: add_formula_breathing_room(image, font_size),
         scratch: None,
     })
+}
+
+/// Pad a formula image with transparent rows above and below so its
+/// vertical rhythm matches the text grid.
+///
+/// Text lines carry their own inter-line gap: a terminal cell is taller
+/// than the glyph box (WezTerm line-height 1.15, most fonts 1.2+), so two
+/// text lines leave roughly half a cell's worth of background between
+/// glyph boxes on each side.  A rendered formula has no such built-in
+/// margin — `paint_images` overlays it flush against the reserved cell
+/// rect's top edge — so formulas and images sit visually tighter against
+/// their neighbours than text does.  ~1/10 of the cell height per side
+/// restores the look of an ordinary line gap.  The extra rows are
+/// transparent, so layout, aspect-row accounting (`aspect_rows_of`) and
+/// the block's reserved height all follow automatically from the new
+/// dimensions.
+fn add_formula_breathing_room(
+    image: image::DynamicImage,
+    font_size: Option<(u16, u16)>,
+) -> image::DynamicImage {
+    use image::imageops::overlay;
+    use image::{GenericImageView, ImageBuffer, Rgba};
+    let cell_h = u32::from(font_size.map_or(16, |(_, h)| h.max(1)));
+    let pad = (cell_h / 10).clamp(1, 6);
+    let (w, h) = image.dimensions();
+    let mut canvas = ImageBuffer::from_pixel(w, h + 2 * pad, Rgba([0, 0, 0, 0]));
+    overlay(&mut canvas, &image.to_rgba8(), 0, i64::from(pad));
+    image::DynamicImage::ImageRgba8(canvas)
 }
 
 /// Render a LaTeX display-math source to a self-contained SVG string,
@@ -452,6 +480,41 @@ mod tests {
         assert!(loaded.image.height() > 0);
     }
 
+    /// The breathing-room pad scales with the reported cell height and
+    /// keeps the formula's pixels centred vertically inside it (no
+    /// content shift, only transparent margin added top and bottom).
+    #[test]
+    fn breathing_room_pads_transparent_rows_above_and_below() {
+        use image::GenericImageView;
+        use image::Rgba;
+        // 4×8 solid-red image, cell height 30 → pad 3 rows each side.
+        let img = image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+            4,
+            8,
+            Rgba([200, 0, 0, 255]),
+        ));
+        let padded = add_formula_breathing_room(img, Some((8, 30)));
+        assert_eq!(padded.dimensions(), (4, 8 + 2 * 3));
+        let rgba = padded.to_rgba8();
+        // Top pad rows transparent, first content row red.
+        assert_eq!(rgba.get_pixel(0, 0).0[3], 0);
+        assert_eq!(rgba.get_pixel(0, 2).0[3], 0);
+        assert_eq!(rgba.get_pixel(0, 3).0, [200, 0, 0, 255]);
+        // Bottom pad rows transparent, last content row red.
+        // content 3..11, bottom pad 11..14 (height 8+2*3).
+        assert_eq!(rgba.get_pixel(0, 8 + 3).0[3], 0); // first bottom pad
+        assert_eq!(rgba.get_pixel(0, 8 + 2 * 3 - 1).0[3], 0); // last row
+        assert_eq!(rgba.get_pixel(0, 8 + 3 - 1).0, [200, 0, 0, 255]); // last content
+    }
+
+    /// Unknown cell size falls back to a 16 px cell (pad 1).
+    #[test]
+    fn breathing_room_falls_back_to_a_default_cell_height() {
+        let img = image::DynamicImage::new_rgba8(2, 2);
+        let padded = add_formula_breathing_room(img, None);
+        assert_eq!(padded.height(), 2 + 2);
+    }
+
     /// The rendered formula's pixel height must track the terminal cell
     /// font size (16 px cell → roughly one text line), not balloon to the
     /// whole image envelope — the bug where display math rendered huge.
@@ -470,8 +533,10 @@ mod tests {
         .expect("display math should render");
         // Natural-mode raster keeps the SVG's own size.  With RaTeX em =
         // 16 × LATEX_EM_TO_CELL ≈ 9.6 user units and no padding, a single
-        // line of math rasterizes to ≈ 1.06 em × 1.333 px/pt ≈ 13.6 px —
-        // one cell, not the 640 px a full-envelope fill would produce.
+        // line of math rasterizes to ≈ 1.06 em × 1.333 px/pt ≈ 13.6 px,
+        // plus 2 px of breathing room (1 per side at a 16 px cell) —
+        // still one cell, not the 640 px a full-envelope fill would
+        // produce.
         let h = loaded.image.height();
         assert!(
             (8..=24).contains(&h),
