@@ -239,6 +239,7 @@ pub fn resolve_latex(
     max_cells: Option<(u16, u16)>,
     font_size: Option<(u16, u16)>,
     fg: [u8; 4],
+    bg: [u8; 4],
 ) -> Result<LoadedImage, DiagramError> {
     let svg = render_latex_svg(source, fg, font_size)?;
     let image = rasterize_svg(
@@ -253,9 +254,55 @@ pub fn resolve_latex(
     .map_err(DiagramError::from)?;
     Ok(LoadedImage {
         url,
-        image: add_formula_breathing_room(image, font_size),
+        image: flatten_to_background(add_formula_breathing_room(image, font_size), bg),
         scratch: None,
     })
+}
+
+/// Composite a formula image onto the document background colour,
+/// replacing transparency with opaque `bg`.
+///
+/// Two consumers need an opaque image:
+///
+/// * **Halfblocks (active scroll / partial visibility)** encode each cell
+///   through `to_rgb8()`, which *drops the alpha channel* — a transparent
+///   pixel's RGB is read as-is, and formula transparency is
+///   `Rgba([0,0,0,0])`, i.e. black.  With the native protocol idling
+///   during scroll (`paint_images` falls back to the halfblocks scratch
+///   while `is_scrolling`), every transparent region around a formula
+///   painted black — the "black blob while scrolling" bug.  Flattened
+///   onto the document `bg`, those regions encode as `bg`, which is
+///   exactly what the native composite shows.
+/// * **The letter-box / trailing margin** a formula's rect reserves
+///   (the rect spans the whole column): the same reasoning — encode as
+///   `bg`, not black.
+///
+/// Result is visually identical to the transparent composite whenever the
+/// terminal honours alpha (native kitty/iTerm2/sixel paths), because the
+/// cells beneath the image are painted with the same document `bg`.
+fn flatten_to_background(image: image::DynamicImage, bg: [u8; 4]) -> image::DynamicImage {
+    use image::GenericImageView;
+    let [br, bg_, bb, ba] = bg;
+    let (w, h) = image.dimensions();
+    let mut out = image::ImageBuffer::new(w, h);
+    let src = image.to_rgba8();
+    for (x, y, px) in src.enumerate_pixels() {
+        let [r, g, b, a] = px.0;
+        // Straight alpha-over: the formula PNG is transparent or fully
+        // opaque in practice (no partial coverage), but stay exact for
+        // antialiased glyph edges.
+        let alpha = f32::from(a) / 255.0;
+        let ba_ = f32::from(ba) / 255.0;
+        let mix = |s: u8, d: u8| {
+            (f32::from(s) * alpha + f32::from(d) * ba_ * (1.0 - alpha)).round() as u8
+        };
+        out.put_pixel(
+            x,
+            y,
+            image::Rgba([mix(r, br), mix(g, bg_), mix(b, bb), 255]),
+        );
+    }
+    image::DynamicImage::ImageRgba8(out)
 }
 
 /// Pad a formula image with transparent rows above and below so its
@@ -474,6 +521,7 @@ mod tests {
             Some((80, 24)),
             Some((8, 16)),
             [0xcc, 0xcc, 0xcc, 255],
+            [0x1a, 0x1a, 0x1a, 255],
         )
         .expect("trivial display math should render");
         assert!(loaded.image.width() > 0);
@@ -515,6 +563,36 @@ mod tests {
         assert_eq!(padded.height(), 2 + 2);
     }
 
+    /// Transparent formula pixels must flatten onto the document
+    /// background, never survive as black — halfblocks encode via
+    /// `to_rgb8()`, which reads a transparent pixel's RGB as-is
+    /// (`Rgba([0,0,0,0])` → black).
+    #[test]
+    fn flatten_composites_transparency_onto_the_document_background() {
+        use image::{GenericImageView, Rgba};
+        let img = image::DynamicImage::ImageRgba8(image::ImageBuffer::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                Rgba([0, 0, 0, 0])
+            } else {
+                Rgba([200, 0, 0, 255])
+            }
+        }));
+        let out = flatten_to_background(img, [10, 20, 30, 255]);
+        let rgba = out.to_rgba8();
+        assert_eq!(
+            rgba.get_pixel(0, 0).0,
+            [10, 20, 30, 255],
+            "transparent → bg"
+        );
+        assert_eq!(
+            rgba.get_pixel(1, 0).0,
+            [200, 0, 0, 255],
+            "opaque content kept"
+        );
+        assert_eq!(rgba.get_pixel(0, 0).0[3], 255, "output fully opaque");
+        assert_eq!(out.dimensions(), (2, 1), "dimensions unchanged");
+    }
+
     /// The rendered formula's pixel height must track the terminal cell
     /// font size (16 px cell → roughly one text line), not balloon to the
     /// whole image envelope — the bug where display math rendered huge.
@@ -529,6 +607,7 @@ mod tests {
             Some((80, 40)),
             Some((8, 16)),
             [0xcc, 0xcc, 0xcc, 255],
+            [0x1a, 0x1a, 0x1a, 255],
         )
         .expect("display math should render");
         // Natural-mode raster keeps the SVG's own size.  With RaTeX em =

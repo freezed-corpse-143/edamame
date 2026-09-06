@@ -546,6 +546,13 @@ impl App {
         let latex_fg = crate::ui::dim::color_to_rgb(self.editor.theme().palette.text)
             .map(|[r, g, b]| [r, g, b, 255])
             .unwrap_or([0xcc, 0xcc, 0xcc, 255]);
+        // Document background for the same reason the halfblocks fallback
+        // needs an opaque image: transparent formula pixels must encode
+        // as the document background, never as the black `to_rgb8()`
+        // produces from `Rgba([0,0,0,0])`.
+        let latex_bg = crate::ui::dim::color_to_rgb(self.editor.theme().palette.bg)
+            .map(|[r, g, b]| [r, g, b, 255])
+            .unwrap_or([0x1a, 0x1a, 0x1a, 255]);
 
         for info in infos {
             // Route each block to its respective enabled flag.  Skip
@@ -602,6 +609,7 @@ impl App {
                                 max_cells,
                                 font_size,
                                 latex_fg,
+                                latex_bg,
                             )
                             .map_err(|e| (url.clone(), e.to_string()))
                         }
