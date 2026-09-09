@@ -314,7 +314,7 @@ mod tests {
     fn fixture_labels_are_unique_ascending_and_agree_with_the_cursor() {
         let source = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/sample.md"
+            "/tests/fixtures/general.md"
         ))
         .expect("the sample fixture must be readable");
 
