@@ -14,6 +14,7 @@
 //!   table is memoized per parse, so a mislabel would persist until the next re-parse.
 
 use crate::document::ParsedDoc;
+use crate::editor::effective_rows::EffectiveRows;
 use crate::editor::state::sub_lines_in_block;
 use crate::editor::EditorState;
 use crate::ui::rendered_view::raw_source_lines;
@@ -26,20 +27,55 @@ thread_local! {
 
 impl EditorState {
     /// Buffer line to label visual row `visual_row` with, or `None` for an unnumbered row.
-    /// Preview/Rendered counterpart of `raw_line_at_visual_row`.
+    /// Preview/Rendered counterpart of `raw_line_at_visual_row`.  Builds an [`EffectiveRows`] per
+    /// call; the gutter, which asks per visible row, calls [`Self::source_line_at_visual_row_with`]
+    /// with one built for the whole frame instead.
     pub fn source_line_at_visual_row(&self, visual_row: usize, width: usize) -> Option<usize> {
-        let (rendered_idx, sub_row) = self.parsed.line_at_visual_row(visual_row, width);
-        if sub_row != 0 {
-            return None;
+        self.source_line_at_visual_row_with(&self.effective_rows(width), visual_row)
+    }
+
+    /// [`Self::source_line_at_visual_row`] against a prebuilt [`EffectiveRows`], so a per-row
+    /// caller doesn't reconstruct it (which allocates the revealed block's source) every row.
+    pub(crate) fn source_line_at_visual_row_with(
+        &self,
+        effective: &EffectiveRows,
+        visual_row: usize,
+    ) -> Option<usize> {
+        use crate::editor::effective_rows::RowHit;
+        // Route through `EffectiveRows` so a revealed reflowed block's raw expansion is counted:
+        // its rows are raw source lines, and rows below it shift.  Identity everywhere else, so
+        // this equals the base `line_at_visual_row` outside that reveal.
+        match effective.line_at_visual_row(visual_row) {
+            RowHit::Raw { raw_line, sub } => {
+                if sub != 0 {
+                    return None; // a wrap continuation of a raw line carries no number
+                }
+                // Each revealed raw line is a source line: the block's first source line + offset.
+                let cursor_byte = self.buffer.rope().char_to_byte(self.cursor.offset);
+                let block_start = self
+                    .parsed
+                    .source_map
+                    .original_range_for_byte(cursor_byte)?
+                    .start;
+                Some(self.buffer.rope().byte_to_line(block_start) + raw_line)
+            }
+            RowHit::Rendered {
+                line: rendered_idx,
+                sub,
+            } => {
+                if sub != 0 {
+                    return None;
+                }
+                // Cached on the `ParsedDoc`, not keyed on buffer version: an in-line edit bumps the
+                // version without moving a line, and the walk is full-document.
+                let parsed = &self.parsed;
+                parsed
+                    .source_lines_or_init(|| build_source_line_map(parsed))
+                    .get(rendered_idx)
+                    .copied()
+                    .flatten()
+            }
         }
-        // Cached on the `ParsedDoc`, not keyed on buffer version: an in-line edit bumps the
-        // version without moving a line, and the walk is full-document.
-        let parsed = &self.parsed;
-        parsed
-            .source_lines_or_init(|| build_source_line_map(parsed))
-            .get(rendered_idx)
-            .copied()
-            .flatten()
     }
 }
 
@@ -93,10 +129,18 @@ fn build_source_line_map(parsed: &ParsedDoc) -> Vec<Option<usize>> {
             .unwrap_or(0);
 
         let subs = sub_lines_in_block(parsed, start, block_idx, own, source, &raw_lines);
-        // Last writer wins (module doc): overwrite, never `get_or_insert`.
+        // Last writer wins (module doc): overwrite, never `get_or_insert` — *except* a reflowed
+        // paragraph, whose several source lines all collapse onto one rendered flow row (`subs`
+        // is all-zeros because `block_own == 1` caps them).  There the row shows the flow's first
+        // character, so it must be labeled with the *first* source line — first writer wins.
+        let reflowed = parsed.is_reflowed_paragraph_at(start);
         for (raw_line, &sub) in subs.iter().enumerate().take(last_content + 1) {
             if let Some(slot) = map.get_mut(rendered.start + sub) {
-                *slot = Some(block_line + raw_line);
+                if reflowed {
+                    slot.get_or_insert(block_line + raw_line);
+                } else {
+                    *slot = Some(block_line + raw_line);
+                }
             }
         }
     }
@@ -305,10 +349,41 @@ mod tests {
         }
     }
 
+    /// A reflowed paragraph (Preview mode) collapses its source lines into one flow, so the
+    /// gutter numbers only its first rendered row — with the flow's *first* source line — and
+    /// leaves the rest folded.  Without the first-writer branch the row would show the paragraph's
+    /// last source line.
+    #[test]
+    fn reflowed_paragraph_labels_its_first_source_line() {
+        let mut state = EditorState::new(Buffer::from_str("one\ntwo\nthree\n\nafter\n"), theme());
+        // Preview reflows by default; reconcile the parse the way the App does each frame.
+        state.set_viewport_width(80);
+        state.sync_reflow_for_mode();
+        let labels = labels(&state, 80);
+        assert_eq!(
+            labels.first().copied().flatten(),
+            Some(0),
+            "the flow's row must be numbered with its first source line: {labels:?}"
+        );
+        let numbered: Vec<usize> = labels.iter().flatten().copied().collect();
+        assert!(
+            !numbered.contains(&1) && !numbered.contains(&2),
+            "the folded soft-break lines must not be numbered: {labels:?}"
+        );
+        assert!(
+            numbered.contains(&4),
+            "`after` (line 4) must keep its own number: {labels:?}"
+        );
+    }
+
     /// A version-keyed cache would rebuild the full-document walk on every keystroke.
     #[test]
     fn typing_within_a_line_does_not_rebuild_the_table() {
         let mut state = state_for("alpha\n\nbravo\n", 80);
+        // This exercises the memoized rendered→source table, which is orthogonal to reflow; with
+        // reflow on, row 0 is a revealed raw line that never consults the table, so disable it to
+        // keep the caching assertions about the table itself.
+        state.set_reflow(false);
         let before = builds(|| {
             let _ = state.source_line_at_visual_row(0, 80);
         });

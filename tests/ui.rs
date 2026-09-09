@@ -279,6 +279,65 @@ fn rendered_view_paints_selection_across_multiple_rendered_blocks() {
     );
 }
 
+/// With reflow on in Rendered mode a reflowed paragraph renders as one wrapped flow, but
+/// revealing it (cursor inside) must stack all its raw source lines — not just the cursor's one
+/// line — so you edit the real bytes.
+#[test]
+fn reflowed_paragraph_reveals_all_raw_source_lines_stacked() {
+    use edamame::document::Buffer;
+    use edamame::editor::EditorState;
+    use edamame::ui::{RenderedView, RenderedViewState};
+
+    let theme = Box::leak(Box::new(Theme::default()));
+    // Markdown that differs raw-vs-rendered (`**bold**`) so the reveal is unmistakable.
+    let src = "**bold** words\nsecond line\nthird line\n";
+    let mut state = EditorState::new(Buffer::from_str(src), theme);
+    state.mode = Mode::Rendered;
+    state.set_viewport_width(40);
+    state.set_reflow(true);
+    // Cursor at the start → inside the paragraph; `cursor_block_entered_at == None` ⇒ revealed.
+    state.cursor.offset = 0;
+
+    let width = 40u16;
+    let backend = TestBackend::new(width, 6);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut view_state = RenderedViewState::default();
+    terminal
+        .draw(|frame| {
+            let view = RenderedView {
+                cursor_style: theme.status_mode_rendered,
+                visual_kind: None,
+                drop_indicator: None,
+                show_table_buttons: false,
+                state: &state,
+                theme,
+            };
+            frame.render_stateful_widget(view, frame.area(), &mut view_state);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let row_text = |y: u16| -> String {
+        (0..width)
+            .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect::<String>()
+    };
+    assert!(
+        row_text(0).contains("**bold**"),
+        "row 0 must show the raw first source line, got {:?}",
+        row_text(0)
+    );
+    assert!(
+        row_text(1).contains("second line"),
+        "row 1 must show the raw second source line, got {:?}",
+        row_text(1)
+    );
+    assert!(
+        row_text(2).contains("third line"),
+        "row 2 must show the raw third source line, got {:?}",
+        row_text(2)
+    );
+}
+
 /// Regression: with the cursor on the phantom final line (after the source's
 /// trailing '\n'), the last real block must stay rendered.  Before the
 /// phantom-line virtual block existed, the cursor fell back to the last real

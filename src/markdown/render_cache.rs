@@ -27,6 +27,9 @@ pub(super) struct RenderSettings {
     pub row_striping: bool,
     pub big_h1: bool,
     pub syntax_highlighting: bool,
+    /// Reflow prose paragraphs (soft breaks → spaces, wrap to viewport).  A render-output knob, so
+    /// it belongs in the fingerprint: toggling it (e.g. a mode switch into Raw) must clear the cache.
+    pub reflow_paragraphs: bool,
     /// `highlight::warm_generation()` at build time, or 0 when highlighting is off.  Warming a
     /// grammar changes a code block's rendered lines without changing its `Block` value, so
     /// without this the block would stay uncolored for the life of the document.
@@ -76,6 +79,7 @@ mod tests {
             row_striping: false,
             big_h1: false,
             syntax_highlighting: true,
+            reflow_paragraphs: false,
             highlight_generation: 0,
             highlight_retry_epoch: 0,
         }

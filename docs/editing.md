@@ -34,6 +34,8 @@ edamame parses CommonMark plus a set of GitHub extensions.
 
 **Smart punctuation is on**, and currently not configurable. Straight quotes render as curly ones, `--` becomes an en dash, `...` becomes an ellipsis. Your source file is untouched — this is display only.
 
+**Paragraphs reflow to the width of your terminal.** If you hard-wrap prose in the source — a line break every 80 columns, say — those single line breaks are treated as spaces. edamame joins them back into one paragraph and wraps it to fit the view, instead of showing a stack of ragged short lines. A deliberate line break — two trailing spaces or a backslash at the end of a line — is kept. Turn reflow off with **Reflow paragraphs** in the settings overlay, or `reflow = false` in `config.toml`.
+
 **Frontmatter is shown as data, not prose.** A `---`-delimited YAML block (or a `+++`-delimited TOML one) at the top of a file renders verbatim — one row per source line, dimmed, with each key picked out from its value. It stays fully editable, and it is left out of an HTML export, since it describes the document rather than belonging to it.
 
 **Only the very first line of the file can open frontmatter.** The delimiter has to be the first thing in the document — no blank line, no indentation, nothing above it — and it has to be closed by a matching delimiter. A `---` anywhere else is an ordinary horizontal rule, including one sitting directly above a heading, so section separators in an existing document keep working as they always did. A file that opens `+++` gets TOML frontmatter only, and vice versa. Note that a YAML block closed with `...` instead of `---` displays a `---` on that row — the source is unchanged, and moving the cursor into the block shows it as written.

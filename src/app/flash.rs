@@ -75,9 +75,9 @@ impl App {
         self.transient.as_ref().and_then(|m| m.until)
     }
 
-    /// Build the hint content for this frame.  Priority: Prompt > CommandLine > Transient
-    /// > hovered-link > Chords, so a `Saved` flash or a file-changed prompt is never masked
-    /// by an idle hover.
+    /// Build the hint content for this frame.  Priority order: Prompt, then CommandLine, then
+    /// Transient, then hovered-link, then Chords — so a `Saved` flash or a file-changed prompt
+    /// is never masked by an idle hover.
     pub(super) fn hint_content(&self) -> HintContent {
         if let Some(prompt) = self.hint_prompt.as_ref() {
             return HintContent::Prompt {

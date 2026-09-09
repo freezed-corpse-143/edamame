@@ -294,6 +294,18 @@ impl App {
         self.last_doc_height = dims.doc_height;
         self.last_doc_width = dims.doc_width;
         self.editor.set_viewport_width(dims.doc_width);
+        // `parsed` is one mode-independent spine, so a mode switch that changes whether paragraphs
+        // reflow has to rebuild it.  A no-op when the reflow state already agrees with the mode.
+        self.editor.sync_reflow_for_mode();
+        // Latch a mermaid / reflowed-paragraph reveal once its dwell delay elapses, so it stays
+        // revealed as the cursor moves within it (the delay itself re-arms per line, time-driven,
+        // so this has no action site of its own).
+        self.editor.latch_cursor_reveal();
+        // Reconcile cursor visibility across a reflowed block's reveal/un-reveal height change
+        // (time-driven, so it has no action site of its own): the block's top and everything above
+        // stay put and only content below reflows.  Inert unless reflow is on in Rendered mode.
+        self.editor
+            .anchor_reflow_reveal(dims.doc_width, dims.doc_height);
         // A command-line `#section` applies on the first frame that knows the
         // document's dimensions and clears itself.
         self.apply_startup_anchor(dims.doc_height, dims.doc_width);

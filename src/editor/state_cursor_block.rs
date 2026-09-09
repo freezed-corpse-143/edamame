@@ -31,16 +31,37 @@ impl EditorState {
             Some(start_line..end_line + 1)
         });
 
-        // A mermaid block reveals as one unit, so re-arming the timer on intra-block line
-        // moves would flash the image placeholder back in between them.
+        // Crossing into a different block drops the "revealed as one unit" latch: the new block
+        // must earn its own reveal (a dwell, or the immediate reflow-from-below case below).
+        if previous_block_idx != self.cursor_block_idx {
+            self.cursor_reveal_latched = false;
+        }
+
         let (current_line, _) = self.cursor.line_col(&self.buffer);
         if Some(current_line) != self.cursor_line_idx {
-            let staying_in_mermaid = previous_block_idx == self.cursor_block_idx
-                && self
-                    .cursor_block_idx
-                    .is_some_and(|idx| self.parsed.is_mermaid_block(idx));
             self.cursor_line_idx = Some(current_line);
-            if !staying_in_mermaid {
+            // Re-arm the delay on every buffer-line change — the same beat every block gets — so
+            // scrolling *through* a block never dwells long enough to reveal it.  (A mermaid
+            // diagram and a reflowed paragraph then stay revealed once a dwell latches them, via
+            // `cursor_reveal_latched`, so re-arming here doesn't flash them collapsed mid-block.)
+            //
+            // The one exception is *entering* a reflowed paragraph on a line other than its first
+            // — an upward move or a click.  Its raw form is taller than its rendered form, so
+            // during the delay the collapsed single flow row can't show the cursor on its true
+            // line: it would sit on that top row and then drop when the block expands.  Reveal
+            // such an entry at once (and latch it) so the cursor lands on the right line
+            // immediately.  A top-line entry (a downward move) keeps the delay — its line *is* the
+            // flow row, so nothing jumps and fast downward scrolling stays smooth.
+            let entering_block = previous_block_idx != self.cursor_block_idx;
+            let on_first_line = self
+                .cursor_block_line_range
+                .as_ref()
+                .is_some_and(|r| current_line == r.start);
+            if entering_block && !on_first_line && self.parsed.is_reflowed_paragraph_at(cursor_byte)
+            {
+                self.cursor_block_entered_at = None;
+                self.cursor_reveal_latched = true;
+            } else {
                 self.cursor_block_entered_at = Some(Instant::now());
             }
         }
@@ -56,7 +77,9 @@ impl EditorState {
 
     /// Whether the cursor block should show raw source.  False during the `RAW_REVEAL_DELAY`
     /// window, during a mouse drag (the click anchor must not shift), and while a search or
-    /// `:s` preview is active (blocks must not flip to raw under the highlights).
+    /// `:s` preview is active (blocks must not flip to raw under the highlights).  A latched
+    /// one-unit block (mermaid / reflowed paragraph) stays revealed past a delay re-arm — see
+    /// [`Self::cursor_reveal_latched`].
     pub fn cursor_block_revealed(&self) -> bool {
         if self.drag_in_progress {
             return false;
@@ -67,9 +90,32 @@ impl EditorState {
         if self.substitute_preview.is_some() {
             return false;
         }
+        if self.cursor_reveal_latched {
+            return true;
+        }
         match self.cursor_block_entered_at {
             None => true,
             Some(t) => t.elapsed() >= RAW_REVEAL_DELAY,
+        }
+    }
+
+    /// Latch the reveal of a "reveal as one unit" block — a mermaid diagram or a reflowed
+    /// paragraph — once it has been revealed by a dwell, so it stays revealed while the cursor
+    /// remains inside even as line moves re-arm the delay.  Called once per frame from
+    /// `App::prepare_viewport`.  Other blocks (tables, code) are left to the per-line delay, so
+    /// they keep revealing row by row and hide again under a moving cursor.
+    pub fn latch_cursor_reveal(&mut self) {
+        if self.cursor_reveal_latched || self.mode != Mode::Rendered {
+            return;
+        }
+        let is_one_unit = self.cursor_block_idx.is_some_and(|idx| {
+            self.parsed.is_mermaid_block(idx) || {
+                let cursor_byte = self.buffer.rope().char_to_byte(self.cursor.offset);
+                self.parsed.is_reflowed_paragraph_at(cursor_byte)
+            }
+        });
+        if is_one_unit && self.cursor_block_revealed() {
+            self.cursor_reveal_latched = true;
         }
     }
 
@@ -137,5 +183,145 @@ impl EditorState {
         // Same split the painter uses, so reserved rows and painted lines can't disagree.
         let rows = crate::ui::rendered_view::revealed_source_line_count(source);
         Some((ordinal, url, rows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::Theme;
+    use crate::document::Buffer;
+    use crate::editor::{EditorState, Mode};
+
+    fn theme() -> &'static Theme {
+        Box::leak(Box::new(Theme::default()))
+    }
+
+    /// Once a reflowed paragraph is revealed (latched by a dwell), moving between its source lines
+    /// keeps it revealed even though each move re-arms the delay — so it never flashes collapsed
+    /// mid-block.  The latch, not a suppressed timer, is what holds it.
+    #[test]
+    fn moving_within_a_revealed_reflowed_paragraph_keeps_it_revealed() {
+        let mut st = EditorState::new(Buffer::from_str("one\ntwo\nthree\n\nafter\n"), theme());
+        st.mode = Mode::Rendered;
+        st.set_viewport_width(80);
+        st.sync_reflow_for_mode();
+        // Cursor rests on the paragraph's first source line; dwell reveals it, and the per-frame
+        // latch step then pins it revealed.
+        st.cursor.offset = 0;
+        st.update_cursor_block();
+        st.cursor_block_entered_at = None;
+        st.latch_cursor_reveal();
+        assert!(st.cursor_reveal_latched, "a dwell must latch the reveal");
+
+        // Move down to the second source line: the delay re-arms, but the latch holds the reveal.
+        let byte = st.buffer.contents().find("two").unwrap();
+        st.cursor.offset = st.buffer.rope().byte_to_char(byte);
+        st.update_cursor_block();
+        assert!(
+            st.cursor_block_entered_at.is_some(),
+            "an intra-block line move re-arms the delay, like every other block",
+        );
+        assert!(
+            st.cursor_block_revealed(),
+            "the latch must hold the paragraph revealed across the move",
+        );
+    }
+
+    /// Scrolling *through* a reflowed paragraph (a hold-down that re-arms the delay every line)
+    /// must not reveal it — the delay never elapses, exactly as for any other block.  This is the
+    /// regression the old "don't re-arm within a one-unit block" shortcut caused: the timer, set
+    /// once on entry, elapsed a few lines in and de-rendered the block mid-scroll.
+    #[test]
+    fn scrolling_through_a_reflowed_paragraph_does_not_reveal_it() {
+        let mut st = EditorState::new(
+            Buffer::from_str("intro\n\none\ntwo\nthree\nfour\nfive\n\nafter\n"),
+            theme(),
+        );
+        st.mode = Mode::Rendered;
+        st.set_viewport_width(80);
+        st.sync_reflow_for_mode();
+        // Enter from above (first line), the way a downward scroll does.
+        let first = st.buffer.contents().find("one").unwrap();
+        st.cursor.offset = st.buffer.rope().byte_to_char(first);
+        st.update_cursor_block();
+        for word in ["two", "three", "four", "five"] {
+            let byte = st.buffer.contents().find(word).unwrap();
+            st.cursor.offset = st.buffer.rope().byte_to_char(byte);
+            st.update_cursor_block(); // re-arms the delay with a fresh instant every line
+            st.latch_cursor_reveal();
+            assert!(
+                !st.cursor_block_revealed(),
+                "the block must stay rendered while scrolling through it (at {word})",
+            );
+        }
+    }
+
+    /// Entering a reflowed paragraph on a line other than its first (an upward move or a click)
+    /// reveals it immediately, so the cursor lands on its true line at once rather than sitting on
+    /// the collapsed flow's top row for `RAW_REVEAL_DELAY` and then dropping.
+    #[test]
+    fn entering_a_reflowed_paragraph_from_below_reveals_immediately() {
+        let mut st = EditorState::new(Buffer::from_str("intro\n\none\ntwo\nthree\n\nafter\n"), theme());
+        st.mode = Mode::Rendered;
+        st.set_viewport_width(80);
+        st.sync_reflow_for_mode();
+        // Rest below the paragraph, revealed there, then move up onto its last source line.
+        let after = st.buffer.contents().find("after").unwrap();
+        st.cursor.offset = st.buffer.rope().byte_to_char(after);
+        st.update_cursor_block();
+        st.cursor_block_entered_at = None;
+
+        let last = st.buffer.contents().find("three").unwrap();
+        st.cursor.offset = st.buffer.rope().byte_to_char(last);
+        st.update_cursor_block();
+        assert!(
+            st.cursor_block_entered_at.is_none(),
+            "entering a reflowed paragraph on a non-first line must skip the reveal delay",
+        );
+        assert!(st.cursor_block_revealed());
+    }
+
+    /// The downward counterpart: entering a reflowed paragraph on its first line keeps the reveal
+    /// delay (its line is the flow row, so nothing jumps, and fast downward scrolling stays smooth).
+    #[test]
+    fn entering_a_reflowed_paragraph_from_above_keeps_the_delay() {
+        let mut st = EditorState::new(Buffer::from_str("intro\n\none\ntwo\nthree\n\nafter\n"), theme());
+        st.mode = Mode::Rendered;
+        st.set_viewport_width(80);
+        st.sync_reflow_for_mode();
+        let intro = st.buffer.contents().find("intro").unwrap();
+        st.cursor.offset = st.buffer.rope().byte_to_char(intro);
+        st.update_cursor_block();
+        st.cursor_block_entered_at = None;
+
+        let first = st.buffer.contents().find("one").unwrap();
+        st.cursor.offset = st.buffer.rope().byte_to_char(first);
+        st.update_cursor_block();
+        assert!(
+            st.cursor_block_entered_at.is_some(),
+            "entering on the first line must keep the reveal delay",
+        );
+    }
+
+    /// The counterpart: crossing into a *different* block does re-arm the timer, so the new
+    /// block honors the reveal delay (jitter suppression on entry is preserved).
+    #[test]
+    fn crossing_into_another_block_rearms_the_reveal_timer() {
+        let mut st = EditorState::new(Buffer::from_str("one\ntwo\nthree\n\nafter\n"), theme());
+        st.mode = Mode::Rendered;
+        st.set_viewport_width(80);
+        st.sync_reflow_for_mode();
+        st.cursor.offset = 0;
+        st.update_cursor_block();
+        st.cursor_block_entered_at = None;
+
+        // Into the `after` paragraph, a different block.
+        let byte = st.buffer.contents().find("after").unwrap();
+        st.cursor.offset = st.buffer.rope().byte_to_char(byte);
+        st.update_cursor_block();
+        assert!(
+            st.cursor_block_entered_at.is_some(),
+            "crossing into a new block must re-arm the reveal delay",
+        );
     }
 }

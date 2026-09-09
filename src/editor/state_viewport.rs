@@ -98,7 +98,9 @@ impl EditorState {
                 .as_ref()
                 .map(|d| d.total_visual_rows(width))
                 .unwrap_or(0),
-            _ => self.parsed.total_visual_rows(width),
+            // `effective_rows` is the identity unless a reflowed cursor block is revealed, so this
+            // equals `parsed.total_visual_rows(width)` everywhere except that reveal.
+            _ => self.effective_rows(width).total_visual_rows(),
         }
     }
 
@@ -201,20 +203,42 @@ impl EditorState {
                 self.buffer.line_to_char(line) + raw_col
             }
             _ => {
-                let (line_idx, _sub) = self.rendered_line_at_visual_row(visual_row, width.max(1));
-                if line_idx >= self.parsed.lines.len() {
-                    return self.buffer.len_chars();
-                }
-                self.parsed
-                    .source_map
-                    .original_byte_for_rendered_line(line_idx)
-                    .map(|byte| {
+                use crate::editor::effective_rows::RowHit;
+                match self
+                    .effective_rows(width.max(1))
+                    .line_at_visual_row(visual_row)
+                {
+                    RowHit::Raw { raw_line, .. } => {
+                        // Inside a revealed reflowed block: snap to that raw source line's start.
+                        let cursor_byte = self.buffer.rope().char_to_byte(self.cursor.offset);
+                        let Some(range) =
+                            self.parsed.source_map.original_range_for_byte(cursor_byte)
+                        else {
+                            return self.buffer.len_chars();
+                        };
+                        let first_line = self.buffer.rope().byte_to_line(range.start);
+                        let target =
+                            (first_line + raw_line).min(self.buffer.line_count().saturating_sub(1));
                         self.buffer
-                            .rope()
-                            .byte_to_char(byte)
+                            .line_to_char(target)
                             .min(self.buffer.len_chars())
-                    })
-                    .unwrap_or(self.buffer.len_chars())
+                    }
+                    RowHit::Rendered { line: line_idx, .. } => {
+                        if line_idx >= self.parsed.lines.len() {
+                            return self.buffer.len_chars();
+                        }
+                        self.parsed
+                            .source_map
+                            .original_byte_for_rendered_line(line_idx)
+                            .map(|byte| {
+                                self.buffer
+                                    .rope()
+                                    .byte_to_char(byte)
+                                    .min(self.buffer.len_chars())
+                            })
+                            .unwrap_or(self.buffer.len_chars())
+                    }
+                }
             }
         }
     }

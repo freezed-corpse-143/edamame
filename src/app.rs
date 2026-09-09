@@ -282,6 +282,7 @@ fn configure_new_editor(
     editor.set_row_striping(config.table.row_striping);
     editor.set_big_h1(config.editor.big_h1);
     editor.set_syntax_highlighting(config.editor.syntax_highlighting);
+    editor.set_reflow(config.editor.reflow);
     if !images_layout_on || !diagrams_layout_on {
         editor.refresh_parsed();
     }

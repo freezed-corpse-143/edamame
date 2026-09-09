@@ -42,7 +42,7 @@ use self::rows::{build_rows, RowAction, RowDef};
 #[allow(unused_imports)]
 pub(crate) use self::rows::{
     HEADER_NOTE, LABEL_AUTOSAVE, LABEL_BIG_H1, LABEL_BLINK_CURSOR, LABEL_DIFF_ON_CHANGE,
-    LABEL_LIMIT_WIDTH, LABEL_LINE_NUMBERS, LABEL_SCROLL_SPEED, LABEL_SHOW_DIAGRAMS,
+    LABEL_LIMIT_WIDTH, LABEL_LINE_NUMBERS, LABEL_REFLOW, LABEL_SCROLL_SPEED, LABEL_SHOW_DIAGRAMS,
     LABEL_SHOW_IMAGES, LABEL_SHOW_REMOTE_IMAGES, LABEL_SYNTAX_HIGHLIGHTING, LABEL_TABLE_BUTTONS,
     LABEL_VIM_MODE, LABEL_VISUAL_LINE_NAV,
 };
@@ -853,6 +853,7 @@ mod tests {
                 "",
                 "Autosave",
                 "Big H1 headings",
+                "Reflow paragraphs",
                 "Blink cursor",
                 "Check for updates",
                 "Limit editor width",

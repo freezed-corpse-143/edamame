@@ -8,8 +8,11 @@ Each released version's section is also what ships as the GitHub release notes: 
 
 ## [Unreleased]
 
-### Changed
+### Added
 
+- Manually-wrapped paragraphs now reflow to the editor width. A paragraph wrapped in the source is joined into a single line and wrapped to fit the editor, instead of showing one short row per source line. A hard break (two trailing spaces or a backslash) still splits. Can be turned off in settings (Reflow paragraphs).
+
+### Changed
 - The editor is now capped at 100 columns by default, for more comfortable reading on wide terminals. Turn it off with the "Limit editor width" toggle in settings (Ctrl-P → Open settings). You can also change the character limit there.
 
 ### Fixed

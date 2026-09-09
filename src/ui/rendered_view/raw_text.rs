@@ -43,6 +43,18 @@ pub(crate) fn revealed_source_line_count(source: &str) -> usize {
     total.saturating_sub(trailing).max(1)
 }
 
+/// The raw source lines a block reveals: [`raw_source_lines`] with trailing blank lines dropped
+/// (never below one).  The reflow reveal stacks these, so it must use the same set
+/// [`revealed_source_line_count`] counts — a paragraph's byte range absorbs the blank line after
+/// it, and that blank owns its own rendered row, so revealing it too would over-count the block.
+pub(crate) fn revealed_source_lines(source: &str) -> Vec<&str> {
+    let mut lines = raw_source_lines(source);
+    while lines.len() > 1 && lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
 /// Byte offset within `block_source` where raw line `line_idx` starts.
 pub(super) fn raw_line_byte_start(block_source: &str, line_idx: usize) -> usize {
     let mut byte = 0usize;

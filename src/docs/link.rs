@@ -141,7 +141,6 @@ mod tests {
     }
 
     /// Every `](target)` that looks like a local Markdown path; deliberately not a parser.
-
     fn md_link_targets(src: &str) -> Vec<String> {
         let mut out = Vec::new();
         let bytes: Vec<char> = src.chars().collect();

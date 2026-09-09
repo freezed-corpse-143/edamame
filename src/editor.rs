@@ -1,4 +1,5 @@
 pub mod edit_ops;
+pub mod effective_rows;
 pub mod footnote_edit;
 pub mod link;
 pub mod list_edit;

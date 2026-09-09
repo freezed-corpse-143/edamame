@@ -211,6 +211,31 @@ fn preview_mode_paints_matches_too() {
     assert_eq!(cell.style().bg, t.selection.bg);
 }
 
+/// A reflowed paragraph (Preview) joins its source lines into one flow, so a match on a later
+/// source line must highlight the right cells of that flow — not be dropped by the old
+/// per-source-line intersection.
+#[test]
+fn preview_reflowed_paragraph_highlights_match_across_soft_break() {
+    let t = theme();
+    let mut st = state_with_search("alpha\nbeta\n", "beta", None);
+    assert_eq!(st.mode, Mode::Preview);
+    // Apply Preview reflow the way `App::prepare_viewport` does each frame: "alpha\nbeta"
+    // renders as "alpha beta" on one row.
+    st.sync_reflow_for_mode();
+    let buf = render_editor(&mut st, 40, 8);
+    // "beta" lives at rendered cols 6..10 of the reflowed flow.
+    for x in 6..10u16 {
+        let cell = buf.cell((x, 0)).unwrap();
+        assert_eq!(
+            cell.style().bg,
+            t.selection.bg,
+            "col {x} of the reflowed flow must be highlighted",
+        );
+    }
+    // The join space (col 5) is not part of the match.
+    assert_ne!(buf.cell((5, 0)).unwrap().style().bg, t.selection.bg);
+}
+
 #[test]
 fn raw_view_paints_matches_per_line() {
     let t = theme();
@@ -445,6 +470,9 @@ fn search_highlight_on_paragraph_line_starting_with_ordered_marker() {
     let mut st = state_with_search("intro line\n2. lazy word\n", "2.", None);
     st.mode = Mode::Rendered;
     st.set_viewport_width(40);
+    // Keep the two source lines as distinct rendered rows: this pins the per-source-line overlay's
+    // list-marker gating, which reflow (joining them into one flow) would sidestep.
+    st.set_reflow(false);
     let buf = render_editor(&mut st, 40, 8);
     // Match "2." sits at rendered cols 0..2 of row 1.  (Col 0 isn't probed:
     // the pre-reveal cursor indicator sits there and shares the highlight's
@@ -691,6 +719,9 @@ fn rendered_view_paints_a_multiline_preview_highlight() {
     let t = theme();
     let mut st = EditorState::new(Buffer::from_str("foo\nbar\n"), theme());
     st.mode = Mode::Rendered;
+    // The multiline highlight paints across a soft break onto two rendered rows; reflow would join
+    // them into one flow, so keep it off to exercise the across-rows overlay walk.
+    st.set_reflow(false);
     edamame::editor::vim_ops::update_substitute_preview(&mut st, r"%s/o\nb/X\nY/", None, 8, 40);
     assert_eq!(st.buffer.contents(), "foX\nYar\n");
     let buf = render_editor(&mut st, 40, 8);

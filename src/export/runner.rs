@@ -37,7 +37,6 @@ pub fn preflight(target: &Path, overwrite: bool) -> Result<(), PreflightError> {
 /// Write `bytes` to `path` via a same-directory temp file and rename, so an interrupted
 /// write never leaves a truncated export. The temp name is random and `O_EXCL`
 /// (`NamedTempFile`), not a predictable sibling a symlink could be pre-planted under.
-
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;

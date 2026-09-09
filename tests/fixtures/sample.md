@@ -104,8 +104,21 @@ Inline code inside a long paragraph wraps with the rest of the text: ` let (non_
 
 A [web link](https://github.com/mijowi/edamame), a [file link](./sample_diagrams.md), and a [link to a heading](#the-stack) further up this document.
 
-Escapes stay verbatim: \*not emphasized*, \# not a heading, \`not code`,
-1\. not a list, and \&ouml; not a character entity.
+Escapes stay verbatim: \*not emphasized*, \# not a heading, \`not code`, 1\. not a list, and \&ouml; not a character entity.
+
+## Paragraph reflow
+
+This paragraph is hard-wrapped in the source at a narrow
+width, one short line after another, the way you might type
+prose in an editor set to break at 60-odd columns. None of
+these single line breaks are semantic Markdown, so edamame
+joins them back into one flow and wraps it to fill the view.
+
+A hard break with a backslash,\
+or one with two trailing spaces,  
+still split the lines.
+
+Move the cursor into either paragraph and it reveals your real source, line for line.
 
 ## Images and diagrams
 

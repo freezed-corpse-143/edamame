@@ -104,13 +104,13 @@ impl<'t> Renderer<'t> {
                                 spans.push(tp);
                             }
                             out.push(Line::from(spans));
-                            self.render_block(other, out, &child_indent_prefix);
+                            self.render_block(other, out, &child_indent_prefix, false);
                         }
                     }
                 } else {
                     // Later blocks take the child indent, so their text aligns with this item's
                     // text column.
-                    self.render_block(block, out, &child_indent_prefix);
+                    self.render_block(block, out, &child_indent_prefix, false);
                 }
             }
         }
