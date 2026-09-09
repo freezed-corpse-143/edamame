@@ -120,6 +120,11 @@ pub struct ParsedDoc {
     /// Lazy per-buffer-line raw ↔ rendered column maps, for the selection painter and the
     /// cursor-indicator overlay.
     inline_maps: Vec<OnceCell<InlineColMap>>,
+    /// Whether this parse rendered prose paragraphs with reflow on (soft breaks → spaces,
+    /// wrapped as one flow).  Consumers that map a rendered row to a source line
+    /// (`state_source_lines`, `mouse_ops::coord`, the overlay painter) branch on it, because a
+    /// reflowed paragraph's rendered row spans several source lines rather than one.
+    pub reflow_paragraphs: bool,
 }
 
 impl ParsedDoc {
@@ -146,6 +151,7 @@ impl ParsedDoc {
             false,
             false,
             true,
+            false,
             None,
         )
     }
@@ -178,6 +184,9 @@ impl ParsedDoc {
         // When false, fenced diagram blocks stay ordinary code blocks and their source
         // shows verbatim — what a user who declined the diagrams prompt should see.
         promote_diagrams: bool,
+        // When true, prose paragraphs reflow (soft breaks become spaces, the paragraph
+        // wraps to the viewport as one flow) instead of rendering one row per source line.
+        reflow_paragraphs: bool,
         // Block-level render memoization, so unchanged blocks reuse their rendered lines.
         // `None` (tests, one-shot builds) renders everything from scratch.
         render_cache: Option<&mut RenderCache>,
@@ -218,7 +227,8 @@ impl ParsedDoc {
             .with_image_max_height(image_max_height)
             .with_row_striping(row_striping)
             .with_big_h1(big_h1)
-            .with_syntax_highlighting(syntax_highlighting);
+            .with_syntax_highlighting(syntax_highlighting)
+            .with_reflow_paragraphs(reflow_paragraphs);
         if let Some(override_fn) = image_row_override {
             renderer = renderer.with_image_row_override(override_fn);
         }
@@ -407,7 +417,31 @@ impl ParsedDoc {
             visual_rows: RefCell::new(Vec::new()),
             source_lines: OnceCell::new(),
             inline_maps: (0..line_count).map(|_| OnceCell::new()).collect(),
+            reflow_paragraphs,
         }
+    }
+
+    /// Whether the block covering `byte` is a paragraph rendered with reflow on *and* collapsed
+    /// to a single rendered logical line.  The single gate the reflow-aware consumers (gutter,
+    /// mouse, overlay, `EffectiveRows`) share so they agree on which blocks lost the 1:1
+    /// source-line ↔ rendered-row correspondence.  Resolved through
+    /// [`real_block_for_byte`](Self::real_block_for_byte), never a raw `blocks` index (whose
+    /// space counts blank-line virtual blocks).
+    ///
+    /// A paragraph with a hard break does not reflow (`render_paragraph`), so it renders as
+    /// several logical lines and the single-line check excludes it — those consumers keep the
+    /// per-source-line path.  A soft-break-only paragraph stays one logical line even when it
+    /// wraps to several *visual* rows, so wrapping is unaffected.
+    pub fn is_reflowed_paragraph_at(&self, byte: usize) -> bool {
+        self.reflow_paragraphs
+            && matches!(
+                self.real_block_for_byte(byte),
+                Some(crate::markdown::Block::Paragraph { .. })
+            )
+            && {
+                let r = self.source_map.rendered_lines_for_byte(byte);
+                r.end.saturating_sub(r.start) == 1
+            }
     }
 
     /// Number of rendered lines.
@@ -908,6 +942,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             None,
         );
         for line in &doc.lines {

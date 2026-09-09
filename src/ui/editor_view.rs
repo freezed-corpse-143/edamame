@@ -302,12 +302,15 @@ impl<'a> StatefulWidget for EditorView<'a> {
             let style = self.theme.line_number;
             match mode {
                 Mode::Preview | Mode::Rendered => {
+                    // One `EffectiveRows` for the whole gutter: rebuilding it per row would
+                    // re-allocate the revealed block's source on every visible line.
+                    let effective = self.state.effective_rows(content_width);
                     super::gutter::paint_gutter(
                         buf,
                         ga,
                         scroll,
                         line_count,
-                        |row, w| self.state.source_line_at_visual_row(row, w),
+                        |row, _w| self.state.source_line_at_visual_row_with(&effective, row),
                         content_width,
                         style,
                     );

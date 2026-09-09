@@ -50,6 +50,10 @@ pub struct EditorConfig {
     /// Syntax-highlight fenced code blocks by the language named in the fence.  There is no
     /// auto-detection: an unlabeled or unknown fence renders as plain code.
     pub syntax_highlighting: bool,
+    /// Reflow prose paragraphs: a soft line break inside a paragraph (source hard-wrapping) becomes
+    /// a space and the paragraph wraps to the viewport as one flow.  A hard break (trailing two
+    /// spaces or a backslash) still forces a row split.  On by default.
+    pub reflow: bool,
     /// Autosave after `autosave_idle_ms` of typing inactivity.  Never fires for a buffer with no
     /// file path.
     pub autosave_enabled: bool,
@@ -120,6 +124,7 @@ impl Default for EditorConfig {
             max_width_cols: 100,
             big_h1: false,
             syntax_highlighting: true,
+            reflow: true,
             autosave_enabled: false,
             autosave_idle_ms: AUTOSAVE_IDLE_MS_DEFAULT,
             diff_on_change: true,

@@ -61,6 +61,11 @@ pub struct Renderer<'t> {
     /// `config.editor.syntax_highlighting`.  When false the highlighter is
     /// never called and body rows are single-span lines.
     syntax_highlighting: bool,
+    /// Reflow prose paragraphs: a soft break becomes a space and the paragraph
+    /// wraps to the viewport as one flow, instead of each source line getting
+    /// its own rendered row.  A hard break still forces a row split.  See
+    /// `docs/dev/plans/paragraph-reflow.md`.
+    reflow_paragraphs: bool,
 }
 
 impl<'t> Renderer<'t> {
@@ -75,6 +80,7 @@ impl<'t> Renderer<'t> {
             row_striping: false,
             big_h1: false,
             syntax_highlighting: false,
+            reflow_paragraphs: false,
         }
     }
 
@@ -119,13 +125,18 @@ impl<'t> Renderer<'t> {
         self
     }
 
+    pub fn with_reflow_paragraphs(mut self, on: bool) -> Self {
+        self.reflow_paragraphs = on;
+        self
+    }
+
     /// Render a list of top-level blocks to styled lines.  Tests and
     /// `ui::preview` only; production uses `render_with_counts`.
     #[allow(dead_code)]
     pub fn render(&self, blocks: &[Block]) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for block in blocks {
-            self.render_block(block, &mut lines, "");
+            self.render_block(block, &mut lines, "", true);
         }
         lines
     }
@@ -140,7 +151,7 @@ impl<'t> Renderer<'t> {
 
         for block in blocks {
             let before = lines.len();
-            self.render_block(block, &mut lines, "");
+            self.render_block(block, &mut lines, "", true);
             counts.push(lines.len() - before);
         }
 
@@ -164,6 +175,7 @@ impl<'t> Renderer<'t> {
             row_striping: self.row_striping,
             big_h1: self.big_h1,
             syntax_highlighting: self.syntax_highlighting,
+            reflow_paragraphs: self.reflow_paragraphs,
             // Read here rather than threaded in from `EditorState`: the
             // renderer consults the warm grammars, so this is the one place
             // that can't fall out of step with them.  Pinned to 0 when off so
@@ -191,14 +203,14 @@ impl<'t> Renderer<'t> {
             // ImageBlock row counts track the decode cache, which changes
             // without the AST changing — never cache them.
             if matches!(block, Block::ImageBlock { .. }) {
-                self.render_block(block, &mut lines, "");
+                self.render_block(block, &mut lines, "", true);
             } else if let Some(hit) = cache.entries.get(block) {
                 lines.extend(hit.iter().cloned());
             } else if let Some((key, hit)) = prev.remove_entry(block) {
                 lines.extend(hit.iter().cloned());
                 cache.entries.insert(key, hit);
             } else {
-                self.render_block(block, &mut lines, "");
+                self.render_block(block, &mut lines, "", true);
                 cache
                     .entries
                     .insert(block.clone(), lines[before..].to_vec());
@@ -217,13 +229,22 @@ impl<'t> Renderer<'t> {
         block: &Block,
         out: &mut Vec<Line<'static>>,
         indent_prefix: &str,
+        // Whether `block` is a top-level document block.  Nested calls (blockquote children,
+        // list-item blocks, footnote-definition bodies) pass `false` so their paragraphs never
+        // reflow — see `render_paragraph`.
+        top_level: bool,
     ) {
         match block {
             Block::Heading { level, inlines } => {
                 self.render_heading(*level, inlines, out);
             }
             Block::Paragraph { inlines } => {
-                self.render_paragraph(inlines, out, indent_prefix);
+                self.render_paragraph(
+                    inlines,
+                    out,
+                    indent_prefix,
+                    self.reflow_paragraphs && top_level,
+                );
             }
             Block::CodeBlock {
                 language,
@@ -344,7 +365,7 @@ impl<'t> Renderer<'t> {
     ) {
         let mut body: Vec<Line<'static>> = Vec::new();
         for b in blocks {
-            self.render_block(b, &mut body, "");
+            self.render_block(b, &mut body, "", false);
         }
         let leader = format!("  {label}.  ");
         let cont_indent = " ".repeat(leader.chars().count());
@@ -535,15 +556,23 @@ impl<'t> Renderer<'t> {
         inlines: &[Inline],
         out: &mut Vec<Line<'static>>,
         indent_prefix: &str,
+        // Reflow this paragraph.  Only true for a genuinely top-level `Block::Paragraph`: the
+        // rendered-row ↔ source-line consumers (gutter, mouse, overlay, `EffectiveRows`) key on
+        // a top-level `Block::Paragraph` via `real_block_for_byte`.
+        reflow: bool,
     ) {
+        // A paragraph with a hard break renders as several logical lines, each spanning several
+        // source lines — a shape the consumers can't map (they assume a reflowed paragraph is one
+        // rendered line).  Fall back to one row per source line for it, exactly like reflow-off.
+        let reflow = reflow && !inlines.iter().any(|i| matches!(i, Inline::HardBreak));
+
         let prefix = indent_prefix.to_string();
-        // Split at both breaks so every source line break gets its own visual
-        // line: CommonMark collapses soft breaks into spaces, but the rendered
-        // content has to mirror the source line-for-line.  Segments go through
-        // `render_inlines`, not inline-by-inline, because adjacent footnote
-        // references fuse into one marker and only that function sees the run.
+        // Reflow joins a paragraph's soft breaks into one flow that `line_render` wraps to the
+        // viewport; without it, each break gets its own row (CommonMark collapses soft breaks to
+        // spaces, but the rendered form then mirrors the source line-for-line).  Split via
+        // `render_inlines`, not inline-by-inline, so adjacent footnote references still fuse.
         let segments: Vec<&[Inline]> = inlines
-            .split(|i| matches!(i, Inline::HardBreak | Inline::SoftBreak))
+            .split(|i| !reflow && matches!(i, Inline::HardBreak | Inline::SoftBreak))
             .collect();
         let last = segments.len() - 1;
 
@@ -721,7 +750,7 @@ impl<'t> Renderer<'t> {
             if i > 0 {
                 inner_lines.push(Line::from(""));
             }
-            self.render_block(block, &mut inner_lines, "");
+            self.render_block(block, &mut inner_lines, "", false);
         }
 
         for line in inner_lines {
@@ -1180,6 +1209,76 @@ mod tests {
         assert!(!lines.is_empty());
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("Hello"));
+    }
+
+    // ── Paragraph reflow ──────────────────────────────────────────────
+
+    /// Without reflow (the default), each soft break gets its own rendered row.
+    #[test]
+    fn soft_breaks_split_rows_by_default() {
+        let lines = renderer()
+            .with_viewport_width(80)
+            .render(&parse("one\ntwo\nthree\n"));
+        assert_eq!(lines.len(), 3);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts, vec!["one", "two", "three"]);
+    }
+
+    /// With reflow on, soft breaks become spaces and the paragraph flows to one
+    /// row when it fits the viewport.
+    #[test]
+    fn reflow_joins_soft_breaks_into_one_flow() {
+        let lines = renderer()
+            .with_viewport_width(80)
+            .with_reflow_paragraphs(true)
+            .render(&parse("one\ntwo\nthree\n"));
+        assert_eq!(lines.len(), 1, "soft-broken lines should reflow to one row");
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text.trim_end(), "one two three");
+    }
+
+    /// A paragraph containing a hard break does not reflow at all: it would render as several
+    /// logical lines each spanning several source lines, which the reflow-aware consumers can't
+    /// map, so it falls back to one row per source line (soft breaks no longer collapse either).
+    #[test]
+    fn hard_break_paragraph_falls_back_to_one_row_per_line() {
+        let lines = renderer()
+            .with_viewport_width(80)
+            .with_reflow_paragraphs(true)
+            .render(&parse("one\ntwo  \nthree\n"));
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(texts, vec!["one", "two", "three"]);
+    }
+
+    /// Reflow joins soft breaks into one *logical* line; wrapping to the
+    /// viewport is `line_render`'s job downstream, so the renderer emits a single
+    /// row here even when the flow is wider than the viewport.
+    #[test]
+    fn reflow_emits_one_logical_line_wider_than_viewport() {
+        let lines = renderer()
+            .with_viewport_width(10)
+            .with_reflow_paragraphs(true)
+            .render(&parse("alpha\nbeta\ngamma\ndelta\n"));
+        assert_eq!(
+            lines.len(),
+            1,
+            "the renderer joins soft breaks into one line; wrapping is downstream"
+        );
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text.trim_end(), "alpha beta gamma delta");
     }
 
     #[test]

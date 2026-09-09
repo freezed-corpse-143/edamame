@@ -292,6 +292,72 @@ pub fn rendered_sub_line_to_offset(
         return state.buffer.rope().byte_to_char(block.range.start);
     }
 
+    // A reflowed paragraph's several source lines collapse into one flow, so `sub_idx` no longer
+    // names a raw source line.  Two shapes: revealed (raw lines shown stacked) and not (one
+    // wrapped rendered flow) — handled separately below.
+    if !is_table && state.parsed.is_reflowed_paragraph_at(block.range.start) {
+        // The stacked-raw reveal only happens in Rendered mode; Preview always shows the flow.
+        let revealed = state.mode == Mode::Rendered
+            && state.cursor_block_revealed()
+            && rendered_line_idx == crate::editor::state::cursor_rendered_line_idx(state);
+        if revealed {
+            // Revealed: the block shows its raw source lines *stacked*, so `sub_row_within_line`
+            // walks those lines' wrap rows.  Find the raw line and wrap sub it lands on, map the
+            // cell column within that raw line, and resolve to a buffer offset via the raw line's
+            // buffer position — the same shape as the mermaid / setext reveal paths.
+            let raw_lines = crate::ui::rendered_view::revealed_source_lines(block_text);
+            let mut remaining = sub_row_within_line;
+            let mut chosen = raw_lines.len().saturating_sub(1);
+            let mut wrap_sub = 0usize;
+            for (i, rl) in raw_lines.iter().enumerate() {
+                let n = revealed_raw_rows(rl, viewport_width).0.len().max(1);
+                if remaining < n {
+                    chosen = i;
+                    wrap_sub = remaining;
+                    break;
+                }
+                remaining -= n;
+            }
+            let raw_line_text = raw_lines.get(chosen).copied().unwrap_or("");
+            let (rows, indent) = revealed_raw_rows(raw_line_text, viewport_width);
+            let sub = wrap_sub.min(rows.len().saturating_sub(1));
+            let rowr = rows.get(sub).copied().unwrap_or((0, 0, 0));
+            let (start, end, _) = rowr;
+            let is_last_row = sub + 1 == rows.len();
+            let max_in_row = line_render::last_col_in_row(rowr, is_last_row);
+            let row_indent = if sub == 0 { 0 } else { indent };
+            let row_chars = raw_line_text.chars().skip(start).take(end - start);
+            let in_row = line_render::char_idx_at_cell_col(row_chars, col, row_indent);
+            let raw_col = (start + in_row).min(max_in_row);
+            let first_buf_line = state.buffer.rope().byte_to_line(block.range.start);
+            let target = (first_buf_line + chosen).min(state.buffer.line_count().saturating_sub(1));
+            return (state.buffer.line_to_char(target) + raw_col).min(buffer_len);
+        }
+        // Not revealed: the block is one wrapped rendered flow.  Resolve the wrap with
+        // `click_to_rendered_char_idx`, then turn that rendered column into a raw char through the
+        // block-wide inline collapse map (soft breaks → spaces, the collapse owned in
+        // `InlineColMap`); the raw char is a char offset into the block.  `col` is a cell column,
+        // which `click_to_rendered_char_idx` folds in, so this stays correct across wide glyphs.
+        let content = block_text.strip_suffix('\n').unwrap_or(block_text);
+        let rendered_line = &state.parsed.lines[rendered_line_idx];
+        let rendered_chars: Vec<(char, ratatui::style::Style)> = rendered_line
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars().map(move |c| (c, span.style)))
+            .collect();
+        let rendered_idx = click_to_rendered_char_idx(
+            rendered_line,
+            &rendered_chars,
+            col,
+            sub_row_within_line,
+            viewport_width,
+        );
+        let map = crate::markdown::InlineColMap::build(content);
+        let raw_char = map.rendered_to_raw_vec()[rendered_idx.min(map.rendered_len())];
+        let block_start_char = state.buffer.rope().byte_to_char(block.range.start);
+        return (block_start_char + raw_char).min(buffer_len);
+    }
+
     let (line_byte_start, line_byte_end) = raw_line_byte_range(block_text, raw_line_idx);
     let line_text = &block_text[line_byte_start..line_byte_end];
     let rendered_line = &state.parsed.lines[rendered_line_idx];
@@ -504,6 +570,15 @@ fn revealed_raw_row_count(
     let is_table = table_edit::is_table_block(block_text);
     if is_table {
         return None;
+    }
+    // A revealed reflowed paragraph is one rendered line that reveals to its *stacked* raw lines,
+    // so its row count is the sum of every raw line's wrap count — not just the first line's.
+    if state.parsed.is_reflowed_paragraph_at(block_range.start) {
+        let total: usize = crate::ui::rendered_view::revealed_source_lines(block_text)
+            .iter()
+            .map(|rl| revealed_raw_rows(rl, viewport_width).0.len().max(1))
+            .sum();
+        return Some(total.max(1));
     }
     let cursor_line = crate::editor::state::cursor_rendered_line_idx(state);
     if rendered_line_idx != cursor_line {
@@ -894,4 +969,86 @@ pub(super) fn table_cell_char_range_at(
 /// precision deep in the padding of wrapped lines.
 fn line_row_width(line: &Line<'_>, _sub_row: usize) -> usize {
     line.spans.iter().map(|s| s.content.chars().count()).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Theme;
+    use crate::document::Buffer;
+
+    fn theme() -> &'static Theme {
+        Box::leak(Box::new(Theme::default()))
+    }
+
+    /// Preview state with paragraph reflow reconciled, as `App::prepare_viewport` does each frame.
+    fn preview_state(src: &str, width: usize) -> EditorState {
+        let mut st = EditorState::new(Buffer::from_str(src), theme());
+        assert_eq!(st.mode, Mode::Preview);
+        st.set_viewport_width(width);
+        st.sync_reflow_for_mode();
+        st
+    }
+
+    /// A click on a reflowed paragraph maps through the block-wide flow, not a single raw line:
+    /// "one\ntwo\nthree" renders as "one two three" on one row, and a click on the third word
+    /// must resolve to that word's offset in the source, not somewhere inside the first line.
+    #[test]
+    fn click_in_reflowed_paragraph_maps_across_source_lines() {
+        let state = preview_state("one\ntwo\nthree\n", 80);
+        // Rendered "one two three": col 8 is the 't' of "three".  In the source
+        // (o0 n1 e2 \n3 t4 w5 o6 \n7 t8 …) that same 't' is char 8.
+        let off = rendered_sub_line_to_offset(&state, 0, 0, 8, 80);
+        assert_eq!(off, 8);
+        assert_eq!(state.buffer.contents().chars().nth(off), Some('t'));
+
+        // The 'w' of "two" (rendered col 5) is source char 5.
+        let off_two = rendered_sub_line_to_offset(&state, 0, 0, 5, 80);
+        assert_eq!(off_two, 5);
+        assert_eq!(state.buffer.contents().chars().nth(off_two), Some('w'));
+    }
+
+    /// In Rendered mode with the block revealed, the reflowed paragraph shows its raw lines
+    /// stacked, so a click on the third stacked row must resolve to that source line — not through
+    /// the collapsed flow.
+    #[test]
+    fn click_in_revealed_reflowed_block_maps_to_stacked_raw_line() {
+        let mut st = EditorState::new(Buffer::from_str("one\ntwo\nthree\n"), theme());
+        st.mode = Mode::Rendered;
+        st.set_viewport_width(80);
+        st.sync_reflow_for_mode(); // reflow is default-on; reconcile the parse as a frame would
+        st.cursor.offset = 0;
+        st.update_cursor_block();
+        st.cursor_block_entered_at = None; // skip the reveal delay
+        assert!(
+            st.cursor_block_revealed(),
+            "block must reveal (no delay pending)"
+        );
+        // Stacked rows: 0 = "one", 1 = "two", 2 = "three".  Row 2, col 0 → start of "three".
+        let off = rendered_sub_line_to_offset(&st, 0, 2, 0, 80);
+        assert_eq!(off, 8);
+        assert!(st.buffer.contents()[st.buffer.rope().char_to_byte(off)..].starts_with("three"));
+        // Col 2 within that row → the second 'r' of "three".
+        let off_col = rendered_sub_line_to_offset(&st, 0, 2, 2, 80);
+        assert_eq!(off_col, 10);
+    }
+
+    /// A hard break makes a paragraph render one row per source line (it no longer reflows), so
+    /// the reflow branch must not fire and a click on a later line resolves to that line's source.
+    /// "one two  \nthree" renders as "one two" / "three"; a click on the second line's 't' must
+    /// land on 'three' (source char 10), not char 0.
+    #[test]
+    fn click_in_hard_break_paragraph_stays_per_source_line() {
+        let state = preview_state("one two  \nthree\n", 80);
+        assert!(
+            !state.parsed.is_reflowed_paragraph_at(0),
+            "a hard-break paragraph is multi-line and must not take the reflow path",
+        );
+        let off = rendered_sub_line_to_offset(&state, 1, 0, 0, 80);
+        assert_eq!(
+            state.buffer.contents().chars().nth(off),
+            Some('t'),
+            "click on the second segment must land on 'three', got offset {off}",
+        );
+    }
 }

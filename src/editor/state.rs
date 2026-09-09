@@ -157,6 +157,13 @@ pub struct EditorState {
     /// without further movement, which is what stops multi-line elements flickering under fast
     /// cursor movement.
     pub cursor_block_entered_at: Option<Instant>,
+    /// Latch for a "reveal as one unit" block (a mermaid diagram or a reflowed paragraph): once
+    /// such a block reveals on a dwell it stays revealed while the cursor is inside it, even as
+    /// line moves re-arm [`Self::cursor_block_entered_at`].  So scrolling *through* one never
+    /// reveals it (the delay re-arms per line like every other block), a dwell does, and moving
+    /// within a revealed one never flashes it collapsed.  Reset on crossing into another block
+    /// ([`Self::update_cursor_block`]); set by [`Self::latch_cursor_reveal`].
+    pub cursor_reveal_latched: bool,
     /// When the last click-driven table row / column delete landed, guarding the `✕` handles
     /// against an accidental double-click.  Anchored to the delete rather than the multi-click
     /// chord, whose window restarts on every press and so would never expire under sustained
@@ -223,6 +230,27 @@ pub struct EditorState {
     /// until a parse-dependent path calls [`Self::flush_parsed_if_dirty`].  Cross-line edits
     /// re-parse immediately instead.
     pub parsed_dirty: bool,
+    /// Whether the current `parsed` was built with paragraph reflow on.  Reflow depends on the
+    /// mode (`want_reflow`: on in Preview and Rendered, off in Raw), but `parsed` is one
+    /// mode-independent spine, so a mode switch that changes it must reparse.
+    /// [`Self::sync_reflow_for_mode`] compares this against the mode each frame.
+    parsed_reflow: bool,
+    /// Master switch for paragraph reflow (soft breaks → spaces, wrapped as one flow), from
+    /// `config.editor.reflow`.  On by default.  Gates both Preview and Rendered (in Rendered the
+    /// revealed cursor block expands to its raw lines via `EffectiveRows`); Raw and Diff never
+    /// reflow.  See `docs/dev/plans/paragraph-reflow.md`.
+    pub(crate) reflow: bool,
+    /// Whether the cursor block was reflow-revealed last frame.  A change means the block's
+    /// height just toggled under a cursor that no keypress moved, which is when
+    /// [`Self::anchor_reflow_reveal`] re-checks cursor visibility.  Inert unless [`Self::reflow`]
+    /// is on.
+    prev_reflow_has_reveal: bool,
+    /// Memo for the reveal patch [`Self::effective_rows`] hands out.  Building it allocates the
+    /// revealed block's source and measures each raw line's wrap; the viewport, scrollbar, cursor
+    /// row, and gutter each query `effective_rows` per frame, so without this that work repeats
+    /// several times a frame.  `RefCell` because `effective_rows` runs behind `&self` (widgets
+    /// query it mid-render).  Keyed on `parsed_version`, so a reparse invalidates it implicitly.
+    effective_cache: std::cell::RefCell<crate::editor::effective_rows::EffectiveRowsCache>,
     /// Buffer line range of the cursor's block as of the last `update_cursor_block`.  Stable
     /// across in-line typing, which is what lets the rendered view read the block's raw text from
     /// the live buffer without consulting the stale `source_map`.
@@ -353,6 +381,7 @@ impl EditorState {
             cursor_block_idx: None,
             cursor_line_idx: None,
             cursor_block_entered_at: None,
+            cursor_reveal_latched: false,
             last_table_delete_at: None,
             drag_in_progress: false,
             theme,
@@ -375,6 +404,12 @@ impl EditorState {
             pending_column_widths_commit: None,
             pending_link_follow: None,
             parsed_dirty: false,
+            // Matches `ParsedDoc::build` above (reflow off).  The App's initial `refresh_parsed`
+            // reconciles this with the Preview default before the first frame.
+            parsed_reflow: false,
+            reflow: true,
+            prev_reflow_has_reveal: false,
+            effective_cache: std::cell::RefCell::new(Default::default()),
             cursor_block_line_range: None,
             cursor_blink: CursorBlink::default(),
             modal_open: false,
@@ -699,6 +734,109 @@ impl EditorState {
         self.refresh_parsed();
     }
 
+    /// Reparse if the reflow the current `parsed` was built with no longer matches the mode
+    /// (`want_reflow`), since `parsed` is one mode-independent spine.  Called once per frame from
+    /// `App::prepare_viewport`; a no-op except the first frame after a mode switch that changes it.
+    pub fn sync_reflow_for_mode(&mut self) {
+        if self.parsed_reflow != self.want_reflow() {
+            self.refresh_parsed();
+        }
+    }
+
+    /// Enable (or disable) paragraph reflow (`config.editor.reflow`).  Reparses if this changes
+    /// the effective reflow for the current mode.
+    pub fn set_reflow(&mut self, on: bool) {
+        if self.reflow == on {
+            return;
+        }
+        self.reflow = on;
+        self.sync_reflow_for_mode();
+    }
+
+    /// Whether the current mode should render paragraphs reflowed: Preview and Rendered do when
+    /// `reflow` is on; Raw is verbatim source and Diff has its own parse, so neither ever does.
+    pub(crate) fn want_reflow(&self) -> bool {
+        self.reflow && matches!(self.mode, Mode::Preview | Mode::Rendered)
+    }
+
+    /// The per-frame visual-row view with the raw-reveal patch applied.  Identity unless the
+    /// cursor rests in a *reflowed* paragraph that is currently revealed: only then does the
+    /// block's raw form (its source lines) differ in height from its rendered (one wrapped flow)
+    /// form, so only then must scroll, gutter, and mouse arithmetic count the raw lines instead.
+    pub fn effective_rows(&self, width: usize) -> crate::editor::effective_rows::EffectiveRows<'_> {
+        use crate::editor::effective_rows::EffectiveRows;
+        let width = width.max(1);
+        // The cheap decision (no allocation): does the cursor rest in a revealed reflowed block?
+        // The block's rendered start uniquely identifies it within a parse, so it — with the parse
+        // version and width — keys the memo; an intra-block cursor move stays a hit.
+        let reveal = self.reflow_reveal_target();
+        let key = (
+            self.parsed_version,
+            width,
+            reveal.as_ref().map(|(rendered, _)| rendered.start),
+        );
+        if let Some((base_total, patch)) = self.effective_cache.borrow().get(key) {
+            return EffectiveRows::from_cached(&self.parsed, width, base_total, patch);
+        }
+        // Miss: build the view once (the allocating path — the block's source and its raw-line wrap
+        // counts) and memoize its parts so the frame's remaining queries reuse them.
+        let built = match reveal {
+            Some((rendered, cursor_byte)) => {
+                let raw = crate::ui::rendered_view::raw_block_cursor(self, cursor_byte);
+                // Trailing blanks absorbed into the block range own their own rendered rows, so
+                // exclude them — the reveal stacks only the content lines.
+                let raw_lines = crate::ui::rendered_view::revealed_source_lines(&raw.source);
+                EffectiveRows::with_reveal(&self.parsed, width, rendered, &raw_lines)
+            }
+            None => EffectiveRows::identity(&self.parsed, width),
+        };
+        let (base_total, patch) = built.cache_parts();
+        self.effective_cache.borrow_mut().store(key, base_total, patch);
+        built
+    }
+
+    /// The revealed reflowed block, if any: its rendered-line range and the cursor byte inside it.
+    /// Only `RenderedView` reveals a block as raw; Preview paints pure rendered lines, so a patch
+    /// there would make the arithmetic count raw rows the paint never shows.  Cheap — no allocation.
+    fn reflow_reveal_target(&self) -> Option<(std::ops::Range<usize>, usize)> {
+        if self.mode != Mode::Rendered || !self.cursor_block_revealed() {
+            return None;
+        }
+        let cursor_byte = self.buffer.rope().char_to_byte(self.cursor.offset);
+        if !self.parsed.is_reflowed_paragraph_at(cursor_byte) {
+            return None;
+        }
+        let block_idx = self.parsed.source_map.block_for_byte(cursor_byte)?;
+        let rendered = self.parsed.source_map.rendered_lines_for_block(block_idx);
+        (!rendered.is_empty()).then_some((rendered, cursor_byte))
+    }
+
+    /// Keep the view sensible across a reflow reveal/un-reveal.  When the cursor rests in a
+    /// reflowed paragraph, entering it (after `RAW_REVEAL_DELAY`) expands the block from one
+    /// wrapped flow row to its raw source lines, and leaving it collapses it back — a height
+    /// change driven by the frame timer, not a keypress.  Called once per frame from
+    /// `App::prepare_viewport`; inert unless `reflow` is on in Rendered mode.
+    ///
+    /// The expansion happens *below* the block's first row, which sits at the same visual row
+    /// before and after (the rows above it are unchanged), so simply leaving `scroll` alone pins
+    /// the block's top and everything above it and lets only the content below reflow — the same
+    /// feel as an image/mermaid reveal.  On the toggle frame we therefore just re-run
+    /// `ensure_cursor_visible`, which scrolls the *minimum* to keep the cursor on screen (usually
+    /// nothing) rather than dragging the whole document to re-pin the cursor's exact row.
+    pub fn anchor_reflow_reveal(&mut self, width: usize, height: usize) {
+        if self.mode != Mode::Rendered || !self.reflow || width == 0 {
+            // Re-entering (mode switch, reflow-enable) should be treated as a fresh toggle, not a
+            // continuation, so the next eligible frame reconciles cursor visibility once.
+            self.prev_reflow_has_reveal = false;
+            return;
+        }
+        let has_reveal = self.effective_rows(width).has_reveal();
+        if has_reveal != self.prev_reflow_has_reveal {
+            self.ensure_cursor_visible(height, width);
+        }
+        self.prev_reflow_has_reveal = has_reveal;
+    }
+
     /// Commit a pending column-width drag by writing the `<!-- tui-columns: [...] -->` comment
     /// into the buffer.  Cancel goes through [`Self::cancel_pending_column_widths`].
     pub fn commit_pending_column_widths(&mut self) {
@@ -796,6 +934,9 @@ impl EditorState {
             }
             images.reserved_rows(url, max_w, max_h, font_size)
         };
+        // Reflow applies per `want_reflow`.  It rides in `RenderSettings`, so a mode switch that
+        // changes it clears the render cache; `sync_reflow_for_mode` triggers the reparse.
+        let reflow_paragraphs = self.want_reflow();
         self.parsed = ParsedDoc::build_with_overrides(
             &content,
             self.theme,
@@ -808,8 +949,10 @@ impl EditorState {
             self.big_h1,
             self.syntax_highlighting,
             self.diagrams_enabled,
+            reflow_paragraphs,
             Some(&mut self.render_cache),
         );
+        self.parsed_reflow = reflow_paragraphs;
         self.parsed_version = self.parsed_version.wrapping_add(1);
         self.parsed_dirty = false;
         // Evict unreferenced URLs — editing inside a mermaid fence mints a new synthetic URL per
@@ -883,6 +1026,8 @@ impl EditorState {
                 self.big_h1,
                 self.syntax_highlighting,
                 self.diagrams_enabled,
+                // Diff review has its own parse and never reflows.
+                false,
                 Some(&mut self.diff_render_cache),
             )
         };
@@ -1021,6 +1166,16 @@ fn rendered_cursor_screen_row(state: &EditorState, width: usize) -> usize {
 }
 
 pub(super) fn rendered_cursor_visual_row(state: &EditorState, width: usize) -> usize {
+    let er = state.effective_rows(width);
+    if er.has_reveal() {
+        // The cursor rests inside a reflowed, revealed block: its visual row is the rows before
+        // the block, plus the raw lines above the cursor's, plus its sub-row within its raw line.
+        // `cursor_sub_line_in_rendered` already wraps the cursor's *buffer* line — which is its
+        // raw source line — so it supplies that sub-row exactly.
+        let cursor_byte = state.buffer.rope().char_to_byte(state.cursor.offset);
+        let raw = crate::ui::rendered_view::raw_block_cursor(state, cursor_byte);
+        return er.raw_line_visual_row(raw.raw_line) + cursor_sub_line_in_rendered(state, 0, width);
+    }
     let cursor_rendered = cursor_rendered_line_idx(state);
     let rows_before = state.parsed.visual_rows_before(cursor_rendered, width);
     rows_before + cursor_sub_line_in_rendered(state, cursor_rendered, width)
@@ -1254,6 +1409,141 @@ mod tests {
         // Out-of-bounds index must not panic.
         let oob = state.inline_map_for(99, "anything");
         assert_eq!(oob.raw_len(), 8);
+    }
+
+    /// Concatenated text of every non-blank rendered line (skips the phantom trailing row and
+    /// any separator blanks), one string per row.
+    fn line_texts(state: &EditorState) -> Vec<String> {
+        state
+            .parsed
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// Reflow is on by default in both Preview and Rendered, off in Raw, and the master switch
+    /// (`set_reflow`) disables it everywhere.  A mode switch that changes the effective reflow
+    /// reparses (via `sync_reflow_for_mode`, as `prepare_viewport` calls it each frame).  Note
+    /// `line_texts` reads the *rendered* spine (`parsed.lines`): the Rendered-mode raw reveal is a
+    /// display overlay, so the rendered spine is the reflowed flow in both view modes.
+    #[test]
+    fn reflow_is_default_on_in_preview_and_rendered_off_in_raw() {
+        let flow = vec!["one two three".to_string()];
+        let split = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+
+        let mut state = EditorState::new(Buffer::from_str("one\ntwo\nthree\n"), theme());
+        assert_eq!(state.mode, Mode::Preview);
+        state.sync_reflow_for_mode();
+        assert_eq!(line_texts(&state), flow, "Preview reflows by default");
+
+        state.mode = Mode::Rendered;
+        state.sync_reflow_for_mode();
+        assert_eq!(line_texts(&state), flow, "Rendered reflows by default too");
+
+        state.mode = Mode::Raw;
+        state.sync_reflow_for_mode();
+        // Raw uses buffer text, not `parsed.lines`, but the parse still tracks `want_reflow`: Raw
+        // never reflows, so the rendered spine is per-line again.
+        assert_eq!(line_texts(&state), split, "Raw never reflows");
+
+        // The master switch turns it off in the view modes too.
+        state.mode = Mode::Rendered;
+        state.set_reflow(false);
+        assert_eq!(
+            line_texts(&state),
+            split,
+            "disabling reflow splits the flow back"
+        );
+    }
+
+    /// When a reflowed paragraph reveals (grows) while the cursor stays on screen, the block's
+    /// top and everything above it must stay put — only content below reflows.  The expansion is
+    /// entirely below the block's first row, so `scroll` is left unchanged (the mermaid-style
+    /// reveal), rather than dragging the document to re-pin the cursor's exact row.
+    #[test]
+    fn reflow_reveal_keeps_block_top_and_content_above_put() {
+        let src = "a\n\nb\n\nc\n\none\ntwo\nthree\nfour\nfive\n\nafter\n";
+        let mut state = EditorState::new(Buffer::from_str(src), theme());
+        state.mode = Mode::Rendered;
+        state.set_viewport_width(20);
+        state.set_reflow(true);
+        let (w, h) = (20usize, 20usize); // tall enough the expansion never pushes the cursor off
+        // Cursor into the reflowed paragraph on its first line (a downward entry), the case that
+        // keeps the reveal delay; the expansion then happens entirely below the cursor.
+        let byte = state.buffer.contents().find("one").unwrap();
+        state.cursor.offset = state.buffer.rope().byte_to_char(byte);
+        state.update_cursor_block();
+
+        // Frame 1: reveal delay pending (block still one flow row).  Park the flow row at the top
+        // of the viewport so the expansion has ample headroom below.
+        state.cursor_block_entered_at = Some(std::time::Instant::now());
+        assert!(!state.cursor_block_revealed());
+        state.scroll = super::rendered_cursor_visual_row(&state, w);
+        state.anchor_reflow_reveal(w, h);
+        let scroll_before = state.scroll;
+
+        // Frame 2: the reveal fires (block expands to its raw lines) — cursor hasn't moved.
+        state.cursor_block_entered_at = None;
+        assert!(
+            state.effective_rows(w).has_reveal(),
+            "the block must now be reflow-revealed"
+        );
+        state.anchor_reflow_reveal(w, h);
+        assert_eq!(
+            state.scroll, scroll_before,
+            "revealing a paragraph while the cursor stays visible must not move the document",
+        );
+    }
+
+    /// Switching into Rendered mode with the cursor already resting in a reflowed paragraph must
+    /// not yank the view: the first Rendered frame's `anchor_reflow_reveal` only re-checks cursor
+    /// visibility, so the scroll the mode switch established (cursor already visible) survives.
+    #[test]
+    fn switching_into_rendered_mode_leaves_the_scroll_alone() {
+        // A reflowed paragraph deep enough that the cursor sits mid-viewport, not at the top.
+        let mut src = String::new();
+        for i in 0..10 {
+            src.push_str(&format!("filler {i}\n\n"));
+        }
+        src.push_str("alpha beta\ngamma delta\nepsilon zeta\n\ntail\n");
+        let mut state = EditorState::new(Buffer::from_str(&src), theme());
+        let (w, h) = (20usize, 10usize);
+        state.set_viewport_width(w);
+        let byte = state.buffer.contents().find("gamma").unwrap();
+        state.cursor.offset = state.buffer.rope().byte_to_char(byte);
+        state.update_cursor_block();
+        state.cursor_block_entered_at = None; // resting → revealed once in Rendered
+
+        // A few Preview frames (as `prepare_viewport` runs them), then scroll so the cursor is
+        // visible mid-document.
+        for _ in 0..3 {
+            state.sync_reflow_for_mode();
+            state.anchor_reflow_reveal(w, h);
+        }
+        state.mode = Mode::Preview;
+        state.ensure_cursor_visible(h, w);
+
+        // The mode-switch action flips to Rendered and fits the cursor.
+        state.mode = Mode::Rendered;
+        state.ensure_cursor_visible(h, w);
+        let scroll_after_switch = state.scroll;
+
+        // The next frame's per-frame anchor must leave that scroll alone.
+        state.sync_reflow_for_mode();
+        state.anchor_reflow_reveal(w, h);
+        assert_eq!(
+            state.scroll, scroll_after_switch,
+            "entering Rendered mode must not move the view",
+        );
     }
 
     /// With images declined, every image block collapses to its one-line placeholder — the same

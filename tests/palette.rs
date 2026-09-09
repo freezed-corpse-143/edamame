@@ -182,6 +182,7 @@ impl SettingsStateExt for SettingsState {
             // except "Show line numbers" grouped below the image rows.
             "Autosave",
             "Big H1 headings",
+            "Reflow paragraphs",
             "Blink cursor",
             "Check for updates",
             "Limit editor width",

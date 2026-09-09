@@ -15,8 +15,9 @@ use crate::app::App;
 use crate::config::sections::VIM_HANDLER;
 use crate::config::Config;
 use crate::ui::settings_overlay::{
-    LABEL_BIG_H1, LABEL_BLINK_CURSOR, LABEL_SCROLL_SPEED, LABEL_SHOW_DIAGRAMS, LABEL_SHOW_IMAGES,
-    LABEL_SHOW_REMOTE_IMAGES, LABEL_SYNTAX_HIGHLIGHTING, LABEL_VIM_MODE, LABEL_VISUAL_LINE_NAV,
+    LABEL_BIG_H1, LABEL_BLINK_CURSOR, LABEL_REFLOW, LABEL_SCROLL_SPEED, LABEL_SHOW_DIAGRAMS,
+    LABEL_SHOW_IMAGES, LABEL_SHOW_REMOTE_IMAGES, LABEL_SYNTAX_HIGHLIGHTING, LABEL_VIM_MODE,
+    LABEL_VISUAL_LINE_NAV,
 };
 use crate::ui::{ModalKind, SettingsResponse, SettingsState, SettingsView};
 
@@ -66,6 +67,7 @@ fn resolve(app: &mut App, response: SettingsResponse) -> ModalOutcome {
 pub(crate) fn apply_live_update(label: &str, app: &mut App) {
     match label {
         LABEL_BIG_H1 => app.editor.set_big_h1(app.config.editor.big_h1),
+        LABEL_REFLOW => app.editor.set_reflow(app.config.editor.reflow),
         LABEL_SYNTAX_HIGHLIGHTING => app
             .editor
             .set_syntax_highlighting(app.config.editor.syntax_highlighting),
@@ -156,6 +158,7 @@ mod tests {
     /// effect without a restart.  Kept in sync by [`live_update_coverage_is_exhaustive`].
     const LIVE_UPDATE_LABELS: &[&str] = &[
         LABEL_BIG_H1,
+        LABEL_REFLOW,
         LABEL_BLINK_CURSOR,
         LABEL_SCROLL_SPEED,
         LABEL_SHOW_DIAGRAMS,

@@ -131,6 +131,15 @@ appearance = "dark"
 # custom theme can restyle them. Default: true.
 # syntax_highlighting = true
 
+# Reflow prose paragraphs. A single (soft) line break inside a paragraph is
+# not semantic in Markdown — CommonMark collapses it to a space — so edamame
+# joins hard-wrapped source lines back into one paragraph and wraps them to
+# the viewport width, rather than showing one short row per source line. A
+# hard break (two trailing spaces or a backslash) still forces a split, and
+# moving the cursor into a paragraph reveals its real source line for line.
+# When false, every source line keeps its own row. Default: true.
+# reflow = true
+
 # Blink the editor cursor. When false the cursor is drawn solid and never
 # hidden. The settings overlay exposes this on/off toggle. Default: true.
 # cursor_blink = true

@@ -29,7 +29,9 @@ pub(crate) use self::paint::{
     paint_search_overlays, paint_substitute_preview_overlays, paint_yank_flash,
 };
 use self::raw_text::raw_line_byte_start;
-pub(crate) use self::raw_text::{raw_block_cursor, raw_source_lines, revealed_source_line_count};
+pub(crate) use self::raw_text::{
+    raw_block_cursor, raw_source_lines, revealed_source_line_count, revealed_source_lines,
+};
 
 /// State for the `RenderedView` widget; owned by `EditorViewState`, updated every frame.
 #[derive(Debug, Default)]
@@ -218,8 +220,24 @@ impl<'a> StatefulWidget for RenderedView<'a> {
 
         view_state.scroll = editor.scroll;
         let scroll = view_state.scroll;
-        let (mut virtual_idx, mut first_sub_row) =
-            editor.rendered_line_at_visual_row(scroll, area.width as usize);
+        // Reflow-reveal-aware start: `EffectiveRows` is the identity unless the cursor rests in a
+        // reflowed, revealed paragraph, in which case the block's one rendered flow line is
+        // replaced by its `M` raw source lines.  A viewport that opens *inside* that block then
+        // starts on one of those raw lines (`start_raw`), not the rendered line.
+        let effective = editor.effective_rows(area.width as usize);
+        let reflow_reveal_range = effective.block_rendered();
+        let (mut virtual_idx, mut first_sub_row, mut start_raw): (
+            usize,
+            usize,
+            Option<(usize, usize)>,
+        ) = match effective.line_at_visual_row(scroll) {
+            crate::editor::effective_rows::RowHit::Rendered { line, sub } => (line, sub, None),
+            crate::editor::effective_rows::RowHit::Raw { raw_line, sub } => (
+                reflow_reveal_range.as_ref().map(|r| r.start).unwrap_or(0),
+                0,
+                Some((raw_line, sub)),
+            ),
+        };
 
         // Jitter suppression: keep the block rendered until the reveal delay elapses.
         let reveal_raw = editor.cursor_block_revealed();
@@ -261,7 +279,60 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                     None
                 }
             });
-            if reveal_raw && is_big_h1_block && in_cursor_block {
+            if reveal_raw && in_cursor_block && effective.has_reveal() {
+                // A reflowed paragraph reveals as its stacked raw source lines: the rendered form
+                // was one wrapped flow, the raw form is `M` source lines, so paint them all in
+                // this one iteration (the block occupies a single rendered line, so `virtual_idx`
+                // then advances straight past it).  `EffectiveRows` already made scroll, gutter,
+                // and mouse count these rows.  Only the first painted raw line honors `skip_rows`,
+                // for a viewport opening mid-block.
+                let (first_raw, first_sub) = start_raw.take().unwrap_or((0, 0));
+                let block_start = block_range_for_cursor.as_ref().map(|r| r.start);
+                // Trailing blanks absorbed into the block range own their own rows, so stack only
+                // the content lines (matches `EffectiveRows` and `revealed_raw_row_count`).
+                let reveal_count =
+                    revealed_source_line_count(&raw_block_source).min(raw_lines.len());
+                let mut used = 0usize;
+                for (raw_idx, &raw_text) in raw_lines
+                    .iter()
+                    .enumerate()
+                    .take(reveal_count)
+                    .skip(first_raw)
+                {
+                    if vis_y + used >= height {
+                        break;
+                    }
+                    let sub_skip = if raw_idx == first_raw { first_sub } else { 0 };
+                    let sel_cols = selection_bytes.zip(block_start).and_then(|((sa, sb), bs)| {
+                        let raw_line_start_in_block =
+                            raw_line_byte_start(&raw_block_source, raw_idx);
+                        let raw_line_start_abs = bs + raw_line_start_in_block;
+                        let raw_line_end_abs = raw_line_start_abs + raw_text.len();
+                        let start_byte = sa.max(raw_line_start_abs).min(raw_line_end_abs);
+                        let end_byte = sb.max(raw_line_start_abs).min(raw_line_end_abs);
+                        if start_byte >= end_byte {
+                            return None;
+                        }
+                        let start_col = raw_text[..start_byte - raw_line_start_abs].chars().count();
+                        let end_col = raw_text[..end_byte - raw_line_start_abs].chars().count();
+                        Some((start_col, end_col))
+                    });
+                    let styled = make_raw_line_over(raw_text, sel_cols, self.theme, reveal_base);
+                    let cursor_override = (cursor_visible && raw_idx == cursor_raw_line)
+                        .then_some((cursor_col, cursor_indicator_style));
+                    let rows = render_line_with_cursor_from_visual(
+                        &styled,
+                        area,
+                        buf,
+                        (vis_y + used) as u16,
+                        wrap,
+                        cursor_override,
+                        sub_skip,
+                    ) as usize;
+                    used += rows;
+                }
+                rows_used = used;
+            } else if reveal_raw && is_big_h1_block && in_cursor_block {
                 // `# Title` on the first sub-line, the other big-text rows blanked, the last
                 // sub-line keeps the rendered rule.
                 let sub = virtual_idx - cursor_block_lines.start;
@@ -607,12 +678,14 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                 let setext_revealed = reveal_raw && is_setext && in_cursor_block;
                 let mermaid_revealed = reveal_raw && is_mermaid_block && in_cursor_block;
                 let wrapped_revealed = reveal_raw && wrapped_sub_idx_opt.is_some();
-                // Three separate suppression cases; clippy's collapse hides which is which.
+                let reflow_revealed = reveal_raw && in_cursor_block && effective.has_reveal();
+                // Separate suppression cases; clippy's collapse hides which is which.
                 #[allow(clippy::nonminimal_bool)]
                 if !(reveal_raw && virtual_idx == cursor_rendered_line && code_block_allows_reveal)
                     && !setext_revealed
                     && !mermaid_revealed
                     && !wrapped_revealed
+                    && !reflow_revealed
                 {
                     paint_byte_range_overlay(
                         editor,

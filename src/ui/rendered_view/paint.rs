@@ -128,6 +128,44 @@ pub(super) fn paint_byte_range_overlay(
         .rendered_lines_for_byte(block_range.start);
     let sub_idx_in_block = rendered_line_idx.saturating_sub(rendered_span.start);
     let is_table = table_edit::is_table_block(block_text);
+
+    // A reflowed paragraph collapses several source lines into one wrapped flow, so a rendered
+    // row no longer maps to a single raw line.  Intersect the selection with the whole block and
+    // map its raw-column span through the block-wide inline collapse map (soft breaks → spaces,
+    // owned in `InlineColMap`); `paint_cols_on_line` still handles the wrap.
+    if !is_table && editor.parsed.is_reflowed_paragraph_at(block_range.start) {
+        let Some(line) = editor.parsed.lines.get(rendered_line_idx) else {
+            return;
+        };
+        let actual_rendered: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        let content = block_text.strip_suffix('\n').unwrap_or(block_text);
+        let content_start = block_range.start;
+        let content_end = block_range.start + content.len();
+        let sel_s = sel_start_byte.max(content_start);
+        let sel_e = sel_end_byte.min(content_end);
+        if sel_s >= sel_e {
+            return;
+        }
+        let start_raw_col = content[..sel_s - content_start].chars().count();
+        let end_raw_col = content[..sel_e - content_start].chars().count();
+        let map = crate::markdown::InlineColMap::build(content);
+        let (rend_start, rend_end) = match (
+            map.raw_to_rendered_checked(start_raw_col, actual_rendered),
+            map.raw_to_rendered_checked(end_raw_col, actual_rendered),
+        ) {
+            (Some(rs), Some(re)) => (rs, re),
+            _ => (
+                start_raw_col.min(actual_rendered),
+                end_raw_col.min(actual_rendered),
+            ),
+        };
+        if rend_start < rend_end {
+            paint_cols_on_line(
+                line, buf, area, y_start, rows_used, skip_rows, rend_start, rend_end, style,
+            );
+        }
+        return;
+    }
     // Wrap-chunk index of a table sub-line within its logical row.
     let mut table_sub = 0usize;
     let raw_line_idx = if is_table {

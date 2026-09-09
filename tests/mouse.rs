@@ -2630,11 +2630,12 @@ fn same_mermaid_block_click_does_not_set_drag_in_progress() {
     let src = "```mermaid\nflowchart TD\nA-->B\nB-->C\n```\n";
     let mut st = state(src);
     st.mode = Mode::Rendered;
-    // Seed cursor on the first content line; reveal already active.
+    // Seed cursor on the first content line and let a dwell latch the reveal.
     st.cursor.offset = src.find("flowchart").unwrap();
     st.update_cursor_block();
     st.cursor_block_entered_at = None;
-    assert!(st.cursor_block_revealed());
+    st.latch_cursor_reveal();
+    assert!(st.cursor_block_revealed() && st.cursor_reveal_latched);
     let original_block = st.cursor_block_idx;
 
     // Click on row 2 of the rendered output (raw line "A-->B" within
@@ -2788,46 +2789,51 @@ fn click_on_wrapped_mermaid_line_lands_on_continuation() {
 }
 
 #[test]
-fn intra_mermaid_line_move_does_not_rearm_reveal_timer() {
-    // `update_cursor_block` re-arms `cursor_block_entered_at` on every
-    // buffer-line change so tables (and other multi-line blocks) get a
-    // uniform per-cell reveal delay.  Mermaid is exempt: re-arming on
-    // each line move would flash the image placeholder back in for
-    // ~120ms after every keystroke.  Verify the timer holds steady
-    // while the cursor stays inside the same mermaid block.
+fn intra_mermaid_line_move_keeps_the_reveal_latched() {
+    // `update_cursor_block` re-arms `cursor_block_entered_at` on every buffer-line change so
+    // tables (and other multi-line blocks) get a uniform per-cell reveal delay — mermaid
+    // included, so that *scrolling through* a mermaid block never dwells long enough to reveal
+    // it.  Once a dwell has revealed it, though, `cursor_reveal_latched` holds it revealed while
+    // the cursor stays inside, so intra-block line moves don't flash the image placeholder back.
     let src = "Intro paragraph.\n\n```mermaid\nflowchart TD\nA-->B\nB-->C\n```\n\nTrailer.\n";
     let mut st = state(src);
     st.mode = Mode::Rendered;
-    // Seed cursor on the intro paragraph so the next move actually
-    // crosses a block boundary (and arms the timer).
+    // Seed cursor on the intro paragraph so the next move actually crosses a block boundary.
     st.cursor.offset = 0;
     st.update_cursor_block();
-    st.cursor_block_entered_at = None;
 
-    // Enter the mermaid block — block boundary crossed, timer arms.
+    // Enter the mermaid block — block boundary crossed, timer arms, latch drops.
     st.cursor.offset = src.find("flowchart").unwrap();
     st.update_cursor_block();
-    let entered_at = st.cursor_block_entered_at;
     assert!(
-        entered_at.is_some(),
-        "entering mermaid arms the reveal timer"
+        st.cursor_block_entered_at.is_some() && !st.cursor_reveal_latched,
+        "entering mermaid arms the reveal timer and starts unrevealed",
     );
 
-    // Move to the next content line within the same mermaid block.
+    // A dwell reveals it, and the per-frame latch step pins that reveal.
+    st.cursor_block_entered_at = None;
+    st.latch_cursor_reveal();
+    assert!(st.cursor_reveal_latched, "a dwell latches the mermaid reveal");
+
+    // Move to the next content line within the same mermaid block: the timer re-arms, but the
+    // latch holds the reveal, so the placeholder never flashes back.
     st.cursor.offset = src.find("A-->B").unwrap();
     st.update_cursor_block();
-    assert_eq!(
-        st.cursor_block_entered_at, entered_at,
-        "intra-mermaid line move must not re-arm the reveal timer",
+    assert!(
+        st.cursor_block_entered_at.is_some(),
+        "an intra-mermaid line move re-arms the reveal timer, like every other block",
+    );
+    assert!(
+        st.cursor_block_revealed(),
+        "the latch holds the mermaid block revealed across the move",
     );
 
-    // Moving back to the intro paragraph (a different block) must
-    // re-arm the timer.
+    // Moving back to the intro paragraph (a different block) drops the latch and re-arms.
     st.cursor.offset = 0;
     st.update_cursor_block();
-    assert_ne!(
-        st.cursor_block_entered_at, entered_at,
-        "leaving the mermaid block re-arms the reveal timer",
+    assert!(
+        !st.cursor_reveal_latched && st.cursor_block_entered_at.is_some(),
+        "leaving the mermaid block drops the latch and re-arms the reveal timer",
     );
 }
 
