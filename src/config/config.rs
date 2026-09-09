@@ -9,8 +9,8 @@ use super::keymap::KeyBindingOverrides;
 use super::persistence::config_writes_allowed;
 use super::readers::{read_keybindings, read_main_config, read_theme_named};
 pub use super::sections::{
-    AppearanceMode, CustomExportEntry, DevConfig, DiagramsConfig, DiagramsEnabled, EditorConfig,
-    ExportConfig, ImagesConfig, ImagesEnabled, ModalConfig, RemoteImagePolicy, TableConfig,
+    AppearanceMode, CustomExportEntry, DevConfig, EditorConfig, ExportConfig, FiguresConfig,
+    FiguresEnabled, ImagesConfig, ImagesEnabled, ModalConfig, RemoteImagePolicy, TableConfig,
 };
 use super::theme::Theme;
 use super::theme_file::ThemeFile;
@@ -54,7 +54,17 @@ pub struct Config {
     pub modal: ModalConfig,
     pub table: TableConfig,
     pub images: ImagesConfig,
-    pub diagrams: DiagramsConfig,
+    /// Consent gate for inline rendering of *figures* — ```mermaid
+    /// diagrams **and** `$$...$$` display math, which share one image
+    /// pipeline and one consent switch.
+    ///
+    /// The section was `[diagrams]` before display math existed:
+    /// `alias = "diagrams"` keeps old configs loading, and [`Config::load`]
+    /// rewrites the header to `[figures]` on first launch (see
+    /// [`migrate_legacy_config_keys`]).  The parallel `[export.html].figures`
+    /// key gates the *export* side of the same pipeline.
+    #[serde(alias = "diagrams")]
+    pub figures: FiguresConfig,
     pub export: ExportConfig,
     pub dev: DevConfig,
 }
@@ -69,7 +79,7 @@ impl Default for Config {
             modal: ModalConfig::default(),
             table: TableConfig::default(),
             images: ImagesConfig::default(),
-            diagrams: DiagramsConfig::default(),
+            figures: FiguresConfig::default(),
             export: ExportConfig::default(),
             dev: DevConfig::default(),
         }
@@ -172,6 +182,18 @@ impl Config {
                         "failed to persist theme fallback to config.toml",
                     );
                 }
+            }
+        }
+        // Migrate legacy section names ([diagrams] → [figures]) in the
+        // on-disk file so it matches the current spelling.  Gated on the
+        // same persist flag as the theme-fallback write above and on config
+        // writes being allowed (test isolation, `--no-config`); the `alias`
+        // on `Config::diagrams` means the session already loaded correctly
+        // whether or not this runs.  Only writes when a legacy name is
+        // actually present, so an up-to-date config never triggers a write.
+        if persist_fallback && config_writes_allowed() {
+            if let Some(d) = &dir {
+                migrate_config_file_in_place(&d.join("config.toml"));
             }
         }
         Ok(LoadedConfig {
@@ -398,6 +420,10 @@ fn save_merge(config: &Config, path: &Path) -> Result<String> {
             path.display()
         )
     })?;
+    // Rename any legacy section (`[diagrams]` → `[figures]`) before the
+    // merge, so the in-memory values — serialized under the new name —
+    // land in the user's own section instead of appending a second one.
+    migrate_legacy_config_keys(&mut existing_doc);
     let new_doc: DocumentMut = new_serialized
         .parse()
         .context("internal error: serialized config failed to re-parse")?;
@@ -414,6 +440,90 @@ fn save_merge(config: &Config, path: &Path) -> Result<String> {
     );
 
     Ok(existing_doc.to_string())
+}
+
+// ── config-key migration ──────────────────────────────────────────────────────
+
+/// Rename legacy `diagrams` keys in `doc` to their current spelling
+/// (`figures`), preserving each key's value and inline comments.
+///
+/// The `diagrams` → `figures` rename happened when display math joined the
+/// consent gate; it touches two places, migrated together so a rewritten
+/// file carries no legacy spelling at either level:
+///
+/// * the top-level `[diagrams]` section → `[figures]`, and
+/// * the `[export.html].diagrams` toggle → `figures`.
+///
+/// Returns `true` when it changed anything.  If both names are already
+/// present at a level (a hand-edited file), the new one wins and the legacy
+/// entry is dropped.
+///
+/// Each `remove` + `insert` renames in place: at the pinned toml_edit
+/// version it keeps the entry's original position and all of its decor —
+/// the comment block above a header, the inline comment on a value,
+/// everything but the characters of the name itself.
+/// (`save_merge_migrates_a_legacy_diagrams_section` and
+/// `migrate_legacy_config_keys_renames_diagrams_to_figures` pin both the
+/// position and the comment preservation, so a toml_edit upgrade that
+/// regressed either would fail CI.)  Going through toml_edit rather than a
+/// raw-text swap is what makes `[ diagrams ]`-with-spaces and the nested
+/// `[export.html].diagrams` key safe.
+fn migrate_legacy_config_keys(doc: &mut toml_edit::DocumentMut) -> bool {
+    let mut changed = rename_table_key(doc.as_table_mut(), "diagrams", "figures");
+    // The parallel `[export.html].diagrams` toggle was renamed the same
+    // way; migrate it in place too.  Absent / non-table `export`/`html`
+    // just means nothing to do.
+    if let Some(export_html) = doc
+        .get_mut("export")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .and_then(|export| export.get_mut("html"))
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        changed |= rename_table_key(export_html, "diagrams", "figures");
+    }
+    changed
+}
+
+/// Rename key `from` to `to` within one table, in place, keeping the
+/// entry's value and decor.  No-op (returns `false`) when `from` is absent;
+/// when both exist, `to` is kept and `from` dropped.  Works on any
+/// [`toml_edit::TableLike`] so the top-level document table and the nested
+/// `[export.html]` table share one implementation.
+fn rename_table_key(table: &mut dyn toml_edit::TableLike, from: &str, to: &str) -> bool {
+    if !table.contains_key(from) {
+        return false;
+    }
+    if table.contains_key(to) {
+        table.remove(from);
+    } else if let Some(item) = table.remove(from) {
+        table.insert(to, item);
+    }
+    true
+}
+
+/// Rewrite `path` in place if it still uses a legacy section name (see
+/// [`migrate_legacy_config_keys`]).  A no-op when the file is missing,
+/// unparseable (already reported by `read_main_config`), or already
+/// current.  Failures are logged and non-fatal — the `alias` on
+/// [`Config`]'s field means the session loaded correctly regardless.
+fn migrate_config_file_in_place(path: &Path) {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut doc) = raw.parse::<toml_edit::DocumentMut>() else {
+        return;
+    };
+    if !migrate_legacy_config_keys(&mut doc) {
+        return;
+    }
+    match std::fs::write(path, doc.to_string()) {
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "migrated [diagrams] → [figures] in config")
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "failed to migrate legacy config keys")
+        }
+    }
 }
 
 /// Merge `new` into `existing`, leaving comments / decor untouched.
@@ -1131,7 +1241,10 @@ mod tests {
         assert!(serialized.contains("[editor]"));
         assert!(serialized.contains("[modal]"));
         assert!(serialized.contains("[images]"));
-        assert!(serialized.contains("[diagrams]"));
+        // The screen-consent section is `[figures]` (renamed from
+        // `[diagrams]`; see the field's serde rename).
+        assert!(serialized.contains("[figures]"));
+        assert!(!serialized.contains("[diagrams]"));
         assert!(serialized.contains("[export"));
         assert!(serialized.contains("[dev]"));
     }
@@ -1141,7 +1254,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.export.html.stylesheet, "builtin");
         assert!(!config.export.html.inline_images);
-        assert!(config.export.html.diagrams);
+        assert!(config.export.html.figures);
         assert!(config.export.custom.is_empty());
 
         let toml_str = r#"
@@ -1155,6 +1268,19 @@ extension = "pdf"
         assert_eq!(config.export.custom[0].name, "PDF (weasyprint)");
         assert_eq!(config.export.custom[0].extension, "pdf");
         assert_eq!(config.export.custom[0].command.len(), 3);
+    }
+
+    /// A config written before display-math export existed uses
+    /// `[export.html].diagrams`; the `alias` keeps it loading onto the
+    /// renamed `figures` field.
+    #[test]
+    fn legacy_export_diagrams_key_loads_via_alias() {
+        let config: Config =
+            toml::from_str("[export.html]\ndiagrams = false\n").expect("legacy export key parses");
+        assert!(
+            !config.export.html.figures,
+            "legacy [export.html].diagrams must map onto figures"
+        );
     }
 
     // ── save_merge: comment-preserving in-place update ─────────────────────
@@ -1297,6 +1423,126 @@ appearance = \"dark\"
         let out = save_merge(&config, &path).expect("merge ok");
         assert!(out.contains("theme = \"catppuccin\""));
         assert!(out.contains("# active theme"));
+    }
+
+    // ── [diagrams] → [figures] rename + migration ─────────────────────
+
+    /// An old config written with `[diagrams]` still loads: the `alias`
+    /// on the field keeps deserialization working so an un-migrated file
+    /// (read-only, `--no-config`) runs correctly.
+    #[test]
+    fn legacy_diagrams_section_deserializes_via_alias() {
+        let config: Config =
+            toml::from_str("[diagrams]\nenabled = \"never\"\n").expect("legacy config parses");
+        assert_eq!(config.figures.enabled, FiguresEnabled::Never);
+    }
+
+    /// The current section name is `[figures]`: a serialized config uses
+    /// it, not the legacy `[diagrams]`.
+    #[test]
+    fn config_serializes_the_figures_section_name() {
+        let config = Config {
+            figures: FiguresConfig {
+                enabled: FiguresEnabled::Always,
+                ..FiguresConfig::default()
+            },
+            ..Config::default()
+        };
+        let out = toml::to_string_pretty(&config).expect("serialize");
+        assert!(out.contains("[figures]"), "expected [figures] in:\n{out}");
+        assert!(!out.contains("[diagrams]"), "legacy name leaked:\n{out}");
+    }
+
+    /// The unit rename preserves the section's value and drops the old key.
+    #[test]
+    fn migrate_legacy_config_keys_renames_diagrams_to_figures() {
+        use toml_edit::DocumentMut;
+        // A realistic multi-section file: the rename must touch only the
+        // header, keep the section *in place* (between [images] and
+        // [export.html]), and preserve every comment around it.
+        let src = "theme = \"Nord\"\n\n\
+                   [images]\nenabled = \"always\"\n\n\
+                   # ── Diagrams ──\n[diagrams]\n# master switch\nenabled = \"always\" # mine\n\n\
+                   [export.html]\ndiagrams = true\n";
+        let mut doc: DocumentMut = src.parse().unwrap();
+        assert!(migrate_legacy_config_keys(&mut doc));
+        let out = doc.to_string();
+        assert!(out.contains("[figures]"), "not renamed:\n{out}");
+        // Both levels migrate: the top-level header AND the nested export
+        // toggle, with no stray `diagrams` spelling left anywhere.
+        assert!(!out.contains("[diagrams]"), "old header kept:\n{out}");
+        assert!(
+            out.contains("figures = true"),
+            "nested export toggle not migrated:\n{out}"
+        );
+        assert!(
+            !out.contains("diagrams = true"),
+            "legacy export toggle survived:\n{out}"
+        );
+        // Comments and value survive verbatim.
+        assert!(
+            out.contains("# ── Diagrams ──"),
+            "header comment lost:\n{out}"
+        );
+        assert!(out.contains("# master switch"), "body comment lost:\n{out}");
+        assert!(
+            out.contains("enabled = \"always\" # mine"),
+            "value/comment lost:\n{out}"
+        );
+        // Position preserved: [figures] stays between [images] and [export.html].
+        let f = out.find("[figures]").unwrap();
+        assert!(out.find("[images]").unwrap() < f && f < out.find("[export.html]").unwrap());
+        // Idempotent: a file already on the new name is untouched.
+        let mut current: DocumentMut = "[figures]\nenabled = \"ask\"\n".parse().unwrap();
+        assert!(!migrate_legacy_config_keys(&mut current));
+    }
+
+    /// A save over a legacy file migrates the header AND lands the
+    /// in-memory value in the migrated section (not a second `[figures]`).
+    #[test]
+    fn save_merge_migrates_a_legacy_diagrams_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "theme = \"Edamame\"\n\n[diagrams]\nenabled = \"always\"\n",
+        )
+        .unwrap();
+        let config = Config {
+            figures: FiguresConfig {
+                enabled: FiguresEnabled::Always,
+                ..FiguresConfig::default()
+            },
+            ..Config::default()
+        };
+        let out = save_merge(&config, &path).expect("merge ok");
+        assert!(out.contains("[figures]"), "not migrated:\n{out}");
+        assert!(
+            !out.contains("[diagrams]"),
+            "duplicate/legacy section:\n{out}"
+        );
+        assert!(out.contains("enabled = \"always\""), "value lost:\n{out}");
+        // Round-trips back to the same value.
+        let round: Config = toml::from_str(&out).expect("parses");
+        assert_eq!(round.figures.enabled, FiguresEnabled::Always);
+    }
+
+    /// The eager in-place migration rewrites the file and is a no-op the
+    /// second time.
+    #[test]
+    fn migrate_config_file_in_place_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[diagrams]\nenabled = \"never\"\n").unwrap();
+        migrate_config_file_in_place(&path);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("[figures]") && !after.contains("[diagrams]"));
+        migrate_config_file_in_place(&path);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            after,
+            "second run changed the file"
+        );
     }
 
     /// A non-default value for a key not currently in the user's

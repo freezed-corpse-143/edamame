@@ -7,9 +7,20 @@
 //! - The [`App`] methods that spawn decode workers and translate
 //!   `ImagesEnabled` policy into runtime decisions.
 
+use std::time::{Duration, Instant};
+
 use ratatui::layout::Rect;
 
 use super::{App, AppEvent};
+
+/// Idle window after the last edit before a diagram / `$$...$$` math block
+/// re-render is dispatched.  Typing in Rendered mode reparses on every
+/// keystroke (for wrap-aware cursor visibility), each reparse minting a
+/// fresh content-hashed URL, so without this debounce every keystroke
+/// would spawn a render (RaTeX/mermaid → SVG → raster) the user never sees
+/// mid-burst.  Matches the 120 ms `RAW_REVEAL_DELAY` so the deferred render
+/// lands about when the reveal itself settles after the last keystroke.
+pub(super) const DIAGRAM_RENDER_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// One-viewport-height prefetch margin (in rendered lines) above and
 /// below the visible area.  An image whose rendered rows intersect
@@ -154,10 +165,10 @@ impl App {
         if !self.media_renderable() {
             return false;
         }
-        match self.config.diagrams.enabled {
-            crate::config::DiagramsEnabled::Always => true,
-            crate::config::DiagramsEnabled::Never => false,
-            crate::config::DiagramsEnabled::Ask => self.session_diagrams_enabled.unwrap_or(false),
+        match self.config.figures.enabled {
+            crate::config::FiguresEnabled::Always => true,
+            crate::config::FiguresEnabled::Never => false,
+            crate::config::FiguresEnabled::Ask => self.session_diagrams_enabled.unwrap_or(false),
         }
     }
 
@@ -183,10 +194,10 @@ impl App {
         if !self.media_renderable() {
             return false;
         }
-        match self.config.diagrams.enabled {
-            crate::config::DiagramsEnabled::Never => false,
-            crate::config::DiagramsEnabled::Always => true,
-            crate::config::DiagramsEnabled::Ask => self.session_diagrams_enabled != Some(false),
+        match self.config.figures.enabled {
+            crate::config::FiguresEnabled::Never => false,
+            crate::config::FiguresEnabled::Always => true,
+            crate::config::FiguresEnabled::Ask => self.session_diagrams_enabled != Some(false),
         }
     }
 
@@ -235,7 +246,7 @@ impl App {
         self.needs_draw = true;
     }
 
-    /// React to a settings-overlay change of `config.diagrams.enabled`.
+    /// React to a settings-overlay change of `config.figures.enabled`.
     /// Called only when the value actually changed.  Counterpart of
     /// [`Self::apply_images_setting_change`] for diagram blocks —
     /// deliberately independent, mirroring the two startup prompts:
@@ -256,11 +267,11 @@ impl App {
         }
         // Any queued prompt reflects the pre-change value; rebuild below.
         self.modal_stack
-            .remove_first::<super::modal::DiagramsEnabledPromptModal>();
-        match self.config.diagrams.enabled {
-            crate::config::DiagramsEnabled::Always => self.dispatch_image_decodes(),
-            crate::config::DiagramsEnabled::Ask => self.queue_diagrams_enabled_prompt(),
-            crate::config::DiagramsEnabled::Never => {}
+            .remove_first::<super::modal::FiguresEnabledPromptModal>();
+        match self.config.figures.enabled {
+            crate::config::FiguresEnabled::Always => self.dispatch_image_decodes(),
+            crate::config::FiguresEnabled::Ask => self.queue_diagrams_enabled_prompt(),
+            crate::config::FiguresEnabled::Never => {}
         }
         self.images_dirty = true;
         self.needs_draw = true;
@@ -359,12 +370,12 @@ impl App {
             || self.session_diagrams_enabled.is_some()
             || self
                 .modal_stack
-                .contains::<super::modal::DiagramsEnabledPromptModal>()
+                .contains::<super::modal::FiguresEnabledPromptModal>()
         {
             return;
         }
         if let Some(m) =
-            super::modal::DiagramsEnabledPromptModal::from_state(&self.editor, &self.config)
+            super::modal::FiguresEnabledPromptModal::from_state(&self.editor, &self.config)
         {
             self.modal_stack.push(Box::new(m));
         }
@@ -448,13 +459,37 @@ impl App {
     /// (terminal height minus the status bar).  `scroll` is the top
     /// visible rendered-line index.
     pub(super) fn dispatch_visible_image_decodes(&mut self, scroll: usize, doc_height: usize) {
-        let infos = infos_in_viewport_window(
+        // Debounce diagram / math render dispatch across a typing burst:
+        // arm the hold on any buffer-version change (every edit path bumps
+        // it), and while the window is open skip diagram-sourced blocks so
+        // a keystroke's throwaway content-hashed URL isn't rendered.  Plain
+        // images are never held — their URL is stable source text, not a
+        // per-keystroke hash.  The first pass only records the version, so
+        // opening a document isn't mistaken for an edit.
+        let now = Instant::now();
+        let version = self.editor.buffer.version();
+        if self
+            .diagram_render_watch_version
+            .is_some_and(|prev| prev != version)
+        {
+            self.diagram_render_hold_until = Some(now + DIAGRAM_RENDER_DEBOUNCE);
+        }
+        self.diagram_render_watch_version = Some(version);
+        let holding = self.diagram_render_hold_until.is_some_and(|t| now < t);
+        if !holding {
+            self.diagram_render_hold_until = None;
+        }
+
+        let mut infos = infos_in_viewport_window(
             &self.editor.parsed.image_blocks,
             &self.editor.parsed.source_map,
             scroll,
             doc_height,
             VIEWPORT_DISPATCH_MARGIN,
         );
+        if holding {
+            infos.retain(|info| info.source.is_none());
+        }
         self.dispatch_image_decodes_for(&infos);
     }
 
@@ -938,5 +973,81 @@ mod tests {
         )
         .expect("non-empty diff");
         assert!(infos_in_diff_viewport_window(&diff, 40, 0, 20, 0).is_empty());
+    }
+
+    /// Typing inside a `$$...$$` block mints a fresh content-hashed URL on
+    /// every keystroke (Rendered mode reparses per key for cursor
+    /// visibility).  The render dispatch must be debounced: the initial
+    /// render fires immediately, an edit's new URL is *held* during the
+    /// typing burst, and it dispatches only once the window elapses.
+    #[test]
+    fn diagram_render_dispatch_is_debounced_while_typing() {
+        let mut app = crate::app::test_utils::app_with_buffer("$$\nx^2\n$$\n", 0);
+        app.config.figures.enabled = crate::config::FiguresEnabled::Always;
+        app.editor.diagrams_enabled = true;
+        app.editor.mode = crate::editor::Mode::Rendered;
+        app.editor.math_preview = true;
+        app.editor.refresh_parsed();
+        // Dispatch spawns workers only with a live event channel.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        app.app_tx = Some(tx);
+
+        let latex_url = |app: &crate::app::App| {
+            app.editor
+                .parsed
+                .image_blocks
+                .iter()
+                .find(|i| matches!(i.source, Some(crate::diagram::DiagramSource::Latex(_))))
+                .expect("latex block")
+                .url
+                .clone()
+        };
+        let url0 = latex_url(&app);
+
+        // First pass records the version (not an edit) → initial render
+        // dispatched immediately, no hold.
+        app.dispatch_visible_image_decodes(0, 40);
+        assert!(
+            app.editor.images.status(&url0).is_some(),
+            "initial render dispatched"
+        );
+        assert!(app.diagram_render_hold_until.is_none());
+
+        // Type inside the formula: the reparse mints a new URL.
+        app.editor.cursor.offset = "$$\n".chars().count() + 1;
+        crate::editor::edit_ops::apply(
+            &mut app.editor,
+            crate::config::Action::InsertChar('y'),
+            24,
+            80,
+        );
+        let url1 = latex_url(&app);
+        assert_ne!(url0, url1, "edit changed the formula URL");
+
+        // Dispatch during the burst: the edit armed the hold, so the new
+        // URL is not requested.
+        app.dispatch_visible_image_decodes(0, 40);
+        assert!(
+            app.diagram_render_hold_until.is_some(),
+            "edit armed the hold"
+        );
+        assert!(
+            app.editor.images.status(&url1).is_none(),
+            "new formula render held during typing"
+        );
+
+        // Window elapses (simulate) → the deferred render dispatches and
+        // the hold clears.
+        app.diagram_render_hold_until =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        app.dispatch_visible_image_decodes(0, 40);
+        assert!(
+            app.editor.images.status(&url1).is_some(),
+            "render dispatched after the debounce window"
+        );
+        assert!(
+            app.diagram_render_hold_until.is_none(),
+            "hold cleared after firing"
+        );
     }
 }

@@ -14,7 +14,7 @@ pub use inline_col_map::InlineColMap;
 pub use parser::{
     annotate_list_blanks, is_closing_fence, parse, parse_opening_fence, parse_raw_with_ranges,
     promote_diagram_code_blocks, promote_display_math_paragraphs, promote_html_comments,
-    promote_image_paragraphs,
+    promote_image_paragraphs, split_display_math_paragraphs,
 };
 pub use render_cache::RenderCache;
 pub use renderer::{ImageRowOverride, Renderer};

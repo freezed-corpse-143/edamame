@@ -212,19 +212,33 @@ impl EditorState {
         // lines painted onto them can't disagree, and without allocating
         // the `Vec` of slices just to read its length.
         let raw_rows = crate::ui::rendered_view::revealed_source_line_count(source);
-        // `$$...$$` math blocks reserve a live-preview band below the raw
-        // source: the decoded formula renders there while the user edits
-        // (its URL hashes the source, so every keystroke re-renders).
-        // Same row count the renderer's override would give the image
-        // outside the reveal — decoded → aspect rows, still decoding →
-        // the `image_max_height` placeholder reservation, so the layout
-        // doesn't jump when the reveal opens.
-        let preview_rows = if self.parsed.is_latex_block(block_idx) {
+        // `$$...$$` math blocks reserve a live-preview band at the block's
+        // top when the preview is enabled: the decoded formula renders
+        // there (keeping the position it had pre-reveal) while the editable
+        // source paints below it (its URL hashes the source, so every
+        // keystroke re-renders).  Same row count the renderer's override
+        // would give the image outside the reveal — decoded → aspect rows,
+        // still decoding → the `image_max_height` placeholder reservation,
+        // so the image doesn't resize when the reveal opens.  Off (or for a
+        // mermaid / plain-image block), the band is zero and the reveal
+        // hides the image entirely.
+        let preview_rows = if self.math_preview && self.parsed.is_latex_block(block_idx) {
             let max_w = self.image_max_width.min(u16::MAX as usize) as u16;
             let max_h = self.image_max_height.min(u16::MAX as usize) as u16;
             self.images
                 .reserved_rows(url, max_w, max_h, self.image_font_size)
-                .unwrap_or(self.image_max_height)
+                .unwrap_or_else(|| {
+                    // The URL is unknown: still decoding, or a keystroke's
+                    // throwaway hash whose render the debounce is holding.
+                    // Keep the band at this block's last resolved height so
+                    // it doesn't jump to the `image_max_height` placeholder
+                    // while typing; fall back to that placeholder only when
+                    // there is no prior reveal for this block to carry over.
+                    self.image_reveal
+                        .as_ref()
+                        .filter(|r| r.ordinal == ordinal && r.preview_rows > 0)
+                        .map_or(self.image_max_height, |r| r.preview_rows)
+                })
         } else {
             0
         };

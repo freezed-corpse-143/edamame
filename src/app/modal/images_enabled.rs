@@ -35,7 +35,7 @@ impl ImagesEnabledPromptModal {
         }
         // Diagram blocks are synthetic `Block::ImageBlock`s promoted
         // from fenced code blocks; they carry `source: Some(_)` and are
-        // handled by `DiagramsEnabledPromptModal` instead.  A document
+        // handled by `FiguresEnabledPromptModal` instead.  A document
         // with only diagrams (no real images) must not trigger this
         // prompt.
         let has_real_image = editor

@@ -252,7 +252,18 @@ impl<'t> Renderer<'t> {
                 self.render_heading(*level, inlines, out);
             }
             Block::Paragraph { inlines } => {
-                self.render_paragraph(inlines, out, indent_prefix);
+                // A `$$...$$`-only paragraph that survived promotion (figures
+                // disabled) renders as a fenced-style ` math ` code block —
+                // the source counterpart of the display-math reveal — rather
+                // than inline code, matching how a `` ```mermaid `` fence
+                // stays a code block when figures are off.
+                if let Some(body) =
+                    crate::markdown::parser::post_pass::display_math_block_body(block)
+                {
+                    self.render_code_block(Some("math"), &body, true, out);
+                } else {
+                    self.render_paragraph(inlines, out, indent_prefix);
+                }
             }
             Block::CodeBlock {
                 language,

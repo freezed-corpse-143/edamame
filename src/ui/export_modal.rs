@@ -7,7 +7,7 @@
 //! "open the result" buttons all live in one dismissable place:
 //!
 //! * **Options** — a `Title` text field, two toggles (`Inline images`,
-//!   `Inline diagrams`), a `Stylesheet` pill and the `Format` list, above
+//!   `Inline figures`), a `Stylesheet` pill and the `Format` list, above
 //!   a lone `[ Export ]` button (Esc dismisses; there is no Cancel
 //!   button).  Each setting is separated by a spacer; each toggle carries
 //!   a muted note describing its current (On/Off) state.  Enter exports
@@ -25,7 +25,7 @@
 //! every one of them — that is the point.**  The Format list chooses
 //! HTML or a configured converter; a custom export renders the
 //! document to HTML first and pipes *that* through the converter, so the
-//! stylesheet, the inline-images toggle and the diagrams toggle shape a
+//! stylesheet, the inline-images toggle and the figures toggle shape a
 //! PDF exactly as they shape an HTML file.  The only per-format string is
 //! the success phase's primary button, taken from the selected
 //! [`ExportFormat`] rather than branched on here, so the state never
@@ -73,8 +73,8 @@ const NOTE_INDENT: &str = "  ";
 // toggle and swaps as the value flips.
 const IMAGES_NOTE_ON: &str = "Inline images as data:URIs";
 const IMAGES_NOTE_OFF: &str = "Leave images as links";
-const DIAGRAMS_NOTE_ON: &str = "Inline diagrams as SVG";
-const DIAGRAMS_NOTE_OFF: &str = "Leave diagrams as code";
+const FIGURES_NOTE_ON: &str = "Render diagrams and math as images";
+const FIGURES_NOTE_OFF: &str = "Leave diagrams and math as source";
 
 const OPTION_BUTTONS: &[&str] = &["Export"];
 
@@ -151,7 +151,7 @@ pub enum ExportPhase {
 enum OptFocus {
     Title,
     Images,
-    Diagrams,
+    Figures,
     Stylesheet,
     Format,
     Export,
@@ -164,7 +164,7 @@ impl OptFocus {
     const ORDER: [OptFocus; 6] = [
         OptFocus::Title,
         OptFocus::Images,
-        OptFocus::Diagrams,
+        OptFocus::Figures,
         OptFocus::Stylesheet,
         OptFocus::Format,
         OptFocus::Export,
@@ -202,9 +202,9 @@ enum FormRow {
     Images,
     /// The muted note under the images toggle.
     ImagesNote,
-    Diagrams,
-    /// The muted note under the diagrams toggle.
-    DiagramsNote,
+    Figures,
+    /// The muted note under the figures toggle.
+    FiguresNote,
     Stylesheet,
     /// The `Format` header above the radio rows.
     FormatLabel,
@@ -231,8 +231,8 @@ fn form_rows(format_count: usize) -> Vec<FormRow> {
         FormRow::Images,
         FormRow::ImagesNote,
         FormRow::Spacer,
-        FormRow::Diagrams,
-        FormRow::DiagramsNote,
+        FormRow::Figures,
+        FormRow::FiguresNote,
         FormRow::Spacer,
         FormRow::Stylesheet,
         FormRow::Spacer,
@@ -254,7 +254,7 @@ fn focus_reveal_rows(rows: &[FormRow], focus: OptFocus, format_idx: usize) -> Ve
     let wanted: [Option<FormRow>; 2] = match focus {
         OptFocus::Title => [None, Some(FormRow::Title)],
         OptFocus::Images => [Some(FormRow::ImagesNote), Some(FormRow::Images)],
-        OptFocus::Diagrams => [Some(FormRow::DiagramsNote), Some(FormRow::Diagrams)],
+        OptFocus::Figures => [Some(FormRow::FiguresNote), Some(FormRow::Figures)],
         OptFocus::Stylesheet => [None, Some(FormRow::Stylesheet)],
         OptFocus::Format => [None, Some(FormRow::Format(format_idx))],
         OptFocus::Export => [None, None],
@@ -268,7 +268,7 @@ pub struct ExportChoices {
     /// `<title>` text; `None` when the field was left blank.
     pub title: Option<String>,
     pub inline_images: bool,
-    pub render_diagrams: bool,
+    pub render_figures: bool,
     /// `"builtin"` or a stylesheet path, ready for
     /// `Stylesheet::from_config_value`.
     pub stylesheet: String,
@@ -304,7 +304,7 @@ pub struct ExportState {
     /// Title field buffer (append-only, like the insert-table fields).
     pub title: String,
     pub inline_images: bool,
-    pub render_diagrams: bool,
+    pub render_figures: bool,
     /// `(display label, config value)` pairs; index 0 is always the
     /// compiled-in default stylesheet (labelled `Default`, value `builtin`).
     pub stylesheets: Vec<(String, String)>,
@@ -339,7 +339,7 @@ pub struct ExportState {
     format_rects: Vec<(usize, Rect)>,
     title_rect: Option<Rect>,
     images_rect: Option<Rect>,
-    diagrams_rect: Option<Rect>,
+    figures_rect: Option<Rect>,
     stylesheet_rect: Option<Rect>,
     export_button_rect: Option<Rect>,
     /// Button-row rects for the current message phase (overwrite / success /
@@ -360,7 +360,7 @@ impl ExportState {
         formats: Vec<ExportFormat>,
         title: String,
         inline_images: bool,
-        render_diagrams: bool,
+        render_figures: bool,
         stylesheets: Vec<(String, String)>,
         stylesheet_idx: usize,
     ) -> Self {
@@ -370,7 +370,7 @@ impl ExportState {
             format_idx: 0,
             title,
             inline_images,
-            render_diagrams,
+            render_figures,
             stylesheets,
             stylesheet_idx,
             submitted_title: None,
@@ -384,7 +384,7 @@ impl ExportState {
             format_rects: Vec::new(),
             title_rect: None,
             images_rect: None,
-            diagrams_rect: None,
+            figures_rect: None,
             stylesheet_rect: None,
             export_button_rect: None,
             msg_button_rects: Vec::new(),
@@ -401,7 +401,7 @@ impl ExportState {
         self.format_rects.clear();
         self.title_rect = None;
         self.images_rect = None;
-        self.diagrams_rect = None;
+        self.figures_rect = None;
         self.stylesheet_rect = None;
         self.export_button_rect = None;
         self.msg_button_rects.clear();
@@ -557,8 +557,8 @@ impl ExportState {
             self.apply_input(ControlInput::Activate);
             return ExportResponse::Continue;
         }
-        if rect_contains(self.diagrams_rect, col, row) {
-            self.focus = OptFocus::Diagrams;
+        if rect_contains(self.figures_rect, col, row) {
+            self.focus = OptFocus::Figures;
             self.apply_input(ControlInput::Activate);
             return ExportResponse::Continue;
         }
@@ -724,11 +724,11 @@ impl ExportState {
                     self.inline_images = v;
                 }
             }
-            OptFocus::Diagrams => {
+            OptFocus::Figures => {
                 if let ControlEvent::Changed(ControlValue::Toggle(v)) =
-                    Control::Toggle.apply(ControlValue::Toggle(self.render_diagrams), input)
+                    Control::Toggle.apply(ControlValue::Toggle(self.render_figures), input)
                 {
-                    self.render_diagrams = v;
+                    self.render_figures = v;
                 }
             }
             OptFocus::Stylesheet => {
@@ -773,7 +773,7 @@ impl ExportState {
         ExportChoices {
             title,
             inline_images: self.inline_images,
-            render_diagrams: self.render_diagrams,
+            render_figures: self.render_figures,
             stylesheet,
         }
     }
@@ -876,7 +876,7 @@ impl<'a> StatefulWidget for ExportView<'a> {
 
 impl<'a> ExportView<'a> {
     fn render_options(&self, area: Rect, buf: &mut Buffer, state: &mut ExportState) {
-        let labels: [&str; 4] = ["Title", "Inline images", "Inline diagrams", "Stylesheet"];
+        let labels: [&str; 4] = ["Title", "Inline images", "Inline figures", "Stylesheet"];
         let label_w = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
         // Own the pill labels so the later `pill_spans` borrow doesn't pin
         // `state` across the `state.esc_button_rect` assignment below.
@@ -891,8 +891,8 @@ impl<'a> ExportView<'a> {
         let note_w = [
             IMAGES_NOTE_ON,
             IMAGES_NOTE_OFF,
-            DIAGRAMS_NOTE_ON,
-            DIAGRAMS_NOTE_OFF,
+            FIGURES_NOTE_ON,
+            FIGURES_NOTE_OFF,
         ]
         .iter()
         .map(|n| NOTE_INDENT.len() + n.chars().count())
@@ -1004,14 +1004,14 @@ impl<'a> ExportView<'a> {
                 FormRow::ImagesNote => {
                     self.render_note(buf, row_area, images_note(state.inline_images));
                 }
-                FormRow::Diagrams => {
-                    let focused = state.focus == OptFocus::Diagrams;
-                    let control = toggle_spans(state.render_diagrams, focused, false, self.theme);
-                    self.render_row(buf, row_area, "Inline diagrams", label_w, focused, control);
-                    state.diagrams_rect = Some(control_rect(row_area.x, row_area.y, hit_w));
+                FormRow::Figures => {
+                    let focused = state.focus == OptFocus::Figures;
+                    let control = toggle_spans(state.render_figures, focused, false, self.theme);
+                    self.render_row(buf, row_area, "Inline figures", label_w, focused, control);
+                    state.figures_rect = Some(control_rect(row_area.x, row_area.y, hit_w));
                 }
-                FormRow::DiagramsNote => {
-                    self.render_note(buf, row_area, diagrams_note(state.render_diagrams));
+                FormRow::FiguresNote => {
+                    self.render_note(buf, row_area, figures_note(state.render_figures));
                 }
                 FormRow::Stylesheet => {
                     let focused = state.focus == OptFocus::Stylesheet;
@@ -1297,12 +1297,12 @@ fn images_note(on: bool) -> &'static str {
     }
 }
 
-/// Current-state note for the "Inline diagrams" toggle.
-fn diagrams_note(on: bool) -> &'static str {
+/// Current-state note for the "Inline figures" toggle.
+fn figures_note(on: bool) -> &'static str {
     if on {
-        DIAGRAMS_NOTE_ON
+        FIGURES_NOTE_ON
     } else {
-        DIAGRAMS_NOTE_OFF
+        FIGURES_NOTE_OFF
     }
 }
 
@@ -1369,7 +1369,7 @@ mod tests {
         assert_eq!(s.focus, OptFocus::Title, "focus starts on the first row");
         for expected in [
             OptFocus::Images,
-            OptFocus::Diagrams,
+            OptFocus::Figures,
             OptFocus::Stylesheet,
             OptFocus::Format,
             OptFocus::Export,
@@ -1475,7 +1475,7 @@ mod tests {
             ExportResponse::Submit(ExportChoices {
                 title: Some("My Doc".to_owned()),
                 inline_images: true,
-                render_diagrams: true,
+                render_figures: true,
                 stylesheet: "/cfg/export/paper.css".to_owned(),
             })
         );
@@ -1582,7 +1582,7 @@ mod tests {
     fn renders_options_form() {
         let backend = TestBackend::new(70, 22);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut s = state(); // inline_images off, render_diagrams on
+        let mut s = state(); // inline_images off, render_figures on
         terminal
             .draw(|frame| {
                 let view = ExportView {
@@ -1611,7 +1611,7 @@ mod tests {
             "images-off note: {content}"
         );
         assert!(
-            content.contains(DIAGRAMS_NOTE_ON),
+            content.contains(FIGURES_NOTE_ON),
             "diagrams-on note: {content}"
         );
     }
@@ -1620,8 +1620,8 @@ mod tests {
     fn toggle_note_swaps_with_state() {
         assert_eq!(images_note(true), IMAGES_NOTE_ON);
         assert_eq!(images_note(false), IMAGES_NOTE_OFF);
-        assert_eq!(diagrams_note(true), DIAGRAMS_NOTE_ON);
-        assert_eq!(diagrams_note(false), DIAGRAMS_NOTE_OFF);
+        assert_eq!(figures_note(true), FIGURES_NOTE_ON);
+        assert_eq!(figures_note(false), FIGURES_NOTE_OFF);
     }
 
     /// Render the modal once into a headless backend so the click hit-rects
@@ -1820,7 +1820,7 @@ mod tests {
             "custom row: {content}"
         );
         // Every shared option is present regardless of format.
-        for expected in ["Title", "Inline images", "Inline diagrams", "Stylesheet"] {
+        for expected in ["Title", "Inline images", "Inline figures", "Stylesheet"] {
             assert!(content.contains(expected), "{expected} missing: {content}");
         }
     }
@@ -1911,7 +1911,7 @@ mod tests {
         for control in [
             FormRow::Title,
             FormRow::Images,
-            FormRow::Diagrams,
+            FormRow::Figures,
             FormRow::Stylesheet,
         ] {
             assert!(rows.iter().position(|r| *r == control).unwrap() < list_start);

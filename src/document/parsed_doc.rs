@@ -10,8 +10,8 @@ use crate::document::visual_cache::VisualRowCache;
 use crate::document::SourceMap;
 use crate::markdown::{
     annotate_list_blanks, inlines_to_plain, parse_raw_with_ranges, promote_diagram_code_blocks,
-    promote_display_math_paragraphs, promote_html_comments, promote_image_paragraphs, Block,
-    ImageRowOverride, InlineColMap, RenderCache, Renderer,
+    promote_display_math_paragraphs, promote_html_comments, promote_image_paragraphs,
+    split_display_math_paragraphs, Block, ImageRowOverride, InlineColMap, RenderCache, Renderer,
 };
 
 /// Setext heading style detected from raw block source.  `None` for ATX
@@ -171,6 +171,21 @@ pub struct ParsedDoc {
     /// columns and rendered (inline-markup-collapsed) char columns.  Used by
     /// the selection painter and cursor-indicator overlay.
     inline_maps: Vec<OnceCell<InlineColMap>>,
+    /// `(block_idx, band_rows)` for a `$$...$$` block currently revealed
+    /// with the live math preview, or `None`.  When set, that block's
+    /// rendered rows split into a top **preview band** of `band_rows` (the
+    /// rendered formula, painted by `ui::image_view`) followed by the
+    /// editable raw-source rows — so the formula keeps the block's top
+    /// edge instead of jumping below the source when the reveal opens.
+    /// Every rendered-row ⇄ source-line mapping ([`sub_lines_in_block`],
+    /// the gutter, the click hit-test, the reveal painter) shifts the
+    /// source rows down by `band_rows` through
+    /// [`latex_source_offset`](Self::latex_source_offset).  Set by
+    /// `EditorState::refresh_parsed` from the live `image_reveal`; a
+    /// mermaid or preview-off reveal leaves it `None`.
+    ///
+    /// [`sub_lines_in_block`]: crate::editor::state::sub_lines_in_block
+    pub(crate) math_source_offset: Option<(usize, usize)>,
 }
 
 impl ParsedDoc {
@@ -284,16 +299,31 @@ impl ParsedDoc {
         // the same way.  Each returns a `url → DiagramSource` map — merged
         // and attached to `ImageBlockInfo.source` below so the App decode
         // worker can find the source text without re-walking `blocks`.
-        let mut diagram_sources = if promote_diagrams {
-            promote_diagram_code_blocks(&mut blocks)
+        //
+        // Both are gated on `promote_diagrams` (the live diagrams-enabled
+        // setting): mermaid and display math share one consent switch, so a
+        // user who declined the diagrams prompt (or set
+        // `[diagrams].enabled = "never"`) keeps seeing the original source —
+        // the fenced code block for mermaid, the `$$...$$` paragraph for
+        // math — instead of a placeholder they can't render.
+        let diagram_sources = if promote_diagrams {
+            let mut sources = promote_diagram_code_blocks(&mut blocks);
+            sources.extend(promote_display_math_paragraphs(
+                &mut blocks,
+                &mut real_ranges,
+                source,
+            ));
+            sources
         } else {
+            // Figures off: mermaid fences already ARE code blocks, but two
+            // `$$...$$` formulas stacked with no blank line between them are
+            // one paragraph (pulldown folds them).  Split that paragraph so
+            // each formula becomes its own block and renders as a separate
+            // fenced-style `math` code block — matching how the figures-on
+            // path promotes them to one image block per formula.
+            split_display_math_paragraphs(&mut blocks, &mut real_ranges, source);
             HashMap::new()
         };
-        diagram_sources.extend(promote_display_math_paragraphs(
-            &mut blocks,
-            &mut real_ranges,
-            source,
-        ));
         if let Some((override_start, widths)) = live_table_widths {
             apply_live_table_widths(&mut blocks, &real_ranges, *override_start, widths);
         }
@@ -526,6 +556,9 @@ impl ParsedDoc {
             visual_rows: RefCell::new(Vec::new()),
             source_lines: OnceCell::new(),
             inline_maps: (0..line_count).map(|_| OnceCell::new()).collect(),
+            // Set by `EditorState::refresh_parsed` once the live reveal is
+            // known; a fresh parse starts with no preview split.
+            math_source_offset: None,
         }
     }
 
@@ -598,13 +631,28 @@ impl ParsedDoc {
         })
     }
 
-    /// True when `block_idx` is a *diagram-derived* image block whose raw
-    /// source spans many lines — mermaid fences and `$$...$$` math both.
-    /// Such blocks reveal as a single unit: every reserved rendered row
-    /// swaps to its matching raw-source line (1:1, cursor included), so
-    /// the raw-reveal bookkeeping (timer, drag suppression, click/row
-    /// mapping) treats them alike.  Ordinary `![alt](url)` images are a
-    /// single source line and stay on the generic image path.
+    /// Rows of the live math-preview band above the revealed raw source
+    /// for `block_idx`, or `0` when the block has no such band (not the
+    /// revealed math block, mermaid, or preview off).  The reveal paints
+    /// the rendered formula in these top rows and the editable `$$...$$`
+    /// source below them, so every rendered-row ⇄ source-line mapping
+    /// shifts the source down by this amount.  See
+    /// [`math_source_offset`](Self::math_source_offset).
+    pub(crate) fn latex_source_offset(&self, block_idx: usize) -> usize {
+        match self.math_source_offset {
+            Some((idx, band)) if idx == block_idx => band,
+            _ => 0,
+        }
+    }
+
+    /// True when `block_idx` is a *diagram-derived* image block — a mermaid
+    /// fence or a `$$...$$` math formula — regardless of how many source
+    /// lines it spans (a one-line `$$x$$` counts too).  Such blocks reveal
+    /// as a single unit: every reserved rendered row swaps to its matching
+    /// raw-source line (1:1, cursor included), so the raw-reveal
+    /// bookkeeping (timer, drag suppression, click/row mapping) treats them
+    /// alike.  Ordinary `![alt](url)` images stay on the generic image
+    /// path.
     pub fn is_diagram_reveal_block(&self, block_idx: usize) -> bool {
         self.image_blocks.iter().any(|info| {
             info.block_idx == block_idx
@@ -1053,6 +1101,58 @@ mod tests {
         );
     }
 
+    /// Display math is gated on the same consent switch as diagrams. With
+    /// `promote_diagrams = false` (the user declined the figures prompt, or
+    /// set `[figures].enabled = "never"`) a `$$...$$` paragraph is NOT
+    /// promoted to an image block — it stays a paragraph and renders as its
+    /// literal source, the way a declined mermaid fence stays a code block.
+    /// Regression for the promotion that used to ignore the setting.
+    #[test]
+    fn display_math_is_not_promoted_when_figures_disabled() {
+        let src = "$$\nE = mc^2\n$$\n";
+        let doc = ParsedDoc::build_with_overrides(
+            src,
+            theme(),
+            true,
+            10,
+            None,
+            None,
+            false,
+            80,
+            false,
+            false,
+            /* promote_diagrams */ false,
+            None,
+        );
+        assert!(
+            doc.image_blocks.is_empty(),
+            "no image block should be promoted with figures disabled: {:?}",
+            doc.blocks
+        );
+        // With figures off the `$$...$$` paragraph renders as a
+        // fenced-style ` math ` code block (not inline code, not an image):
+        // a ` math ` header, the formula body, and a blank closing row.
+        // The `$$` delimiters are hidden here and reveal only under the
+        // cursor.
+        let rendered: String = doc
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            rendered.contains("E = mc^2"),
+            "the formula body must stay visible when figures are disabled: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("math"),
+            "the block must carry a ` math ` header: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("$$"),
+            "the styled block hides the `$$` delimiters (they reveal on cursor): {rendered:?}"
+        );
+    }
+
     #[test]
     fn setext_h2_has_two_rendered_lines() {
         let src = "Heading\n-------\n";
@@ -1134,6 +1234,58 @@ mod tests {
             .collect();
         assert!(sources[0].contains("X ="), "first source: {sources:?}");
         assert!(sources[1].contains("A ="), "second source: {sources:?}");
+    }
+
+    /// With figures OFF the same stacked pair (folded by pulldown into one
+    /// paragraph) must still split into two separate blocks, each rendering
+    /// as its own fenced-style ` math ` code block — not one merged block,
+    /// and not inline code.
+    #[test]
+    fn adjacent_display_math_paragraphs_split_when_figures_off() {
+        let src = "$$\nX = 1\n$$\n$$\nA = 2\n$$\n";
+        let doc = ParsedDoc::build_with_overrides(
+            src,
+            theme(),
+            true,
+            10,
+            None,
+            None,
+            false,
+            80,
+            false,
+            false,
+            /* promote_diagrams */ false,
+            None,
+        );
+        // Nothing is promoted to an image with figures off.
+        assert!(doc.image_blocks.is_empty(), "blocks: {:?}", doc.blocks);
+        // Two separate `math` code blocks: two ` math ` header rows, both
+        // formula bodies present, and no literal `$$` in the rendered lines
+        // (delimiters reveal only under the cursor).
+        let rendered: String = doc
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rendered.matches("math").count(),
+            2,
+            "expected two ` math ` headers: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("X = 1") && rendered.contains("A = 2"),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered.contains("$$"),
+            "delimiters must be hidden: {rendered:?}"
+        );
     }
 
     #[test]

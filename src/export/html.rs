@@ -71,12 +71,16 @@ pub struct HtmlExportOptions {
     /// Value inserted into the `<title>` element.  When `None`, a
     /// sensible fallback (`"Document"`) is used.
     pub title: Option<String>,
-    /// When true (the default), fenced ```mermaid code blocks
-    /// are rendered to inline SVG and wrapped in
-    /// `<figure class="mermaid-diagram">`.  Falls back to the usual
-    /// `<pre><code class="language-mermaid">` on render failure so the
-    /// source is never lost.
-    pub render_diagrams: bool,
+    /// When true (the default), *figures* — fenced ```mermaid code blocks
+    /// and `$$...$$` display-math paragraphs — are rasterized to PNG and
+    /// wrapped in a `<figure>` (`mermaid-diagram` / `math-formula`).  Each
+    /// falls back to its source form on render failure (the escaped code
+    /// block / literal `$$…$$` text), so the source is never lost.
+    ///
+    /// Independent of this flag, inline `$…$` math is always emitted as its
+    /// literal `$…$` source — inline beautification is out of scope, and
+    /// this keeps the export matching the terminal preview.
+    pub render_figures: bool,
 }
 
 impl Default for HtmlExportOptions {
@@ -86,7 +90,7 @@ impl Default for HtmlExportOptions {
             inline_images: false,
             source_dir: None,
             title: None,
-            render_diagrams: true,
+            render_figures: true,
         }
     }
 }
@@ -94,9 +98,9 @@ impl Default for HtmlExportOptions {
 /// Render `markdown` to a standalone HTML document.
 ///
 /// Mirrors the parser options used by the in-app renderer (tables, task
-/// lists, strikethrough, footnotes, smart punctuation, and — when this
-/// document opens with one — frontmatter) so exported documents look the
-/// same as the terminal preview.  Raw HTML events —
+/// lists, strikethrough, footnotes, smart punctuation, math, and — when
+/// this document opens with one — frontmatter) so exported documents look
+/// the same as the terminal preview.  Raw HTML events —
 /// both block-level (`Event::Html`) and inline (`Event::InlineHtml`) —
 /// are filtered out before serialization so attacker-controlled Markdown
 /// cannot inject `<script>` tags or other executable content into the
@@ -108,6 +112,14 @@ pub fn render_html(markdown: &str, opts: &HtmlExportOptions) -> Result<String> {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_SMART_PUNCTUATION);
+    // Math must be recognised so `$$…$$` reaches `replace_math` as
+    // `Event::DisplayMath` (rasterized to a figure) rather than surviving
+    // as literal dollar-delimited text.  Mirrors the in-app parse options
+    // (`parse_offsets::BASE_OPTIONS`).  `replace_math` always runs when
+    // this is on — even with figures disabled — so inline `$…$` and any
+    // un-rasterized display math collapse back to their literal source
+    // instead of pulldown's `<span class="math">` wrapper.
+    options.insert(Options::ENABLE_MATH);
     // Frontmatter must be recognised here for the same reason it is in the
     // renderer: without it, a `---` block parses as a thematic break plus
     // a setext H2 and the exported file opens with the file's YAML keys
@@ -140,9 +152,12 @@ pub fn render_html(markdown: &str, opts: &HtmlExportOptions) -> Result<String> {
         }
     }
 
-    if opts.render_diagrams {
+    if opts.render_figures {
         events = replace_mermaid_with_image(events);
     }
+    // Always run, so inline `$…$` and (with figures off) display math
+    // collapse to literal source rather than a bare `<span class="math">`.
+    events = replace_math(events, opts.render_figures);
 
     // Neutralize dangerous link schemes (`javascript:`, `vbscript:`,
     // non-image `data:`, …) before serialization.  pulldown-cmark's HTML
@@ -345,8 +360,18 @@ fn replace_mermaid_with_image(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
 /// smuggled through the renderer's escaping.
 fn render_mermaid_png_data_uri(source: &str) -> Option<String> {
     let svg = diagram::render_mermaid_svg(source).ok()?;
+    svg_to_png_data_uri(&svg)
+}
+
+/// Rasterize an already-rendered diagram/math SVG to a PNG `data:` URI on
+/// a white background (`None` on any failure).  Shared by the mermaid and
+/// display-math passes: both flatten their SVG to pixels — never inlining
+/// raw `<svg>`, which could carry `<script>` / `foreignObject` / `on*=`
+/// payloads — and embed the PNG as an `<img>`.  Natural sizing keeps the
+/// figure's own dimensions; `MAX_RASTER_*` in `image::svg` bounds them.
+fn svg_to_png_data_uri(svg: &str) -> Option<String> {
     let image = rasterize_svg(
-        &svg,
+        svg,
         SvgSizing {
             envelope: None,
             font_size: None,
@@ -361,6 +386,183 @@ fn render_mermaid_png_data_uri(source: &str) -> Option<String> {
         "data:image/png;base64,{}",
         BASE64.encode(png.into_inner())
     ))
+}
+
+// ── Display math ──────────────────────────────────────────────────────────
+
+/// Rewrite math events in the stream, mirroring the terminal's promotion
+/// rules (`markdown::parser::post_pass::promote_display_math_paragraphs`):
+///
+/// * A paragraph whose body is **only** display math (one or more
+///   `$$…$$`, plus whitespace and breaks) is a *figure* paragraph: the
+///   enclosing `<p>` is dropped (a block-level figure/code block can't nest
+///   in `<p>`) and each formula becomes its own block.  With figures on it
+///   rasterizes to a PNG `<figure class="math-formula">`; with figures off,
+///   or on a render failure, it becomes a fenced `math` code block
+///   (`push_display_math_source_block`) — the styled, padded box mermaid's
+///   non-inlined fallback gets, delimiters removed — never loose `$$…$$`
+///   text.
+/// * Everywhere else — inline `$…$`, display math mixed with other
+///   inlines, or math in a heading / list item — the math collapses to
+///   its literal `$…$` / `$$…$$` source, exactly as the terminal shows
+///   un-promoted math.
+///
+/// Enabling `Options::ENABLE_MATH` is what makes these events exist, so
+/// this pass must run whenever that option is set — otherwise pulldown's
+/// HTML writer would emit a bare `<span class="math">` wrapper (no KaTeX /
+/// MathJax ships with the export, so it would render as raw source anyway,
+/// only less predictably).
+///
+/// Rasterizing to PNG rather than inlining SVG is the same defence the
+/// mermaid pass relies on: no executable markup from RaTeX's output can
+/// survive into the exported file.
+fn replace_math(events: Vec<Event<'_>>, render_figures: bool) -> Vec<Event<'_>> {
+    let mut out: Vec<Event<'_>> = Vec::with_capacity(events.len());
+    let mut iter = events.into_iter();
+    while let Some(event) = iter.next() {
+        match event {
+            Event::Start(Tag::Paragraph) => {
+                // Buffer the paragraph body up to its close (paragraphs
+                // never nest in CommonMark, so the first End wins).
+                let mut body: Vec<Event<'_>> = Vec::new();
+                for inner in iter.by_ref() {
+                    if matches!(inner, Event::End(TagEnd::Paragraph)) {
+                        break;
+                    }
+                    body.push(inner);
+                }
+                if is_display_math_only(&body) {
+                    // A figure paragraph: drop the enclosing `<p>` (a
+                    // block-level `<figure>` / `<pre>` can't nest in `<p>`)
+                    // and emit one block per formula — a rasterized
+                    // `<figure>` when figures are on and the render
+                    // succeeds, otherwise a fenced `math` code block (the
+                    // export peer of the in-app figures-off `math` block,
+                    // and the parallel of mermaid's non-inlined code-block
+                    // fallback).  Whitespace text and breaks were only
+                    // separators between formulas — drop them with the `<p>`.
+                    for inner in body {
+                        if let Event::DisplayMath(source) = inner {
+                            if render_figures {
+                                push_display_math_figure(&mut out, &source);
+                            } else {
+                                push_display_math_source_block(&mut out, &source);
+                            }
+                        }
+                    }
+                } else {
+                    out.push(Event::Start(Tag::Paragraph));
+                    for inner in body {
+                        push_math_as_literal(&mut out, inner);
+                    }
+                    out.push(Event::End(TagEnd::Paragraph));
+                }
+            }
+            other => push_math_as_literal(&mut out, other),
+        }
+    }
+    out
+}
+
+/// True when `body` (a buffered paragraph's inner events) holds at least
+/// one display formula and nothing but display math, whitespace text, and
+/// line breaks — the same shape `collect_display_math_only` recognises in
+/// the terminal promotion pass.
+fn is_display_math_only(body: &[Event<'_>]) -> bool {
+    let mut saw_display = false;
+    for ev in body {
+        match ev {
+            Event::DisplayMath(_) => saw_display = true,
+            Event::Text(t) if t.trim().is_empty() => {}
+            Event::SoftBreak | Event::HardBreak => {}
+            _ => return false,
+        }
+    }
+    saw_display
+}
+
+/// Push `event`, converting any math to its literal source text
+/// (`$…$` / `$$…$$`) and passing everything else through untouched.
+fn push_math_as_literal<'a>(out: &mut Vec<Event<'a>>, event: Event<'a>) {
+    match event {
+        Event::InlineMath(source) => out.push(Event::Text(literal_math(&source, false))),
+        Event::DisplayMath(source) => out.push(Event::Text(literal_math(&source, true))),
+        other => out.push(other),
+    }
+}
+
+/// Emit one display formula as a `<figure class="math-formula">` PNG, or
+/// fall back to a fenced `math` code block ([`push_display_math_source_block`])
+/// on render failure — the same styled, padded box a non-inlined mermaid
+/// diagram gets, not loose `$$…$$` text.
+fn push_display_math_figure(out: &mut Vec<Event<'_>>, source: &str) {
+    match render_latex_png_data_uri(source) {
+        Some(data_uri) => {
+            let html = format!(
+                "<figure class=\"math-formula\">\
+                 <img alt=\"math formula\" src=\"{data_uri}\">\
+                 </figure>"
+            );
+            out.push(Event::Html(CowStr::Boxed(html.into_boxed_str())));
+        }
+        None => push_display_math_source_block(out, source),
+    }
+}
+
+/// Emit one display formula as a fenced `math` code block — the styled,
+/// padded box mermaid's non-inlined fallback produces (`<pre><code
+/// class="language-math">`, painted by the existing code-block rules), with
+/// the `$$` delimiters removed: pulldown already strips them from
+/// `Event::DisplayMath`, and the one surrounding newline on each side (the
+/// `$$` sitting on their own lines) is trimmed the way the in-app
+/// figures-off `math` block does.  Used whenever a display formula is *not*
+/// rasterized — figures off, or a render failure — so it reads as a
+/// formula rather than as source text stranded in a paragraph.
+///
+/// Emitted as real code-block events, not raw `Event::Html`, so pulldown's
+/// writer HTML-escapes the body: no LaTeX can inject markup into the
+/// exported file, the same guarantee `literal_math` gives.
+fn push_display_math_source_block(out: &mut Vec<Event<'_>>, source: &str) {
+    let trimmed = source.strip_prefix('\n').unwrap_or(source);
+    let body = trimmed.strip_suffix('\n').unwrap_or(trimmed);
+    out.push(Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(
+        CowStr::Borrowed("math"),
+    ))));
+    out.push(Event::Text(CowStr::Boxed(body.to_string().into_boxed_str())));
+    out.push(Event::End(TagEnd::CodeBlock));
+}
+
+/// The literal source form of a math span — `$source$` (inline) or
+/// `$$source$$` (display) — as an owned `CowStr`.  Emitted as an
+/// `Event::Text`, so pulldown's writer HTML-escapes it: the delimiters and
+/// LaTeX read back verbatim, exactly as the terminal shows un-rendered
+/// math.
+fn literal_math(source: &str, display: bool) -> CowStr<'static> {
+    let delim = if display { "$$" } else { "$" };
+    CowStr::Boxed(format!("{delim}{source}{delim}").into_boxed_str())
+}
+
+/// Reference cell height (px) the exporter renders display math at.  The
+/// in-app raster sizes off the *terminal's* real cell height; the exporter
+/// has none, so it passes this instead — larger than the 16 px terminal
+/// default so a formula reads at a comfortable display size in the browser
+/// (and stays crisp) rather than the cramped ~1-line PNG a 16 px cell gave.
+/// `diagram::render_latex_svg` scales the formula from it exactly as the
+/// TUI path does, so the export tracks the in-app look, only bigger.
+const HTML_EXPORT_MATH_CELL_PX: u16 = 24;
+
+/// Render display-math `source` to a PNG `data:` URI, or `None` on any
+/// failure (so the caller falls back to the literal source text).  Glyphs
+/// are drawn opaque black for a light document background; the SVG is
+/// rasterized to pixels, never inlined.
+fn render_latex_png_data_uri(source: &str) -> Option<String> {
+    let svg = diagram::render_latex_svg(
+        source,
+        [0, 0, 0, 255],
+        Some((HTML_EXPORT_MATH_CELL_PX, HTML_EXPORT_MATH_CELL_PX)),
+    )
+    .ok()?;
+    svg_to_png_data_uri(&svg)
 }
 
 // ── Image inlining ────────────────────────────────────────────────────────
@@ -646,7 +848,7 @@ mod tests {
             inline_images: true,
             source_dir: Some(dir.path().to_path_buf()),
             title: None,
-            render_diagrams: false,
+            render_figures: false,
         };
         let html = render_html(md, &opts).unwrap();
         assert!(
@@ -665,7 +867,7 @@ mod tests {
             inline_images: true,
             source_dir: Some(PathBuf::from("/tmp")),
             title: None,
-            render_diagrams: false,
+            render_figures: false,
         };
         let html = render_html(md, &opts).unwrap();
         assert!(html.contains("src=\"https://example.com/cat.png\""));
@@ -741,7 +943,7 @@ mod tests {
         let md = "```mermaid\nflowchart TD\n  A[\"<script>alert(1)</script>\"] --> B\n```";
         let opts = HtmlExportOptions {
             stylesheet: Stylesheet::Inline(String::new()),
-            render_diagrams: true,
+            render_figures: true,
             ..HtmlExportOptions::default()
         };
         let html = render_html(md, &opts).unwrap();
@@ -754,6 +956,151 @@ mod tests {
             !html.contains("<script>"),
             "no executable <script> may reach the export:\n{html}"
         );
+    }
+
+    // ── Display math ───────────────────────────────────────────────────
+
+    /// A `$$...$$` paragraph exports as a rasterized `math-formula` figure
+    /// (PNG data URI) — the same treatment mermaid gets — when figures are
+    /// on.  The KaTeX faces are bundled into the shared fontdb, so this
+    /// renders in CI without system fonts.
+    #[test]
+    fn display_math_exports_as_a_png_figure() {
+        let md = "$$\nx^2 + y^2 = z^2\n$$\n";
+        let opts = HtmlExportOptions {
+            stylesheet: Stylesheet::Inline(String::new()),
+            render_figures: true,
+            ..HtmlExportOptions::default()
+        };
+        let html = render_html(md, &opts).unwrap();
+        assert!(
+            html.contains("<figure class=\"math-formula\">"),
+            "expected a math-formula figure:\n{html}"
+        );
+        assert!(
+            html.contains("src=\"data:image/png;base64,"),
+            "formula must be a rasterized PNG:\n{html}"
+        );
+        // Rasterized to pixels, never inlined as SVG / math markup.
+        assert!(!html.contains("<svg"), "no raw SVG:\n{html}");
+        assert!(
+            !html.contains("class=\"math math-"),
+            "pulldown's math span must not survive:\n{html}"
+        );
+    }
+
+    /// The exported formula is rasterized at `HTML_EXPORT_MATH_CELL_PX`,
+    /// not the bare 16 px terminal-cell fallback, so a display equation
+    /// reads at a comfortable size in the browser instead of a cramped
+    /// ~1-line PNG.  Guards the export-sizing fix by decoding the figure
+    /// and asserting its pixel height clears what a 16 px cell produced.
+    #[test]
+    fn exported_display_math_is_rendered_large_enough_to_read() {
+        use image::GenericImageView;
+        let md = "$$\nx^2 + y^2 = z^2\n$$\n";
+        let opts = HtmlExportOptions {
+            stylesheet: Stylesheet::Inline(String::new()),
+            render_figures: true,
+            ..HtmlExportOptions::default()
+        };
+        let html = render_html(md, &opts).unwrap();
+        let marker = "data:image/png;base64,";
+        let start = html.find(marker).expect("png data uri present") + marker.len();
+        let end = start + html[start..].find('"').expect("data uri is quoted");
+        let bytes = BASE64
+            .decode(&html.as_bytes()[start..end])
+            .expect("valid base64 payload");
+        let (w, h) = image::load_from_memory(&bytes)
+            .expect("valid png")
+            .dimensions();
+        // A single-line display formula at the 24 px reference cell
+        // (`HTML_EXPORT_MATH_CELL_PX`) rendered tens of pixels tall —
+        // comfortably past the ~18 px a 16 px-cell fallback gave, and
+        // nowhere near runaway.
+        assert!(
+            (28..=160).contains(&h),
+            "exported formula height {h}px outside expected range (w={w})"
+        );
+    }
+
+    /// With figures disabled, a display-math paragraph renders as a
+    /// fenced `math` code block — the same styled, padded box mermaid's
+    /// non-inlined fallback gets — with the `$$` delimiters removed, never
+    /// loose `$$...$$` text in a paragraph and never a bare math span.
+    #[test]
+    fn display_math_off_renders_as_a_math_code_block() {
+        let md = "$$\na + b\n$$\n";
+        let opts = HtmlExportOptions {
+            stylesheet: Stylesheet::Inline(String::new()),
+            render_figures: false,
+            ..HtmlExportOptions::default()
+        };
+        let html = render_html(md, &opts).unwrap();
+        // Same box as a non-inlined mermaid diagram: a `<pre><code
+        // class="language-math">` block, painted by the existing code-block
+        // CSS — not a `<figure>`, not a math span, not literal `$$`.
+        assert!(
+            html.contains("<pre><code class=\"language-math\">"),
+            "expected a math code block:\n{html}"
+        );
+        assert!(html.contains("a + b"), "formula body kept:\n{html}");
+        assert!(
+            !html.contains("$$"),
+            "delimiters must be stripped:\n{html}"
+        );
+        assert!(!html.contains("<figure"), "no figure when off:\n{html}");
+        assert!(
+            !html.contains("class=\"math math-"),
+            "no math span:\n{html}"
+        );
+    }
+
+    /// A display formula that can't be rasterized (here: over the
+    /// `MAX_LATEX_SOURCE_BYTES` cap, so `render_latex_svg` refuses it)
+    /// falls back to the same `math` code block, not loose `$$...$$` text —
+    /// figures on, but the render fails.
+    #[test]
+    fn oversized_display_math_falls_back_to_a_code_block() {
+        let huge = "1+".repeat(64 * 1024); // well past MAX_LATEX_SOURCE_BYTES
+        let md = format!("$$\n{huge}1\n$$\n");
+        let opts = HtmlExportOptions {
+            stylesheet: Stylesheet::Inline(String::new()),
+            render_figures: true,
+            ..HtmlExportOptions::default()
+        };
+        let html = render_html(&md, &opts).unwrap();
+        assert!(
+            html.contains("<pre><code class=\"language-math\">"),
+            "render failure must fall back to a math code block, not a figure or literal text"
+        );
+        assert!(
+            !html.contains("data:image/png"),
+            "no PNG when the render failed:\n{}",
+            &html[..html.len().min(400)]
+        );
+    }
+
+    /// Inline `$...$` math always stays literal source (delimiters kept),
+    /// matching the terminal preview — regardless of the figures toggle.
+    #[test]
+    fn inline_math_stays_literal_source() {
+        let md = "Solve $a^2 + b^2$ please.\n";
+        for render_figures in [true, false] {
+            let opts = HtmlExportOptions {
+                stylesheet: Stylesheet::Inline(String::new()),
+                render_figures,
+                ..HtmlExportOptions::default()
+            };
+            let html = render_html(md, &opts).unwrap();
+            assert!(
+                html.contains("$a^2 + b^2$"),
+                "inline math must read back as literal source (figures={render_figures}):\n{html}"
+            );
+            assert!(
+                !html.contains("class=\"math math-"),
+                "no math span (figures={render_figures}):\n{html}"
+            );
+        }
     }
 
     // ── Vuln 4: image inlining stays within the source tree ────────────
@@ -781,7 +1128,7 @@ mod tests {
             stylesheet: Stylesheet::Inline(String::new()),
             inline_images: true,
             source_dir: Some(source.path().to_path_buf()),
-            render_diagrams: false,
+            render_figures: false,
             ..HtmlExportOptions::default()
         };
         let html = render_html(&md, &opts).unwrap();
@@ -804,7 +1151,7 @@ mod tests {
             stylesheet: Stylesheet::Inline(String::new()),
             inline_images: true,
             source_dir: Some(source.clone()),
-            render_diagrams: false,
+            render_figures: false,
             ..HtmlExportOptions::default()
         };
         let html = render_html(md, &opts).unwrap();

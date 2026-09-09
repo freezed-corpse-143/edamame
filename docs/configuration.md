@@ -195,13 +195,18 @@ Note that an unrecognized value is accepted without complaint and behaves as `"d
 
 ---
 
-## `[diagrams]`
+## `[figures]`
 
 | Key | Type | Default | Where |
 |---|---|---|---|
 | `enabled` | `"ask"` \| `"always"` \| `"never"` | `"ask"` | overlay |
+| `math_preview` | bool | `true` | overlay |
 
-Controls rendering of ` ```mermaid ` blocks. Deliberately independent of `[images]` so you can opt into one without the other. Same 24-bit color requirement.
+Controls rendering of ` ```mermaid ` diagrams and `$$...$$` display math. Deliberately independent of `[images]` so you can opt into one without the other. Same 24-bit color requirement.
+
+ This gates in-app rendering; the parallel `[export.html].figures` key below gates the *export* side of the same pipeline.
+
+`math_preview` controls the in-place editing of a `$$...$$` block. When on (the default), moving the cursor into a formula opens its editable source just below it, and re-renders the preview on every keystroke. When off, the image is replaced with the source, like a mermaid diagram.
 
 ---
 
@@ -211,7 +216,7 @@ Controls rendering of ` ```mermaid ` blocks. Deliberately independent of `[image
 |---|---|---|
 | `stylesheet` | string | `"builtin"` |
 | `inline_images` | bool | `false` |
-| `diagrams` | bool | `true` |
+| `figures` | bool | `true` |
 
 These are the values the export modal opens with — for a custom target as well as for HTML, since a custom export converts the HTML these settings describe. Whatever you pick in that modal is written back here.
 
@@ -219,7 +224,7 @@ These are the values the export modal opens with — for a custom target as well
 
 `inline_images` base64-embeds local images into the HTML so the file is self-contained. Off by default, partly because it makes large files and partly because an embedded file leaves your machine when you share the export — only images inside the document's own directory tree are ever inlined.
 
-`diagrams` renders diagrams as SVG and inlines them into the export. If off, the raw Mermaid source is outputted instead.
+`figures` rasterizes mermaid diagrams and `$$...$$` math to PNG and embeds them in the export. If off, each is left as its source — the Mermaid code block, or the literal `$$...$$` text.
 
 See [editing.md](editing.md#exporting).
 
@@ -301,7 +306,7 @@ row_striping = false
 enabled = "always"
 remote_policy = "never"
 
-[diagrams]
+[figures]
 enabled = "always"
 
 [export.html]

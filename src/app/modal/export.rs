@@ -163,7 +163,7 @@ impl ExportModal {
     /// choices become next time's defaults.
     fn submit(&mut self, app: &mut App, choices: ExportChoices) {
         app.config.export.html.inline_images = choices.inline_images;
-        app.config.export.html.diagrams = choices.render_diagrams;
+        app.config.export.html.figures = choices.render_figures;
         app.config.export.html.stylesheet = choices.stylesheet;
         app.save_config_with_flash("failed to persist export options");
 
@@ -226,7 +226,7 @@ impl ExportModal {
                 .ok()
                 .and_then(|t| t.parent().map(Path::to_path_buf)),
             title: self.state.submitted_title.clone(),
-            render_diagrams: html.diagrams,
+            render_figures: html.figures,
         };
         let markdown = app.editor.buffer.contents();
         let id = EXPORT_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -378,7 +378,7 @@ impl App {
             formats,
             title,
             html.inline_images,
-            html.diagrams,
+            html.figures,
             stylesheets,
             idx.unwrap_or(0),
         );
@@ -598,7 +598,7 @@ mod tests {
             ExportResponse::Submit(ExportChoices {
                 title: None,
                 inline_images: false,
-                render_diagrams: true,
+                render_figures: true,
                 stylesheet: "builtin".to_owned(),
             }),
         );
@@ -670,7 +670,7 @@ mod tests {
             ExportResponse::Submit(ExportChoices {
                 title: None,
                 inline_images: false,
-                render_diagrams: true,
+                render_figures: true,
                 stylesheet: "builtin".to_owned(),
             }),
         );

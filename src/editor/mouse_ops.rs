@@ -973,10 +973,13 @@ fn image_block_at_click(state: &EditorState, row: usize, viewport_width: usize) 
 /// Compute the cursor offset to use when a click lands anywhere on a
 /// rendered image block.  Returns the buffer char offset at the end of
 /// the block's source text — for regular images, the end of the
-/// `![alt](url)` line; for diagram (`mermaid`) blocks, the end of the
-/// last code line inside the fence (i.e. just before the closing
-/// ```` ``` ````).  Returns `None` when the block has no resolvable
-/// source range.
+/// `![alt](url)` line; for diagram-reveal blocks (mermaid fences and
+/// `$$...$$` display math), the end of the last content line, just before
+/// the closing delimiter (```` ``` ```` / `$$`).  Landing inside the
+/// block's range — rather than at its trailing boundary — is what keeps
+/// the click on a block at end-of-file (no trailing newline) resolving
+/// back to the same block so the reveal opens.  Returns `None` when the
+/// block has no resolvable source range.
 fn image_block_cursor_target(state: &EditorState, block_idx: usize) -> Option<usize> {
     let range = state
         .parsed
@@ -992,6 +995,15 @@ fn image_block_cursor_target(state: &EditorState, block_idx: usize) -> Option<us
         // newline immediately before the closing fence; the char before
         // it is the last char of the last code line.
         trimmed.rfind("\n```").unwrap_or(trimmed.len())
+    } else if state.parsed.is_latex_block(block_idx) {
+        // Land on the last line of the `$$...$$` source, before the
+        // closing delimiter — mirroring the mermaid fence.  Fall back to
+        // the last `$$` on a single-line `$$x$$` formula so the target
+        // still lands inside the block rather than past its end.
+        trimmed
+            .rfind("\n$$")
+            .or_else(|| trimmed.rfind("$$"))
+            .unwrap_or(trimmed.len())
     } else {
         trimmed.len()
     };
@@ -1131,6 +1143,36 @@ mod tests {
         let sel = state.selection.expect("selection set");
         assert_eq!(sel.anchor, 0);
         assert_eq!(sel.active, 11); // up to end of "first line\n"
+    }
+
+    /// Clicking a promoted `$$...$$` block must drop the cursor *inside*
+    /// the block (before the closing `$$`), so it resolves back to the same
+    /// block and the raw-source reveal opens — even for a formula at EOF
+    /// with no trailing newline, the case where the generic "end of source"
+    /// target used to land past the block.
+    #[test]
+    fn click_target_lands_inside_a_latex_block_at_eof() {
+        let text = "intro\n\n$$\nE = mc^2\n$$";
+        let state = EditorState::new(Buffer::from_str(text), theme());
+        let block_idx = state
+            .parsed
+            .image_blocks
+            .iter()
+            .find(|i| state.parsed.is_latex_block(i.block_idx))
+            .expect("$$...$$ promotes to a latex image block")
+            .block_idx;
+        let target = image_block_cursor_target(&state, block_idx).expect("resolvable target");
+        let byte = state.buffer.rope().char_to_byte(target);
+        assert!(
+            byte < text.len(),
+            "target must land before the block's end, got byte {byte} of {}",
+            text.len()
+        );
+        assert_eq!(
+            state.parsed.source_map.block_for_byte(byte),
+            Some(block_idx),
+            "target must resolve back to the latex block so the reveal opens"
+        );
     }
 
     #[test]

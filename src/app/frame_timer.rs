@@ -99,6 +99,10 @@ impl App {
         // Autosave: wake when the idle-debounce window expires so the
         // save fires without the user having to press a key.
         push(self.autosave_deadline());
+        // Diagram / math render debounce: wake when the window expires so
+        // the deferred render dispatches after the user stops typing, even
+        // with no further key event of its own.
+        push(self.diagram_render_hold_until);
         // Section picker: wake when the live-preview debounce expires
         // so the viewport reposition happens even if the user has
         // stopped pressing arrow keys.

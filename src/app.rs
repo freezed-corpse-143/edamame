@@ -350,6 +350,19 @@ pub struct App {
     /// detect that an edit has happened since the previous tick and
     /// restart the debounce window.
     autosave_last_seen_version: u64,
+    /// Debounce deadline for diagram / `$$...$$` math render dispatch.
+    /// While `now < t` the per-frame dispatch skips diagram-sourced blocks
+    /// (plain images are unaffected), so a keystroke's throwaway
+    /// content-hashed URL isn't rendered mid-burst — see
+    /// [`DIAGRAM_RENDER_DEBOUNCE`](image_dispatch::DIAGRAM_RENDER_DEBOUNCE)
+    /// for why.  Re-armed on each edit and contributes to `next_deadline`
+    /// so the render fires after the last keystroke.  Paired with
+    /// [`Self::diagram_render_watch_version`] for edit-edge detection.
+    diagram_render_hold_until: Option<Instant>,
+    /// Last-observed `Buffer::version()` for the diagram-render debounce.
+    /// `None` until the first dispatch pass so opening a document doesn't
+    /// count as an edit and delay its first render.
+    diagram_render_watch_version: Option<u64>,
     /// Debounce timer for the section picker's live-preview scroll.
     /// Set whenever the user navigates the picker; cleared once
     /// [`Self::tick_section_jump`] fires or the modal closes.  Without
@@ -496,6 +509,7 @@ fn configure_new_editor(
     editor.set_row_striping(config.table.row_striping);
     editor.set_big_h1(config.editor.big_h1);
     editor.set_syntax_highlighting(config.editor.syntax_highlighting);
+    editor.set_math_preview(config.figures.math_preview);
     if !images_layout_on || !diagrams_layout_on {
         editor.refresh_parsed();
     }
@@ -644,10 +658,7 @@ impl App {
         let images_off = !capabilities.full_color()
             || matches!(config.images.enabled, crate::config::ImagesEnabled::Never);
         let diagrams_off = !capabilities.full_color()
-            || matches!(
-                config.diagrams.enabled,
-                crate::config::DiagramsEnabled::Never
-            );
+            || matches!(config.figures.enabled, crate::config::FiguresEnabled::Never);
         // Start the grammar warm worker before the first render.  It
         // does two jobs off the critical path: deserializing the syntax
         // dump (~2 ms), and compiling each grammar a document names
@@ -756,7 +767,7 @@ impl App {
         let diagrams_enabled_prompt = if suppress_legacy_prompts || !media_capable {
             None
         } else {
-            modal::DiagramsEnabledPromptModal::from_state(&editor, &config)
+            modal::FiguresEnabledPromptModal::from_state(&editor, &config)
         };
         let remote_image_prompt = if suppress_legacy_prompts || !media_capable {
             None
@@ -829,11 +840,7 @@ impl App {
         // Skipped when images are configured as `Never`, and when the
         // terminal can't render them at all — no diagram will ever
         // decode, so the warmup would be wasted IO.
-        if media_capable
-            && !matches!(
-                config.diagrams.enabled,
-                crate::config::DiagramsEnabled::Never
-            )
+        if media_capable && !matches!(config.figures.enabled, crate::config::FiguresEnabled::Never)
         {
             std::thread::spawn(crate::diagram::warm_fontdb);
         }
@@ -895,6 +902,8 @@ impl App {
             started_with_new_file,
             autosave_pending_since: None,
             autosave_last_seen_version: 0,
+            diagram_render_hold_until: None,
+            diagram_render_watch_version: None,
             section_jump_pending_since: None,
             section_jump_target_scroll: None,
             diff_advance_pending_since: None,

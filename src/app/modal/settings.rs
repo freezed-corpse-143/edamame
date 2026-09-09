@@ -19,8 +19,9 @@ use crate::app::App;
 use crate::config::sections::VIM_HANDLER;
 use crate::config::Config;
 use crate::ui::settings_overlay::{
-    LABEL_BIG_H1, LABEL_BLINK_CURSOR, LABEL_SCROLL_SPEED, LABEL_SHOW_DIAGRAMS, LABEL_SHOW_IMAGES,
-    LABEL_SHOW_REMOTE_IMAGES, LABEL_SYNTAX_HIGHLIGHTING, LABEL_VIM_MODE, LABEL_VISUAL_LINE_NAV,
+    LABEL_BIG_H1, LABEL_BLINK_CURSOR, LABEL_MATH_PREVIEW, LABEL_SCROLL_SPEED, LABEL_SHOW_DIAGRAMS,
+    LABEL_SHOW_IMAGES, LABEL_SHOW_REMOTE_IMAGES, LABEL_SYNTAX_HIGHLIGHTING, LABEL_VIM_MODE,
+    LABEL_VISUAL_LINE_NAV,
 };
 use crate::ui::{ModalKind, SettingsResponse, SettingsState, SettingsView};
 
@@ -100,6 +101,7 @@ pub(crate) fn apply_live_update(label: &str, app: &mut App) {
         LABEL_SHOW_IMAGES => app.apply_images_setting_change(),
         LABEL_SHOW_REMOTE_IMAGES => app.apply_remote_policy_change(),
         LABEL_SHOW_DIAGRAMS => app.apply_diagrams_setting_change(),
+        LABEL_MATH_PREVIEW => app.editor.set_math_preview(app.config.figures.math_preview),
         _ => {}
     }
 }
@@ -179,6 +181,7 @@ mod tests {
     const LIVE_UPDATE_LABELS: &[&str] = &[
         LABEL_BIG_H1,
         LABEL_BLINK_CURSOR,
+        LABEL_MATH_PREVIEW,
         LABEL_SCROLL_SPEED,
         LABEL_SHOW_DIAGRAMS,
         LABEL_SHOW_IMAGES,
@@ -247,6 +250,16 @@ mod tests {
         apply_live_update(LABEL_BIG_H1, &mut app);
         assert_eq!(app.editor.big_h1, app.config.editor.big_h1);
         assert_ne!(app.editor.big_h1, original);
+    }
+
+    #[test]
+    fn live_update_pushes_math_preview_into_editor_cache() {
+        let mut app = make_app();
+        let original = app.editor.math_preview;
+        app.config.figures.math_preview = !original;
+        apply_live_update(LABEL_MATH_PREVIEW, &mut app);
+        assert_eq!(app.editor.math_preview, app.config.figures.math_preview);
+        assert_ne!(app.editor.math_preview, original);
     }
 
     #[test]
@@ -341,7 +354,7 @@ mod tests {
         let mut app = app_with_buffer("```mermaid\ngraph TD;\n```\n", 0);
         app.session_diagrams_enabled = Some(false);
         app.editor.diagrams_enabled = false;
-        app.config.diagrams.enabled = crate::config::DiagramsEnabled::Ask;
+        app.config.figures.enabled = crate::config::FiguresEnabled::Ask;
         apply_live_update(LABEL_SHOW_DIAGRAMS, &mut app);
         assert_eq!(app.session_diagrams_enabled, None);
         assert!(
@@ -350,23 +363,23 @@ mod tests {
         );
         assert!(app
             .modal_stack
-            .contains::<crate::app::modal::DiagramsEnabledPromptModal>());
+            .contains::<crate::app::modal::FiguresEnabledPromptModal>());
     }
 
     #[test]
     fn live_update_diagrams_never_collapses_layout_and_drops_prompt() {
         let mut app = app_with_buffer("```mermaid\ngraph TD;\n```\n", 0);
-        app.config.diagrams.enabled = crate::config::DiagramsEnabled::Ask;
+        app.config.figures.enabled = crate::config::FiguresEnabled::Ask;
         apply_live_update(LABEL_SHOW_DIAGRAMS, &mut app);
         assert!(app
             .modal_stack
-            .contains::<crate::app::modal::DiagramsEnabledPromptModal>());
-        app.config.diagrams.enabled = crate::config::DiagramsEnabled::Never;
+            .contains::<crate::app::modal::FiguresEnabledPromptModal>());
+        app.config.figures.enabled = crate::config::FiguresEnabled::Never;
         apply_live_update(LABEL_SHOW_DIAGRAMS, &mut app);
         assert!(!app.editor.diagrams_enabled);
         assert!(!app
             .modal_stack
-            .contains::<crate::app::modal::DiagramsEnabledPromptModal>());
+            .contains::<crate::app::modal::FiguresEnabledPromptModal>());
     }
 
     #[test]
@@ -374,13 +387,13 @@ mod tests {
         let mut app = app_with_buffer("```mermaid\ngraph TD;\n```\n", 0);
         app.session_diagrams_enabled = Some(false);
         app.editor.diagrams_enabled = false;
-        app.config.diagrams.enabled = crate::config::DiagramsEnabled::Always;
+        app.config.figures.enabled = crate::config::FiguresEnabled::Always;
         apply_live_update(LABEL_SHOW_DIAGRAMS, &mut app);
         assert!(app.editor.diagrams_enabled);
         assert_eq!(app.session_diagrams_enabled, None);
         assert!(!app
             .modal_stack
-            .contains::<crate::app::modal::DiagramsEnabledPromptModal>());
+            .contains::<crate::app::modal::FiguresEnabledPromptModal>());
     }
 
     #[test]

@@ -188,7 +188,7 @@ impl SettingsStateExt for SettingsState {
             "  Char limit",
             "Scroll speed",
             "Diff when file changes",
-            "Show diagrams",
+            "Show figures",
             "Show images",
             "  Show remote images",
             "Show line numbers",

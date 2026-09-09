@@ -343,7 +343,14 @@ pub fn rendered_sub_line_to_offset(
         // consumes `line_text` derived from it.
         0
     } else {
-        block.sub_idx
+        // Diagram-reveal blocks map the rendered sub-row to a raw source
+        // line 1:1, minus the math-preview band a `$$...$$` reveal reserves
+        // above the source (0 for mermaid, a preview-off reveal, or any
+        // ordinary block).  A click on the band rows themselves resolves to
+        // the first source line.
+        block
+            .sub_idx
+            .saturating_sub(state.parsed.latex_source_offset(block.idx))
     };
 
     // Blank-line "virtual blocks" have no content.  The renderer produces
@@ -611,7 +618,11 @@ fn revealed_raw_row_count(
         .unwrap_or("");
 
     if state.parsed.is_diagram_reveal_block(cursor_block_idx) {
-        let sub = rendered_line_idx - block_lines.start;
+        // Shift past the math-preview band (0 unless this is a `$$...$$`
+        // reveal with the preview on) so the rendered row maps to its raw
+        // source line; band rows clamp to the first line.
+        let band = state.parsed.latex_source_offset(cursor_block_idx);
+        let sub = (rendered_line_idx - block_lines.start).saturating_sub(band);
         let raw_line = block_text.split('\n').nth(sub).unwrap_or("");
         return Some(revealed_raw_rows(raw_line, viewport_width).0.len().max(1));
     }

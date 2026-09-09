@@ -527,20 +527,50 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                     skip_rows,
                 ) as usize;
             } else if reveal_raw && is_latex_block && in_cursor_block {
-                // `$$...$$` math blocks reveal as plain raw text — the
-                // full formula source (`$$` delimiters included) paints
-                // 1:1 over the reserved rows, one line per row, exactly
-                // like the mermaid fence case but without code-block
-                // chrome.  The user edits the formula in place; moving
-                // the cursor out collapses it back to the rendered image
-                // (whose URL hashes the edited source, so the image
-                // updates live).
+                // `$$...$$` math blocks reveal as a code block, styled like
+                // the mermaid fence: the opening `$$` becomes a ` math `
+                // language header (`code_block_lang`), the body rows carry
+                // the code surface (`code_block_text`), and the closing `$$`
+                // is a padded blank row on that same surface.  The opening /
+                // closing rows reveal their literal `$$` only when the
+                // cursor lands on them (like a fence's edges).
+                //
+                // With the math preview on, the reveal reserves a top band
+                // for the rendered formula and paints the source *below* it
+                // (so the image keeps the block's top edge and doesn't
+                // jump): band rows paint empty — `image_view` overlays the
+                // formula there — and the source rows shift down by `band`
+                // (`latex_source_offset`).  With the preview off, `band` is
+                // 0 and the source paints from row 0.  Either way the
+                // formula's URL hashes its source, so moving the cursor out
+                // collapses the block back to a freshly rendered image.
+                let band = editor.parsed.latex_source_offset(cursor_block_idx);
                 let sub = virtual_idx - cursor_block_lines.start;
-                let raw_text = raw_lines.get(sub).copied().unwrap_or("");
-                let cursor_on_this = cursor_raw_line == sub;
-                let sel_cols = selection_bytes.and_then(|(sa, sb)| {
+                // Source line under this rendered row, or `None` for a
+                // band row (which paints empty behind the formula overlay).
+                let src_idx = sub.checked_sub(band).filter(|&s| s < raw_lines.len());
+                let raw_text = src_idx
+                    .and_then(|s| raw_lines.get(s))
+                    .copied()
+                    .unwrap_or("");
+                let cursor_on_this = src_idx == Some(cursor_raw_line);
+                // Delimiter rows only when the block has separate opening /
+                // closing lines (a one-line `$$x$$` is neither).  The
+                // closing `$$` is matched by its text, not by `len - 1`: a
+                // math paragraph's byte range can absorb the blank line that
+                // follows it, so `raw_lines` may carry a trailing empty
+                // entry past the real closing delimiter — indexing the last
+                // entry would miss it and leave the closing `$$` styled as a
+                // body row.
+                let is_opening = src_idx == Some(0) && raw_lines.len() >= 2;
+                let is_closing = !is_opening
+                    && src_idx.is_some()
+                    && raw_lines.len() >= 2
+                    && raw_text.trim() == "$$";
+                let width = area.width as usize;
+                let sel_cols = src_idx.zip(selection_bytes).and_then(|(s, (sa, sb))| {
                     let block_start = block_range_for_cursor.as_ref()?.start;
-                    let raw_line_start_in_block = raw_line_byte_start(&raw_block_source, sub);
+                    let raw_line_start_in_block = raw_line_byte_start(&raw_block_source, s);
                     let raw_line_start_abs = block_start + raw_line_start_in_block;
                     let raw_line_end_abs = raw_line_start_abs + raw_text.len();
                     let start_byte = sa.max(raw_line_start_abs).min(raw_line_end_abs);
@@ -552,7 +582,25 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                     let end_col = raw_text[..end_byte - raw_line_start_abs].chars().count();
                     Some((start_col, end_col))
                 });
-                let styled = make_raw_line_with_selection(raw_text, sel_cols, self.theme);
+                let styled = if src_idx.is_none() {
+                    // Band row: transparent so the formula image shows.
+                    make_raw_line_with_selection("", None, self.theme)
+                } else if cursor_on_this && (is_opening || is_closing) {
+                    // Cursor on a delimiter row: reveal the literal `$$`.
+                    make_raw_line_with_selection(raw_text, sel_cols, self.theme)
+                } else if is_opening {
+                    // No cursor: ` math ` header, code-block language surface.
+                    ratatui::text::Line::styled(" math ", self.theme.code_block_lang)
+                } else if is_closing {
+                    // No cursor: padded blank row on the code surface.
+                    ratatui::text::Line::styled(
+                        "\u{00A0}".repeat(width.max(1)),
+                        self.theme.code_block_text,
+                    )
+                } else {
+                    // Body row: code surface, cursor / selection per char.
+                    make_code_styled_body_line(raw_text, sel_cols, self.theme)
+                };
                 let cursor_override = (cursor_on_this && cursor_visible)
                     .then_some((cursor_col, cursor_indicator_style));
                 rows_used = render_line_with_cursor_from_visual(

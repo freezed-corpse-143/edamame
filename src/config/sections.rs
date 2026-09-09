@@ -337,37 +337,45 @@ impl Default for ImagesConfig {
     }
 }
 
-/// Master switch for inline diagram rendering (e.g. mermaid).  `Ask`
-/// prompts the user the first time a document with diagrams is opened;
-/// `Always` renders without prompting; `Never` keeps the placeholder.
+/// Master switch for inline *figure* rendering — mermaid diagrams and
+/// `$$...$$` display math, which share this gate.  `Ask` prompts the user
+/// the first time a document with a figure is opened; `Always` renders
+/// without prompting; `Never` keeps the placeholder / source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum DiagramsEnabled {
-    /// Prompt the user the first time a document with diagrams is opened.
+pub enum FiguresEnabled {
+    /// Prompt the user the first time a document with a figure is opened.
     #[default]
     Ask,
-    /// Always render diagrams inline.
+    /// Always render figures inline.
     Always,
-    /// Never render diagrams — always fall back to the placeholder.
+    /// Never render figures — always fall back to the placeholder / source.
     Never,
 }
 
-/// Diagram-rendering configuration.  Mirrors [`ImagesConfig::enabled`] —
-/// kept separate so a user can opt in to images but not diagrams (or
-/// vice-versa).
+/// Figure-rendering configuration (mermaid diagrams and display math).
+/// Mirrors [`ImagesConfig::enabled`] — kept separate so a user can opt in
+/// to images but not figures (or vice-versa).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct DiagramsConfig {
-    /// Master switch — `"ask"` (default) prompts on first document with
-    /// diagrams, `"always"` renders without prompting, `"never"` always
-    /// falls back to the placeholder.
-    pub enabled: DiagramsEnabled,
+pub struct FiguresConfig {
+    /// Master switch — see [`FiguresEnabled`].
+    pub enabled: FiguresEnabled,
+    /// When true (the default), moving the cursor into a `$$...$$` math
+    /// block keeps the rendered formula in place and opens its editable
+    /// source just below it (the document reflows beneath), re-rendered on
+    /// every keystroke.  When false, the reveal hides the image and shows
+    /// the source alone, exactly like a mermaid fence.  Math-only: mermaid's
+    /// reveal is always source-only (its whole point is seeing the source),
+    /// and ordinary images have a single source line with nothing to preview.
+    pub math_preview: bool,
 }
 
-impl Default for DiagramsConfig {
+impl Default for FiguresConfig {
     fn default() -> Self {
         Self {
-            enabled: DiagramsEnabled::Ask,
+            enabled: FiguresEnabled::Ask,
+            math_preview: true,
         }
     }
 }
@@ -423,13 +431,22 @@ pub struct HtmlExportConfig {
     /// is fully self-contained.  Default: false (keeps output compact and
     /// portable alongside the asset directory).
     pub inline_images: bool,
-    /// When true (the default), fenced ```mermaid code blocks
-    /// are rendered to inline SVG via `mermaid-rs-renderer` and wrapped
-    /// in a `<figure class="mermaid-diagram">`.  On render failure the
-    /// block falls back to `<pre><code class="language-mermaid">` so the
-    /// source is never lost.  Set false to force the code-block form
-    /// (e.g. for pipelines that ship their own client-side mermaid.js).
-    pub diagrams: bool,
+    /// When true (the default), *figures* — fenced ```mermaid code blocks
+    /// **and** `$$...$$` display-math paragraphs — are rasterized to PNG
+    /// and embedded as `<img>` inside a `<figure>` (`mermaid-diagram` /
+    /// `math-formula`).  On render failure each block falls back to its
+    /// source form (the escaped code block / literal `$$…$$` text) so the
+    /// source is never lost.  Set false to leave every figure as source
+    /// (e.g. for pipelines that ship their own client-side mermaid.js or
+    /// MathJax).
+    ///
+    /// On disk the key is `figures`; `alias = "diagrams"` keeps configs
+    /// written before display-math export existed loading unchanged.  It
+    /// was named `diagrams` back when math was *not* rendered into the
+    /// export — now that it is, the key matches the `[figures]` consent
+    /// section.
+    #[serde(alias = "diagrams")]
+    pub figures: bool,
 }
 
 impl Default for HtmlExportConfig {
@@ -437,7 +454,7 @@ impl Default for HtmlExportConfig {
         Self {
             stylesheet: "builtin".into(),
             inline_images: false,
-            diagrams: true,
+            figures: true,
         }
     }
 }

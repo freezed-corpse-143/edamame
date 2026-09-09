@@ -267,7 +267,7 @@ mod tests {
             inline_images: false,
             source_dir: Some(dir.to_path_buf()),
             title: None,
-            render_diagrams: false,
+            render_figures: false,
         }
     }
 

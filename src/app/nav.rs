@@ -716,7 +716,7 @@ mod tests {
 
     use super::*;
     use crate::app::modal::{
-        DiagramsEnabledPromptModal, ImagesEnabledPromptModal, RemoteImagePromptModal,
+        FiguresEnabledPromptModal, ImagesEnabledPromptModal, RemoteImagePromptModal,
     };
     use crate::app::test_utils::app_with_buffer;
 
@@ -1101,7 +1101,7 @@ mod tests {
         let mut app = app_with_buffer("Just prose.\n", 0);
         let (_f, path) = md_file("```mermaid\ngraph TD;\n```\n");
         app.navigate_to_file(path);
-        assert!(app.modal_stack.contains::<DiagramsEnabledPromptModal>());
+        assert!(app.modal_stack.contains::<FiguresEnabledPromptModal>());
         assert!(
             !app.modal_stack.contains::<ImagesEnabledPromptModal>(),
             "a diagram-only document must not raise the images prompt"
@@ -1130,7 +1130,7 @@ mod tests {
         app.navigate_to_file(path);
 
         assert!(!app.modal_stack.contains::<ImagesEnabledPromptModal>());
-        assert!(!app.modal_stack.contains::<DiagramsEnabledPromptModal>());
+        assert!(!app.modal_stack.contains::<FiguresEnabledPromptModal>());
         assert!(
             app.effective_images_enabled(),
             "the session answer carries into the new document"
@@ -1149,7 +1149,7 @@ mod tests {
         app.navigate_to_file(path);
 
         assert!(!app.modal_stack.contains::<ImagesEnabledPromptModal>());
-        assert!(!app.modal_stack.contains::<DiagramsEnabledPromptModal>());
+        assert!(!app.modal_stack.contains::<FiguresEnabledPromptModal>());
         assert!(!app.modal_stack.contains::<RemoteImagePromptModal>());
         assert!(!app.effective_images_enabled());
         assert!(
@@ -1192,7 +1192,7 @@ mod tests {
         app.navigate_to_file(path);
 
         assert!(!app.modal_stack.contains::<ImagesEnabledPromptModal>());
-        assert!(!app.modal_stack.contains::<DiagramsEnabledPromptModal>());
+        assert!(!app.modal_stack.contains::<FiguresEnabledPromptModal>());
         assert!(!app.modal_stack.contains::<RemoteImagePromptModal>());
     }
 

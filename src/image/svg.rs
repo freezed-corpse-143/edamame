@@ -51,10 +51,81 @@ fn shared_fontdb() -> Arc<fontdb::Database> {
         .get_or_init(|| {
             let mut db = fontdb::Database::new();
             db.load_system_fonts();
+            pin_generic_families(&mut db);
             register_bundled_katex_fonts(&mut db);
             Arc::new(db)
         })
         .clone()
+}
+
+/// Point the CSS generic families at a face that is actually loaded.
+///
+/// `fontdb::Database::new()` seeds the generics with Windows/macOS names
+/// ("Arial", "Times New Roman", …), and `load_system_fonts` only overrides
+/// them when fontdb's partial fontconfig parser resolves the config's
+/// `<alias>` blocks — which on some distros (Debian 13) it does not,
+/// leaving `sans-serif` pointing at the absent "Arial".  Two content paths
+/// depend on a *resolvable* generic:
+///
+/// * **Mermaid** emits `font-family="trebuchet ms,verdana,arial,sans-serif"`;
+///   when none of those resolve, generic included, usvg drops every glyph
+///   and the diagram renders as shapes with no text.
+/// * **Display math** — RaTeX renders `\text{…}` as `font-family="sans-serif"`
+///   (math atoms use the bundled `KaTeX_*` faces; prose inside `\text` does
+///   not).  With the generic unresolved the text simply vanishes, so a
+///   formula containing CJK or any non-ASCII prose comes out blank.
+///
+/// Pinning each generic to the first candidate present in the db closes
+/// both gaps; a missing list is a no-op.  A CJK glyph then resolves on its
+/// own: once the generic points at a *present* face, usvg falls back
+/// per-glyph across the whole db (including any system CJK font) for
+/// characters that face lacks — so no CJK-specific family needs pinning
+/// here.  Keeping the generics Latin also keeps mermaid's Latin text in
+/// its intended face.
+fn pin_generic_families(db: &mut fontdb::Database) {
+    fn first_present<'a>(db: &fontdb::Database, candidates: &[&'a str]) -> Option<&'a str> {
+        candidates.iter().copied().find(|name| {
+            db.query(&fontdb::Query {
+                families: &[fontdb::Family::Name(name)],
+                ..Default::default()
+            })
+            .is_some()
+        })
+    }
+    if let Some(f) = first_present(
+        db,
+        &[
+            "DejaVu Sans",
+            "Noto Sans",
+            "Liberation Sans",
+            "Arial",
+            "Helvetica",
+        ],
+    ) {
+        db.set_sans_serif_family(f);
+    }
+    if let Some(f) = first_present(
+        db,
+        &[
+            "DejaVu Serif",
+            "Noto Serif",
+            "Liberation Serif",
+            "Times New Roman",
+        ],
+    ) {
+        db.set_serif_family(f);
+    }
+    if let Some(f) = first_present(
+        db,
+        &[
+            "DejaVu Sans Mono",
+            "Noto Sans Mono",
+            "Liberation Mono",
+            "Courier New",
+        ],
+    ) {
+        db.set_monospace_family(f);
+    }
 }
 
 /// The KaTeX font binaries bundled with the crate (SIL OFL 1.1 — licence
@@ -212,11 +283,11 @@ const KATEX_FONT_FILES: &[(&str, &[u8])] = &[
 /// by construction.
 fn register_bundled_katex_fonts(db: &mut fontdb::Database) {
     use std::sync::Arc;
-    for (name, bytes) in KATEX_FONT_FILES {
+    // The face family name comes from the font binary itself, so the table
+    // key is unused here — it only documents which file each entry is.
+    for (_name, bytes) in KATEX_FONT_FILES {
         let _ = db.load_font_source(fontdb::Source::Binary(Arc::new(*bytes)));
-        let _ = name;
     }
-    let _ = db;
 }
 
 /// Pre-populate the shared fontdb off the hot path so the first real SVG

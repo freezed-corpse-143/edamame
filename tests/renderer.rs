@@ -917,16 +917,22 @@ fn inline_math_renders_source_equivalently() {
     );
 }
 
-/// A `$$...$$`-only paragraph renders as the delimited source through the
-/// bare `parse` path (used by help preview and link scans, which never
-/// promote to image blocks) — the promotion to an image block happens in
-/// `ParsedDoc`, covered by its own test.
+/// A `$$...$$`-only paragraph that is not promoted to an image block
+/// (figures disabled, and the bare `parse` path used by help preview /
+/// link scans) renders as a fenced-style ` math ` code block: a ` math `
+/// language header, the formula body, and a blank closing row.  The `$$`
+/// delimiters are hidden in this rendered form — they reveal only when the
+/// cursor lands on the opening / closing rows (covered in `tests/ui.rs`).
 #[test]
-fn display_math_paragraph_renders_source_without_promotion() {
+fn display_math_paragraph_renders_as_a_math_code_block_without_promotion() {
     let lines = render("$$\nx^2\n$$\n");
     let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
     assert!(
-        text.contains("$$") && text.contains("x^2"),
-        "display math must stay readable as source in non-promoting paths, got: {text:?}"
+        text.contains("math") && text.contains("x^2"),
+        "unpromoted display math must render as a ` math ` code block, got: {text:?}"
+    );
+    assert!(
+        !text.contains("$$"),
+        "the styled block hides the `$$` delimiters (they reveal on cursor), got: {text:?}"
     );
 }

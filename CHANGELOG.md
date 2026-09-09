@@ -8,6 +8,14 @@ Each released version's section is also what ships as the GitHub release notes: 
 
 ## [Unreleased]
 
+### Added
+
+- edamame now displays LaTeX math. A `$$...$$` block renders as a formula image using pure Rust — no additional install needed. HTML export renders math as embedded images.
+
+### Changed
+
+- Math and diagrams have been combined as **Figures** in the diagrams consent setting, HTML export options, and the `[diagrams]` config section (an existing `[diagrams]` is rewritten to `[figures]` automatically on the next launch).
+
 ## [0.1.3] - 2026-09-02
 
 ### Fixed
