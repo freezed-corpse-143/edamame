@@ -353,13 +353,16 @@ A paragraph containing only a `$$...$$` block renders a LaTeX formula as a displ
 
 ```markdown
 $$
-E = mc^2
+\sum_{n=1}^{\infty} \frac{1}{n^2} = \frac{\pi^2}{6}
 $$
 ```
 
 Rendering is pure Rust — no LaTeX or other program needs to be installed. Math uses the **same terminal requirements and the same consent prompt** (the *Figures* setting) as diagrams.
 
 Move the cursor into a formula and its `$$...$$` source opens just below the rendered image to edit — the image stays put and the document reflows beneath it, with the formula re-rendered live as you type. Move the cursor out and the source collapses away, leaving the rendered formula. To hide the preview and edit the source alone (like a diagram), turn off **Math edit preview** in the settings overlay, or set `math_preview = false` under `[figures]`.
+
+
+![LaTeX math formula rendered in edamame](https://raw.githubusercontent.com/mijowi/mijowi.com/refs/heads/main/edamame/media/math.png)
 
 Only whole-paragraph `$$...$$` math is rendered as an image. Inline `$...$` and math mixed with other text in a paragraph stay as their literal source. An HTML export renders display-math paragraphs as images too — the same *Inline figures* toggle that controls diagrams (see [Exporting](#exporting)).
 
