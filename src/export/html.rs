@@ -528,7 +528,9 @@ fn push_display_math_source_block(out: &mut Vec<Event<'_>>, source: &str) {
     out.push(Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(
         CowStr::Borrowed("math"),
     ))));
-    out.push(Event::Text(CowStr::Boxed(body.to_string().into_boxed_str())));
+    out.push(Event::Text(CowStr::Boxed(
+        body.to_string().into_boxed_str(),
+    )));
     out.push(Event::End(TagEnd::CodeBlock));
 }
 
@@ -1044,10 +1046,7 @@ mod tests {
             "expected a math code block:\n{html}"
         );
         assert!(html.contains("a + b"), "formula body kept:\n{html}");
-        assert!(
-            !html.contains("$$"),
-            "delimiters must be stripped:\n{html}"
-        );
+        assert!(!html.contains("$$"), "delimiters must be stripped:\n{html}");
         assert!(!html.contains("<figure"), "no figure when off:\n{html}");
         assert!(
             !html.contains("class=\"math math-"),

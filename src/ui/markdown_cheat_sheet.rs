@@ -248,9 +248,7 @@ fn build(theme: &Theme) -> (Vec<Line<'static>>, Vec<(usize, Style)>) {
     // The qualifier is deliberate: `Renderer::render_paragraph` splits at
     // soft breaks as well, so on screen every source line already gets its
     // own row and the markers change nothing — they matter on export.
-    out.push(Line::raw(
-        "  Two spaces at end of line or a trailing  \\",
-    ));
+    out.push(Line::raw("  Two spaces at end of line or a trailing  \\"));
     out.push(blank());
 
     // ── Diagrams (Mermaid) ────────────────────────────────────────────
