@@ -480,7 +480,7 @@ impl App {
                 }
             }
             Err(_) => {
-                match crate::image::clipboard::read_clipboard_path()
+                match crate::image::clipboard::read_clipboard_text()
                     .as_deref()
                     .and_then(crate::image::clipboard::normalize_image_path)
                 {
@@ -766,7 +766,7 @@ impl App {
                 // Smart paste: OS-clipboard text first, then an image; only
                 // fall through to the kill-ring text when neither is present.
                 let has_text =
-                    crate::image::clipboard::os_clipboard_text().is_some_and(|t| !t.is_empty());
+                    crate::image::clipboard::read_clipboard_text().is_some_and(|t| !t.is_empty());
                 if !has_text && crate::image::clipboard::read_clipboard_image().is_ok() {
                     self.paste_image_from_clipboard(doc_height, doc_width);
                     self.needs_draw = true;

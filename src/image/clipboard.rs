@@ -3,7 +3,7 @@
 //! Two clipboard payloads map to two behaviors:
 //! - a screenshot arrives as a *bitmap* ([`read_clipboard_image`]); it is
 //!   encoded to PNG and saved into the configured image directory;
-//! - a copied image-file *path* arrives as text ([`read_clipboard_path`]);
+//! - a copied image-file *path* arrives as text ([`read_clipboard_text`]);
 //!   it is normalized and referenced directly, without reading or copying
 //!   the file.
 //!
@@ -51,22 +51,11 @@ pub fn read_clipboard_image() -> Result<RawImage, String> {
     Err("clipboard support is disabled in this build".to_owned())
 }
 
-/// The clipboard text, if any — the "copied image-file path" case.
+/// The OS clipboard's text, if any — no in-process kill-ring fallback.
+/// `None` when the clipboard is unreachable, holds no text, or under test
+/// (where touching the real clipboard would race parallel tests).
 #[cfg(feature = "clipboard")]
-pub fn read_clipboard_path() -> Option<String> {
-    let mut cb = arboard::Clipboard::new().ok()?;
-    cb.get_text().ok()
-}
-
-#[cfg(not(feature = "clipboard"))]
-pub fn read_clipboard_path() -> Option<String> {
-    None
-}
-
-/// The OS clipboard's text, if any — without the in-process kill-ring
-/// fallback.  `None` when the clipboard is unreachable or holds no text.
-#[cfg(feature = "clipboard")]
-pub fn os_clipboard_text() -> Option<String> {
+pub fn read_clipboard_text() -> Option<String> {
     if cfg!(test) {
         return None;
     }
@@ -74,7 +63,7 @@ pub fn os_clipboard_text() -> Option<String> {
 }
 
 #[cfg(not(feature = "clipboard"))]
-pub fn os_clipboard_text() -> Option<String> {
+pub fn read_clipboard_text() -> Option<String> {
     None
 }
 

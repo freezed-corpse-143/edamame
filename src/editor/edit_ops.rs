@@ -1357,7 +1357,7 @@ pub fn insert_image_at_cursor(
         state,
         "!",
         "alt text",
-        URL_PLACEHOLDER,
+        None,
         viewport_height,
         viewport_width,
     )
@@ -1375,7 +1375,7 @@ pub fn insert_link_at_cursor(
         state,
         "",
         "link text",
-        URL_PLACEHOLDER,
+        None,
         viewport_height,
         viewport_width,
     )
@@ -1392,7 +1392,7 @@ pub fn insert_image_reference_at_cursor(
     viewport_height: usize,
     viewport_width: usize,
 ) -> bool {
-    insert_inline_snippet(state, "!", "", url, viewport_height, viewport_width)
+    insert_inline_snippet(state, "!", "", Some(url), viewport_height, viewport_width)
 }
 
 /// Shared body of the image / link snippet inserts.  Returns `false` —
@@ -1411,11 +1411,15 @@ pub fn insert_image_reference_at_cursor(
 ///   text placeholder selected instead.  A multi-line selection is
 ///   dropped rather than wrapped (link text can't span blocks) so no
 ///   buffer text is destroyed.
+///
+/// `url` is `None` to insert and select the URL placeholder (the image /
+/// link snippet flows), or `Some(url)` to insert a fixed destination and
+/// leave the cursor just past the link (the clipboard paste flow).
 fn insert_inline_snippet(
     state: &mut EditorState,
     prefix: &str,
     text_placeholder: &str,
-    url: &str,
+    url: Option<&str>,
     viewport_height: usize,
     viewport_width: usize,
 ) -> bool {
@@ -1459,7 +1463,10 @@ fn insert_inline_snippet(
             false,
         ),
     };
-    let inserted = format!("{prefix}[{visible_text}]({url})");
+    let inserted = format!(
+        "{prefix}[{visible_text}]({})",
+        url.unwrap_or(URL_PLACEHOLDER)
+    );
     let inserted_len = inserted.chars().count();
     state.cursor.offset = offset;
     state.apply_delta(EditDelta {
@@ -1467,7 +1474,7 @@ fn insert_inline_snippet(
         removed,
         inserted,
     });
-    if url == URL_PLACEHOLDER {
+    if url.is_none() {
         let (sel_start, sel_len) = if select_placeholder_url {
             (
                 offset + prefix.len() + 1 + visible_text.chars().count() + 2,

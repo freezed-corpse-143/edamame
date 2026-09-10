@@ -324,9 +324,10 @@ pub struct ImagesConfig {
     pub max_height: usize,
     /// Policy for fetching `http(s)://` images.
     pub remote_policy: RemoteImagePolicy,
-    /// Directory where pasted screenshots are saved.  Relative to the
-    /// open document (or an absolute path); overridden by the
-    /// `EDAMAME_IMAGES_DIR` environment variable when set.
+    /// Directory where pasted screenshots are saved.  Defaults to a
+    /// global per-user directory; a relative value resolves against the
+    /// open document, an absolute value is used verbatim.  Overridden by
+    /// the `EDAMAME_IMAGES_DIR` environment variable when set.
     pub save_dir: String,
 }
 
