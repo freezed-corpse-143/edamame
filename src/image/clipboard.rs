@@ -31,6 +31,10 @@ pub struct RawImage {
 /// The clipboard bitmap, or `Err` when no bitmap is present.
 #[cfg(feature = "clipboard")]
 pub fn read_clipboard_image() -> Result<RawImage, String> {
+    // Tests must not touch the real OS clipboard (it races parallel tests).
+    if cfg!(test) {
+        return Err("clipboard unavailable in tests".to_owned());
+    }
     let mut cb = arboard::Clipboard::new().map_err(|e| format!("clipboard unavailable: {e}"))?;
     let img = cb
         .get_image()
@@ -56,6 +60,21 @@ pub fn read_clipboard_path() -> Option<String> {
 
 #[cfg(not(feature = "clipboard"))]
 pub fn read_clipboard_path() -> Option<String> {
+    None
+}
+
+/// The OS clipboard's text, if any — without the in-process kill-ring
+/// fallback.  `None` when the clipboard is unreachable or holds no text.
+#[cfg(feature = "clipboard")]
+pub fn os_clipboard_text() -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+#[cfg(not(feature = "clipboard"))]
+pub fn os_clipboard_text() -> Option<String> {
     None
 }
 

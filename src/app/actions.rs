@@ -453,6 +453,59 @@ impl App {
         }
     }
 
+    /// Paste an image from the OS clipboard: a screenshot is saved and
+    /// referenced; a copied image-file path is referenced directly.
+    fn paste_image_from_clipboard(&mut self, doc_height: usize, doc_width: usize) {
+        let save_dir = crate::image::clipboard::images_dir_from_env()
+            .unwrap_or_else(|| self.config.images.save_dir.clone());
+        let doc_path = self.file_path.clone();
+        match crate::image::clipboard::read_clipboard_image() {
+            Ok(raw) => {
+                match crate::image::clipboard::save_image(&raw, &save_dir, doc_path.as_deref()) {
+                    Ok(link) => {
+                        let inserted = crate::editor::edit_ops::insert_image_reference_at_cursor(
+                            &mut self.editor,
+                            &link,
+                            doc_height,
+                            doc_width,
+                        );
+                        if !inserted {
+                            self.notify(
+                                "Cannot insert image inside this block",
+                                ModalKind::Warning,
+                            );
+                        }
+                    }
+                    Err(e) => self.notify(e, ModalKind::Error),
+                }
+            }
+            Err(_) => {
+                match crate::image::clipboard::read_clipboard_path()
+                    .as_deref()
+                    .and_then(crate::image::clipboard::normalize_image_path)
+                {
+                    Some(path) => {
+                        let inserted = crate::editor::edit_ops::insert_image_reference_at_cursor(
+                            &mut self.editor,
+                            &path,
+                            doc_height,
+                            doc_width,
+                        );
+                        if !inserted {
+                            self.notify(
+                                "Cannot insert image inside this block",
+                                ModalKind::Warning,
+                            );
+                        }
+                    }
+                    None => {
+                        self.flash("No image or image path on the clipboard", MessageKind::Info)
+                    }
+                }
+            }
+        }
+    }
+
     /// Intercept App-level actions (`FollowLinkUnderCursor`,
     /// `NavigateBack`, `NavigateForward`) before they hit `edit_ops::apply`.
     ///
@@ -705,63 +758,21 @@ impl App {
                 true
             }
             Action::PasteImage => {
-                let save_dir = crate::image::clipboard::images_dir_from_env()
-                    .unwrap_or_else(|| self.config.images.save_dir.clone());
-                let doc_path = self.file_path.clone();
-                match crate::image::clipboard::read_clipboard_image() {
-                    Ok(raw) => {
-                        match crate::image::clipboard::save_image(
-                            &raw,
-                            &save_dir,
-                            doc_path.as_deref(),
-                        ) {
-                            Ok(link) => {
-                                let inserted =
-                                    crate::editor::edit_ops::insert_image_reference_at_cursor(
-                                        &mut self.editor,
-                                        &link,
-                                        doc_height,
-                                        doc_width,
-                                    );
-                                if !inserted {
-                                    self.notify(
-                                        "Cannot insert image inside this block",
-                                        ModalKind::Warning,
-                                    );
-                                }
-                            }
-                            Err(e) => self.notify(e, ModalKind::Error),
-                        }
-                    }
-                    Err(_) => {
-                        match crate::image::clipboard::read_clipboard_path()
-                            .as_deref()
-                            .and_then(crate::image::clipboard::normalize_image_path)
-                        {
-                            Some(path) => {
-                                let inserted =
-                                    crate::editor::edit_ops::insert_image_reference_at_cursor(
-                                        &mut self.editor,
-                                        &path,
-                                        doc_height,
-                                        doc_width,
-                                    );
-                                if !inserted {
-                                    self.notify(
-                                        "Cannot insert image inside this block",
-                                        ModalKind::Warning,
-                                    );
-                                }
-                            }
-                            None => self.flash(
-                                "No image or image path on the clipboard",
-                                MessageKind::Info,
-                            ),
-                        }
-                    }
-                }
+                self.paste_image_from_clipboard(doc_height, doc_width);
                 self.needs_draw = true;
                 true
+            }
+            Action::Paste => {
+                // Smart paste: OS-clipboard text first, then an image; only
+                // fall through to the kill-ring text when neither is present.
+                let has_text =
+                    crate::image::clipboard::os_clipboard_text().is_some_and(|t| !t.is_empty());
+                if !has_text && crate::image::clipboard::read_clipboard_image().is_ok() {
+                    self.paste_image_from_clipboard(doc_height, doc_width);
+                    self.needs_draw = true;
+                    return true;
+                }
+                false
             }
             Action::InsertFootnote => {
                 crate::editor::edit_ops::insert_footnote_at_cursor(
