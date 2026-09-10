@@ -993,7 +993,7 @@ mod tests {
         assert!(seeded.contains("theme = \"256 Dark\""));
         assert!(!seeded.contains("theme = \"Edamame\""));
         assert!(
-            seeded.contains("# Name of the active theme."),
+            seeded.contains("# Active theme"),
             "annotations survive the swap"
         );
         let mut warnings = Vec::new();
@@ -1379,7 +1379,7 @@ appearance = \"dark\"
         assert_eq!(round.theme, "Dracula");
         assert_eq!(round.modal.handler, "vim");
         assert!(out.contains("# edamame configuration"));
-        assert!(out.contains("# Name of the active theme."));
+        assert!(out.contains("# Active theme"));
     }
 
     /// A key the user set explicitly is rewritten even when it is back at the default —

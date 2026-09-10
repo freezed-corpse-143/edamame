@@ -26,7 +26,7 @@ Inside it:
 | `themes/` | Your custom themes — see [themes.md](themes.md) |
 | `export/` | Custom stylesheets for HTML export |
 
-All four are created on first run and **never overwritten afterwards**. The shipped `config.toml` is heavily commented, so reading it is often faster than reading this page.
+All four are created on first run and **never overwritten afterwards**. The shipped `config.toml` carries a one-line comment beside every setting and its default; this page is the fuller reference when you want the *why* behind one.
 
 To find the folder from inside edamame: `Ctrl-P` → "Open settings" → the first row is "Open config folder". The second, "Open config.toml", opens the file in `$VISUAL` / `$EDITOR`.
 

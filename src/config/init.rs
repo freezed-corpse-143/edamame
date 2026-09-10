@@ -78,7 +78,106 @@ fn write_if_absent(path: &Path, contents: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::config::Config;
+
+    /// Machine-managed bookkeeping that [`Config::save`] writes on its own.  Deliberately absent
+    /// from the shipped template — a fresh config should not carry state the user never sets — so
+    /// [`reference_config_documents_every_default_setting`] both skips these in its coverage sweep
+    /// and asserts they never appear as reference lines.
+    const BOOKKEEPING_KEYS: &[&str] = &[
+        "editor.seen_terminal_fingerprints",
+        "editor.last_update_check",
+        "editor.update_notified_for",
+        "editor.last_version_seen",
+    ];
+
+    /// Drop a trailing ` # comment` from a value, leaving quoted `#`s alone.
+    fn strip_inline_comment(value: &str) -> &str {
+        let mut in_string = false;
+        for (i, c) in value.char_indices() {
+            match c {
+                '"' => in_string = !in_string,
+                '#' if !in_string => return &value[..i],
+                _ => {}
+            }
+        }
+        value
+    }
+
+    /// Collect `section.key -> value` for every scalar assignment in a TOML-ish string, tracking
+    /// the current `[section]` header.  A leading `# ` (a commented-out reference line) and any
+    /// trailing inline comment are ignored, so the annotated template and a bare
+    /// `toml::to_string_pretty` serialization parse through the same lens.  First write per key
+    /// wins.  Non-identifier keys (prose lines that happen to contain `=`) are skipped.
+    fn scalar_assignments(src: &str) -> HashMap<String, String> {
+        let mut section = String::new();
+        let mut out = HashMap::new();
+        for raw in src.lines() {
+            let line = raw.trim_start();
+            let line = line.strip_prefix('#').map_or(line, str::trim_start);
+            if let Some(rest) = line.strip_prefix('[') {
+                if let Some(name) = rest.split(']').next() {
+                    section = name.trim().to_string();
+                }
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                continue;
+            }
+            let value = strip_inline_comment(value.trim()).trim().to_string();
+            let full = if section.is_empty() {
+                key.to_string()
+            } else {
+                format!("{section}.{key}")
+            };
+            out.entry(full).or_insert(value);
+        }
+        out
+    }
+
+    /// The shipped `config.toml` must list every configurable setting exactly once, at its
+    /// compiled-in default — so adding a `Config` field without documenting it, or letting a
+    /// default drift from the comment beside it, is a test failure rather than a silent gap.
+    /// Machine-written bookkeeping is the sole, asserted, exception.
+    #[test]
+    fn reference_config_documents_every_default_setting() {
+        let serialized = toml::to_string_pretty(&Config::default()).expect("serialize default");
+        let defaults = scalar_assignments(&serialized);
+        let reference = scalar_assignments(REFERENCE_CONFIG_TOML);
+
+        for (key, default_value) in &defaults {
+            // Empty arrays (`export.custom = []`) have no scalar reference line; the custom-export
+            // block is shown as a commented `[[export.custom]]` example instead.
+            if default_value == "[]" || BOOKKEEPING_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            match reference.get(key) {
+                Some(reference_value) => assert_eq!(
+                    reference_value, default_value,
+                    "config.toml lists `{key} = {reference_value}` but the default is \
+                     `{default_value}` — update the reference line",
+                ),
+                None => panic!(
+                    "config.toml has no line for `{key}` (default `{default_value}`) — document \
+                     it, or add it to BOOKKEEPING_KEYS if edamame writes it automatically",
+                ),
+            }
+        }
+
+        for key in BOOKKEEPING_KEYS {
+            assert!(
+                !reference.contains_key(*key),
+                "`{key}` is machine-written bookkeeping and must not ship in config.toml",
+            );
+        }
+    }
 
     #[test]
     fn seed_keeps_reference_verbatim_on_truecolor() {
