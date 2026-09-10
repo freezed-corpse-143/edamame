@@ -1353,7 +1353,14 @@ pub fn insert_image_at_cursor(
     viewport_height: usize,
     viewport_width: usize,
 ) -> bool {
-    insert_inline_snippet(state, "!", "alt text", viewport_height, viewport_width)
+    insert_inline_snippet(
+        state,
+        "!",
+        "alt text",
+        URL_PLACEHOLDER,
+        viewport_height,
+        viewport_width,
+    )
 }
 
 /// Insert a link snippet (`[link text](file path or URL)`) at the
@@ -1364,7 +1371,28 @@ pub fn insert_link_at_cursor(
     viewport_height: usize,
     viewport_width: usize,
 ) -> bool {
-    insert_inline_snippet(state, "", "link text", viewport_height, viewport_width)
+    insert_inline_snippet(
+        state,
+        "",
+        "link text",
+        URL_PLACEHOLDER,
+        viewport_height,
+        viewport_width,
+    )
+}
+
+/// Insert a complete image reference `![](url)` at the cursor (empty alt
+/// text), reusing [`insert_inline_snippet`]'s pre-flight and
+/// selection-wrapping but skipping the placeholder selection — the
+/// cursor lands just past the link.  Used by the clipboard paste flow
+/// where the path is already known.
+pub fn insert_image_reference_at_cursor(
+    state: &mut EditorState,
+    url: &str,
+    viewport_height: usize,
+    viewport_width: usize,
+) -> bool {
+    insert_inline_snippet(state, "!", "", url, viewport_height, viewport_width)
 }
 
 /// Shared body of the image / link snippet inserts.  Returns `false` —
@@ -1387,6 +1415,7 @@ fn insert_inline_snippet(
     state: &mut EditorState,
     prefix: &str,
     text_placeholder: &str,
+    url: &str,
     viewport_height: usize,
     viewport_width: usize,
 ) -> bool {
@@ -1430,27 +1459,32 @@ fn insert_inline_snippet(
             false,
         ),
     };
-    let inserted = format!("{prefix}[{visible_text}]({URL_PLACEHOLDER})");
+    let inserted = format!("{prefix}[{visible_text}]({url})");
+    let inserted_len = inserted.chars().count();
     state.cursor.offset = offset;
     state.apply_delta(EditDelta {
         offset,
         removed,
         inserted,
     });
-    let (sel_start, sel_len) = if select_placeholder_url {
-        (
-            offset + prefix.len() + 1 + visible_text.chars().count() + 2,
-            URL_PLACEHOLDER.len(),
-        )
+    if url == URL_PLACEHOLDER {
+        let (sel_start, sel_len) = if select_placeholder_url {
+            (
+                offset + prefix.len() + 1 + visible_text.chars().count() + 2,
+                URL_PLACEHOLDER.len(),
+            )
+        } else {
+            (offset + prefix.len() + 1, text_placeholder.len())
+        };
+        let sel_end = sel_start + sel_len;
+        state.selection = Some(Selection {
+            anchor: sel_start,
+            active: sel_end,
+        });
+        state.cursor.offset = sel_end;
     } else {
-        (offset + prefix.len() + 1, text_placeholder.len())
-    };
-    let sel_end = sel_start + sel_len;
-    state.selection = Some(Selection {
-        anchor: sel_start,
-        active: sel_end,
-    });
-    state.cursor.offset = sel_end;
+        state.cursor.offset = offset + inserted_len;
+    }
     state.cursor.preferred_col = state.cursor.cell_col(&state.buffer);
     state.update_cursor_block();
     state.ensure_cursor_visible(viewport_height, viewport_width);

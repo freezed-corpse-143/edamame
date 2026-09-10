@@ -153,6 +153,7 @@ pub(super) fn action_caps(action: &Action) -> ActionCaps {
             | InsertTable
             | InsertImage
             | InsertLink
+            | PasteImage
             | InsertFootnote
             | DeleteFootnote
             | RenumberFootnotes
@@ -222,6 +223,7 @@ pub(super) fn action_caps(action: &Action) -> ActionCaps {
         | TableMoveRowDown | TableMoveColumnLeft | TableMoveColumnRight | TableInsertRowAbove
         | TableInsertRowBelow | TableInsertColumnLeft | TableInsertColumnRight | TableDeleteRow
         | TableDeleteColumn | TableInsertBreak | InsertTable | InsertImage | InsertLink
+        | PasteImage
         | InsertFootnote | DeleteFootnote | RenumberFootnotes | FixListNumbering | SearchReplace
         | SearchReplaceAll | FollowLinkUnderCursor | NavigateBack | NavigateForward
         | GoToSection | OpenDoc(_) | Open | Save | SaveAs | ExportHtml
@@ -698,6 +700,65 @@ impl App {
                         format!("Cannot insert {what} inside this block"),
                         ModalKind::Warning,
                     );
+                }
+                self.needs_draw = true;
+                true
+            }
+            Action::PasteImage => {
+                let save_dir = crate::image::clipboard::images_dir_from_env()
+                    .unwrap_or_else(|| self.config.images.save_dir.clone());
+                let doc_path = self.file_path.clone();
+                match crate::image::clipboard::read_clipboard_image() {
+                    Ok(raw) => {
+                        match crate::image::clipboard::save_image(
+                            &raw,
+                            &save_dir,
+                            doc_path.as_deref(),
+                        ) {
+                            Ok(link) => {
+                                let inserted =
+                                    crate::editor::edit_ops::insert_image_reference_at_cursor(
+                                        &mut self.editor,
+                                        &link,
+                                        doc_height,
+                                        doc_width,
+                                    );
+                                if !inserted {
+                                    self.notify(
+                                        "Cannot insert image inside this block",
+                                        ModalKind::Warning,
+                                    );
+                                }
+                            }
+                            Err(e) => self.notify(e, ModalKind::Error),
+                        }
+                    }
+                    Err(_) => {
+                        match crate::image::clipboard::read_clipboard_path()
+                            .as_deref()
+                            .and_then(crate::image::clipboard::normalize_image_path)
+                        {
+                            Some(path) => {
+                                let inserted =
+                                    crate::editor::edit_ops::insert_image_reference_at_cursor(
+                                        &mut self.editor,
+                                        &path,
+                                        doc_height,
+                                        doc_width,
+                                    );
+                                if !inserted {
+                                    self.notify(
+                                        "Cannot insert image inside this block",
+                                        ModalKind::Warning,
+                                    );
+                                }
+                            }
+                            None => self.flash(
+                                "No image or image path on the clipboard",
+                                MessageKind::Info,
+                            ),
+                        }
+                    }
                 }
                 self.needs_draw = true;
                 true

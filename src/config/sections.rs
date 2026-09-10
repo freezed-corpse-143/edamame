@@ -324,6 +324,10 @@ pub struct ImagesConfig {
     pub max_height: usize,
     /// Policy for fetching `http(s)://` images.
     pub remote_policy: RemoteImagePolicy,
+    /// Directory where pasted screenshots are saved.  Relative to the
+    /// open document (or an absolute path); overridden by the
+    /// `EDAMAME_IMAGES_DIR` environment variable when set.
+    pub save_dir: String,
 }
 
 impl Default for ImagesConfig {
@@ -333,8 +337,24 @@ impl Default for ImagesConfig {
             max_width: 100,
             max_height: 24,
             remote_policy: RemoteImagePolicy::Ask,
+            save_dir: default_image_save_dir(),
         }
     }
+}
+
+/// Default image save directory: a global per-user location under the
+/// XDG data directory (e.g. `~/.local/share/edamame/images`), matching
+/// where edamame writes its logs.  Falls back to `./images` when the data
+/// directory is unavailable.
+fn default_image_save_dir() -> String {
+    dirs::data_dir()
+        .map(|d| {
+            d.join("edamame")
+                .join("images")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_else(|| "./images".to_owned())
 }
 
 /// Master switch for inline diagram rendering (e.g. mermaid).  `Ask`
