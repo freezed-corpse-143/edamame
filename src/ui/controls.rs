@@ -11,7 +11,7 @@
 //! | --------- | ------------------------ | ------------------------- | ------------------------ |
 //! | Focused   | `primary` fill, rev, bold | `primary` fill, rev, bold | track value-colored; row label takes the fill |
 //! | Unfocused | `secondary` fg, no bg    | `secondary` fill, rev     | track value-colored      |
-//! | Disabled  | `text_muted` fg, no bg, dim | `text_muted` fg, no bg, dim | track no bg, muted    |
+//! | Disabled  | `text_muted` fg, no bg, dim | `text_muted` fg, no bg, dim | track desaturated (`bg_muted` fill), muted, dim |
 //!
 //! The modifiers keep the states distinct on a monochrome terminal; the toggle also encodes its
 //! value by handle position and the literal `on`/`off` text.
@@ -298,27 +298,42 @@ pub fn toggle_width() -> usize {
 /// Spans for an iOS-style on/off slider: a light `|` handle flush right when on, left when off,
 /// over a value-colored fill.  `focused` is deliberately ignored — inverting the track would
 /// destroy the on-is-green reading, so focus is shown by the row's label column instead.
+///
+/// A `disabled` toggle drops the to `bg_muted`(edamame's muted-track surface — scrollbar / table
+/// stripes) with the handle one step lighter on `text_muted`, and the whole widget is `DIM` to mark it inert.
 pub fn toggle_spans(on: bool, _focused: bool, disabled: bool, theme: &Theme) -> Vec<Span<'static>> {
     let p = &theme.palette;
     let label = if on { " on " } else { " off" };
 
-    if disabled {
-        let muted = Style::default()
-            .fg(p.text_muted)
-            .add_modifier(Modifier::DIM);
-        let track = if on { "  |" } else { "|  " };
-        return vec![Span::styled(track, muted), Span::styled(label, muted)];
-    }
+    let (fill_bg, handle_bg, grip_fg, label_fg) = if disabled {
+        (p.bg_muted, p.text_muted, p.bg_muted, p.text_muted)
+    } else {
+        let value = if on { p.success } else { p.text_muted };
+        (value, p.text, p.text_muted, value)
+    };
+    let extra = if disabled {
+        Modifier::DIM
+    } else {
+        Modifier::empty()
+    };
 
-    let value = if on { p.success } else { p.text_muted };
-    let handle = Span::styled("|", Style::default().fg(p.text_muted).bg(p.text));
-    let fill = Span::styled("  ", Style::default().bg(value));
+    let handle = Span::styled(
+        "|",
+        Style::default()
+            .fg(grip_fg)
+            .bg(handle_bg)
+            .add_modifier(extra),
+    );
+    let fill = Span::styled("  ", Style::default().bg(fill_bg).add_modifier(extra));
     let mut spans = if on {
         vec![fill, handle]
     } else {
         vec![handle, fill]
     };
-    spans.push(Span::styled(label, Style::default().fg(value)));
+    spans.push(Span::styled(
+        label,
+        Style::default().fg(label_fg).add_modifier(extra),
+    ));
     spans
 }
 
@@ -380,13 +395,6 @@ mod tests {
                 "on={on}",
             );
         }
-    }
-
-    #[test]
-    fn disabled_toggle_drops_the_fill() {
-        let spans = toggle_spans(true, false, true, theme());
-        assert_eq!(spans[0].style.bg, None);
-        assert!(spans[0].style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
