@@ -21,14 +21,15 @@ use usvg::fontdb;
 /// invalidated, since the installed fonts don't change mid-session.
 static SHARED_FONTDB: OnceLock<Arc<fontdb::Database>> = OnceLock::new();
 
-/// The shared `fontdb::Database`, loading system fonts on first call.  Later calls are lock-free
-/// `Arc` clones from any thread.
+/// The shared `fontdb::Database`, loading system fonts and the bundled KaTeX fonts on first call.
+/// Later calls are lock-free `Arc` clones from any thread.
 fn shared_fontdb() -> Arc<fontdb::Database> {
     SHARED_FONTDB
         .get_or_init(|| {
             let mut db = fontdb::Database::new();
             db.load_system_fonts();
             pin_generic_families(&mut db);
+            register_bundled_katex_fonts(&mut db);
             Arc::new(db)
         })
         .clone()
@@ -36,13 +37,14 @@ fn shared_fontdb() -> Arc<fontdb::Database> {
 
 /// Point the CSS generic families at a face that is actually loaded.
 ///
-/// `fontdb::Database::new()` seeds the generics with Windows/macOS names ("Arial", "Times New
-/// Roman", …), and `load_system_fonts` only overrides them when fontdb's partial fontconfig parser
-/// resolves the config's `<alias>` blocks — which on some distros (Debian 13) it does not, leaving
-/// `sans-serif` pointing at the absent "Arial".  Mermaid emits
-/// `font-family="trebuchet ms,verdana,arial,sans-serif"`; when none of those resolve, generic
-/// included, usvg drops every glyph and the diagram renders as shapes with no text.  Pinning each
-/// generic to the first candidate present in the db closes that gap; a missing list is a no-op.
+/// `fontdb::Database::new()` seeds the generics with Windows/macOS names ("Arial", …), and
+/// `load_system_fonts` only overrides them when fontdb's partial fontconfig parser resolves the
+/// config's `<alias>` blocks — which on some distros (Debian 13) it does not, leaving `sans-serif`
+/// pointing at the absent "Arial".  Two paths need a *resolvable* generic: mermaid emits
+/// `font-family="…,sans-serif"`, and RaTeX renders `\text{…}` as `sans-serif`; unresolved, usvg
+/// drops the glyphs and the text vanishes.  Pinning each generic to the first present candidate
+/// closes both gaps (a missing list is a no-op); usvg then falls back per-glyph across the db for
+/// characters that face lacks, so no CJK family needs pinning here.
 fn pin_generic_families(db: &mut fontdb::Database) {
     fn first_present<'a>(db: &fontdb::Database, candidates: &[&'a str]) -> Option<&'a str> {
         candidates.iter().copied().find(|name| {
@@ -53,22 +55,201 @@ fn pin_generic_families(db: &mut fontdb::Database) {
             .is_some()
         })
     }
-    if let Some(f) =
-        first_present(db, &["DejaVu Sans", "Noto Sans", "Liberation Sans", "Arial", "Helvetica"])
-    {
+    if let Some(f) = first_present(
+        db,
+        &[
+            "DejaVu Sans",
+            "Noto Sans",
+            "Liberation Sans",
+            "Arial",
+            "Helvetica",
+        ],
+    ) {
         db.set_sans_serif_family(f);
     }
     if let Some(f) = first_present(
         db,
-        &["DejaVu Serif", "Noto Serif", "Liberation Serif", "Times New Roman"],
+        &[
+            "DejaVu Serif",
+            "Noto Serif",
+            "Liberation Serif",
+            "Times New Roman",
+        ],
     ) {
         db.set_serif_family(f);
     }
     if let Some(f) = first_present(
         db,
-        &["DejaVu Sans Mono", "Noto Sans Mono", "Liberation Mono", "Courier New"],
+        &[
+            "DejaVu Sans Mono",
+            "Noto Sans Mono",
+            "Liberation Mono",
+            "Courier New",
+        ],
     ) {
         db.set_monospace_family(f);
+    }
+}
+
+/// The KaTeX font binaries bundled with the crate (SIL OFL 1.1 — licence
+/// in `src/assets/katex/OFL.txt`, provenance in `FONT_NOTICE.txt`).
+/// These are the faces RaTeX's `<text>` SVG output names (`KaTeX_Main`,
+/// `KaTeX_Math`, …), so registering them makes the shared fontdb
+/// self-sufficient for math rendering on machines without KaTeX
+/// installed.  Paths are manifest-relative so the list is independent of
+/// this file's depth in the source tree.
+const KATEX_FONT_FILES: &[(&str, &[u8])] = &[
+    (
+        "KaTeX_AMS-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_AMS-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Caligraphic-Bold.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Caligraphic-Bold.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Caligraphic-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Caligraphic-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Fraktur-Bold.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Fraktur-Bold.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Fraktur-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Fraktur-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Main-Bold.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Main-Bold.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Main-BoldItalic.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Main-BoldItalic.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Main-Italic.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Main-Italic.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Main-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Main-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Math-BoldItalic.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Math-BoldItalic.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Math-Italic.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Math-Italic.ttf"
+        )),
+    ),
+    (
+        "KaTeX_SansSerif-Bold.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_SansSerif-Bold.ttf"
+        )),
+    ),
+    (
+        "KaTeX_SansSerif-Italic.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_SansSerif-Italic.ttf"
+        )),
+    ),
+    (
+        "KaTeX_SansSerif-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_SansSerif-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Script-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Script-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Size1-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Size1-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Size2-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Size2-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Size3-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Size3-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Size4-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Size4-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Typewriter-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Typewriter-Regular.ttf"
+        )),
+    ),
+];
+
+/// Register every bundled KaTeX face into `db` (zero-copy binary
+/// sources).  Called once when the shared fontdb initialises; idempotent
+/// by construction.
+fn register_bundled_katex_fonts(db: &mut fontdb::Database) {
+    use std::sync::Arc;
+    // The face family name comes from the font binary itself, so the table
+    // key is unused here — it only documents which file each entry is.
+    for (_name, bytes) in KATEX_FONT_FILES {
+        let _ = db.load_font_source(fontdb::Source::Binary(Arc::new(*bytes)));
     }
 }
 
@@ -250,6 +431,43 @@ mod tests {
             envelope,
             font_size: Some((8, 16)),
             mode: SvgScaleMode::Fill,
+        }
+    }
+
+    // ── Bundled KaTeX fonts ──────────────────────────────────────────
+
+    /// The shared fontdb must carry every KaTeX_* family that
+    /// ratex-svg's `<text>` output names (Main, Math, AMS, Caligraphic,
+    /// Fraktur, SansSerif, Script, Size1..4, Typewriter).  LaTeX
+    /// rendering is a text-SVG + shared-fontdb pipeline, so a family
+    /// that fails to resolve would render with a silent system-font
+    /// fallback — glyphs in the wrong face, or missing.  This test is
+    /// the guard rail against RaTeX renaming its internal face table.
+    #[test]
+    fn bundled_katex_families_resolve_in_the_shared_fontdb() {
+        let db = shared_fontdb();
+        let families: std::collections::HashSet<String> = db
+            .faces()
+            .filter_map(|f| f.families.first().map(|(name, _)| name.clone()))
+            .collect();
+        for family in [
+            "KaTeX_Main",
+            "KaTeX_Math",
+            "KaTeX_AMS",
+            "KaTeX_Caligraphic",
+            "KaTeX_Fraktur",
+            "KaTeX_SansSerif",
+            "KaTeX_Script",
+            "KaTeX_Size1",
+            "KaTeX_Size2",
+            "KaTeX_Size3",
+            "KaTeX_Size4",
+            "KaTeX_Typewriter",
+        ] {
+            assert!(
+                families.contains(family),
+                "KaTeX family {family} must be registered in the shared fontdb (faces: {families:?})"
+            );
         }
     }
 

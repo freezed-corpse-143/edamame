@@ -56,6 +56,9 @@ impl App {
         push(self.editor.cursor_blink.next_toggle());
         push(self.editor.yank_flash_deadline());
         push(self.autosave_deadline());
+        // Figure render debounce: wake when the window expires so the deferred render
+        // dispatches after the user stops typing, even with no key event of its own.
+        push(self.diagram_render_hold_until);
         push(self.section_jump_deadline());
         push(self.diff_advance_deadline());
         push(self.search_advance_deadline());

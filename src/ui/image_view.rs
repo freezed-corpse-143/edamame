@@ -109,7 +109,7 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Im
         return out;
     }
 
-    for info in &state.parsed.image_blocks {
+    for (ordinal, info) in state.parsed.image_blocks.iter().enumerate() {
         let rendered_range = state
             .parsed
             .source_map
@@ -123,8 +123,28 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Im
         let y_offset: isize = block_top as isize - scroll as isize;
 
         let reserved = rendered_range.end.saturating_sub(rendered_range.start) as isize;
+        // A `$$...$$` block mid raw-reveal, with the preview on, reserves a
+        // live-preview band for the formula PLUS `raw_rows` source lines
+        // (see `ImageReveal::preview_rows`).  The formula paints in the
+        // band at the block's TOP — the same rows it occupied before the
+        // reveal, so the image doesn't jump — and the renderer paints the
+        // editable source in the rows below.  So the image rect keeps the
+        // block's top edge and shrinks to the band height (`reserved` minus
+        // the source rows painted beneath).  With the preview off the image
+        // is suppressed entirely (see `EditorView`) and this loop never
+        // reaches it while revealed.
+        let source_rows_below = match state.image_reveal.as_ref() {
+            Some(reveal)
+                if reveal.preview_rows > 0
+                    && reveal.ordinal == ordinal
+                    && reveal.url == info.url =>
+            {
+                reveal.rows as isize
+            }
+            _ => 0,
+        };
         let image_top = area.y as isize + y_offset;
-        let image_bottom = image_top + reserved;
+        let image_bottom = image_top + reserved - source_rows_below;
         let viewport_top = area.y as isize;
         let viewport_bottom = (area.y as isize) + area.height as isize;
         // Not even one row intersects the viewport.
@@ -142,7 +162,7 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Im
                 x: area.x,
                 y: rect_y,
                 width: area.width,
-                height: reserved.max(0).min(u16::MAX as isize) as u16,
+                height: (reserved - source_rows_below).max(0).min(u16::MAX as isize) as u16,
             },
             natural_top: image_top,
         });

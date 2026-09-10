@@ -88,7 +88,9 @@ fn blend_toward(src: [u8; 3], target: [u8; 3], t: f32) -> [u8; 3] {
 }
 
 /// RGB triple for a `Color`; `None` for `Color::Reset`, whose concrete RGB is unknown.
-fn color_to_rgb(color: Color) -> Option<[u8; 3]> {
+/// `pub(crate)`: also used by the image decode worker to tint display math with the theme's
+/// text color.
+pub(crate) fn color_to_rgb(color: Color) -> Option<[u8; 3]> {
     match color {
         Color::Reset => None,
         Color::Black => Some(ANSI_PALETTE[0]),

@@ -244,6 +244,30 @@ fn build(theme: &Theme) -> (Vec<Line<'static>>, Vec<(usize, Style)>) {
         Span::raw("  "),
         Span::styled("```", theme.code_block_text),
     ]));
+    out.push(blank());
+
+    // ── Math (display) ────────────────────────────────────────────────
+    // Mirrors the Mermaid block above: a paragraph that is only `$$…$$`
+    // renders as a display-math formula.  The opening `$$` uses the
+    // language surface (`code_block_lang`), the body and closing `$$` the
+    // darker code surface (`code_block_text`) — the same three-row shape,
+    // so `size_surface_lines` gives it the same padded background.
+    out.push(section(theme, "Math (display)"));
+    surface_pad.push((out.len(), theme.code_block_lang));
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("$$", theme.code_block_lang),
+    ]));
+    surface_pad.push((out.len(), theme.code_block_text));
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("E = mc^2", theme.code_block_text),
+    ]));
+    surface_pad.push((out.len(), theme.code_block_text));
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("$$", theme.code_block_text),
+    ]));
 
     (out, surface_pad)
 }
@@ -359,6 +383,8 @@ mod tests {
         assert!(s.contains("~~strike~~"));
         assert!(s.contains("==highlight=="));
         assert!(s.contains("Mermaid"));
+        assert!(s.contains("Math (display)"));
+        assert!(s.contains("E = mc^2"));
         assert!(s.contains("Links"));
         assert!(s.contains("Images"));
         assert!(s.contains("Footnotes"));

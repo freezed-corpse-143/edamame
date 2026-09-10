@@ -11,9 +11,12 @@ Each released version's section is also what ships as the GitHub release notes: 
 ### Added
 
 - Manually-wrapped paragraphs now reflow to the editor width. A paragraph wrapped in the source is joined into a single line and wrapped to fit the editor, instead of showing one short row per source line. A hard break (two trailing spaces or a backslash) still splits. Can be turned off in settings (Reflow paragraphs).
+- edamame now displays LaTeX math. A `$$...$$` block renders as a formula image using pure Rust — no additional install needed. HTML export renders math as embedded images.
 
 ### Changed
+
 - The editor is now capped at 100 columns by default, for more comfortable reading on wide terminals. Turn it off with the "Limit editor width" toggle in settings (Ctrl-P → Open settings). You can also change the character limit there.
+- Math and diagrams have been combined as **Figures** in the diagrams consent setting, HTML export options, and the `[diagrams]` config section (an existing `[diagrams]` is rewritten to `[figures]` automatically on the next launch).
 
 ### Fixed
 

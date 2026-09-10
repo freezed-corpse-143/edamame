@@ -28,8 +28,8 @@ impl ImagesEnabledPromptModal {
         if !matches!(config.images.enabled, crate::config::ImagesEnabled::Ask) {
             return None;
         }
-        // Diagram blocks are synthetic image blocks with `source: Some(_)`; they belong to
-        // `DiagramsEnabledPromptModal` and must not trigger this prompt.
+        // Diagram / math blocks are synthetic image blocks with `source: Some(_)`; they belong
+        // to `FiguresEnabledPromptModal` and must not trigger this prompt.
         let has_real_image = editor
             .parsed
             .image_blocks

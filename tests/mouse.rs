@@ -2813,7 +2813,10 @@ fn intra_mermaid_line_move_keeps_the_reveal_latched() {
     // A dwell reveals it, and the per-frame latch step pins that reveal.
     st.cursor_block_entered_at = None;
     st.latch_cursor_reveal();
-    assert!(st.cursor_reveal_latched, "a dwell latches the mermaid reveal");
+    assert!(
+        st.cursor_reveal_latched,
+        "a dwell latches the mermaid reveal"
+    );
 
     // Move to the next content line within the same mermaid block: the timer re-arms, but the
     // latch holds the reveal, so the placeholder never flashes back.

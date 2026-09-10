@@ -61,6 +61,196 @@ pub fn promote_diagram_code_blocks(blocks: &mut [Block]) -> HashMap<String, Diag
     sources
 }
 
+/// Replace every display-math-only paragraph (one or more `Inline::Math { display: true }`,
+/// separated by breaks and whitespace-only text) with one synthetic `Block::ImageBlock` **per
+/// formula**, URL `diagram-math-<sha256(source)>`.  Returns the `url → DiagramSource` map, merged
+/// into [`promote_diagram_code_blocks`]'s so `ParsedDoc` attaches the source to `ImageBlockInfo`
+/// for the decode worker.
+///
+/// pulldown-cmark folds stacked `$$...$$` blocks (no blank line between) into one paragraph of
+/// `[Math, SoftBreak, Math]`; this re-splits it into one image block per formula, `real_ranges`
+/// rewritten to stay 1:1 with `blocks`.  Paragraphs mixing math with other inlines are left alone.
+/// Called from [`crate::document::ParsedDoc::build_with_overrides`] only — not [`super::parse`] —
+/// like [`promote_diagram_code_blocks`], so other `parse` consumers keep seeing the paragraph.
+pub fn promote_display_math_paragraphs(
+    blocks: &mut Vec<Block>,
+    real_ranges: &mut Vec<Range<usize>>,
+    source: &str,
+) -> HashMap<String, DiagramSource> {
+    let mut sources = HashMap::new();
+    let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
+    let mut out_ranges: Vec<Range<usize>> = Vec::with_capacity(real_ranges.len());
+    for (block, range) in blocks.drain(..).zip(real_ranges.drain(..)) {
+        let Block::Paragraph { inlines } = &block else {
+            out.push(block);
+            out_ranges.push(range);
+            continue;
+        };
+        let Some(math_sources) = collect_display_math_only(inlines) else {
+            out.push(block);
+            out_ranges.push(range);
+            continue;
+        };
+        // Carve each formula's byte range from the paragraph's source
+        // text.  `split_math_ranges` walks the paragraph body locating
+        // `$$` delimiter pairs; a failure to locate them (shouldn't
+        // happen — pulldown already parsed them) falls back to keeping
+        // the paragraph as-is.
+        let Some(piece_ranges) = split_math_ranges(source, &range, math_sources.len()) else {
+            out.push(block);
+            out_ranges.push(range);
+            continue;
+        };
+        for (i, formula) in math_sources.iter().enumerate() {
+            let diagram_source = DiagramSource::Latex(formula.clone());
+            let url = crate::diagram::synthetic_url(&diagram_source);
+            sources.insert(url.clone(), diagram_source);
+            out.push(Block::ImageBlock {
+                alt: "math".to_string(),
+                url,
+            });
+            out_ranges.push(piece_ranges[i].clone());
+        }
+    }
+    *blocks = out;
+    *real_ranges = out_ranges;
+    sources
+}
+
+/// Figures-off counterpart of [`promote_display_math_paragraphs`]: when a display-math-only
+/// paragraph holds more than one `$$...$$` formula (pulldown folds stacked formulas into one
+/// paragraph), split it into one single-formula `Block::Paragraph` per formula so each renders as
+/// its own fenced-style `math` code block — the figures-on block boundaries minus the image.
+/// `real_ranges` is rewritten 1:1, each range carved by [`split_math_ranges`].  A single-formula
+/// paragraph is left untouched (already one block, painted via [`display_math_block_body`]).
+/// Called from [`crate::document::ParsedDoc::build_with_overrides`] only, figures-off branch.
+pub fn split_display_math_paragraphs(
+    blocks: &mut Vec<Block>,
+    real_ranges: &mut Vec<Range<usize>>,
+    source: &str,
+) {
+    let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
+    let mut out_ranges: Vec<Range<usize>> = Vec::with_capacity(real_ranges.len());
+    for (block, range) in blocks.drain(..).zip(real_ranges.drain(..)) {
+        let split = match &block {
+            Block::Paragraph { inlines } => collect_display_math_only(inlines)
+                .filter(|formulas| formulas.len() >= 2)
+                .and_then(|formulas| {
+                    split_math_ranges(source, &range, formulas.len())
+                        .map(|ranges| (formulas, ranges))
+                }),
+            _ => None,
+        };
+        match split {
+            Some((formulas, piece_ranges)) => {
+                for (i, formula) in formulas.into_iter().enumerate() {
+                    out.push(Block::Paragraph {
+                        inlines: vec![Inline::Math {
+                            source: formula,
+                            display: true,
+                        }],
+                    });
+                    out_ranges.push(piece_ranges[i].clone());
+                }
+            }
+            None => {
+                out.push(block);
+                out_ranges.push(range);
+            }
+        }
+    }
+    *blocks = out;
+    *real_ranges = out_ranges;
+}
+
+/// If `inlines` contains only display-math inlines (plus soft/hard breaks
+/// and whitespace-only text between them), return each formula's LaTeX
+/// source in order.  Returns `None` for mixed paragraphs, lone inline
+/// (`$...$`) math, or a paragraph with no display math at all.
+fn collect_display_math_only(inlines: &[Inline]) -> Option<Vec<String>> {
+    let mut formulas: Vec<String> = Vec::new();
+    for inline in inlines {
+        match inline {
+            Inline::Math {
+                source,
+                display: true,
+            } => formulas.push(source.clone()),
+            Inline::Math { .. } => return None, // lone inline $...$
+            Inline::Text(t) if t.trim().is_empty() => {}
+            Inline::SoftBreak | Inline::HardBreak => {}
+            _ => return None,
+        }
+    }
+    (!formulas.is_empty()).then_some(formulas)
+}
+
+/// A figures-off `$$...$$` paragraph stays a `Block::Paragraph` and renders as a fenced-style
+/// `math` code block — the source counterpart of the display-math reveal, like a `` ```mermaid ``
+/// fence when figures are off.
+///
+/// Returns the formula body (LaTeX with the delimiter newlines stripped, for
+/// `Renderer::render_code_block(Some("math"), body, true, …)`) iff `block` is a paragraph whose
+/// only inline is a single **multi-line** `$$\n…\n$$` formula (delimiters on their own lines).
+/// `None` for everything else — a mixed paragraph, stacked formulas, inline `$…$`, or a one-line
+/// `$$x$$` (no delimiter rows to align the fence against).
+///
+/// The renderer and `editor::state::sub_lines_in_block` must agree on this shape: the latter maps
+/// its rendered rows 1:1 onto source lines so the cursor and click hit-test land right.
+pub(crate) fn display_math_block_body(block: &Block) -> Option<String> {
+    let Block::Paragraph { inlines } = block else {
+        return None;
+    };
+    let mut formula: Option<&str> = None;
+    for inline in inlines {
+        match inline {
+            Inline::Math {
+                source,
+                display: true,
+            } if formula.is_none() => formula = Some(source),
+            Inline::Math { .. } => return None, // a second formula, or inline $…$
+            Inline::Text(t) if t.trim().is_empty() => {}
+            Inline::SoftBreak | Inline::HardBreak => {}
+            _ => return None,
+        }
+    }
+    // Require `$$` on their own lines: the source then reads `\n…\n`, and
+    // stripping one newline each side leaves the body whose rendered fence
+    // rows line up 1:1 with the source's two `$$` lines.
+    let inner = formula?.strip_prefix('\n')?.strip_suffix('\n')?;
+    Some(inner.to_string())
+}
+
+/// Split a display-math paragraph's source into `count` byte ranges, one per `$$...$$` formula.
+/// Each range runs from a formula's opening `$$` to just past its closing `$$` (the last extends
+/// to the paragraph end); the whitespace *between* formulas is left out of both — `ParsedDoc::build`
+/// covers it via `extended_ranges`, and absorbing it here would give the preceding formula an extra
+/// reveal row.  `None` when the delimiters cannot be matched (paragraph left as-is).
+///
+/// Assumes each formula is one `$$...$$` pair with no literal `$$` in its body — true for anything
+/// pulldown already parsed as a single `DisplayMath` event; a stray interior `$$` would miscount,
+/// which the `None` fallback does not catch, so this pins the invariant.
+fn split_math_ranges(source: &str, para: &Range<usize>, count: usize) -> Option<Vec<Range<usize>>> {
+    let body = source.get(para.clone())?;
+    let mut ranges = Vec::with_capacity(count);
+    let mut search_from = 0usize;
+    for i in 0..count {
+        let open = body[search_from..].find("$$")? + search_from;
+        // Closing `$$`: find the next occurrence after the opening.
+        let close_rel = body[open + 2..].find("$$")?;
+        let close = open + 2 + close_rel;
+        // If this is the last formula, the range extends to the end of
+        // the paragraph (absorbing trailing soft break / whitespace).
+        let end = if i + 1 == count {
+            body.len()
+        } else {
+            close + 2
+        };
+        ranges.push(para.start + open..para.start + end);
+        search_from = close + 2;
+    }
+    Some(ranges)
+}
+
 /// `Some((alt, url))` iff `inlines` is exactly one `Inline::Image` plus optional
 /// whitespace-only text and breaks.  Mixed content keeps its placeholder treatment.
 fn extract_lone_image(inlines: &[Inline]) -> Option<(String, String)> {

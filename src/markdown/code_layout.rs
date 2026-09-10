@@ -84,6 +84,12 @@ pub fn code_rendered_col_to_raw_col(raw_line: &str, fenced: bool, rendered_col: 
 /// every other block reveals its cursor line.  The single derivation of the rule — the mouse
 /// hit-test must agree with the view about which rows show raw text.
 ///
+/// A figures-off `$$...$$` paragraph renders as a fenced-style `math` code
+/// block (see [`display_math_block_body`](crate::markdown::parser::post_pass::display_math_block_body)),
+/// so it follows the same rule: only the `$$` delimiter rows reveal, and the
+/// formula body — whose characters don't change — stays rendered, exactly
+/// like a `` ```mermaid `` fence's body.
+///
 /// `block` is the *post-processed* AST block, resolved via
 /// [`ParsedDoc::real_block_for_byte`](crate::document::ParsedDoc::real_block_for_byte) — never by
 /// indexing `parsed.blocks` with a source-map index.  `None` (a blank-line virtual block)
@@ -96,6 +102,17 @@ pub fn line_allows_raw_reveal(
     match block {
         Some(Block::CodeBlock { fenced, .. }) => {
             is_code_fence_row(*fenced, raw_line_idx, raw_lines)
+        }
+        // A figures-off `$$...$$` math paragraph is painted as a fenced-style
+        // `math` code block, so reveal only its `$$` delimiter rows (the
+        // opening line and any `$$`-only line — matched by text so a trailing
+        // blank the paragraph range absorbs can't hide the closing one),
+        // never the formula body.
+        Some(b) if crate::markdown::parser::post_pass::display_math_block_body(b).is_some() => {
+            raw_line_idx == 0
+                || raw_lines
+                    .get(raw_line_idx)
+                    .is_some_and(|l| l.trim() == "$$")
         }
         _ => true,
     }
@@ -235,5 +252,39 @@ mod tests {
         assert!(!line_allows_raw_reveal(Some(&indented), 0, &indented_lines));
         assert!(line_allows_raw_reveal(Some(&para), 0, &prose_lines));
         assert!(line_allows_raw_reveal(None, 0, &prose_lines));
+    }
+
+    /// A figures-off `$$...$$` math paragraph reveals like a fenced code
+    /// block: only its `$$` delimiter rows de-render (opening row 0 and the
+    /// closing `$$` line), and the formula body stays rendered — the
+    /// characters don't change, so de-rendering it would be pointless churn
+    /// (the bug the reuse of this gate fixes).
+    #[test]
+    fn display_math_paragraph_reveals_only_its_delimiter_rows() {
+        use crate::markdown::ast::Inline;
+        let math = Block::Paragraph {
+            inlines: vec![Inline::Math {
+                source: "\nE = mc^2\n".into(),
+                display: true,
+            }],
+        };
+        let lines = ["$$", "E = mc^2", "$$"];
+        assert!(
+            line_allows_raw_reveal(Some(&math), 0, &lines),
+            "opening `$$` reveals"
+        );
+        assert!(
+            !line_allows_raw_reveal(Some(&math), 1, &lines),
+            "formula body must NOT de-render"
+        );
+        assert!(
+            line_allows_raw_reveal(Some(&math), 2, &lines),
+            "closing `$$` reveals"
+        );
+        // A trailing blank the paragraph range can absorb must not hide the
+        // closing `$$` (matched by text, not by last index).
+        let with_blank = ["$$", "E = mc^2", "$$", ""];
+        assert!(line_allows_raw_reveal(Some(&math), 2, &with_blank));
+        assert!(!line_allows_raw_reveal(Some(&math), 1, &with_blank));
     }
 }

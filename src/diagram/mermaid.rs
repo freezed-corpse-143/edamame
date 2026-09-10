@@ -2,22 +2,21 @@
 //! exporter; [`resolve_mermaid`] serves the App decode worker.
 //!
 //! Every call into the third-party renderer is wrapped in `catch_unwind`: `mermaid-rs-renderer`
-//! has known panic bugs (invalid hex colors, empty subgraphs, over-wide sequence labels) and a
-//! panicking worker thread would strand the cache entry as `Pending` forever.
+//! 0.2.x has known panic bugs (invalid hex colors, empty subgraphs, over-wide sequence labels)
+//! and a panicking worker thread would strand the cache entry as `Pending` forever.
 //!
-//! The synthetic URL `diagram-mermaid-<hex-sha256>` is content-addressed, so it is stable across
-//! reparses and editing one block invalidates only that block.  It is opaque elsewhere;
-//! `ImageBlockInfo.source` is the reliable discriminator.
+//! The shared cache-key URL scheme, [`DiagramSource`](super::common::DiagramSource), and
+//! [`DiagramError`] live in [`super::common`]; the LaTeX-math backend in [`super::math`].
 
-use std::fmt::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use sha2::{Digest, Sha256};
+use crate::image::{rasterize_svg, LoadedImage, SvgScaleMode, SvgSizing};
 
-use crate::image::{rasterize_svg, LoadedImage, SvgError, SvgScaleMode, SvgSizing};
+use super::common::{panic_message, DiagramError};
 
-/// Pre-populate the shared fontdb (which lives in `crate::image::svg`) and mermaid-rs-renderer's
-/// own font cache, off the hot path.  Called by the App warmup thread at startup.
+/// Pre-populate the shared fontdb (which lives in `crate::image::svg`, shared with the SVG-file
+/// rasterizer and the math backend) and mermaid-rs-renderer's own font cache, off the hot path.
+/// Called by the App warmup thread at startup.
 pub fn warm_fontdb() {
     crate::image::svg::warm_fontdb();
     // Best-effort, so a known upstream panic must not escape.  The guard keeps the process panic
@@ -27,60 +26,6 @@ pub fn warm_fontdb() {
     let _ = catch_unwind(|| {
         let _ = mermaid_rs_renderer::render("flowchart TD\nA-->B\n");
     });
-}
-
-/// Source for a diagram block.  An enum so other backends can be added without rewiring
-/// `ImageBlockInfo`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum DiagramSource {
-    Mermaid(String),
-}
-
-/// Errors reported by the diagram pipeline, one variant per stage so the hint line can name the
-/// failure.  Messages are owned `String`s rather than chained sources so this stays `Send + Sync`
-/// for the App's mpsc channel.
-#[derive(Debug, thiserror::Error)]
-pub enum DiagramError {
-    #[error("mermaid render failed: {0}")]
-    RenderFailed(String),
-    #[error("svg parse failed: {0}")]
-    SvgParse(String),
-    #[error("raster failed: {0}")]
-    Raster(String),
-    #[error("png decode failed: {0}")]
-    Decode(String),
-}
-
-impl From<SvgError> for DiagramError {
-    fn from(err: SvgError) -> Self {
-        match err {
-            SvgError::Parse(m) => DiagramError::SvgParse(m),
-            SvgError::Raster(m) => DiagramError::Raster(m),
-            SvgError::Decode(m) => DiagramError::Decode(m),
-        }
-    }
-}
-
-/// Prefix shared by every URL produced by [`synthetic_url`]; see [`is_diagram_url`].
-const SYNTHETIC_URL_PREFIX: &str = "diagram-mermaid-";
-
-/// Synthetic cache-key URL for a mermaid source; stable across process invocations.
-pub fn synthetic_url(source: &DiagramSource) -> String {
-    match source {
-        DiagramSource::Mermaid(src) => {
-            let digest = Sha256::digest(src.as_bytes());
-            let mut hex = String::with_capacity(digest.len() * 2);
-            for byte in digest {
-                write!(hex, "{byte:02x}").expect("writing to a String is infallible");
-            }
-            format!("{SYNTHETIC_URL_PREFIX}{hex}")
-        }
-    }
-}
-
-/// True for a [`synthetic_url`] key, as opposed to a document-authored image URL.
-pub fn is_diagram_url(url: &str) -> bool {
-    url.starts_with(SYNTHETIC_URL_PREFIX)
 }
 
 /// The renderer has no internal length, node-count, or timeout bound, so a pathological diagram
@@ -138,18 +83,6 @@ pub fn resolve_mermaid(
     })
 }
 
-/// Best-effort message from a `catch_unwind` payload; an unrecognized payload still reports a
-/// failure rather than being lost.
-fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
-        (*s).to_string()
-    } else {
-        "unknown payload".to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use image::DynamicImage;
@@ -164,28 +97,12 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_url_is_stable_for_same_source() {
-        let a = synthetic_url(&DiagramSource::Mermaid("flowchart TD\nA-->B".into()));
-        let b = synthetic_url(&DiagramSource::Mermaid("flowchart TD\nA-->B".into()));
-        assert_eq!(a, b);
-        assert!(a.starts_with("diagram-mermaid-"));
-        assert_eq!(a.len(), "diagram-mermaid-".len() + 64);
-    }
-
-    #[test]
     fn oversized_mermaid_source_is_rejected_before_render() {
         // Must error out *without* reaching the renderer, so this test needs no fonts.
         let huge = format!("flowchart TD\n{}", "A-->B\n".repeat(20_000));
         assert!(huge.len() > 64 * 1024);
         let err = render_mermaid_svg(&huge).unwrap_err();
         assert!(matches!(err, DiagramError::RenderFailed(_)));
-    }
-
-    #[test]
-    fn synthetic_url_differs_for_different_sources() {
-        let a = synthetic_url(&DiagramSource::Mermaid("flowchart TD\nA-->B".into()));
-        let b = synthetic_url(&DiagramSource::Mermaid("flowchart TD\nA-->C".into()));
-        assert_ne!(a, b);
     }
 
     // Non-deterministic across font installs, so this is a "does it render at all" check only.

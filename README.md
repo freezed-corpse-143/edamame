@@ -89,7 +89,7 @@ edamame checks for a new release once a day and tells you when one appears (see 
 
 - **Hybrid rendered/raw editing** — the document stays formatted; only the cursor's line shows its source
 - **Real table editing** — tables render as a grid, you edit cell by cell, `Tab` between cells, drag with the mouse to reorder or resize
-- **Inline images and Mermaid diagrams** on terminals that support them
+- **Inline images, Mermaid diagrams, and LaTeX math** on terminals that support them
 - **Search and replace**, with smartcase navigation
 - **Diff review for external changes** — when something else writes your file, accept or reject each change hunk by hunk instead of losing work
 - **Vim mode**, optional — motions, operators, text objects, `:s` with a live preview
@@ -122,7 +122,7 @@ edamame runs anywhere, but a few things depend on your terminal:
 
 | Feature | Requires |
 |---|---|
-| Images, diagrams, most themes | 24-bit color (plus an image protocol for images) |
+| Images, diagrams, math, most themes | 24-bit color (plus an image protocol for images) |
 | Mouse selection and table handles | Mouse reporting |
 | ``Ctrl-` ``, `Ctrl-Shift-T`, `Alt-Shift-*` | The kitty keyboard protocol |
 

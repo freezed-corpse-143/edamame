@@ -19,7 +19,7 @@ use ratatui::{
     widgets::{Block, Paragraph, StatefulWidget, Widget, Wrap},
 };
 
-use crate::config::{DiagramsEnabled, ImagesEnabled, RemoteImagePolicy, Theme};
+use crate::config::{FiguresEnabled, ImagesEnabled, RemoteImagePolicy, Theme};
 use crate::terminal::Capabilities;
 use crate::ui::cap_summary::{cap_row_height, render_cap_row as shared_render_cap_row, CapSummary};
 use crate::ui::controls::{self, Control, ControlEvent, ControlInput, ControlValue};
@@ -84,7 +84,7 @@ pub struct WelcomeState {
     pub focused: WelcomeFocus,
     pub images: ImagesEnabled,
     pub remote: RemoteImagePolicy,
-    pub diagrams: DiagramsEnabled,
+    pub diagrams: FiguresEnabled,
     /// "Use Vim motions" toggle; Save flips `config.modal.handler` to `"vim"` and activates
     /// modal editing for the running session.
     pub use_vim: bool,
@@ -147,7 +147,7 @@ impl WelcomeState {
         caps: &Capabilities,
         images: ImagesEnabled,
         remote: RemoteImagePolicy,
-        diagrams: DiagramsEnabled,
+        diagrams: FiguresEnabled,
         use_vim: bool,
         check_for_updates: bool,
     ) -> Self {
@@ -159,7 +159,7 @@ impl WelcomeState {
         let (images, diagrams) = if full_color {
             (images, diagrams)
         } else {
-            (ImagesEnabled::Never, DiagramsEnabled::Never)
+            (ImagesEnabled::Never, FiguresEnabled::Never)
         };
         let mut state = Self {
             focused: WelcomeFocus::Theme,
@@ -414,7 +414,7 @@ const CONTROL_COL: u16 = 22;
 const QUICK_START_TEXT: &str = "edamame is a Markdown editor for your terminal, featuring:\n\
 • 3 modes — PREVIEW for viewing; EDIT renders everything but \
 the line the cursor is on; RAW is unformatted \n\
-• Mouse, image, and Mermaid diagram support, depending on your terminal's capabilities\n\
+• Mouse, image, KaTeX Math, and Mermaid diagram support, depending on your terminal's capabilities\n\
 • GitHub Flavored Markdown, including tables, task lists, and more, plus highlights\n\
 • Diff mode — review external file changes hunk by hunk\n\
 • Command palette for access to commands and settings (Ctrl-P)\n\
@@ -423,10 +423,10 @@ the line the cursor is on; RAW is unformatted \n\
 const DEGRADED_HINT: &str = "✗ — Consider upgrading to a modern terminal, \
 such as kitty, wezterm, or ghostty, for a better experience.";
 /// Hint shown when the terminal is below 24-bit color.  `WelcomeState::new` forces images and
-/// diagrams to `Never` and Save persists that, so without this line the modal would silently
+/// figures to `Never` and Save persists that, so without this line the modal would silently
 /// write two settings the user never chose.  Says "24-bit color" rather than naming a depth:
 /// `Ansi256`, `Ansi16`, and `NoColor` all take the same branch.
-const NO_TRUECOLOR_HINT: &str = "✗ — Images and diagrams have been turned off \
+const NO_TRUECOLOR_HINT: &str = "✗ — Images and figures have been turned off \
 and theme switching is unavailable due to no 24-bit color support.";
 
 /// Rows a string occupies at `width` columns under `Paragraph::wrap(Wrap { trim: false })`.
@@ -746,7 +746,7 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
             &mut scratch,
             scratch_rect,
             y,
-            "Show diagrams",
+            "Show figures",
             controls::pill_spans(
                 controls::ASK_ALWAYS_NEVER,
                 pill_index(&DIAGRAMS_ORDER, state.diagrams),
@@ -765,7 +765,7 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
             body_x,
             y,
             body_w,
-            "Render mermaid code blocks as inline diagrams.",
+            "Render mermaid diagrams and $$…$$ math inline.",
             muted_style,
             self.theme,
         );
@@ -1006,10 +1006,10 @@ const REMOTE_ORDER: [RemoteImagePolicy; 3] = [
     RemoteImagePolicy::Always,
     RemoteImagePolicy::Never,
 ];
-const DIAGRAMS_ORDER: [DiagramsEnabled; 3] = [
-    DiagramsEnabled::Ask,
-    DiagramsEnabled::Always,
-    DiagramsEnabled::Never,
+const DIAGRAMS_ORDER: [FiguresEnabled; 3] = [
+    FiguresEnabled::Ask,
+    FiguresEnabled::Always,
+    FiguresEnabled::Never,
 ];
 
 /// Index of `value` within its pill `order`, for [`Control::apply`].  Falls back to 0, which is
@@ -1173,7 +1173,7 @@ mod tests {
             caps,
             ImagesEnabled::Ask,
             RemoteImagePolicy::Ask,
-            DiagramsEnabled::Ask,
+            FiguresEnabled::Ask,
             false,
             true,
         )
@@ -1384,7 +1384,7 @@ mod tests {
         // and render quantized halfblocks.  Remote is a fetch preference, so it keeps its value.
         let s = make_state(&caps_256_color());
         assert_eq!(s.images, ImagesEnabled::Never);
-        assert_eq!(s.diagrams, DiagramsEnabled::Never);
+        assert_eq!(s.diagrams, FiguresEnabled::Never);
         assert_eq!(s.remote, RemoteImagePolicy::Ask);
     }
 
@@ -1392,7 +1392,7 @@ mod tests {
     fn truecolor_leaves_the_incoming_tristate_values_alone() {
         let s = make_state(&caps_full());
         assert_eq!(s.images, ImagesEnabled::Ask);
-        assert_eq!(s.diagrams, DiagramsEnabled::Ask);
+        assert_eq!(s.diagrams, FiguresEnabled::Ask);
         assert_eq!(s.remote, RemoteImagePolicy::Ask);
     }
 

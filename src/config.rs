@@ -15,7 +15,7 @@ pub mod warnings;
 // name in dead-code analysis, but removing it breaks resolution in `src/export/`.
 #[allow(unused_imports)]
 pub use config::{
-    AppearanceMode, Config, ConfigWarning, CustomExportEntry, DiagramsEnabled, ImagesEnabled,
+    AppearanceMode, Config, ConfigWarning, CustomExportEntry, FiguresEnabled, ImagesEnabled,
     LoadedConfig, RemoteImagePolicy, WarningKind,
 };
 pub use keymap::{Action, CoalesceKind, KeyBindingOverrides, KeyMap, KeyMapError};

@@ -1947,19 +1947,19 @@ mod tests {
     /// ever set `session_diagrams_enabled`.
     #[test]
     fn a_read_only_review_asks_the_media_prompts_for_its_document() {
-        use crate::app::modal::DiagramsEnabledPromptModal;
+        use crate::app::modal::FiguresEnabledPromptModal;
         let old = "# Doc\n\n```mermaid\ngraph TD;\nA-->B;\n```\n\nbefore\n";
         let new = "# Doc\n\n```mermaid\ngraph TD;\nA-->B;\n```\n\nafter\n";
         let app = read_only_app(old, new);
         assert!(
             matches!(
-                app.config.diagrams.enabled,
-                crate::config::DiagramsEnabled::Ask
+                app.config.figures.enabled,
+                crate::config::FiguresEnabled::Ask
             ),
             "ask is the default policy this test depends on",
         );
         assert!(
-            app.modal_stack.contains::<DiagramsEnabledPromptModal>(),
+            app.modal_stack.contains::<FiguresEnabledPromptModal>(),
             "the diagrams prompt must be queued for the reviewed document",
         );
     }

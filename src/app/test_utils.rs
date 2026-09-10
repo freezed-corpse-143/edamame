@@ -50,7 +50,7 @@ mod theme_downgrade_tests {
 
     use crate::app::modal::types::{Modal, ModalOutcome};
     use crate::app::modal::{TerminalCapabilitiesModal, ThemeDowngradeModal, WelcomeModal};
-    use crate::config::{Config, DiagramsEnabled, ImagesEnabled, KeyBindingOverrides, Theme};
+    use crate::config::{Config, FiguresEnabled, ImagesEnabled, KeyBindingOverrides, Theme};
     use crate::terminal::{Capabilities, ColorDepth};
 
     use super::App;
@@ -114,7 +114,7 @@ mod theme_downgrade_tests {
             ..Config::default()
         };
         config.images.enabled = ImagesEnabled::Always;
-        config.diagrams.enabled = DiagramsEnabled::Always;
+        config.figures.enabled = FiguresEnabled::Always;
         let app = App::new(
             config,
             KeyBindingOverrides::default(),
@@ -132,7 +132,7 @@ mod theme_downgrade_tests {
         assert!(!app.editor.images_enabled);
         assert!(!app.editor.diagrams_enabled);
         assert_eq!(app.config.images.enabled, ImagesEnabled::Always);
-        assert_eq!(app.config.diagrams.enabled, DiagramsEnabled::Always);
+        assert_eq!(app.config.figures.enabled, FiguresEnabled::Always);
     }
 
     #[test]
@@ -143,7 +143,7 @@ mod theme_downgrade_tests {
         };
         let mut config = Config::default();
         config.images.enabled = ImagesEnabled::Always;
-        config.diagrams.enabled = DiagramsEnabled::Always;
+        config.figures.enabled = FiguresEnabled::Always;
         let app = App::new(
             config,
             KeyBindingOverrides::default(),
@@ -198,7 +198,7 @@ mod theme_downgrade_tests {
         let _iso = crate::test_env::config_isolation();
         let mut app = app_with_welcome(ColorDepth::Ansi256, "Dracula", false);
         app.config.images.enabled = ImagesEnabled::Always;
-        app.config.diagrams.enabled = DiagramsEnabled::Always;
+        app.config.figures.enabled = FiguresEnabled::Always;
 
         let mut modal = WelcomeModal::new(
             &Capabilities {
@@ -220,7 +220,8 @@ mod theme_downgrade_tests {
         }
 
         assert_eq!(app.config.images.enabled, ImagesEnabled::Always);
-        assert_eq!(app.config.diagrams.enabled, DiagramsEnabled::Always);
+        assert_eq!(app.config.figures.enabled, FiguresEnabled::Always);
+        // The session still refuses to draw them.
         assert!(!app.effective_images_enabled());
         assert!(!app.effective_diagrams_enabled());
     }

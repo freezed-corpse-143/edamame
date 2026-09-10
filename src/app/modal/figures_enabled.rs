@@ -1,6 +1,8 @@
-//! Diagrams-enabled prompt (Yes / No / Always / Never; Esc = No), shown when
-//! `config.diagrams.enabled` is `Ask` and the document has a diagram block.  Deliberately
-//! independent of [`super::ImagesEnabledPromptModal`] so the two opt-ins are separate.
+//! Figures-enabled prompt (Yes / No / Always / Never; Esc = No), shown when
+//! `config.figures.enabled` is `Ask` and the document has a figure — a diagram code block (e.g.
+//! ```mermaid) or a `$$...$$` display-math paragraph.  Yes / No affect only this session; Always /
+//! Never persist.  Deliberately independent of [`super::ImagesEnabledPromptModal`] so the two
+//! opt-ins are separate.
 
 use std::any::Any;
 
@@ -16,16 +18,17 @@ use crate::config::Config;
 use crate::editor::EditorState;
 use crate::ui::{ModalButton, ModalResponse};
 
-pub struct DiagramsEnabledPromptModal {
+pub struct FiguresEnabledPromptModal {
     body: Vec<Line<'static>>,
     buttons: Vec<ModalButton>,
     chrome: ModalChrome,
 }
 
-impl DiagramsEnabledPromptModal {
-    /// `None` unless the policy is `Ask` and the document has diagram blocks.
+impl FiguresEnabledPromptModal {
+    /// `None` unless the policy is `Ask` and the document has a figure (a diagram or `$$...$$`
+    /// math block).
     pub fn from_state(editor: &EditorState, config: &Config) -> Option<Self> {
-        if !matches!(config.diagrams.enabled, crate::config::DiagramsEnabled::Ask) {
+        if !matches!(config.figures.enabled, crate::config::FiguresEnabled::Ask) {
             return None;
         }
         let has_diagram = editor
@@ -37,9 +40,9 @@ impl DiagramsEnabledPromptModal {
             return None;
         }
         let body = vec![
-            Line::raw("This document contains diagrams."),
+            Line::raw("This document contains figures (diagrams or math)."),
             Line::raw(""),
-            Line::raw("Would you like edamame to display diagrams?"),
+            Line::raw("Would you like edamame to display them?"),
         ];
         Some(Self {
             body,
@@ -65,13 +68,13 @@ impl DiagramsEnabledPromptModal {
                 })),
                 1 => ModalOutcome::CloseAnd(Box::new(decline_for_session)),
                 2 => ModalOutcome::CloseAnd(Box::new(|app| {
-                    app.config.diagrams.enabled = crate::config::DiagramsEnabled::Always;
-                    app.save_config_with_flash("failed to persist diagrams.enabled=always");
+                    app.config.figures.enabled = crate::config::FiguresEnabled::Always;
+                    app.save_config_with_flash("failed to persist figures.enabled=always");
                     app.dispatch_image_decodes();
                 })),
                 _ => ModalOutcome::CloseAnd(Box::new(|app| {
-                    app.config.diagrams.enabled = crate::config::DiagramsEnabled::Never;
-                    app.save_config_with_flash("failed to persist diagrams.enabled=never");
+                    app.config.figures.enabled = crate::config::FiguresEnabled::Never;
+                    app.save_config_with_flash("failed to persist figures.enabled=never");
                     decline_for_session(app);
                 })),
             },
@@ -79,10 +82,10 @@ impl DiagramsEnabledPromptModal {
     }
 }
 
-impl Modal for DiagramsEnabledPromptModal {
+impl Modal for FiguresEnabledPromptModal {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &ModalRenderCtx<'_>) {
         self.chrome
-            .render(frame, area, ctx, "Diagrams", &self.body, &self.buttons);
+            .render(frame, area, ctx, "Figures", &self.body, &self.buttons);
     }
 
     fn handle_key(

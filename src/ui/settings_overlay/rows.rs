@@ -3,7 +3,7 @@
 //! underlying config field.  Adding a setting should only touch this file.
 
 use crate::config::sections::{DEFAULT_HANDLER, MAX_WIDTH_COLS_MIN, VIM_HANDLER};
-use crate::config::{Config, DiagramsEnabled, ImagesEnabled, RemoteImagePolicy};
+use crate::config::{Config, FiguresEnabled, ImagesEnabled, RemoteImagePolicy};
 use crate::ui::controls;
 
 /// Labels referenced from outside this module are constants so the App-level live-update wiring in
@@ -22,7 +22,8 @@ pub(crate) const LABEL_SCROLL_SPEED: &str = "Scroll speed";
 pub(crate) const LABEL_VIM_MODE: &str = "Vim mode";
 pub(crate) const LABEL_BLINK_CURSOR: &str = "Blink cursor";
 pub(crate) const LABEL_SHOW_IMAGES: &str = "Show images";
-pub(crate) const LABEL_SHOW_DIAGRAMS: &str = "Show diagrams";
+pub(crate) const LABEL_SHOW_DIAGRAMS: &str = "Show figures";
+pub(crate) const LABEL_MATH_PREVIEW: &str = "  Math edit preview";
 pub(crate) const LABEL_SHOW_REMOTE_IMAGES: &str = "  Show remote images";
 pub(crate) const LABEL_AUTOSAVE: &str = "Autosave";
 pub(crate) const LABEL_LIMIT_WIDTH: &str = "Limit editor width";
@@ -145,10 +146,10 @@ const IMAGES_ENABLED_ORDER: &[ImagesEnabled] = &[
     ImagesEnabled::Never,
 ];
 
-const DIAGRAMS_ENABLED_ORDER: &[DiagramsEnabled] = &[
-    DiagramsEnabled::Ask,
-    DiagramsEnabled::Always,
-    DiagramsEnabled::Never,
+const FIGURES_ENABLED_ORDER: &[FiguresEnabled] = &[
+    FiguresEnabled::Ask,
+    FiguresEnabled::Always,
+    FiguresEnabled::Never,
 ];
 
 const REMOTE_POLICY_ORDER: &[RemoteImagePolicy] = &[
@@ -192,19 +193,19 @@ fn parse_images_enabled(s: &str) -> Result<ImagesEnabled, String> {
     }
 }
 
-fn diagrams_enabled_label(v: DiagramsEnabled) -> &'static str {
+fn diagrams_enabled_label(v: FiguresEnabled) -> &'static str {
     match v {
-        DiagramsEnabled::Ask => "Ask",
-        DiagramsEnabled::Always => "Always",
-        DiagramsEnabled::Never => "Never",
+        FiguresEnabled::Ask => "Ask",
+        FiguresEnabled::Always => "Always",
+        FiguresEnabled::Never => "Never",
     }
 }
 
-fn parse_diagrams_enabled(s: &str) -> Result<DiagramsEnabled, String> {
+fn parse_diagrams_enabled(s: &str) -> Result<FiguresEnabled, String> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "ask" => Ok(DiagramsEnabled::Ask),
-        "always" => Ok(DiagramsEnabled::Always),
-        "never" => Ok(DiagramsEnabled::Never),
+        "ask" => Ok(FiguresEnabled::Ask),
+        "always" => Ok(FiguresEnabled::Always),
+        "never" => Ok(FiguresEnabled::Never),
         other => Err(format!("expected Ask/Always/Never, got {other:?}")),
     }
 }
@@ -442,29 +443,52 @@ pub(super) fn build_rows() -> Vec<RowDef> {
         },
         RowDef {
             label: LABEL_SHOW_DIAGRAMS,
-            description: Some("\nRender Mermaid code blocks as inline diagrams"),
+            description: Some("\nRender mermaid diagrams and $$…$$ math inline"),
             describe: None,
             kind: RowKind {
                 focusable: true,
                 action: RowAction::Cycle,
-                read: |c, _| diagrams_enabled_label(c.diagrams.enabled).to_owned(),
+                read: |c, _| diagrams_enabled_label(c.figures.enabled).to_owned(),
                 write_string: |c, v| {
-                    c.diagrams.enabled = parse_diagrams_enabled(v)?;
+                    c.figures.enabled = parse_diagrams_enabled(v)?;
                     Ok(())
                 },
                 read_value: Some(|c| {
                     controls::ControlValue::Choice(order_index(
-                        DIAGRAMS_ENABLED_ORDER,
-                        c.diagrams.enabled,
+                        FIGURES_ENABLED_ORDER,
+                        c.figures.enabled,
                     ))
                 }),
                 write_value: Some(|c, v| {
                     if let controls::ControlValue::Choice(i) = v {
-                        c.diagrams.enabled = order_value(DIAGRAMS_ENABLED_ORDER, i);
+                        c.figures.enabled = order_value(FIGURES_ENABLED_ORDER, i);
                     }
                 }),
                 options: Some(controls::Control::Pill(controls::ASK_ALWAYS_NEVER)),
                 disabled: None,
+            },
+        },
+        RowDef {
+            label: LABEL_MATH_PREVIEW,
+            description: Some("\nEditing a $$…$$ block opens its source below the formula"),
+            describe: None,
+            kind: RowKind {
+                focusable: true,
+                action: RowAction::Cycle,
+                read: |c, _| bool_label(c.figures.math_preview).to_owned(),
+                write_string: no_write,
+                read_value: Some(|c| controls::ControlValue::Toggle(c.figures.math_preview)),
+                write_value: Some(|c, v| {
+                    if let controls::ControlValue::Toggle(b) = v {
+                        c.figures.math_preview = b;
+                    }
+                }),
+                options: Some(controls::Control::Toggle),
+                // Inert when figures are off: with `[figures].enabled =
+                // "never"` no `$$...$$` block is promoted, so there is no
+                // reveal for the preview to affect.  Mirrors the
+                // remote-images row locking to images-`Never`.
+                disabled: Some(|c| matches!(c.figures.enabled, FiguresEnabled::Never)),
             },
         },
         RowDef {

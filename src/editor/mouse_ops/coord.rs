@@ -277,14 +277,24 @@ pub fn rendered_sub_line_to_offset(
         let (raw_idx, sub) = table_raw_line_idx(state, &block, block_text);
         table_sub = sub;
         raw_idx
-    } else if state.parsed.is_image_block(block.idx) && !state.parsed.is_mermaid_block(block.idx) {
-        // An image reserves many rendered rows for one source line; mapping a reserved row
-        // through `sub_idx` would index a phantom raw line and poison the inline-map cache for
-        // an unrelated buffer line.  Mermaid is excluded: its reveal overlay paints raw source
-        // 1:1 onto the reserved rows, so `sub_idx` is the correct source line there.
+    } else if state.parsed.is_image_block(block.idx)
+        && !state.parsed.is_diagram_reveal_block(block.idx)
+    {
+        // An image reserves many rendered rows for one source line; mapping a reserved row through
+        // `sub_idx` would index a phantom raw line and poison the inline-map cache for an unrelated
+        // buffer line.  Diagram-reveal blocks (mermaid fences, `$$...$$` math) are excluded: their
+        // reveal overlay paints raw source 1:1 onto the reserved rows, so `sub_idx` is the correct
+        // source line there.
         0
     } else {
-        block.sub_idx
+        // Diagram-reveal blocks map the rendered sub-row to a raw source
+        // line 1:1, minus the math-preview band a `$$...$$` reveal reserves
+        // above the source (0 for mermaid, a preview-off reveal, or any
+        // ordinary block).  A click on the band rows themselves resolves to
+        // the first source line.
+        block
+            .sub_idx
+            .saturating_sub(state.parsed.latex_source_offset(block.idx))
     };
 
     // Virtual blank blocks: place the cursor at block start.
@@ -379,7 +389,7 @@ pub fn rendered_sub_line_to_offset(
         && line_reveals
         && state.cursor_block_revealed()
         && rendered_line_idx == crate::editor::state::cursor_rendered_line_idx(state);
-    if state.parsed.is_mermaid_block(block.idx) || revealed_cursor_line {
+    if state.parsed.is_diagram_reveal_block(block.idx) || revealed_cursor_line {
         let (rows, indent) = revealed_raw_rows(line_text, viewport_width);
         let sub = sub_row_within_line.min(rows.len().saturating_sub(1));
         let row = rows.get(sub).copied().unwrap_or((0, 0, 0));
@@ -560,8 +570,12 @@ fn revealed_raw_row_count(
         .get(block_range.start..block_range.end.min(source.len()))
         .unwrap_or("");
 
-    if state.parsed.is_mermaid_block(cursor_block_idx) {
-        let sub = rendered_line_idx - block_lines.start;
+    if state.parsed.is_diagram_reveal_block(cursor_block_idx) {
+        // Shift past the math-preview band (0 unless this is a `$$...$$`
+        // reveal with the preview on) so the rendered row maps to its raw
+        // source line; band rows clamp to the first line.
+        let band = state.parsed.latex_source_offset(cursor_block_idx);
+        let sub = (rendered_line_idx - block_lines.start).saturating_sub(band);
         let raw_line = block_text.split('\n').nth(sub).unwrap_or("");
         return Some(revealed_raw_rows(raw_line, viewport_width).0.len().max(1));
     }

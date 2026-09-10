@@ -199,6 +199,15 @@ pub struct App {
     autosave_pending_since: Option<Instant>,
     /// Last-observed `Buffer::version()`, so `tick_autosave` can spot an edit since the last tick.
     autosave_last_seen_version: u64,
+    /// Debounce deadline for figure (diagram / `$$...$$` math) render dispatch.  While `now < t`
+    /// the per-frame dispatch skips figure-sourced blocks (plain images unaffected), so a
+    /// keystroke's throwaway content-hashed URL isn't rendered mid-burst — see
+    /// [`DIAGRAM_RENDER_DEBOUNCE`](image_dispatch::DIAGRAM_RENDER_DEBOUNCE).  Re-armed on each edit;
+    /// paired with [`Self::diagram_render_watch_version`] for edit-edge detection.
+    diagram_render_hold_until: Option<Instant>,
+    /// Last-observed `Buffer::version()` for the figure-render debounce.  `None` until the first
+    /// dispatch pass so opening a document doesn't count as an edit and delay its first render.
+    diagram_render_watch_version: Option<u64>,
     /// Debounce for the section picker's live-preview scroll; without it, holding `↓` thrashes
     /// the viewport on every focus change.
     section_jump_pending_since: Option<Instant>,
@@ -283,6 +292,7 @@ fn configure_new_editor(
     editor.set_big_h1(config.editor.big_h1);
     editor.set_syntax_highlighting(config.editor.syntax_highlighting);
     editor.set_reflow(config.editor.reflow);
+    editor.set_math_preview(config.figures.math_preview);
     if !images_layout_on || !diagrams_layout_on {
         editor.refresh_parsed();
     }
@@ -382,10 +392,7 @@ impl App {
         let images_off = !capabilities.full_color()
             || matches!(config.images.enabled, crate::config::ImagesEnabled::Never);
         let diagrams_off = !capabilities.full_color()
-            || matches!(
-                config.diagrams.enabled,
-                crate::config::DiagramsEnabled::Never
-            );
+            || matches!(config.figures.enabled, crate::config::FiguresEnabled::Never);
         // The grammar warm worker takes two costs off the critical path: deserializing the syntax
         // dump (~2 ms) and compiling each grammar a document names (~9-18 ms) — the latter being
         // the one highlighting cost that scales with how many *languages* are in play rather than
@@ -462,7 +469,7 @@ impl App {
         let diagrams_enabled_prompt = if suppress_legacy_prompts || !media_capable {
             None
         } else {
-            modal::DiagramsEnabledPromptModal::from_state(&editor, &config)
+            modal::FiguresEnabledPromptModal::from_state(&editor, &config)
         };
         let remote_image_prompt = if suppress_legacy_prompts || !media_capable {
             None
@@ -504,15 +511,11 @@ impl App {
             modal_stack.push(Box::new(m));
         }
 
-        // Warm both font caches the diagram pipeline loads on first call (mermaid's own fontdb
+        // Warm both font caches the figure pipeline loads on first call (mermaid's own fontdb
         // and ours for `usvg`) off the critical path: each scans OS font dirs for 100-300 ms, and
-        // without this a document with N diagrams spawns N concurrent scans — the dominant source
-        // of initial-load lag.  Skipped when no diagram can ever decode, where it is wasted IO.
-        if media_capable
-            && !matches!(
-                config.diagrams.enabled,
-                crate::config::DiagramsEnabled::Never
-            )
+        // without this a document with N figures spawns N concurrent scans — the dominant source
+        // of initial-load lag.  Skipped when no figure can ever decode, where it is wasted IO.
+        if media_capable && !matches!(config.figures.enabled, crate::config::FiguresEnabled::Never)
         {
             std::thread::spawn(crate::diagram::warm_fontdb);
         }
@@ -571,6 +574,8 @@ impl App {
             started_with_new_file,
             autosave_pending_since: None,
             autosave_last_seen_version: 0,
+            diagram_render_hold_until: None,
+            diagram_render_watch_version: None,
             section_jump_pending_since: None,
             section_jump_target_scroll: None,
             diff_advance_pending_since: None,

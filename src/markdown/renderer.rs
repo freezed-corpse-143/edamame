@@ -239,12 +239,22 @@ impl<'t> Renderer<'t> {
                 self.render_heading(*level, inlines, out);
             }
             Block::Paragraph { inlines } => {
-                self.render_paragraph(
-                    inlines,
-                    out,
-                    indent_prefix,
-                    self.reflow_paragraphs && top_level,
-                );
+                // A `$$...$$`-only paragraph that survived promotion (figures disabled) renders
+                // as a fenced-style ` math ` code block — the source counterpart of the
+                // display-math reveal — matching how a `` ```mermaid `` fence stays a code block
+                // when figures are off.
+                if let Some(body) =
+                    crate::markdown::parser::post_pass::display_math_block_body(block)
+                {
+                    self.render_code_block(Some("math"), &body, true, out);
+                } else {
+                    self.render_paragraph(
+                        inlines,
+                        out,
+                        indent_prefix,
+                        self.reflow_paragraphs && top_level,
+                    );
+                }
             }
             Block::CodeBlock {
                 language,
@@ -813,6 +823,12 @@ impl<'t> Renderer<'t> {
                     .chars()
                     .count()
             }
+            // Math renders as its delimited source — width equals the raw
+            // text width, so table borders and cursor columns stay aligned.
+            Inline::Math { source, display } => {
+                let delim = if *display { "$$" } else { "$" };
+                delim.chars().count() + source.chars().count() + delim.chars().count()
+            }
             Inline::SoftBreak | Inline::HardBreak => 1,
         }
     }
@@ -930,6 +946,21 @@ impl<'t> Renderer<'t> {
                 vec![Span::styled(
                     reference_marker(std::iter::once(label.as_str())),
                     base.patch(self.theme.footnote),
+                )]
+            }
+
+            // Math renders as its delimited source text in phase 1 —
+            // width-equivalent to the raw source, so wrap, cursor columns
+            // and the inline column map need no adjustment.  A paragraph
+            // holding exactly one display-math inline is promoted to a
+            // `Block::ImageBlock` by the post-pass before it ever reaches
+            // this arm, so the display form here is the mixed-paragraph
+            // fallback only.
+            Inline::Math { source, display } => {
+                let delim = if *display { "$$" } else { "$" };
+                vec![Span::styled(
+                    format!("{delim}{source}{delim}"),
+                    base.patch(self.theme.code_span),
                 )]
             }
 

@@ -43,7 +43,7 @@ appearance = "dark"
 
 # Show the first-run welcome modal at startup. The modal's "Show on next
 # launch" toggle writes this value when you save. While the welcome is still
-# pending it also suppresses the images / remote-image / diagrams / capabilities
+# pending it also suppresses the images / remote-image / figures / capabilities
 # prompts so you are never double-prompted. Default: true.
 # show_welcome = true
 
@@ -197,12 +197,19 @@ enabled = "ask"
 # Policy for `http(s)://` image URLs: "ask" | "always" | "never".
 remote_policy = "ask"
 
-# ── Diagrams ──────────────────────────────────────────────────────────────────
-[diagrams]
-# Master switch for inline diagram rendering (e.g. ```mermaid):
-# "ask" | "always" | "never".  Kept separate from `[images].enabled` so a
-# user can opt in to one without the other.
+# ── Figures ───────────────────────────────────────────────────────────────────
+[figures]
+# Master switch for inline rendering of figures — ```mermaid diagrams and
+# `$$...$$` display math: "ask" | "always" | "never".  Kept separate from
+# `[images].enabled` so a user can opt in to one without the other.
+# (Renamed from [diagrams]; an old [diagrams] section is still read and is
+# migrated to [figures] automatically.)
 enabled = "ask"
+# While editing a `$$...$$` math block (cursor inside it, in Rendered mode),
+# keep the rendered formula in place and open its editable source just below
+# it, re-rendered on every keystroke.  Set false to hide the image during
+# editing and show the source alone, like a mermaid diagram.  Math blocks only.
+math_preview = true
 
 # ── Export ────────────────────────────────────────────────────────────────────
 # Run an export from the command palette (Ctrl-P → "Export…"). Pick the
@@ -219,8 +226,10 @@ enabled = "ask"
 #                               # written there on first run — copy it to
 #                               # `<name>.css` and edit it as a starting point.
 # inline_images  = false        # when true, local images are base64-embedded
-# diagrams       = true         # render ```mermaid blocks as inline SVG
-#                               # (false → leave as <pre><code class="language-mermaid">)
+# figures        = true         # render ```mermaid diagrams and $$...$$ display
+#                               # math as embedded PNG images (false → leave each
+#                               # as source: the code block / literal $$...$$ text).
+#                               # Renamed from `diagrams`; the old key is still read.
 
 # Custom export targets. Each block adds one format to the export modal's
 # Format list. edamame renders the document to HTML first — using the

@@ -341,7 +341,16 @@ impl<'a> StatefulWidget for EditorView<'a> {
         // as source, and diff has no raw-reveal to suppress.
         if matches!(mode, Mode::Preview | Mode::Rendered | Mode::Diff) {
             let suppress = if mode == Mode::Rendered && self.state.cursor_block_revealed() {
-                self.state.cursor_block_idx
+                // A revealed block suppresses its image so the raw source
+                // is all the user sees.  The exception is a `$$...$$` block
+                // with the math preview on: it keeps its image as the live
+                // preview painted in the band at the block's top, with the
+                // source below (the snapshot rect already excludes the
+                // source rows).
+                let preview = self.state.math_preview;
+                self.state
+                    .cursor_block_idx
+                    .filter(|&idx| !(preview && self.state.parsed.is_latex_block(idx)))
             } else {
                 None
             };

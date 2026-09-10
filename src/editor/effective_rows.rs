@@ -78,7 +78,12 @@ impl EffectiveRowsCache {
     }
 
     /// Store a freshly built patch under `key`.
-    pub fn store(&mut self, key: (u64, usize, Option<usize>), base_total: usize, patch: Option<Rc<Patch>>) {
+    pub fn store(
+        &mut self,
+        key: (u64, usize, Option<usize>),
+        base_total: usize,
+        patch: Option<Rc<Patch>>,
+    ) {
         self.key = Some(key);
         self.base_total = base_total;
         self.patch = patch;

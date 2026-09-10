@@ -290,6 +290,7 @@ fn collect_link_runs_from_inlines(inlines: &[Inline], out: &mut Vec<LinkRun>) {
             | Inline::Code(_)
             | Inline::HtmlComment(_)
             | Inline::FootnoteReference { .. }
+            | Inline::Math { .. }
             | Inline::SoftBreak
             | Inline::HardBreak => {}
         }

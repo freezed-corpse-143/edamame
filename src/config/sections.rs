@@ -224,29 +224,39 @@ impl Default for ImagesConfig {
     }
 }
 
-/// Master switch for inline diagram rendering (e.g. mermaid); `Never` keeps the placeholder.
+/// Master switch for inline *figure* rendering — mermaid diagrams and `$$...$$` display math,
+/// which share this gate.  `Never` keeps the placeholder / source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum DiagramsEnabled {
-    /// Prompt the first time a document with diagrams is opened.
+pub enum FiguresEnabled {
+    /// Prompt the first time a document with a figure is opened.
     #[default]
     Ask,
+    /// Always render figures inline.
     Always,
+    /// Never render figures — always fall back to the placeholder / source.
     Never,
 }
 
-/// Diagram-rendering configuration.  Mirrors [`ImagesConfig::enabled`], kept separate so a user
-/// can opt in to images but not diagrams.
+/// Figure-rendering configuration (mermaid diagrams and display math).  Mirrors
+/// [`ImagesConfig::enabled`], kept separate so a user can opt in to images but not figures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct DiagramsConfig {
-    pub enabled: DiagramsEnabled,
+pub struct FiguresConfig {
+    /// Master switch — see [`FiguresEnabled`].
+    pub enabled: FiguresEnabled,
+    /// When true (the default), the cursor entering a `$$...$$` math block keeps the rendered
+    /// formula in place and opens its editable source just below it, re-rendered on every
+    /// keystroke; when false, the reveal shows the source alone, like a mermaid fence.  Math-only:
+    /// mermaid's reveal is always source-only, and ordinary images have nothing to preview.
+    pub math_preview: bool,
 }
 
-impl Default for DiagramsConfig {
+impl Default for FiguresConfig {
     fn default() -> Self {
         Self {
-            enabled: DiagramsEnabled::Ask,
+            enabled: FiguresEnabled::Ask,
+            math_preview: true,
         }
     }
 }
@@ -281,10 +291,15 @@ pub struct HtmlExportConfig {
     pub stylesheet: String,
     /// Embed local image references as `data:` URIs so the HTML is self-contained.
     pub inline_images: bool,
-    /// Render mermaid fences to inline SVG.  A render failure falls back to a `language-mermaid`
-    /// code block so the source is never lost; set false to force that form (e.g. for pipelines
-    /// shipping their own mermaid.js).
-    pub diagrams: bool,
+    /// Render *figures* — fenced ```mermaid code blocks and `$$...$$` display math — to PNG
+    /// embedded as `<img>` inside a `<figure>` (`mermaid-diagram` / `math-formula`).  A render
+    /// failure falls back to the block's source form so it is never lost; set false to leave every
+    /// figure as source (e.g. for pipelines shipping their own mermaid.js or MathJax).
+    ///
+    /// On disk the key is `figures`; `alias = "diagrams"` keeps configs written before math export
+    /// existed loading unchanged, and matches the `[figures]` consent section.
+    #[serde(alias = "diagrams")]
+    pub figures: bool,
 }
 
 impl Default for HtmlExportConfig {
@@ -292,7 +307,7 @@ impl Default for HtmlExportConfig {
         Self {
             stylesheet: "builtin".into(),
             inline_images: false,
-            diagrams: true,
+            figures: true,
         }
     }
 }

@@ -2747,3 +2747,206 @@ fn empty_document_shows_the_cursor_in_rendered_mode() {
         "the cursor block must be painted at line 0, column 0 of an empty document"
     );
 }
+
+/// A revealed `$$...$$` math block is styled like a mermaid fence: the
+/// opening `$$` becomes a ` math ` language header on the `code_block_lang`
+/// surface, the body carries the `code_block_text` code surface, and the
+/// closing `$$` is a blank padded row on that same surface — the delimiter
+/// rows show their literal `$$` only when the cursor is on them.  Here the
+/// cursor sits on the body line, so the delimiters show their styled forms.
+/// Preview off keeps the source flush to the block top (no formula band),
+/// so rows 0/1/2 are opening / body / closing.
+#[test]
+fn revealed_math_block_is_styled_like_a_code_block() {
+    use edamame::document::Buffer;
+    use edamame::editor::EditorState;
+    use edamame::ui::{RenderedView, RenderedViewState};
+
+    let theme = Box::leak(Box::new(Theme::default()));
+    let mut state = EditorState::new(Buffer::from_str("$$\nE = mc^2\n$$\n"), theme);
+    state.mode = Mode::Rendered;
+    state.math_preview = false; // source flush to the top, no formula band
+                                // Cursor on the body line ("E = mc^2"), past the opening "$$\n".
+    state.cursor.offset = "$$\n".chars().count() + 1;
+    state.update_cursor_block();
+    state.cursor_block_entered_at = None; // skip the jitter delay
+    assert!(state.cursor_block_revealed(), "the math block must reveal");
+    assert!(state.sync_image_reveal());
+
+    let backend = TestBackend::new(25, 6);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut view_state = RenderedViewState::default();
+    terminal
+        .draw(|frame| {
+            let view = RenderedView {
+                cursor_style: theme.status_mode_rendered,
+                visual_kind: None,
+                drop_indicator: None,
+                show_table_buttons: false,
+                state: &state,
+                theme,
+            };
+            frame.render_stateful_widget(view, frame.area(), &mut view_state);
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer().clone();
+    let row_text = |y: u16| -> String {
+        (0..25u16)
+            .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect()
+    };
+    let row_has_bg = |y: u16, bg| {
+        (0..25u16).any(|x| {
+            buf.cell((x, y))
+                .map(|c| c.style().bg == bg)
+                .unwrap_or(false)
+        })
+    };
+
+    // Row 0: the ` math ` header on the language surface — not a literal `$$`.
+    assert!(
+        row_text(0).contains("math"),
+        "opening row: {:?}",
+        row_text(0)
+    );
+    assert!(
+        !row_text(0).contains("$$"),
+        "opening `$$` must be hidden when the cursor is elsewhere: {:?}",
+        row_text(0)
+    );
+    assert!(
+        row_has_bg(0, theme.code_block_lang.bg),
+        "header row must carry the code-block language surface"
+    );
+    // Row 1: the body line on the code surface.
+    assert!(
+        row_text(1).contains("E = mc^2"),
+        "body row: {:?}",
+        row_text(1)
+    );
+    assert!(
+        row_has_bg(1, theme.code_block_text.bg),
+        "body row must carry the code-block text surface"
+    );
+    // Row 2: the closing `$$` renders as a blank padded row on the code
+    // surface (no literal `$$` without the cursor).
+    assert!(
+        !row_text(2).contains("$$"),
+        "closing `$$` must be hidden when the cursor is elsewhere: {:?}",
+        row_text(2)
+    );
+    assert!(
+        row_has_bg(2, theme.code_block_text.bg),
+        "closing row must carry the code-block surface"
+    );
+}
+
+/// When the cursor lands on a `$$...$$` block's opening delimiter, that row
+/// reveals its literal `$$` for editing (rather than the ` math ` header) —
+/// the same affordance a fenced code block gives its opening fence.
+#[test]
+fn revealed_math_block_shows_literal_delimiter_under_the_cursor() {
+    use edamame::document::Buffer;
+    use edamame::editor::EditorState;
+    use edamame::ui::{RenderedView, RenderedViewState};
+
+    let theme = Box::leak(Box::new(Theme::default()));
+    let mut state = EditorState::new(Buffer::from_str("$$\nE = mc^2\n$$\n"), theme);
+    state.mode = Mode::Rendered;
+    state.math_preview = false;
+    state.cursor.offset = 0; // on the opening `$$`
+    state.update_cursor_block();
+    state.cursor_block_entered_at = None;
+    assert!(state.cursor_block_revealed());
+    assert!(state.sync_image_reveal());
+
+    let backend = TestBackend::new(25, 6);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut view_state = RenderedViewState::default();
+    terminal
+        .draw(|frame| {
+            let view = RenderedView {
+                cursor_style: theme.status_mode_rendered,
+                visual_kind: None,
+                drop_indicator: None,
+                show_table_buttons: false,
+                state: &state,
+                theme,
+            };
+            frame.render_stateful_widget(view, frame.area(), &mut view_state);
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer().clone();
+    let row0: String = (0..25u16)
+        .filter_map(|x| buf.cell((x, 0)).map(|c| c.symbol().to_string()))
+        .collect();
+    assert!(
+        row0.contains("$$"),
+        "opening row must reveal its literal `$$` under the cursor: {row0:?}"
+    );
+    assert!(
+        !row0.contains("math"),
+        "the ` math ` header must yield to the raw delimiter under the cursor: {row0:?}"
+    );
+}
+
+/// Regression: when a `$$...$$` block is followed by more content, its byte
+/// range absorbs the trailing blank line, so the reveal's `raw_lines` gains
+/// a trailing empty entry past the real closing `$$`.  The closing must
+/// still be detected (matched by its `$$` text, not by the last index) and
+/// render as a blank padded row — not fall through to the body branch and
+/// show a literal `$$`.  Cursor on the body so the closing has no cursor.
+#[test]
+fn revealed_math_block_closing_is_blank_even_with_trailing_content() {
+    use edamame::document::Buffer;
+    use edamame::editor::EditorState;
+    use edamame::ui::{RenderedView, RenderedViewState};
+
+    let theme = Box::leak(Box::new(Theme::default()));
+    let src = "Intro.\n\n$$\nE = mc^2\n$$\n\nAfter.\n";
+    let mut state = EditorState::new(Buffer::from_str(src), theme);
+    state.mode = Mode::Rendered;
+    state.math_preview = false;
+    // Cursor on the body line "E = mc^2" (offset past "Intro.\n\n$$\n").
+    state.cursor.offset = "Intro.\n\n$$\n".chars().count() + 1;
+    state.update_cursor_block();
+    state.cursor_block_entered_at = None; // skip the jitter delay (block changed)
+    assert!(state.cursor_block_revealed(), "the math block must reveal");
+    assert!(state.sync_image_reveal());
+
+    let backend = TestBackend::new(25, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut view_state = RenderedViewState::default();
+    terminal
+        .draw(|frame| {
+            let view = RenderedView {
+                cursor_style: theme.status_mode_rendered,
+                visual_kind: None,
+                drop_indicator: None,
+                show_table_buttons: false,
+                state: &state,
+                theme,
+            };
+            frame.render_stateful_widget(view, frame.area(), &mut view_state);
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer().clone();
+    // No row in the whole view may show a literal `$$` — the opening is the
+    // ` math ` header and the closing is a blank padded row (neither has the
+    // cursor).  Before the fix the closing `$$` leaked through as body text.
+    let mut full = String::new();
+    for y in 0..10u16 {
+        for x in 0..25u16 {
+            if let Some(c) = buf.cell((x, y)) {
+                full.push_str(c.symbol());
+            }
+        }
+    }
+    assert!(
+        !full.contains("$$"),
+        "no literal `$$` should render while the cursor is on the body: {full:?}"
+    );
+}

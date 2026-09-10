@@ -41,9 +41,10 @@ impl EditorState {
         if Some(current_line) != self.cursor_line_idx {
             self.cursor_line_idx = Some(current_line);
             // Re-arm the delay on every buffer-line change — the same beat every block gets — so
-            // scrolling *through* a block never dwells long enough to reveal it.  (A mermaid
-            // diagram and a reflowed paragraph then stay revealed once a dwell latches them, via
-            // `cursor_reveal_latched`, so re-arming here doesn't flash them collapsed mid-block.)
+            // scrolling *through* a block never dwells long enough to reveal it.  (A diagram
+            // (mermaid / `$$` math) and a reflowed paragraph then stay revealed once a dwell
+            // latches them, via `cursor_reveal_latched`, so re-arming here doesn't flash them
+            // collapsed mid-block.)
             //
             // The one exception is *entering* a reflowed paragraph on a line other than its first
             // — an upward move or a click.  Its raw form is taller than its rendered form, so
@@ -78,8 +79,8 @@ impl EditorState {
     /// Whether the cursor block should show raw source.  False during the `RAW_REVEAL_DELAY`
     /// window, during a mouse drag (the click anchor must not shift), and while a search or
     /// `:s` preview is active (blocks must not flip to raw under the highlights).  A latched
-    /// one-unit block (mermaid / reflowed paragraph) stays revealed past a delay re-arm — see
-    /// [`Self::cursor_reveal_latched`].
+    /// one-unit block (diagram — mermaid or `$$` math — or reflowed paragraph) stays revealed past
+    /// a delay re-arm — see [`Self::cursor_reveal_latched`].
     pub fn cursor_block_revealed(&self) -> bool {
         if self.drag_in_progress {
             return false;
@@ -99,9 +100,9 @@ impl EditorState {
         }
     }
 
-    /// Latch the reveal of a "reveal as one unit" block — a mermaid diagram or a reflowed
-    /// paragraph — once it has been revealed by a dwell, so it stays revealed while the cursor
-    /// remains inside even as line moves re-arm the delay.  Called once per frame from
+    /// Latch the reveal of a "reveal as one unit" block — a diagram (mermaid or `$$` math) or a
+    /// reflowed paragraph — once it has been revealed by a dwell, so it stays revealed while the
+    /// cursor remains inside even as line moves re-arm the delay.  Called once per frame from
     /// `App::prepare_viewport`.  Other blocks (tables, code) are left to the per-line delay, so
     /// they keep revealing row by row and hide again under a moving cursor.
     pub fn latch_cursor_reveal(&mut self) {
@@ -109,7 +110,7 @@ impl EditorState {
             return;
         }
         let is_one_unit = self.cursor_block_idx.is_some_and(|idx| {
-            self.parsed.is_mermaid_block(idx) || {
+            self.parsed.is_diagram_reveal_block(idx) || {
                 let cursor_byte = self.buffer.rope().char_to_byte(self.cursor.offset);
                 self.parsed.is_reflowed_paragraph_at(cursor_byte)
             }
@@ -126,8 +127,11 @@ impl EditorState {
     pub fn sync_image_reveal(&mut self) -> bool {
         let target = self.image_reveal_target();
         let unchanged = match (target, self.image_reveal.as_ref()) {
-            (Some((ordinal, url, rows)), Some(cur)) => {
-                ordinal == cur.ordinal && url == cur.url.as_str() && rows == cur.rows
+            (Some((ordinal, url, rows, preview_rows)), Some(cur)) => {
+                ordinal == cur.ordinal
+                    && url == cur.url.as_str()
+                    && rows == cur.rows
+                    && preview_rows == cur.preview_rows
             }
             (None, None) => true,
             _ => false,
@@ -135,10 +139,11 @@ impl EditorState {
         if unchanged {
             return false;
         }
-        self.image_reveal = target.map(|(ordinal, url, rows)| ImageReveal {
+        self.image_reveal = target.map(|(ordinal, url, rows, preview_rows)| ImageReveal {
             ordinal,
             url: url.to_owned(),
             rows,
+            preview_rows,
         });
         // Source is untouched, so every byte range survives the re-parse.
         self.refresh_parsed();
@@ -146,10 +151,10 @@ impl EditorState {
     }
 
     /// The reservation the reveal wants for the cursor position: `(ordinal into
-    /// `ParsedDoc::image_blocks`, URL, one row per raw source line)`, or `None` outside a
+    /// `ParsedDoc::image_blocks`, URL, raw-source rows, preview-band rows)`, or `None` outside a
     /// revealed image block.  See [`ImageReveal`] for why the URL alone can't name a block.
     /// The URL is borrowed, not cloned, because this runs every event-loop pass.
-    fn image_reveal_target(&self) -> Option<(usize, &str, usize)> {
+    fn image_reveal_target(&self) -> Option<(usize, &str, usize, usize)> {
         if self.mode != Mode::Rendered {
             return None;
         }
@@ -159,7 +164,7 @@ impl EditorState {
             return self
                 .image_reveal
                 .as_ref()
-                .map(|r| (r.ordinal, r.url.as_str(), r.rows));
+                .map(|r| (r.ordinal, r.url.as_str(), r.rows, r.preview_rows));
         }
         if !self.cursor_block_revealed() {
             return None;
@@ -181,8 +186,29 @@ impl EditorState {
         let contents = self.parsed.source();
         let source = contents.get(range.start..range.end.min(contents.len()))?;
         // Same split the painter uses, so reserved rows and painted lines can't disagree.
-        let rows = crate::ui::rendered_view::revealed_source_line_count(source);
-        Some((ordinal, url, rows))
+        let raw_rows = crate::ui::rendered_view::revealed_source_line_count(source);
+        // A `$$...$$` block with preview on reserves a top band for the decoded formula (keeping
+        // its pre-reveal position) while the source paints below.  Same row count the renderer's
+        // override gives the image outside the reveal, so it doesn't resize when the reveal opens;
+        // zero for mermaid / plain images / preview off.
+        let preview_rows = if self.math_preview && self.parsed.is_latex_block(block_idx) {
+            let max_w = self.image_max_width.min(u16::MAX as usize) as u16;
+            let max_h = self.image_max_height.min(u16::MAX as usize) as u16;
+            self.images
+                .reserved_rows(url, max_w, max_h, self.image_font_size)
+                .unwrap_or_else(|| {
+                    // URL unknown (still decoding, or a keystroke's throwaway hash the debounce is
+                    // holding): keep this block's last resolved band so it doesn't jump to the
+                    // placeholder while typing, falling back to the placeholder only with no prior.
+                    self.image_reveal
+                        .as_ref()
+                        .filter(|r| r.ordinal == ordinal && r.preview_rows > 0)
+                        .map_or(self.image_max_height, |r| r.preview_rows)
+                })
+        } else {
+            0
+        };
+        Some((ordinal, url, raw_rows, preview_rows))
     }
 }
 
@@ -261,7 +287,10 @@ mod tests {
     /// the collapsed flow's top row for `RAW_REVEAL_DELAY` and then dropping.
     #[test]
     fn entering_a_reflowed_paragraph_from_below_reveals_immediately() {
-        let mut st = EditorState::new(Buffer::from_str("intro\n\none\ntwo\nthree\n\nafter\n"), theme());
+        let mut st = EditorState::new(
+            Buffer::from_str("intro\n\none\ntwo\nthree\n\nafter\n"),
+            theme(),
+        );
         st.mode = Mode::Rendered;
         st.set_viewport_width(80);
         st.sync_reflow_for_mode();
@@ -285,7 +314,10 @@ mod tests {
     /// delay (its line is the flow row, so nothing jumps, and fast downward scrolling stays smooth).
     #[test]
     fn entering_a_reflowed_paragraph_from_above_keeps_the_delay() {
-        let mut st = EditorState::new(Buffer::from_str("intro\n\none\ntwo\nthree\n\nafter\n"), theme());
+        let mut st = EditorState::new(
+            Buffer::from_str("intro\n\none\ntwo\nthree\n\nafter\n"),
+            theme(),
+        );
         st.mode = Mode::Rendered;
         st.set_viewport_width(80);
         st.sync_reflow_for_mode();

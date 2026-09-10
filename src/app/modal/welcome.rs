@@ -59,7 +59,7 @@ impl WelcomeModal {
                 caps,
                 config.images.enabled,
                 config.images.remote_policy,
-                config.diagrams.enabled,
+                config.figures.enabled,
                 config.modal.handler == VIM_HANDLER,
                 config.editor.check_for_updates,
             )
@@ -157,7 +157,7 @@ impl WelcomeModal {
             if image_capable {
                 app.config.images.enabled = images;
                 app.config.images.remote_policy = remote;
-                app.config.diagrams.enabled = diagrams;
+                app.config.figures.enabled = diagrams;
             }
             // Terminal-independent, and this both persists `modal.handler` and
             // updates the running session's modal-editing state.
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn the_update_check_choice_survives_a_weak_terminal() {
-        // Images and diagrams are forced to `Never` below truecolor and not
+        // Images and figures are forced to `Never` below truecolor and not
         // persisted; a network preference must be written regardless.
         let (_iso, mut app) = isolated_app();
         let caps = Capabilities {

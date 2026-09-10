@@ -322,19 +322,19 @@ fn revealing_a_diagram_at_the_fold_keeps_the_cursor_on_screen() {
 
 // ── HTML export ───────────────────────────────────────────────────────────
 
-fn opts(render_diagrams: bool) -> HtmlExportOptions {
+fn opts(render_figures: bool) -> HtmlExportOptions {
     HtmlExportOptions {
         stylesheet: Stylesheet::Inline(String::new()),
         inline_images: false,
         source_dir: None,
         title: None,
-        render_diagrams,
+        render_figures,
     }
 }
 
 #[test]
-fn html_export_falls_back_when_render_diagrams_is_false() {
-    // With `render_diagrams = false`, mermaid blocks must emit the
+fn html_export_falls_back_when_render_figures_is_false() {
+    // With `render_figures = false`, mermaid blocks must emit the
     // standard `<pre><code class="language-mermaid">` so downstream
     // toolchains (e.g. Docusaurus + mermaid.js plugin) can render
     // them client-side.  The source must be preserved verbatim.
@@ -346,6 +346,32 @@ fn html_export_falls_back_when_render_diagrams_is_false() {
     );
     assert!(html.contains("flowchart TD"));
     assert!(!html.contains("<figure class=\"mermaid-diagram\">"));
+}
+
+/// `$$...$$` display math exports as a rasterized `math-formula` figure
+/// (the RaTeX path is CI-safe — KaTeX faces are bundled into the shared
+/// fontdb), and falls back to a styled `language-math` code block when
+/// figures are off — the delimiters stripped, the same padded box the
+/// mermaid fallback above produces.  The end-to-end parallel to that test.
+#[test]
+fn html_export_renders_display_math_as_a_figure() {
+    let md = "$$\nx^2 + y^2 = z^2\n$$\n";
+    let on = render_html(md, &opts(true)).expect("render");
+    assert!(
+        on.contains("<figure class=\"math-formula\">"),
+        "expected a math figure, got:\n{on}"
+    );
+    assert!(on.contains("src=\"data:image/png;base64,"), "got:\n{on}");
+    assert!(!on.contains("<svg"), "rasterized, never inline SVG:\n{on}");
+
+    let off = render_html(md, &opts(false)).expect("render");
+    assert!(
+        off.contains("<code class=\"language-math\">"),
+        "expected the math code-block fallback, got:\n{off}"
+    );
+    assert!(off.contains("x^2 + y^2 = z^2"), "formula body kept:\n{off}");
+    assert!(!off.contains("$$"), "delimiters stripped:\n{off}");
+    assert!(!off.contains("<figure"), "no figure when off:\n{off}");
 }
 
 #[test]
@@ -366,14 +392,20 @@ fn html_export_ignores_non_mermaid_code_blocks() {
 // `cargo test --test diagrams -- --ignored mermaid_live`.
 #[test]
 #[ignore = "requires system fonts; exercises live mermaid-rs-renderer"]
-fn mermaid_live_html_export_emits_inline_svg() {
+fn mermaid_live_html_export_emits_png_figure() {
     let md = "```mermaid\nflowchart TD\nA-->B\n```\n";
     let html = render_html(md, &opts(true)).expect("render");
     assert!(
         html.contains("<figure class=\"mermaid-diagram\">"),
         "expected figure wrapper, got:\n{html}"
     );
-    assert!(html.contains("<svg"));
+    // The SVG is rasterized to a PNG data URI, never inlined (see
+    // `mermaid_export_never_emits_raw_svg_or_script`).
+    assert!(
+        html.contains("src=\"data:image/png;base64,"),
+        "got:\n{html}"
+    );
+    assert!(!html.contains("<svg"), "no raw SVG may reach the export");
     assert!(
         !html.contains("<code class=\"language-mermaid\">"),
         "diagram should not also emit the fallback code block"

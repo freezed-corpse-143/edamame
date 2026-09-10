@@ -123,8 +123,22 @@ pub(crate) struct ImageReveal {
     pub(crate) ordinal: usize,
     /// A `![alt](url)` target, or a diagram's synthetic `diagram-mermaid-<sha256>` key.
     pub(crate) url: String,
-    /// Rendered rows to reserve: one per revealed raw source line.
+    /// Rendered rows to reserve for the raw-source reveal: one per
+    /// revealed raw source line.
     pub(crate) rows: usize,
+    /// Rows reserved for a live rendering of the formula, painted as a
+    /// band at the block's **top** with the editable raw source below it —
+    /// so the formula keeps the position it had before the reveal opened
+    /// instead of jumping down under the source.  Non-zero only for
+    /// `$$...$$` math blocks, and only when `EditorState::math_preview` is
+    /// on (a preview is useless for mermaid — the whole point of its reveal
+    /// is seeing the source — and ordinary images have a single source
+    /// line).  Math formulas re-render on every keystroke, so this is how
+    /// the user watches the formula take shape while typing.  The editor
+    /// override reserves `preview_rows + rows`; `ParsedDoc::math_source_offset`
+    /// records the band so the row ⇄ source-line mapping paints the source
+    /// beneath it.
+    pub(crate) preview_rows: usize,
 }
 
 /// All mutable state owned by the editor: the single source of truth for document contents,
@@ -213,6 +227,12 @@ pub struct EditorState {
     pub big_h1: bool,
     /// From `config.editor.syntax_highlighting`; re-read on every `refresh_parsed`.
     pub syntax_highlighting: bool,
+    /// Propagated from `config.figures.math_preview`.  When true, a revealed `$$...$$` block keeps
+    /// the rendered formula in place and opens its raw source below it (`ImageReveal::preview_rows`);
+    /// when false the reveal shows the source alone, like a mermaid fence.  Set at construction and
+    /// pushed live via [`Self::set_math_preview`]; a bare `EditorState` defaults it off (the
+    /// on-by-default value lives in `FiguresConfig::default`).
+    pub math_preview: bool,
     /// Most-recent document-area width, fed to the renderer on every `refresh_parsed` so table
     /// column widths adapt to the viewport.  Stored here rather than threaded as a parameter so
     /// call sites that don't know the width — undo/redo, paste, file load — pick up the cached
@@ -400,6 +420,7 @@ impl EditorState {
             // Off here, like `big_h1`: "on by default" is carried by `EditorConfig::default()`
             // and applied through `app::configure_new_editor`.
             syntax_highlighting: false,
+            math_preview: false,
             viewport_width: 80,
             pending_column_widths_commit: None,
             pending_link_follow: None,
@@ -723,6 +744,17 @@ impl EditorState {
         self.refresh_parsed();
     }
 
+    /// Toggle the `$$...$$` live-edit preview.  Wired to `config.figures.math_preview` at startup
+    /// and pushed live by the settings overlay.  Only the reveal reservation depends on it, so
+    /// re-sync the reveal: a formula the cursor is inside reflows immediately, elsewhere a no-op.
+    pub fn set_math_preview(&mut self, on: bool) {
+        if self.math_preview == on {
+            return;
+        }
+        self.math_preview = on;
+        self.sync_image_reveal();
+    }
+
     /// Post a new *document area* width (chrome excluded) and re-render if it changed, so table
     /// column widths follow the viewport.
     pub fn set_viewport_width(&mut self, width: usize) {
@@ -791,7 +823,9 @@ impl EditorState {
             None => EffectiveRows::identity(&self.parsed, width),
         };
         let (base_total, patch) = built.cache_parts();
-        self.effective_cache.borrow_mut().store(key, base_total, patch);
+        self.effective_cache
+            .borrow_mut()
+            .store(key, base_total, patch);
         built
     }
 
@@ -916,8 +950,8 @@ impl EditorState {
         let max_h = self.image_max_height as u16;
         let font_size = self.image_font_size;
         let images_enabled = self.images_enabled;
-        // `diagrams_enabled` is honored at promotion time, so a disabled diagram never reaches
-        // this override as a URL at all.
+        // `diagrams_enabled` is honored at promotion time, so a disabled diagram or `$$...$$` math
+        // block never reaches this override as a URL at all.
         //
         // The reveal is checked first because it replaces the image on screen entirely: neither
         // the decode cache nor the images-disabled collapse has a say in the block's height.
@@ -926,10 +960,23 @@ impl EditorState {
         let override_fn = |url: &str, ordinal: usize| {
             if let Some(reveal) = image_reveal {
                 if reveal.ordinal == ordinal && reveal.url == url {
-                    return Some(reveal.rows);
+                    // The raw-source reveal replaces the image's reserved
+                    // rows with one row per revealed source line; a
+                    // `$$...$$` block with the preview on additionally
+                    // reserves a live-preview band for the formula at the
+                    // block's top, with the source below it (see
+                    // `ImageReveal::preview_rows`).
+                    return Some(reveal.rows + reveal.preview_rows);
                 }
             }
-            if !images_enabled {
+            // The images-disabled collapse applies to *real* images only.
+            // Promoted diagram / `$$...$$` math blocks are gated by
+            // `diagrams_enabled` at promotion time — a diagram URL reaching
+            // this override means figures are enabled, so it keeps its
+            // decoded height regardless of the images toggle.  Without this
+            // exemption, turning "Show images" off collapsed every rendered
+            // formula and diagram to a single row (tiny).
+            if !images_enabled && !crate::diagram::is_diagram_url(url) {
                 return Some(1);
             }
             images.reserved_rows(url, max_w, max_h, font_size)
@@ -955,10 +1002,21 @@ impl EditorState {
         self.parsed_reflow = reflow_paragraphs;
         self.parsed_version = self.parsed_version.wrapping_add(1);
         self.parsed_dirty = false;
-        // Evict unreferenced URLs — editing inside a mermaid fence mints a new synthetic URL per
-        // keystroke, orphaning the old entry.  The live set is the *union* of both parses while a
-        // review is open: a URL only on the diff's new side would otherwise be evicted here and
-        // immediately re-requested, a decode/evict loop lasting the whole review.
+        // Record the math-preview split so the row ⇄ source-line mapping paints the rendered
+        // formula in the block's top rows and the editable `$$...$$` source below — keeping the
+        // image where it sat before the reveal.  Non-zero only for a revealed `$$...$$` block with
+        // preview on (`ImageReveal::preview_rows`).
+        self.parsed.math_source_offset = self.image_reveal.as_ref().and_then(|r| {
+            if r.preview_rows == 0 {
+                return None;
+            }
+            let block_idx = self.parsed.image_blocks.get(r.ordinal)?.block_idx;
+            Some((block_idx, r.preview_rows))
+        });
+        // Evict unreferenced URLs — editing inside a mermaid fence or `$$...$$` block mints a new
+        // synthetic URL per keystroke, orphaning the old entry.  The live set is the *union* of
+        // both parses while a review is open: a URL only on the diff's new side would otherwise be
+        // evicted here and immediately re-requested, a decode/evict loop lasting the whole review.
         let mut live: std::collections::HashSet<String> = self
             .parsed
             .image_blocks
@@ -1332,19 +1390,31 @@ pub(crate) fn sub_lines_in_block(
             .collect();
     }
 
-    // These all map 1:1: a mermaid block's reveal paints onto its reserved rows, and code and
-    // metadata blocks render every body line including blanks (as NBSP-padded rows).  Falling
-    // through to the counting branch below would drift the cursor up one row per blank.
-    let is_mermaid = parsed.is_mermaid_block(block_idx);
+    // These all map 1:1: a diagram block's reveal (mermaid fence or `$$...$$` math) paints onto
+    // its reserved rows, and code and metadata blocks render every body line including blanks (as
+    // NBSP-padded rows).  Falling through to the counting branch below would drift the cursor up
+    // one row per blank.
+    let is_diagram_reveal = parsed.is_diagram_reveal_block(block_idx);
+    let real_block = parsed.real_block_for_byte(classify_byte);
     let is_verbatim = matches!(
-        parsed.real_block_for_byte(classify_byte),
+        real_block,
         Some(
             crate::markdown::Block::CodeBlock { .. } | crate::markdown::Block::MetadataBlock { .. }
-        )
-    );
-    if is_mermaid || is_verbatim {
+        ) // A figures-off `$$...$$` paragraph renders as a fenced-style `math`
+          // code block (see `display_math_block_body`), so its rendered rows map
+          // 1:1 onto source lines — including any blank line inside the formula,
+          // which the prose branch below would otherwise drop.
+    ) || real_block
+        .is_some_and(|b| crate::markdown::parser::post_pass::display_math_block_body(b).is_some());
+    if is_diagram_reveal || is_verbatim {
         let last = block_own.saturating_sub(1);
-        return (0..=n).map(|r| r.min(last)).collect();
+        // A `$$...$$` block revealed with the math preview reserves a top
+        // band for the rendered formula and paints the raw source below
+        // it, so each source line r lands on rendered row `r + band`.  The
+        // offset is 0 for mermaid, verbatim blocks, and a preview-off math
+        // reveal, leaving those 1:1.
+        let offset = parsed.latex_source_offset(block_idx);
+        return (0..=n).map(|r| (r + offset).min(last)).collect();
     }
 
     // One rendered line per raw line, except that interior blanks and soft-break continuations
@@ -1477,8 +1547,8 @@ mod tests {
         state.set_viewport_width(20);
         state.set_reflow(true);
         let (w, h) = (20usize, 20usize); // tall enough the expansion never pushes the cursor off
-        // Cursor into the reflowed paragraph on its first line (a downward entry), the case that
-        // keeps the reveal delay; the expansion then happens entirely below the cursor.
+                                         // Cursor into the reflowed paragraph on its first line (a downward entry), the case that
+                                         // keeps the reveal delay; the expansion then happens entirely below the cursor.
         let byte = state.buffer.contents().find("one").unwrap();
         state.cursor.offset = state.buffer.rope().byte_to_char(byte);
         state.update_cursor_block();
@@ -1968,5 +2038,155 @@ mod tests {
         state.enter_diff_mode(diff);
         state.scroll_focused_hunk_into_view(20, 80);
         assert_eq!(state.scroll, 0);
+    }
+
+    /// Drive a `$$...$$` block's reveal with the cursor inside it and
+    /// return the resolved [`ImageReveal`].
+    fn latex_reveal_with(math_preview: bool) -> ImageReveal {
+        let mut state = EditorState::new(Buffer::from_str("$$\nE = mc^2\n$$\n"), theme());
+        state.mode = crate::editor::Mode::Rendered;
+        state.math_preview = math_preview;
+        state.refresh_parsed();
+        let latex_idx = state
+            .parsed
+            .image_blocks
+            .iter()
+            .find(|i| matches!(i.source, Some(crate::diagram::DiagramSource::Latex(_))))
+            .expect("latex block")
+            .block_idx;
+        // Park the cursor inside the block and let the reveal fire (skip the dwell delay).
+        state.cursor.offset = "$$\n".chars().count() + 1;
+        state.update_cursor_block();
+        state.cursor_block_entered_at = None;
+        assert_eq!(state.cursor_block_idx, Some(latex_idx));
+        assert!(state.cursor_block_revealed());
+        assert!(state.sync_image_reveal());
+        state.image_reveal.clone().expect("reveal active")
+    }
+
+    /// With the math preview off, a `$$...$$` block reveals exactly its
+    /// raw source lines — no image band — so it collapses to the source
+    /// the user edits, the same affordance a mermaid fence gets.
+    #[test]
+    fn latex_reveal_without_preview_reserves_only_source_rows() {
+        let reveal = latex_reveal_with(false);
+        // Source: `$$` / body / `$$` → 3 rows, and no band.
+        assert_eq!(reveal.rows, 3);
+        assert_eq!(reveal.preview_rows, 0);
+    }
+
+    /// With the math preview on, the block reserves a live-preview band
+    /// PLUS its source rows — the image not yet decoded → the
+    /// `image_max_height` placeholder reservation (24), so the image
+    /// doesn't resize when the reveal opens.
+    #[test]
+    fn latex_reveal_with_preview_reserves_a_band_above_the_source() {
+        let reveal = latex_reveal_with(true);
+        assert_eq!(reveal.rows, 3);
+        assert_eq!(reveal.preview_rows, 24);
+    }
+
+    /// The flip: with the preview on, the revealed source rows are pushed
+    /// below the formula band, so `math_source_offset` records the band
+    /// height for `block_idx` and `sub_lines_in_block` maps source line 0
+    /// onto rendered row `band` (not row 0).  With the preview off there is
+    /// no band and the mapping stays 1:1 from the block's top.
+    #[test]
+    fn math_preview_offsets_source_rows_below_the_formula_band() {
+        let with = latex_reveal_with(true);
+        let mut state = EditorState::new(Buffer::from_str("$$\nE = mc^2\n$$\n"), theme());
+        state.mode = crate::editor::Mode::Rendered;
+        state.math_preview = true;
+        state.refresh_parsed();
+        let latex_idx = state
+            .parsed
+            .image_blocks
+            .iter()
+            .find(|i| matches!(i.source, Some(crate::diagram::DiagramSource::Latex(_))))
+            .expect("latex block")
+            .block_idx;
+        state.cursor.offset = "$$\n".chars().count() + 1;
+        state.update_cursor_block();
+        state.cursor_block_entered_at = None;
+        assert!(state.sync_image_reveal());
+        assert_eq!(
+            state.parsed.latex_source_offset(latex_idx),
+            with.preview_rows,
+            "the source offset equals the reserved preview band"
+        );
+        // Source line 0 (`$$`) now renders `band` rows down, not at the top.
+        let raw = crate::ui::rendered_view::raw_block_cursor(
+            &state,
+            state.buffer.rope().char_to_byte(state.cursor.offset),
+        );
+        let raw_lines = crate::ui::rendered_view::raw_source_lines(&raw.source);
+        let subs = sub_lines_in_block(
+            &state.parsed,
+            state.buffer.rope().char_to_byte(state.cursor.offset),
+            latex_idx,
+            state.parsed.block_own_line_count(latex_idx),
+            &raw.source,
+            &raw_lines,
+        );
+        assert_eq!(
+            subs[0], with.preview_rows,
+            "first source line sits below the band"
+        );
+    }
+
+    /// A plain image reveals its single source line, never a preview band.
+    #[test]
+    fn plain_image_reveal_reserves_one_source_row() {
+        let mut state = EditorState::new(Buffer::from_str("![logo](logo.png)\n"), theme());
+        state.mode = crate::editor::Mode::Rendered;
+        // Even with the preview on, a plain image gets no band — the band
+        // is `$$...$$`-only.
+        state.math_preview = true;
+        state.refresh_parsed();
+        state.cursor.offset = 2;
+        state.cursor_block_entered_at = None;
+        state.update_cursor_block();
+        // The reveal timer re-arms on any intra-block line move for a
+        // plain image (unlike diagram blocks, which keep their reveal
+        // time); simulate the 120 ms jitter window having elapsed.
+        state.cursor_block_entered_at = None;
+        assert!(state.cursor_block_revealed());
+        assert!(state.sync_image_reveal());
+        let reveal = state.image_reveal.as_ref().expect("reveal active");
+        assert_eq!(reveal.rows, 1, "single source line");
+        assert_eq!(reveal.preview_rows, 0, "plain image: no preview band");
+    }
+
+    /// Turning "Show images" off must NOT shrink a rendered `$$...$$`
+    /// formula (or a mermaid diagram): figures are gated by their own
+    /// setting, so a promoted diagram URL keeps its reserved height
+    /// regardless of the images toggle.  Regression for the images-off
+    /// collapse that squeezed every formula to one row ("tiny math").
+    /// The cursor stays outside the block so the reveal doesn't override
+    /// the reservation.
+    #[test]
+    fn disabling_images_does_not_collapse_a_rendered_math_block() {
+        let src = "Above.\n\n$$\nE = mc^2\n$$\n\nBelow.\n";
+        let mut state = EditorState::new(Buffer::from_str(src), theme());
+        state.mode = crate::editor::Mode::Rendered;
+        state.diagrams_enabled = true;
+        state.cursor.offset = 0; // outside the math block
+        state.images_enabled = false;
+        state.refresh_parsed();
+        let latex_idx = state
+            .parsed
+            .image_blocks
+            .iter()
+            .find(|i| matches!(i.source, Some(crate::diagram::DiagramSource::Latex(_))))
+            .expect("latex block promoted")
+            .block_idx;
+        // With images off, the (undecoded) formula falls back to the
+        // `image_max_height` placeholder reservation — many rows — not the
+        // single-row collapse a real image gets.
+        assert!(
+            state.parsed.block_own_line_count(latex_idx) > 1,
+            "math block collapsed to {} row(s) with images off",
+            state.parsed.block_own_line_count(latex_idx)
+        );
     }
 }
