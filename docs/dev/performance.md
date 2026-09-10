@@ -29,26 +29,32 @@ The frame throttle is 16 ms (`app::frame_timer::MIN_FRAME_INTERVAL`, ~60 fps). F
 
 ## The corpus
 
-`benches/pipeline.rs` generates its documents in-process — deterministic, no on-disk corpus — at **1k / 5k / 20k / 100k source lines** in five mixes. The mixes exist because cost per block varies enormously; keep them stable, since they are what makes a future measurement comparable to the ones below.
+`benches/pipeline.rs` generates its documents in-process — deterministic, no on-disk corpus — at **1k / 5k / 20k / 100k source lines** in six mixes. The mixes exist because cost per block varies enormously; keep them stable, since they are what makes a future measurement comparable to the ones below.
 
 | Corpus | Composition | Stresses |
 |---|---|---|
-| `prose` | Paragraphs with bold/links | Inline rendering, virtual blank-line blocks |
+| `prose` | Paragraphs with bold/links | Inline rendering, virtual blank-line blocks, reflow |
 | `lists` | Deep nested lists with checkboxes | List post-pass and rendering |
 | `tables` | Many medium tables | Table column measurement (`table_layout`) |
 | `code` | Fenced `rust` blocks | Syntax highlighting, NBSP padding, cheap inlines |
+| `math` | Prose with inline `$…$` + stacked `$$…$$` blocks | Math delimiter scan, per-formula display-math promotion/split |
 | `mixed` | Blend + headings + footnotes | Anchors, source map, everything |
+
+`math` measures only the *synchronous* parse + promotion work: a `$$…$$` block promotes to a `Block::ImageBlock` that reserves space, and the RaTeX raster behind it is produced later by the async decode worker — off this path, like every image and mermaid diagram.
 
 Two details of the harness matter for reproducibility:
 
 - **Grammars are warmed on the bench thread first** (`warm_grammars`, calling `highlight::warm_inline`). Highlighting is eventually-consistent in the live app — a cold grammar renders plain while a background worker compiles it — so without the warm call the `code` and `mixed` numbers would be a coin-toss mixture of the highlighted and plain paths.
 - **`full_pipeline_memoized` alternates between two source variants differing in one character**, so every build is a warm cache with exactly one changed block. That is the steady-state edit cost; `full_pipeline` is the cold-open / paste-whole-document cost.
+- **`build_doc` runs with paragraph reflow on**, matching the shipped `reflow = true` default; `render_only` sets the same flag so the derived `other` residual stays honest. The M3 tables above predate the flag and ran with it off.
 
 `cargo bench --bench pipeline` to reproduce.
 
 ## Results
 
 Run 2026-08-22 on an Apple M3 (8 cores, macOS 15.7.5), rustc 1.96.1, release profile, criterion 0.5, sample size 10. Times are criterion means, all from one run. These supersede the 2026-06-10 figures in the archived plan, which predate syntax highlighting and were taken on different hardware — compare shapes, not ratios, across the two.
+
+This run **predates paragraph reflow and display math**: `build_doc` ran with reflow off, and there was no `math` mix. The [second baseline](#second-baseline--reflow--display-math) below covers both on a different machine. Reflow is neutral-to-slightly-cheaper on this path (see there), so the shapes below still hold; the `math` profile is new.
 
 ### Steady-state edit — `full_pipeline_memoized`
 
@@ -114,6 +120,59 @@ Change in the 20k figure, `full_pipeline` → `full_pipeline_memoized`:
 ### Resize — `visual_cache_build`
 
 Cold prefix-sum rebuild on the `mixed` corpus: 1.42 / 7.01 / 23.9 / 138.3 ms at 1k / 5k / 20k / 100k. Over one frame from roughly 20k lines, but it fires only on a width change and is already behind the 80 ms `RESIZE_QUIESCE` window — leave it alone unless live resize jank shows up.
+
+## Second baseline — reflow + display math
+
+Run 2026-09-10 on an Intel Core Ultra 7 258V (8 cores, Linux 6.16 / Debian 13), rustc 1.98.0, release profile, criterion 0.8, sample size 10. This is the first run with the shipped defaults after the two features: `build_doc` runs **reflow on**, and a `math` mix is present.
+
+This machine measures roughly **2–2.5× slower than the M3** above (5k `prose` steady-state: 3.85 → 10.2 ms), so it is a *separate* baseline, not a delta on the M3 tables. Compare shapes within each block; do not divide one machine's number by the other's. Against the 16 ms frame budget on *this* box, steady-state edits stay inside a frame only up to ~1k lines for the heavy mixes; every mix crosses it by 5–20k. That is a slower-hardware statement, not a regression — no stage is quadratic, and scaling is linear throughout.
+
+### Steady-state edit — `full_pipeline_memoized`
+
+| Corpus | 1k | 5k | 20k | 100k |
+|---|---|---|---|---|
+| `prose` | 1.94 ms | 10.2 ms | 44.6 ms | 252.9 ms |
+| `lists` | 2.35 ms | 12.8 ms | 64.6 ms | 347.4 ms |
+| `tables` | 2.92 ms | 16.2 ms | 73.4 ms | 389.0 ms |
+| `code` | 1.01 ms | 4.24 ms | 24.3 ms | 168.9 ms |
+| `math` | 1.09 ms | 6.33 ms | 27.8 ms | 163.9 ms |
+| `mixed` | 1.61 ms | 8.22 ms | 43.3 ms | 232.4 ms |
+
+### Cold open — `full_pipeline`
+
+| Corpus | 1k | 5k | 20k | 100k |
+|---|---|---|---|---|
+| `prose` | 1.67 ms | 9.61 ms | 45.2 ms | 283.3 ms |
+| `lists` | 1.47 ms | 7.89 ms | 39.8 ms | 203.7 ms |
+| `tables` | 6.32 ms | 35.8 ms | 153.6 ms | 762.7 ms |
+| `code` | 8.52 ms | 41.4 ms | 167.2 ms | 845.4 ms |
+| `math` | 1.06 ms | 5.67 ms | 24.6 ms | 134.5 ms |
+| `mixed` | 2.94 ms | 15.0 ms | 67.7 ms | 344.9 ms |
+
+### Stage breakdown at 20k lines
+
+| Corpus | full | `parse_merged` | `render_only` | other | dominant | (`parse_offsets` / `parse_ast`) |
+|---|---|---|---|---|---|---|
+| `prose` | 45.2 ms | 31.3 ms | 12.4 ms | 1.5 ms | **parse 69%** | 10.2 / 29.1 ms |
+| `lists` | 39.8 ms | 23.7 ms | 11.9 ms | 4.2 ms | **parse 60%** | 7.6 / 21.6 ms |
+| `tables` | 153.6 ms | 40.0 ms | 108.9 ms | 4.7 ms | **render 71%** | 11.4 / 36.9 ms |
+| `code` | 167.2 ms | 1.2 ms | 162.4 ms | ~3.5 ms | **render ~97%** | 0.7 / 1.1 ms |
+| `math` | 24.6 ms | 7.4 ms | 3.6 ms | 13.6 ms | **other 55%** | 3.9 / 7.0 ms |
+| `mixed` | 67.7 ms | 19.1 ms | 43.4 ms | 5.3 ms | **render 64%** | 6.4 / 17.6 ms |
+
+`mixed` stage scaling across 1k / 5k / 20k / 100k stays linear: `parse_merged` 0.78 / 4.39 / 19.1 / 109.8 ms, `render_only` 1.90 / 10.1 / 43.4 / 233.2 ms.
+
+### What the two features cost
+
+- **Reflow is neutral-to-slightly-cheaper on the pipeline.** A controlled same-machine on/off run (cold `full_pipeline`) put reflow *on* at 9.61 ms vs *off* at 10.3 ms for 20k `prose`, and 344.9 vs 369.0 ms for 100k `mixed` — a ~6–9% *win* on prose, flat elsewhere. Reflow emits one `Line` per top-level paragraph instead of one per source line, so the pipeline allocates fewer lines and caches fewer entries; the wrap itself is paid at draw time, which is viewport-limited and off this path. The reveal-aware `EffectiveRows` overlay is likewise viewport arithmetic, not `refresh_parsed` work, so nothing there is on the measured path.
+- **`math` is cheap but `other`-dominated.** Parse and render are both small (7.4 / 3.6 ms at 20k); the 55% `other` residual is the per-formula `$$` source scan, image-block promotion, and source-map / anchor derivation over many short blocks — the inverse of every other corpus, which is parse- or render-bound. It stays comfortably inside budget.
+- **`math` shows the `lists`-style memoization regression** (+13% memoized vs cold at 20k; 24.6 → 27.8 ms). Its blocks are cheap-to-render placeholders, so the cache's hash-whole-`Block` + clone-lines-out costs more than re-rendering — the clone-on-hit ceiling below, not a new problem.
+
+### Resize — `visual_cache_build`
+
+Cold prefix-sum rebuild on the `mixed` corpus: 3.02 / 14.5 / 61.7 / 296.1 ms at 1k / 5k / 20k / 100k. Same shape as the M3 row, ~2.5× slower. Fires only on a width change and sits behind the 80 ms `RESIZE_QUIESCE` window, so it is one rebuild per quiesced drag, not per frame — left alone.
+
+The `visual_cache_build` group now uses **flat sampling** (`SamplingMode::Flat`, 5 s measurement time). A single rebuild at 100k lines is ~0.3 s — larger than the group's old 2 s window, so the default linear sampling could only fit one iteration per sample and misreported the mean (nanoseconds one run, ±42% in [#35](https://github.com/mijowi/edamame/issues/35)). Flat sampling runs a fixed iteration count per sample and reports slow routines correctly; the numbers above are stable across repeats. This is a harness fix, not a cache change — the cache's width-cycling still forces a genuine cold rebuild every call.
 
 ## The two optimizations, and why they must not be undone
 
