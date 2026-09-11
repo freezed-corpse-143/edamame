@@ -36,7 +36,7 @@ pub enum UpdateReport<'a> {
 
 /// Left column of the two version rows: the longer label plus a separating space, so the
 /// values line up.
-const VERSION_LABEL_WIDTH: usize = "Installed version: ".len();
+const VERSION_LABEL_WIDTH: usize = "Installed: ".len();
 
 /// Label on the post-upgrade notice's version row.  Names the program rather than saying
 /// "installed", since it renders only for [`PostUpgradeOccasion::OnDemand`].
@@ -96,7 +96,10 @@ pub fn body_lines(theme: &Theme, report: UpdateReport<'_>, installed: &str) -> V
         ],
         UpdateReport::Available { tag, notes } => {
             let mut out = vec![
-                Line::from(Span::styled("Update available.".to_owned(), theme.h1)),
+                Line::from(Span::styled(
+                    "A new version of edamame is available.".to_owned(),
+                    theme.h1,
+                )),
                 Line::raw(""),
             ];
             out.extend(version_rows(theme, installed, tag));
@@ -197,8 +200,9 @@ fn note_lines(notes: &[String]) -> Vec<Line<'static>> {
     let mut after_heading = false;
     for raw in notes {
         if let Some(text) = heading_text(raw) {
-            // The blank *before* a heading separates sections and is kept; the one after it is
-            // Keep a Changelog's shape, and rows are scarce in a modal.
+            if after_heading {
+                out.push(Line::raw(""));
+            }
             out.push(Line::from(Span::styled(
                 text.to_owned(),
                 Style::new().add_modifier(Modifier::BOLD),
@@ -253,16 +257,11 @@ fn version_rows(theme: &Theme, installed: &str, latest: &str) -> [Line<'static>;
     [
         version_row(
             theme,
-            "Installed version:",
+            "Installed:",
             format!("v{installed}"),
             VERSION_LABEL_WIDTH,
         ),
-        version_row(
-            theme,
-            "Latest release:",
-            latest.to_owned(),
-            VERSION_LABEL_WIDTH,
-        ),
+        version_row(theme, "Latest:", latest.to_owned(), VERSION_LABEL_WIDTH),
     ]
 }
 
@@ -331,8 +330,8 @@ mod tests {
         ));
         // The verdict is a sentence; the numbers are rows.
         assert!(body.starts_with("edamame is up to date."), "{body}");
-        assert!(body.contains("Installed version: v0.1.0"), "{body}");
-        assert!(body.contains("Latest release:    v0.1.0"), "{body}");
+        assert!(body.contains("Installed: v0.1.0"), "{body}");
+        assert!(body.contains("Latest:    v0.1.0"), "{body}");
     }
 
     #[test]
@@ -350,8 +349,8 @@ mod tests {
                 .expect("row present")
         };
         // Both values start at the label column, so the shorter label was padded to it.
-        assert_eq!(value("Installed version:"), "v0.1.0");
-        assert_eq!(value("Latest release:"), "v0.2.0");
+        assert_eq!(value("Installed:"), "v0.1.0");
+        assert_eq!(value("Latest:"), "v0.2.0");
     }
 
     #[test]
@@ -363,12 +362,12 @@ mod tests {
         ));
         assert!(body.starts_with("Couldn't compare versions."));
         // Both numbers are still shown.
-        assert!(body.contains("Installed version:"), "{body}");
+        assert!(body.contains("Installed:"), "{body}");
         assert!(body.contains("v0.1.0"), "{body}");
         assert!(body.contains("v0.2.0-rc1"), "{body}");
         // And it must not assert the thing it cannot know.
         assert!(!body.contains("up to date"));
-        assert!(!body.contains("Update available"));
+        assert!(!body.contains("is available"));
     }
 
     #[test]
@@ -392,9 +391,12 @@ mod tests {
             },
             "0.1.0",
         ));
-        assert!(body.starts_with("Update available."), "{body}");
-        assert!(body.contains("Installed version: v0.1.0"), "{body}");
-        assert!(body.contains("Latest release:    v0.2.0"), "{body}");
+        assert!(
+            body.starts_with("A new version of edamame is available."),
+            "{body}"
+        );
+        assert!(body.contains("Installed: v0.1.0"), "{body}");
+        assert!(body.contains("Latest:    v0.2.0"), "{body}");
         // Structural styling only…
         assert!(body.contains("\nAdded"), "{body}");
         // …but nothing *inside* a line is interpreted.
@@ -475,7 +477,7 @@ mod tests {
         assert!(rendered.starts_with("Updated to v0.1.2."));
         // The headline already names the version, so the labeled row would repeat it.
         assert!(!rendered.contains(VERSION_LABEL));
-        assert!(!rendered.contains("Installed version:"));
+        assert!(!rendered.contains("Installed:"));
         // Structural styling, shared with the release-check path.
         assert!(rendered.contains("Added"));
         assert!(!rendered.contains("### Added"));
@@ -500,7 +502,7 @@ mod tests {
 
     #[test]
     fn a_post_upgrade_report_shows_no_second_version_row() {
-        // Nothing to compare against, so "Latest release:" would have no value to show.
+        // Nothing to compare against, so a "Latest:" row would have no value to show.
         for occasion in [PostUpgradeOccasion::Upgrade, PostUpgradeOccasion::OnDemand] {
             let body = post_upgrade_body_lines(
                 theme(),
@@ -508,7 +510,7 @@ mod tests {
                 PostUpgradeReport::Found { notes: &[] },
                 "0.1.2",
             );
-            assert!(!text(&body).contains("Latest release:"));
+            assert!(!text(&body).contains("Latest:"));
             assert_eq!(
                 body.len(),
                 1,

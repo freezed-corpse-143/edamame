@@ -92,7 +92,7 @@ fn top_level_value<'a>(json: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// The semver alphabet and nothing else: whitespace and control characters would break
-/// the `Latest release:` row's layout, and `/ ? # % &` would change what
+/// the `Latest:` row's layout, and `/ ? # % &` would change what
 /// [`super::fetch::release_url`] resolves to once the tag is interpolated into it.
 fn is_tag_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+')
