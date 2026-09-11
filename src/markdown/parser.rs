@@ -3,7 +3,8 @@ pub mod post_pass;
 pub use post_pass::{
     annotate_list_blanks, attach_trailing_tui_columns_comments, is_closing_fence,
     parse_opening_fence, promote_diagram_code_blocks, promote_display_math_paragraphs,
-    promote_html_comments, promote_image_paragraphs, split_display_math_paragraphs,
+    promote_html_comments, promote_image_paragraphs, reconstruct_broken_display_math,
+    split_display_math_paragraphs,
 };
 
 use std::ops::Range;

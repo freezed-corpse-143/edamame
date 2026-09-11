@@ -194,12 +194,19 @@ impl EditorState {
         let preview_rows = if self.math_preview && self.parsed.is_latex_block(block_idx) {
             let max_w = self.image_max_width.min(u16::MAX as usize) as u16;
             let max_h = self.image_max_height.min(u16::MAX as usize) as u16;
+            // `aspect_rows`, not `reserved_rows`: the former answers `None` for a *failed* decode
+            // as well as a pending one, so an invalid formula falls through to the same "keep the
+            // last resolved band" branch as an in-flight one.  `reserved_rows` would instead
+            // collapse the band to one row (`Some(1)`) the instant an intermediate keystroke fails
+            // to parse, then spring it back when the formula is valid again — the janky mid-typing
+            // reflow this branch exists to prevent.
             self.images
-                .reserved_rows(url, max_w, max_h, self.image_font_size)
+                .aspect_rows(url, max_w, max_h, self.image_font_size)
                 .unwrap_or_else(|| {
-                    // URL unknown (still decoding, or a keystroke's throwaway hash the debounce is
-                    // holding): keep this block's last resolved band so it doesn't jump to the
-                    // placeholder while typing, falling back to the placeholder only with no prior.
+                    // URL unknown (still decoding, a failed/invalid render, or a keystroke's
+                    // throwaway hash the debounce is holding): keep this block's last resolved band
+                    // so it doesn't jump to the placeholder while typing, falling back to the
+                    // placeholder only with no prior.
                     self.image_reveal
                         .as_ref()
                         .filter(|r| r.ordinal == ordinal && r.preview_rows > 0)

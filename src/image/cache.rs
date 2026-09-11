@@ -372,8 +372,11 @@ impl ImageCache {
     }
 
     /// Rows a decoded image occupies when fitted into `max_width_cells × max_height_cells` at
-    /// `font_size` pixels per cell.  `None` before the decode lands.  Used by tests.
-    #[allow(dead_code)]
+    /// `font_size` pixels per cell.  `None` for anything but a `Ready` decode — both `Pending`
+    /// *and* `Failed` answer `None`, unlike [`Self::reserved_rows`], which collapses `Failed` to
+    /// the single placeholder row.  The math preview band relies on that difference: an invalid
+    /// formula (a `Failed` decode) must hold the block's last resolved height rather than snap to
+    /// one row mid-typing, so it asks here, not through `reserved_rows`.
     pub fn aspect_rows(
         &self,
         url: &str,

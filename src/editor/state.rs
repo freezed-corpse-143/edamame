@@ -2189,4 +2189,50 @@ mod tests {
             state.parsed.block_own_line_count(latex_idx)
         );
     }
+
+    /// Regression: while typing a `$$...$$` formula, an intermediate keystroke
+    /// that leaves the LaTeX invalid must NOT collapse the live-preview band to
+    /// one row.  The band holds its last resolved height, so the document
+    /// doesn't reflow on every not-yet-valid intermediate state — the fix uses
+    /// `aspect_rows` (which reports `None` for a failed decode) rather than
+    /// `reserved_rows` (which collapses a failure to the single placeholder row).
+    #[test]
+    fn invalid_formula_holds_the_last_preview_band() {
+        let mut state = EditorState::new(Buffer::from_str("$$\nE = mc^2\n$$\n"), theme());
+        state.mode = crate::editor::Mode::Rendered;
+        state.math_preview = true;
+        state.refresh_parsed();
+        let url = state
+            .parsed
+            .image_blocks
+            .iter()
+            .find(|i| matches!(i.source, Some(crate::diagram::DiagramSource::Latex(_))))
+            .expect("latex block")
+            .url
+            .clone();
+        // A valid formula has decoded: the band takes the image's fitted height.
+        state
+            .images
+            .set_decoded(&url, image::DynamicImage::new_rgba8(100, 200));
+        state.cursor.offset = "$$\n".chars().count() + 1;
+        state.update_cursor_block();
+        state.cursor_block_entered_at = None;
+        assert!(state.sync_image_reveal());
+        let band = state.image_reveal.as_ref().expect("reveal").preview_rows;
+        assert!(
+            band > 1,
+            "a decoded formula reserves a multi-row band, got {band}"
+        );
+
+        // The current source's decode now fails — the state a half-typed,
+        // not-yet-valid formula lands in.  The band must hold `band`, never
+        // collapse to the single placeholder row `reserved_rows` would give.
+        state.images.set_failed(&url, "invalid latex".into());
+        state.sync_image_reveal();
+        assert_eq!(
+            state.image_reveal.as_ref().expect("reveal").preview_rows,
+            band,
+            "an invalid formula holds the last resolved band, not the 1-row placeholder",
+        );
+    }
 }

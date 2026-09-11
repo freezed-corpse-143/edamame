@@ -61,6 +61,61 @@ pub fn promote_diagram_code_blocks(blocks: &mut [Block]) -> HashMap<String, Diag
     sources
 }
 
+/// Rescue a `$$…$$`-delimited paragraph that pulldown-cmark left as plain text.
+///
+/// pulldown-cmark's math extension tracks brace nesting: a `$$` closing delimiter that falls
+/// inside an unbalanced `{ … }` group is not treated as a delimiter, so a formula like
+/// `$$x^{123$$` (a half-typed `x^{123}`) never becomes `Event::DisplayMath` — it is emitted as
+/// bare `Text`/`SoftBreak` inlines instead.  Mid-typing, that means a `$$…$$` block silently stops
+/// being math the instant a brace is left open: it is no longer promoted, its reserved image rows
+/// vanish, and the formula reflows to prose — snapping back only once the brace is closed.
+///
+/// This runs before [`promote_display_math_paragraphs`] / [`split_display_math_paragraphs`] and
+/// rewrites such a paragraph back into a single `Inline::Math { display: true }`, so it flows
+/// through the normal promotion and keeps its reserved rows.  The render then fails cleanly on the
+/// invalid LaTeX (placeholder / persisted preview band), exactly like any other broken formula —
+/// the block stays a stable, reserved figure the whole time the braces are unbalanced.
+///
+/// Deliberately conservative: only a paragraph whose *source* is exactly one `$$ … $$` pair (no
+/// interior `$$`, non-empty body), and never one pulldown already parsed as display math.  The
+/// carved `inner` matches pulldown's own source convention — the delimiters stripped, interior
+/// whitespace (including the delimiter-line newlines) kept — so `split_math_ranges` and
+/// `display_math_block_body` treat it identically to a formula pulldown parsed itself.
+pub fn reconstruct_broken_display_math(
+    blocks: &mut [Block],
+    real_ranges: &[Range<usize>],
+    source: &str,
+) {
+    for (block, range) in blocks.iter_mut().zip(real_ranges) {
+        let Block::Paragraph { inlines } = block else {
+            continue;
+        };
+        // Already recognized as display math — pulldown got it right, leave it.
+        if collect_display_math_only(inlines).is_some() {
+            continue;
+        }
+        let Some(raw) = source.get(range.clone()) else {
+            continue;
+        };
+        let trimmed = raw.trim_matches(|c: char| c.is_ascii_whitespace());
+        let Some(inner) = trimmed
+            .strip_prefix("$$")
+            .and_then(|body| body.strip_suffix("$$"))
+        else {
+            continue;
+        };
+        // One `$$…$$` pair with a body: an interior `$$` means multiple formulas or prose, which
+        // we leave to pulldown's own (correct) handling.
+        if inner.is_empty() || inner.contains("$$") {
+            continue;
+        }
+        *inlines = vec![Inline::Math {
+            source: inner.to_string(),
+            display: true,
+        }];
+    }
+}
+
 /// Replace every display-math-only paragraph (one or more `Inline::Math { display: true }`,
 /// separated by breaks and whitespace-only text) with one synthetic `Block::ImageBlock` **per
 /// formula**, URL `diagram-math-<sha256(source)>`.  Returns the `url → DiagramSource` map, merged

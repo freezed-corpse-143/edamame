@@ -11,7 +11,8 @@ use crate::document::SourceMap;
 use crate::markdown::{
     annotate_list_blanks, inlines_to_plain, parse_raw_with_ranges, promote_diagram_code_blocks,
     promote_display_math_paragraphs, promote_html_comments, promote_image_paragraphs,
-    split_display_math_paragraphs, Block, ImageRowOverride, InlineColMap, RenderCache, Renderer,
+    reconstruct_broken_display_math, split_display_math_paragraphs, Block, ImageRowOverride,
+    InlineColMap, RenderCache, Renderer,
 };
 
 /// Setext heading style detected from raw block source.
@@ -215,6 +216,12 @@ impl ParsedDoc {
         // Image-only paragraphs become `Block::ImageBlock` so the renderer reserves
         // multi-row space for the graphics overlay.  In place, so alignment stays 1:1.
         promote_image_paragraphs(&mut blocks, Some(&mut real_ranges));
+        // Rescue a `$$...$$` block whose interior LaTeX pulldown refused to close (an unbalanced
+        // brace mid-typing): rebuild the display-math inline so it promotes like any other formula
+        // instead of collapsing to prose and losing its reserved rows.  Runs in both branches so
+        // the figures-off `math` code-block rendering stays consistent too.  Ranges and block
+        // count are untouched, so the 1:1 alignment holds.
+        reconstruct_broken_display_math(&mut blocks, &real_ranges, source);
         // Fenced diagram blocks and `$$...$$`-only paragraphs take the same path.  Each returns a
         // `url → DiagramSource` map, merged and attached to `ImageBlockInfo.source` below so the
         // decode worker finds the source text without re-walking `blocks`.  Both are gated on
@@ -935,6 +942,57 @@ mod tests {
             "synthetic math url expected: {}",
             math_blocks[0].url
         );
+    }
+
+    /// Regression: pulldown-cmark refuses to close a `$$...$$` span whose body has an unbalanced
+    /// `{`, so a half-typed `x^{123` degrades to plain text and the block loses its reserved rows
+    /// mid-typing.  `reconstruct_broken_display_math` rescues it: the block must still promote to a
+    /// Latex image block (whose render then fails cleanly), so the figure stays reserved while the
+    /// braces are open.
+    #[test]
+    fn broken_brace_math_still_promotes_to_a_reserved_image_block() {
+        for src in ["$$\nx^2 = z^{123\n$$\n", "$$x^2 = z^{123$$\n"] {
+            let doc = ParsedDoc::build(src, theme(), true, 10);
+            let math_blocks: Vec<_> = doc
+                .image_blocks
+                .iter()
+                .filter(|info| matches!(info.source, Some(crate::diagram::DiagramSource::Latex(_))))
+                .collect();
+            assert_eq!(
+                math_blocks.len(),
+                1,
+                "an unbalanced-brace formula must still reserve an image block for {src:?}; blocks: {:?}",
+                doc.blocks
+            );
+            assert!(
+                matches!(&math_blocks[0].source, Some(crate::diagram::DiagramSource::Latex(s)) if s.contains("z^{123")),
+                "the raw (invalid) latex must be carried through for {src:?}: {:?}",
+                math_blocks[0].source
+            );
+        }
+    }
+
+    /// A paragraph that merely mentions dollar signs — not a lone `$$...$$` block — must NOT be
+    /// dragged into display math by the brace-repair pass.
+    #[test]
+    fn brace_repair_leaves_ordinary_prose_alone() {
+        for src in [
+            "It cost $$5 and change.\n",            // no closing pair shape
+            "$$a$$ then prose then $$b{$$\n",       // interior `$$`: multiple / mixed
+            "Prose then $$x^{1$$ trailing words\n", // not delimited end to end
+        ] {
+            let doc = ParsedDoc::build(src, theme(), true, 10);
+            let math_blocks = doc
+                .image_blocks
+                .iter()
+                .filter(|info| matches!(info.source, Some(crate::diagram::DiagramSource::Latex(_))))
+                .count();
+            assert_eq!(
+                math_blocks, 0,
+                "prose wrongly promoted for {src:?}: {:?}",
+                doc.blocks
+            );
+        }
     }
 
     /// Display math is gated on the same consent switch as diagrams. With
