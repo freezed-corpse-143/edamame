@@ -8,6 +8,10 @@ Each released version's section is also what ships as the GitHub release notes: 
 
 ## [Unreleased]
 
+### Fixed
+
+- An image that arrives in the document *after* it was opened — a pasted screenshot, or an `![](…)` you type — now raises the images question like one that was there at load. Previously nothing asked, so the image stayed as its source line and never rendered.
+
 ## [0.1.3] - 2026-09-02
 
 ### Fixed
