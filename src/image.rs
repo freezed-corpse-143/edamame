@@ -7,8 +7,8 @@
 //! we produce here.
 
 pub mod cache;
-pub mod clipboard;
 pub mod loader;
+pub mod paste;
 pub mod render;
 pub mod svg;
 

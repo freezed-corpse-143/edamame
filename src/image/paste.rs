@@ -1,17 +1,31 @@
-//! Paste images from the OS clipboard.
+//! Turning what is on the clipboard into a Markdown image reference.
 //!
-//! Two clipboard payloads map to two behaviors:
-//! - a screenshot arrives as a *bitmap* ([`read_clipboard_image`]); it is
-//!   encoded to PNG and saved into the configured image directory;
-//! - a copied image-file *path* arrives as text ([`read_clipboard_text`]);
-//!   it is normalized and referenced directly, without reading or copying
-//!   the file.
+//! The OS half lives in [`crate::clipboard`], which hands over a
+//! [`ClipboardData`] snapshot and knows nothing else.  This module is the
+//! policy that reads that snapshot, plus the one side effect it needs:
+//! writing a bitmap somewhere Markdown can point at.
 //!
-//! The save directory is resolved from `EDAMAME_IMAGES_DIR` (highest),
-//! then `ImagesConfig::save_dir`, relative to the open document.
+//! ```text
+//! select()        which payload wins           (pure)
+//! destination()   select() + save a bitmap     (one write, when needed)
+//! ```
+//!
+//! The order `select` encodes is the order that copies least:
+//!
+//! - a **file** the user copied in a file manager is referenced where it
+//!   lies — nothing is read, nothing is written;
+//! - a **bitmap** (a screenshot) has to be written first, into the
+//!   configured directory;
+//! - **text** that merely names a path is the weakest source and is used
+//!   only when nothing better is present.
+//!
+//! The save directory comes from `EDAMAME_IMAGES_DIR` when set, then
+//! `ImagesConfig::save_dir`, resolved relative to the open document.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::clipboard::{Bitmap, ClipboardData};
 
 /// Environment variable that overrides the configured image save directory.
 pub const IMAGES_DIR_ENV: &str = "EDAMAME_IMAGES_DIR";
@@ -20,51 +34,95 @@ pub const IMAGES_DIR_ENV: &str = "EDAMAME_IMAGES_DIR";
 /// crate features in `Cargo.toml` plus SVG.
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "svg"];
 
-/// Raw RGBA pixels read off the clipboard.
-pub struct RawImage {
-    pub width: u32,
-    pub height: u32,
-    /// RGBA8, row-major, `width * height * 4` bytes.
-    pub rgba: Vec<u8>,
+// ── Policy ────────────────────────────────────────────────────────────────
+
+/// What the clipboard offers, best-first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection<'a> {
+    /// A file the user copied in a file manager: reference it in place.
+    /// Never copied, never read.
+    File(String),
+    /// A bitmap.  Markdown cannot point at pixels, so this one has to be
+    /// written before it can be referenced.
+    Bitmap(&'a Bitmap),
+    /// Text that names an image file.
+    Path(String),
 }
 
-/// The clipboard bitmap, or `Err` when no bitmap is present.
-#[cfg(feature = "clipboard")]
-pub fn read_clipboard_image() -> Result<RawImage, String> {
-    // Tests must not touch the real OS clipboard (it races parallel tests).
-    if cfg!(test) {
-        return Err("clipboard unavailable in tests".to_owned());
+/// What a paste should do, once the snapshot has been interpreted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Insert `![](destination)` at the cursor.
+    Insert(String),
+    /// The clipboard holds no image.  The caller decides what that
+    /// means: the plain paste falls through to text, the palette command
+    /// reports it.
+    NoImage,
+    /// The clipboard held an image that could not be used.  Carries the
+    /// user-facing reason.
+    Failed(String),
+}
+
+/// Where a bitmap would be written, and what a relative directory
+/// resolves against.
+pub struct SaveTarget<'a> {
+    /// The configured directory: absolute, or relative to the document.
+    pub dir: &'a str,
+    /// The open document; `None` for a buffer that has never been saved.
+    pub doc_path: Option<&'a Path>,
+}
+
+/// The best image the snapshot offers, or `None` when it holds none.
+///
+/// This function *is* the priority policy — there is no second place
+/// where the order is written down.
+///
+/// Only the first entry naming an image is used: a multi-file selection
+/// has no single obvious answer, and inserting three references is not
+/// what the chord promised.  Directories and non-image files are skipped
+/// rather than treated as a refusal, so a mixed selection still finds its
+/// image.
+pub fn select(data: &ClipboardData) -> Option<Selection<'_>> {
+    if let Some(path) = first_image_path(&data.files) {
+        return Some(Selection::File(path));
     }
-    let mut cb = arboard::Clipboard::new().map_err(|e| format!("clipboard unavailable: {e}"))?;
-    let img = cb
-        .get_image()
-        .map_err(|e| format!("no image on the clipboard: {e}"))?;
-    Ok(RawImage {
-        width: img.width as u32,
-        height: img.height as u32,
-        rgba: img.bytes.into_owned(),
-    })
-}
-
-#[cfg(not(feature = "clipboard"))]
-pub fn read_clipboard_image() -> Result<RawImage, String> {
-    Err("clipboard support is disabled in this build".to_owned())
-}
-
-/// The OS clipboard's text, if any — no in-process kill-ring fallback.
-/// `None` when the clipboard is unreachable, holds no text, or under test
-/// (where touching the real clipboard would race parallel tests).
-#[cfg(feature = "clipboard")]
-pub fn read_clipboard_text() -> Option<String> {
-    if cfg!(test) {
-        return None;
+    if let Some(bitmap) = &data.bitmap {
+        return Some(Selection::Bitmap(bitmap));
     }
-    arboard::Clipboard::new().ok()?.get_text().ok()
+    data.text
+        .as_deref()
+        .and_then(normalize_image_path)
+        .map(Selection::Path)
 }
 
-#[cfg(not(feature = "clipboard"))]
-pub fn read_clipboard_text() -> Option<String> {
-    None
+/// The Markdown destination for whatever image the clipboard holds — the
+/// whole clipboard-to-Markdown policy, in one call.
+pub fn destination(data: &ClipboardData, target: &SaveTarget<'_>) -> Outcome {
+    match select(data) {
+        None => Outcome::NoImage,
+        Some(Selection::File(path)) | Some(Selection::Path(path)) => Outcome::Insert(path),
+        Some(Selection::Bitmap(bitmap)) => match save_image(bitmap, target.dir, target.doc_path) {
+            Ok(link) => Outcome::Insert(link),
+            Err(e) => Outcome::Failed(e),
+        },
+    }
+}
+
+/// Whether a *plain* paste should stay an ordinary text paste.
+///
+/// `Ctrl-V` is the everyday chord: text on the clipboard means the user
+/// copied text, whatever else is on there with it, and quietly embedding
+/// an image instead would be the surprising behaviour.  The palette's
+/// "paste image" command skips this check — it is the explicit request.
+pub fn plain_paste_wants_text(data: &ClipboardData) -> bool {
+    data.text.as_deref().is_some_and(|text| !text.is_empty())
+}
+
+/// The first entry that names an image file, as a Markdown destination.
+fn first_image_path(paths: &[PathBuf]) -> Option<String> {
+    paths
+        .iter()
+        .find_map(|path| normalize_image_path(&path.to_string_lossy()))
 }
 
 /// The image save directory from the environment, if set and non-empty.
@@ -109,9 +167,11 @@ fn is_image_ext(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ── Saving a bitmap ───────────────────────────────────────────────────────
+
 /// Encode RGBA pixels to PNG bytes.
-fn encode_png(raw: &RawImage) -> Result<Vec<u8>, String> {
-    let img = image::RgbaImage::from_raw(raw.width, raw.height, raw.rgba.clone())
+fn encode_png(bitmap: &Bitmap) -> Result<Vec<u8>, String> {
+    let img = image::RgbaImage::from_raw(bitmap.width, bitmap.height, bitmap.rgba.clone())
         .ok_or_else(|| "invalid RGBA buffer".to_owned())?;
     let dynamic = image::DynamicImage::ImageRgba8(img);
     let mut buf = Vec::new();
@@ -154,15 +214,15 @@ fn unique_image_path(dir: &Path) -> PathBuf {
     path
 }
 
-/// Save `raw` into `dir` and return the Markdown link path to reference
+/// Save `bitmap` into `dir` and return the Markdown link path to reference
 /// it — always the absolute path, forward-slash separated, so the link
 /// stays valid regardless of the terminal's working directory.
-pub fn save_image(raw: &RawImage, dir: &str, doc_path: Option<&Path>) -> Result<String, String> {
+pub fn save_image(bitmap: &Bitmap, dir: &str, doc_path: Option<&Path>) -> Result<String, String> {
     let dir = resolve_save_dir(dir, doc_path)?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("cannot create image directory {}: {e}", dir.display()))?;
     let path = unique_image_path(&dir);
-    let bytes = encode_png(raw)?;
+    let bytes = encode_png(bitmap)?;
     std::fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     let abs = std::fs::canonicalize(&path)
         .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
@@ -217,12 +277,12 @@ mod tests {
 
     #[test]
     fn png_roundtrip() {
-        let raw = RawImage {
+        let bitmap = Bitmap {
             width: 2,
             height: 1,
             rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
         };
-        let bytes = encode_png(&raw).unwrap();
+        let bytes = encode_png(&bitmap).unwrap();
         let decoded = image::load_from_memory(&bytes).unwrap();
         assert_eq!(decoded.width(), 2);
         assert_eq!(decoded.height(), 1);

@@ -377,6 +377,12 @@ pub struct App {
     /// chosen so that refactor only touches this field and the
     /// watch / unwatch call sites.
     pub(crate) watcher: Option<Box<dyn FileWatcher>>,
+    /// The OS clipboard.  Production reads the real one; a test swaps in
+    /// a clipboard whose contents it wrote down, which is the only way
+    /// the paste path can be exercised without borrowing the developer's
+    /// clipboard (or racing parallel tests over it).  See
+    /// [`crate::clipboard`].
+    clipboard: Box<dyn crate::clipboard::ClipboardSource>,
     /// Content hash of the last-observed-on-disk bytes for the open
     /// file.  Updated from three sources: initial load, every
     /// successful save, and every accepted incoming `FileChanged`.
@@ -900,6 +906,7 @@ impl App {
             diff_advance_pending_since: None,
             search_advance_pending_since: None,
             watcher: None,
+            clipboard: crate::clipboard::default_source(),
             last_disk_hash: initial_disk_hash,
             latest_release: None,
             release_check_in_flight: false,

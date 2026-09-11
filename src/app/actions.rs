@@ -18,9 +18,11 @@
 use crossterm::event::{Event, KeyEventKind, MouseEvent, MouseEventKind};
 
 use crate::app::modal;
+use crate::clipboard::ClipboardData;
 use crate::config::sections::{DEFAULT_HANDLER, VIM_HANDLER};
 use crate::config::{Action, Config, KeyBindingOverrides, KeyMap, Theme};
 use crate::editor::{edit_ops, EditorState};
+use crate::image::paste;
 use crate::input::mode_handler::default::DefaultHandler;
 use crate::input::ModeHandler;
 use crate::terminal::ColorDepth;
@@ -453,56 +455,51 @@ impl App {
         }
     }
 
-    /// Paste an image from the OS clipboard: a screenshot is saved and
-    /// referenced; a copied image-file path is referenced directly.
-    fn paste_image_from_clipboard(&mut self, doc_height: usize, doc_width: usize) {
-        let save_dir = crate::image::clipboard::images_dir_from_env()
-            .unwrap_or_else(|| self.config.images.save_dir.clone());
-        let doc_path = self.file_path.clone();
-        match crate::image::clipboard::read_clipboard_image() {
-            Ok(raw) => {
-                match crate::image::clipboard::save_image(&raw, &save_dir, doc_path.as_deref()) {
-                    Ok(link) => {
-                        let inserted = crate::editor::edit_ops::insert_image_reference_at_cursor(
-                            &mut self.editor,
-                            &link,
-                            doc_height,
-                            doc_width,
-                        );
-                        if !inserted {
-                            self.notify(
-                                "Cannot insert image inside this block",
-                                ModalKind::Warning,
-                            );
-                        }
-                    }
-                    Err(e) => self.notify(e, ModalKind::Error),
-                }
+    /// Whatever image the clipboard snapshot offers, resolved to the
+    /// Markdown destination to insert.
+    ///
+    /// The priority between a copied file, a screenshot and a path typed
+    /// as text lives in [`paste::select`], not here — this only supplies
+    /// the two things it cannot know: where screenshots go, and which
+    /// document a relative directory resolves against.
+    fn image_paste_outcome(&self, data: &ClipboardData) -> paste::Outcome {
+        let dir =
+            paste::images_dir_from_env().unwrap_or_else(|| self.config.images.save_dir.clone());
+        paste::destination(
+            data,
+            &paste::SaveTarget {
+                dir: &dir,
+                doc_path: self.file_path.as_deref(),
+            },
+        )
+    }
+
+    /// Insert the pasted image, or tell the user why there was none.
+    ///
+    /// The one insert site for every clipboard image: the file the user
+    /// copied, the screenshot just written, and the path they copied as
+    /// text all arrive here as a [`paste::Outcome`].
+    fn report_pasted_image(
+        &mut self,
+        outcome: paste::Outcome,
+        doc_height: usize,
+        doc_width: usize,
+    ) {
+        let destination = match outcome {
+            paste::Outcome::Insert(destination) => destination,
+            paste::Outcome::Failed(reason) => return self.notify(reason, ModalKind::Error),
+            paste::Outcome::NoImage => {
+                return self.flash("No image or image path on the clipboard", MessageKind::Info)
             }
-            Err(_) => {
-                match crate::image::clipboard::read_clipboard_text()
-                    .as_deref()
-                    .and_then(crate::image::clipboard::normalize_image_path)
-                {
-                    Some(path) => {
-                        let inserted = crate::editor::edit_ops::insert_image_reference_at_cursor(
-                            &mut self.editor,
-                            &path,
-                            doc_height,
-                            doc_width,
-                        );
-                        if !inserted {
-                            self.notify(
-                                "Cannot insert image inside this block",
-                                ModalKind::Warning,
-                            );
-                        }
-                    }
-                    None => {
-                        self.flash("No image or image path on the clipboard", MessageKind::Info)
-                    }
-                }
-            }
+        };
+        let inserted = crate::editor::edit_ops::insert_image_reference_at_cursor(
+            &mut self.editor,
+            &destination,
+            doc_height,
+            doc_width,
+        );
+        if !inserted {
+            self.notify("Cannot insert image inside this block", ModalKind::Warning);
         }
     }
 
@@ -757,22 +754,25 @@ impl App {
                 self.needs_draw = true;
                 true
             }
-            Action::PasteImage => {
-                self.paste_image_from_clipboard(doc_height, doc_width);
+            // One clipboard read per paste, and one place that decides
+            // what the snapshot means.  The two actions differ only in
+            // whether text on the clipboard keeps the chord ordinary:
+            // `PasteImage` is the explicit request, so it never defers.
+            Action::PasteImage | Action::Paste => {
+                let data = self.clipboard.read();
+                let plain_paste = matches!(*action, Action::Paste);
+                if plain_paste && paste::plain_paste_wants_text(&data) {
+                    return false;
+                }
+                let outcome = self.image_paste_outcome(&data);
+                if plain_paste && outcome == paste::Outcome::NoImage {
+                    // Nothing image-shaped on the clipboard: the ordinary
+                    // text paste (kill-ring included) runs instead.
+                    return false;
+                }
+                self.report_pasted_image(outcome, doc_height, doc_width);
                 self.needs_draw = true;
                 true
-            }
-            Action::Paste => {
-                // Smart paste: OS-clipboard text first, then an image; only
-                // fall through to the kill-ring text when neither is present.
-                let has_text =
-                    crate::image::clipboard::read_clipboard_text().is_some_and(|t| !t.is_empty());
-                if !has_text && crate::image::clipboard::read_clipboard_image().is_ok() {
-                    self.paste_image_from_clipboard(doc_height, doc_width);
-                    self.needs_draw = true;
-                    return true;
-                }
-                false
             }
             Action::InsertFootnote => {
                 crate::editor::edit_ops::insert_footnote_at_cursor(
@@ -2851,5 +2851,269 @@ mod tests {
                 assert!(allowed, "{action} navigates and must stay available");
             }
         }
+    }
+
+    // ── Clipboard paste, end to end through a substituted clipboard ─────
+    //
+    // The environment each test simulates is stated in its own comment and
+    // mirrors a measured clipboard shape (Windows 11 26200):
+    //
+    //   Explorer `Ctrl+C` on a file → `CF_HDROP` + shell-private, no text
+    //   Snipping Tool              → `CF_DIBV5` + `CF_DIB` + `CF_BITMAP`
+    //   Text editor `Ctrl+C`       → `CF_UNICODETEXT` + `CF_TEXT`
+    //
+    // These stay in the module that owns the dispatch rather than moving
+    // to `tests/`: an integration test cannot reach `App`'s crate-private
+    // fields (needed to arrange the save directory and read the buffer),
+    // has no `test_env::config_isolation`, and building an `App` without
+    // it can rewrite the developer's own `config.toml`.
+
+    use crate::clipboard::{Bitmap, ClipboardData, ClipboardSource};
+
+    /// A clipboard with scripted contents: the substitution seam the
+    /// production build fills with the OS adapter.  Every read serves the
+    /// same payload, so a test states exactly what the OS would have
+    /// handed over.
+    struct StubClipboard(ClipboardData);
+
+    impl ClipboardSource for StubClipboard {
+        fn read(&mut self) -> ClipboardData {
+            self.0.clone()
+        }
+    }
+
+    /// Hand the app a clipboard it wrote down, instead of the OS one —
+    /// the substitution the production build fills with `OsClipboard`.
+    fn with_clipboard(app: &mut crate::app::App, source: Box<dyn ClipboardSource>) {
+        app.clipboard = source;
+    }
+
+    /// Explorer's `Ctrl+C` on files: a file list, and nothing else.
+    fn file_copy(paths: &[&str]) -> ClipboardData {
+        ClipboardData {
+            files: paths.iter().map(std::path::PathBuf::from).collect(),
+            ..ClipboardData::default()
+        }
+    }
+
+    /// A screenshot: pixels, and nothing else.
+    fn screenshot() -> ClipboardData {
+        ClipboardData {
+            bitmap: Some(Bitmap {
+                width: 2,
+                height: 1,
+                rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+            }),
+            ..ClipboardData::default()
+        }
+    }
+
+    /// Text on the clipboard, as a text editor's `Ctrl+C` leaves it.
+    fn text_copy(text: &str) -> ClipboardData {
+        ClipboardData {
+            text: Some(text.to_owned()),
+            ..ClipboardData::default()
+        }
+    }
+
+    /// Paste at a 40x80 document area and forget whether it was handled —
+    /// every assertion here is about what the user ends up seeing.
+    fn paste(app: &mut crate::app::App, action: Action) {
+        app.dispatch_action(action, 40, 80);
+    }
+
+    /// Whether the parse promoted the reference to an image block — the
+    /// observable that says the pasted image will actually render rather
+    /// than paint as a line of text.
+    fn promoted(app: &crate::app::App, url: &str) -> bool {
+        app.editor.parsed.image_blocks.iter().any(|i| i.url == url)
+    }
+
+    #[test]
+    fn ctrl_v_on_a_file_copied_in_the_file_manager_inserts_a_reference_to_it() {
+        // Explorer copy: CF_HDROP only.  Today nothing happens at all —
+        // the bitmap read and the text read both come back empty.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_buffer("prose\n\n", 7);
+        app.config.images.save_dir = dir.path().to_string_lossy().into_owned();
+        with_clipboard(
+            &mut app,
+            Box::new(StubClipboard(file_copy(&[r"C:\Users\me\shot.png"]))),
+        );
+
+        paste(&mut app, Action::Paste);
+
+        assert_eq!(
+            app.editor.contents(),
+            "prose\n\n![](C:/Users/me/shot.png)\n",
+            "the copied file is referenced where it lies"
+        );
+        assert!(
+            promoted(&app, "C:/Users/me/shot.png"),
+            "the reference must parse as an image block, not paint as text"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("tempdir")
+                .next()
+                .is_none(),
+            "referencing a copied file must not write a copy of it"
+        );
+    }
+
+    #[test]
+    fn the_paste_image_command_accepts_a_copied_file_too() {
+        // The palette command and the chord are the same code path.
+        let mut app = app_with_buffer("prose\n\n", 7);
+        with_clipboard(&mut app, Box::new(StubClipboard(file_copy(&["C:/a.png"]))));
+
+        paste(&mut app, Action::PasteImage);
+
+        assert_eq!(app.editor.contents(), "prose\n\n![](C:/a.png)\n");
+        assert!(promoted(&app, "C:/a.png"));
+    }
+
+    #[test]
+    fn a_multi_file_selection_inserts_one_reference() {
+        let mut app = app_with_buffer("", 0);
+        with_clipboard(
+            &mut app,
+            Box::new(StubClipboard(file_copy(&[
+                "C:/a.png",
+                "C:/b.jpg",
+                "C:/c.webp",
+            ]))),
+        );
+
+        paste(&mut app, Action::Paste);
+
+        assert_eq!(app.editor.contents(), "![](C:/a.png)\n");
+    }
+
+    #[test]
+    fn a_copied_folder_reports_that_there_is_no_image() {
+        // A directory has no image extension, so the paste must say so
+        // rather than insert a reference to the folder.
+        let mut app = app_with_buffer("prose\n", 6);
+        with_clipboard(
+            &mut app,
+            Box::new(StubClipboard(file_copy(&["C:/Pictures"]))),
+        );
+
+        paste(&mut app, Action::PasteImage);
+
+        assert_eq!(app.editor.contents(), "prose\n", "nothing may be inserted");
+        let flash = app.transient.as_ref().expect("a message must be shown");
+        assert_eq!(flash.text, "No image or image path on the clipboard");
+    }
+
+    #[test]
+    fn a_file_list_wins_over_a_bitmap_so_the_bitmap_is_never_saved() {
+        // An image viewer's copy puts both the pixels and the source file
+        // on the clipboard; the file wins, and the pixels are dropped.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_buffer("prose\n\n", 7);
+        app.config.images.save_dir = dir.path().to_string_lossy().into_owned();
+        let mut data = screenshot();
+        data.files = vec![std::path::PathBuf::from("C:/Users/me/shot.png")];
+        with_clipboard(&mut app, Box::new(StubClipboard(data)));
+
+        paste(&mut app, Action::Paste);
+
+        assert_eq!(
+            app.editor.contents(),
+            "prose\n\n![](C:/Users/me/shot.png)\n"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("tempdir")
+                .next()
+                .is_none(),
+            "the bitmap must not be written while a source file is on the clipboard"
+        );
+    }
+
+    #[test]
+    fn a_screenshot_with_no_file_list_is_saved_into_the_configured_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doc = dir.path().join("notes.md");
+        let mut app = app_with_buffer("prose\n\n", 7);
+        app.config.images.save_dir = dir.path().to_string_lossy().into_owned();
+        app.file_path = Some(doc);
+        with_clipboard(&mut app, Box::new(StubClipboard(screenshot())));
+
+        paste(&mut app, Action::PasteImage);
+
+        let written: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("tempdir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            written.len(),
+            1,
+            "the screenshot is written once: {written:?}"
+        );
+        assert!(written[0].starts_with("image-") && written[0].ends_with(".png"));
+        assert!(
+            app.editor.contents().ends_with(".png)\n"),
+            "the buffer references the file that was written: {:?}",
+            app.editor.contents()
+        );
+    }
+
+    // ── Behaviour the refactor must not break ──────────────────────────
+    //
+    // These pin behaviour the branch already produces, so they are the
+    // regression net for replacing the free functions with the port.  They
+    // still compile only once the seam exists.
+
+    #[test]
+    fn ctrl_v_with_text_on_the_clipboard_stays_an_ordinary_paste() {
+        // Text means the user copied text, whatever else is on the
+        // clipboard; the image path must not hijack the chord.
+        //
+        // Note: the *text* itself is still pasted by `edit_ops`, which
+        // reads the OS clipboard directly — routing that half through the
+        // same port is a follow-up, not part of this seam — so the
+        // assertion here is "no image was inserted", not "the text
+        // appeared".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_buffer("prose\n", 6);
+        app.config.images.save_dir = dir.path().to_string_lossy().into_owned();
+        let mut data = file_copy(&["C:/shot.png"]);
+        data.text = Some("hello".to_owned());
+        with_clipboard(&mut app, Box::new(StubClipboard(data)));
+
+        paste(&mut app, Action::Paste);
+
+        assert_eq!(app.editor.contents(), "prose\n");
+        assert!(app.editor.parsed.image_blocks.is_empty());
+        assert!(app.transient.is_none(), "a text copy is not an image miss");
+    }
+
+    #[test]
+    fn an_empty_clipboard_reports_it_without_touching_the_buffer() {
+        let mut app = app_with_buffer("prose\n", 6);
+        with_clipboard(&mut app, Box::new(StubClipboard(ClipboardData::default())));
+
+        paste(&mut app, Action::PasteImage);
+
+        assert_eq!(app.editor.contents(), "prose\n");
+        let flash = app.transient.as_ref().expect("a message must be shown");
+        assert_eq!(flash.text, "No image or image path on the clipboard");
+    }
+
+    #[test]
+    fn a_copied_image_path_in_text_is_still_referenced() {
+        // The behaviour the branch already ships; the port must keep it.
+        let mut app = app_with_buffer("", 0);
+        with_clipboard(
+            &mut app,
+            Box::new(StubClipboard(text_copy(r#""C:\Users\me\shot.png""#))),
+        );
+
+        paste(&mut app, Action::PasteImage);
+
+        assert_eq!(app.editor.contents(), "![](C:/Users/me/shot.png)\n");
     }
 }

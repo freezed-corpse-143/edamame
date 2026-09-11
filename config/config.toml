@@ -191,7 +191,8 @@ remote_policy = "ask"
 # per-user directory under the XDG data dir (~/.local/share/edamame/images
 # on Linux/macOS, %APPDATA%\edamame\images on Windows). A relative value
 # resolves against the open document; absolute is used verbatim. Overridden
-# by the EDAMAME_IMAGES_DIR environment variable when set.
+# by the EDAMAME_IMAGES_DIR environment variable when set. Only screenshots
+# land here: a copied image *file* is referenced where it lies.
 # save_dir = ""
 
 # ── Diagrams ──────────────────────────────────────────────────────────────────
