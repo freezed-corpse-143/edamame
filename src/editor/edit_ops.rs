@@ -1395,6 +1395,34 @@ pub fn insert_image_reference_at_cursor(
     insert_inline_snippet(state, "!", "", Some(url), viewport_height, viewport_width)
 }
 
+/// Frame `reference` as a paragraph of its own at `offset`: a blank line
+/// before it (unless one is already there) and a newline after it (unless
+/// the line already ends).  Returns the text to insert in one delta.
+///
+/// The parse only promotes an image to a block when it is a paragraph's
+/// sole content, so a reference inserted flush against other text would
+/// stay inline and render as a text placeholder instead of the image.
+fn frame_own_paragraph(buffer: &crate::document::Buffer, offset: usize, reference: &str) -> String {
+    let rope = buffer.rope();
+    let len = rope.len_chars();
+    let offset = offset.min(len);
+    // A blank line (or the buffer start) already behind the cursor means
+    // the reference opens its own paragraph and needs no leading break;
+    // sitting at the start of a line whose predecessor is text needs one
+    // blank line, and sitting mid-line needs that line ended first.
+    let at_line_start = offset == 0 || rope.char(offset - 1) == '\n';
+    let above_blank = offset < 2 || rope.char(offset - 2) == '\n';
+    let mut out = String::new();
+    if !(at_line_start && above_blank) {
+        out.push_str(if at_line_start { "\n" } else { "\n\n" });
+    }
+    out.push_str(reference);
+    if offset >= len || rope.char(offset) != '\n' {
+        out.push('\n');
+    }
+    out
+}
+
 /// Shared body of the image / link snippet inserts.  Returns `false` —
 /// leaving mode, selection, and buffer untouched — when the target
 /// block can't host inline Markdown (see
@@ -1463,10 +1491,20 @@ fn insert_inline_snippet(
             false,
         ),
     };
-    let inserted = format!(
+    let reference = format!(
         "{prefix}[{visible_text}]({})",
         url.unwrap_or(URL_PLACEHOLDER)
     );
+    // A fixed-URL insert is the clipboard paste's block image: the parse
+    // promotes an image to a block only when it is a paragraph's *sole*
+    // content (`markdown::parser::post_pass::promote_image_paragraphs`),
+    // so it is framed with its own blank lines.  Left inline it would
+    // paint as a text placeholder rather than the image.
+    let inserted = if url.is_some() {
+        frame_own_paragraph(&state.buffer, offset, &reference)
+    } else {
+        reference
+    };
     let inserted_len = inserted.chars().count();
     state.cursor.offset = offset;
     state.apply_delta(EditDelta {
