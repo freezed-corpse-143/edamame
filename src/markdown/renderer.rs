@@ -17,7 +17,7 @@ use self::util::{link_fallback, link_style_for};
 use super::ast::{inlines_to_plain, Block, Inline, MetadataKind};
 use super::code_layout;
 use super::highlight::{self, Token};
-use super::render_cache::{RenderCache, RenderSettings};
+use super::render_cache::{is_cache_worthy, RenderCache, RenderSettings};
 
 const IMAGE_PREFIX: &str = "Image: ";
 
@@ -201,8 +201,10 @@ impl<'t> Renderer<'t> {
         for block in blocks {
             let before = lines.len();
             // ImageBlock row counts track the decode cache, which changes
-            // without the AST changing — never cache them.
-            if matches!(block, Block::ImageBlock { .. }) {
+            // without the AST changing — never cache them.  Cheap-to-render
+            // blocks bypass the cache too: a hash + line-clone costs more than
+            // re-rendering them (#35 §2, `is_cache_worthy`).
+            if matches!(block, Block::ImageBlock { .. }) || !is_cache_worthy(block) {
                 self.render_block(block, &mut lines, "", true);
             } else if let Some(hit) = cache.entries.get(block) {
                 lines.extend(hit.iter().cloned());
@@ -1169,24 +1171,29 @@ mod tests {
         let r = renderer();
         let mut cache = RenderCache::default();
 
-        let first = parse("alpha\n\nbeta\n\nalpha\n");
+        // Code blocks, not paragraphs: only cache-worthy blocks land in the map
+        // now (paragraphs bypass it), so eviction/dedup is only observable on them.
+        let first = parse("```\nalpha\n```\n\n```\nbeta\n```\n\n```\nalpha\n```\n");
         assert_eq!(first.len(), 3, "two duplicates plus one distinct block");
         r.render_with_counts_cached(&first, &mut cache);
         assert_eq!(cache.entries.len(), 2, "duplicates share one entry");
 
-        let second = parse("beta\n\ngamma\n");
+        let second = parse("```\nbeta\n```\n\n```\ngamma\n```\n");
         r.render_with_counts_cached(&second, &mut cache);
         assert_eq!(cache.entries.len(), 2);
-        assert!(!cache.entries.keys().any(
-            |b| matches!(b, Block::Paragraph { inlines } if inlines_to_plain(inlines) == "alpha")
-        ));
+        assert!(!cache
+            .entries
+            .keys()
+            .any(|b| matches!(b, Block::CodeBlock { content, .. } if content.trim() == "alpha")));
     }
 
     /// A settings change must invalidate the cache — a stale-width hit would
-    /// render rules and tables at the wrong width.
+    /// render tables and code blocks at the wrong width.  Uses a code block: it
+    /// is cache-worthy (so the entry actually persists to be invalidated), and
+    /// its background fill runs to the viewport edge, so width changes its lines.
     #[test]
     fn cache_cleared_on_settings_change() {
-        let blocks = parse("---\n");
+        let blocks = parse("```\ncode\n```\n");
         let mut cache = RenderCache::default();
 
         let narrow = renderer().with_viewport_width(40);
@@ -1195,7 +1202,10 @@ mod tests {
         let wide = renderer().with_viewport_width(120);
         let (wide_lines, _) = wide.render_with_counts_cached(&blocks, &mut cache);
 
-        assert_ne!(narrow_lines, wide_lines, "rule must re-render at new width");
+        assert_ne!(
+            narrow_lines, wide_lines,
+            "block must re-render at new width"
+        );
         assert_eq!(wide_lines, wide.render(&blocks));
     }
 
@@ -1232,6 +1242,66 @@ mod tests {
         let mut cache = RenderCache::default();
         renderer().render_with_counts_cached(&blocks, &mut cache);
         assert!(cache.entries.is_empty());
+    }
+
+    /// Cheap-to-render blocks bypass the cache (#35 §2): a hash + line-clone
+    /// costs more than re-rendering them, so nothing lands in the map.
+    #[test]
+    fn cheap_blocks_bypass_cache() {
+        let blocks = parse("# Heading\n\nplain **prose** here.\n\n- a\n- b\n\n---\n");
+        let mut cache = RenderCache::default();
+        renderer().render_with_counts_cached(&blocks, &mut cache);
+        assert!(
+            cache.entries.is_empty(),
+            "no Table or CodeBlock present, so nothing is cache-worthy: {:?}",
+            cache.entries.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The gate follows nesting: a `List`/`BlockQuote` wrapping a `Table` or
+    /// `CodeBlock` stays cache-worthy, or the expensive nested render would run
+    /// every keystroke.  A container of only cheap content does not.
+    #[test]
+    fn is_cache_worthy_follows_nested_expensive_content() {
+        use crate::markdown::ast::ListItem;
+
+        let code = || Block::CodeBlock {
+            language: None,
+            content: "x\n".into(),
+            fenced: true,
+        };
+        let table = || Block::Table {
+            col_count: 1,
+            headers: vec![vec![]],
+            rows: vec![],
+            user_widths: None,
+        };
+        let item = |blocks| ListItem {
+            blocks,
+            task: None,
+            blank_lines_before: 0,
+        };
+        let list = |items| Block::List {
+            ordered: false,
+            start: None,
+            items,
+        };
+
+        assert!(is_cache_worthy(&code()));
+        assert!(is_cache_worthy(&table()));
+        assert!(is_cache_worthy(&Block::BlockQuote {
+            blocks: vec![table()]
+        }));
+        assert!(is_cache_worthy(&list(vec![item(vec![code()])])));
+
+        assert!(!is_cache_worthy(&Block::Paragraph { inlines: vec![] }));
+        assert!(!is_cache_worthy(&Block::HorizontalRule));
+        assert!(!is_cache_worthy(&Block::BlockQuote {
+            blocks: vec![Block::Paragraph { inlines: vec![] }]
+        }));
+        assert!(!is_cache_worthy(&list(vec![item(vec![
+            Block::Paragraph { inlines: vec![] }
+        ])])));
     }
 
     #[test]

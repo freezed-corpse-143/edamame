@@ -12,8 +12,36 @@
 use std::collections::HashMap;
 
 use ratatui::text::Line;
+use rustc_hash::FxBuildHasher;
 
 use super::ast::Block;
+
+/// The cache's block map. Keyed by whole `Block` AST values, so a lookup hashes a deep
+/// structure — many small `write_*` calls — on every query. std's DoS-resistant SipHash is
+/// both wasted (the keys are local document content, never adversarial network input) and slow
+/// at that write pattern, which is what makes the cache a net loss on cheap-to-render blocks
+/// (`lists`, `math`; see docs/dev/performance.md and issue #35). `FxHasher` is built for small
+/// struct keys and measurably faster here; the AST keying — hence correctness — is unchanged.
+/// (seahash, the crate's other non-crypto hasher, is for whole byte buffers and benched *slower*
+/// than SipHash on these keys.)
+pub(super) type BlockMap = HashMap<Block, Vec<Line<'static>>, FxBuildHasher>;
+
+/// Whether a block is worth memoizing. A cache hit costs a hash of the whole `Block` plus a clone
+/// of its `Vec<Line>`; only blocks whose render is *more* expensive than that come out ahead. That
+/// is `Table` (column measurement) and `CodeBlock` (syntax highlighting) — and any `List` or
+/// `BlockQuote` that *contains* one, since skipping those would re-run the expensive nested render
+/// on every keystroke. Cheap blocks (paragraphs, plain lists, headings, rules) render for less than
+/// a lookup costs, so caching them is a net loss (#35 §2; see docs/dev/performance.md); they bypass
+/// the cache and re-render each build. `ImageBlock` is handled separately by the caller — it is
+/// never cached for an unrelated reason (its rows track the out-of-band decode cache).
+pub(super) fn is_cache_worthy(block: &Block) -> bool {
+    match block {
+        Block::Table { .. } | Block::CodeBlock { .. } => true,
+        Block::BlockQuote { blocks } => blocks.iter().any(is_cache_worthy),
+        Block::List { items, .. } => items.iter().flat_map(|it| &it.blocks).any(is_cache_worthy),
+        _ => false,
+    }
+}
 
 /// Fingerprint of every `Renderer` input besides the block itself; any change clears the whole
 /// cache.  The theme is identified by address — themes are `&'static` and the editor already
@@ -47,17 +75,14 @@ pub(super) struct RenderSettings {
 #[derive(Debug, Default)]
 pub struct RenderCache {
     pub(super) settings: Option<RenderSettings>,
-    pub(super) entries: HashMap<Block, Vec<Line<'static>>>,
+    pub(super) entries: BlockMap,
 }
 
 impl RenderCache {
     /// Reset to the given settings, clearing all entries when they differ from the previous
     /// build's.  Returns the previous entry map; the caller moves hits out of it into the fresh
     /// [`entries`](Self::entries) map and lets the remainder drop.
-    pub(super) fn begin_build(
-        &mut self,
-        settings: RenderSettings,
-    ) -> HashMap<Block, Vec<Line<'static>>> {
+    pub(super) fn begin_build(&mut self, settings: RenderSettings) -> BlockMap {
         if self.settings.as_ref() != Some(&settings) {
             self.entries.clear();
             self.settings = Some(settings);

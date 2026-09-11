@@ -108,6 +108,24 @@ fn math(target: usize) -> String {
     })
 }
 
+fn nested(target: usize) -> String {
+    fill(target, |i, s| {
+        // A list item wrapping a fenced `rust` block, and a blockquote wrapping a
+        // table — the two shapes where an expensive block hides inside a cheap
+        // container.  The render cache must keep caching the *outer* block (#35 §2
+        // `is_cache_worthy` walks into it); a gate that skipped lists/blockquotes
+        // by kind would re-highlight and re-measure this nested content on every
+        // keystroke.  The gap between this corpus's cold and memoized numbers is
+        // the guard: it collapses if the nested content stops being cached.
+        s.push_str(&format!(
+            "- step {i} with **bold** text\n\n  ```rust\n  fn step_{i}(x: usize) -> usize {{ x + {i} }}\n  ```\n\n"
+        ));
+        s.push_str(&format!(
+            "> | Field | Value |\n> | --- | --- |\n> | id | {i} |\n> | ok | yes |\n\n"
+        ));
+    })
+}
+
 fn mixed(target: usize) -> String {
     let mut s = String::from("# Document Title\n\n");
     let mut i = 0;
@@ -146,6 +164,7 @@ const MIXES: &[Corpus] = &[
     ("tables", tables),
     ("code", code),
     ("math", math),
+    ("nested", nested),
     ("mixed", mixed),
 ];
 

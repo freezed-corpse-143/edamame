@@ -229,8 +229,17 @@ notify = "8"
 
 # Fast non-cryptographic hash for the watcher's own-write content filter:
 # zero dependencies, sub-microsecond on typical Markdown files.  It skips
-# echoes of our own saves; no cryptographic guarantee is intended.
+# echoes of our own saves; no cryptographic guarantee is intended.  (Tuned for
+# hashing whole byte buffers; not used for the RenderCache's struct keys — see
+# rustc-hash below.)
 seahash = "4"
+
+# FxHasher for the block-level RenderCache (`markdown::render_cache`).  Its keys
+# are whole `Block` AST values, so a lookup issues many small `write_*` calls
+# for a nested struct — the workload FxHasher is built for and std's SipHash
+# (and seahash, which is for byte streams) are slow at.  Zero dependencies, not
+# DoS-resistant, which is fine: the keys are local document content.  See #35.
+rustc-hash = "2"
 
 # Line- and word-level diff for the diff-mode review subsystem.
 # `TextDiff::from_lines` gives line hunks; `InlineChange` slices each

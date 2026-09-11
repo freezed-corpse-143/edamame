@@ -16,6 +16,7 @@ Each released version's section is also what ships as the GitHub release notes: 
 ### Changed
 
 - The editor is now capped at 100 columns by default, for more comfortable reading on wide terminals. Turn it off with the "Limit editor width" toggle in settings (Ctrl-P → Open settings). You can also change the character limit there.
+- Editing large documents does less work per keystroke: the render cache now uses a faster hash and no longer caches blocks that are cheap to redraw, which removes a slowdown on long list- and math-heavy files.
 - Math and diagrams have been combined as **Figures** in the diagrams consent setting, HTML export options, and the `[diagrams]` config section (an existing `[diagrams]` is rewritten to `[figures]` automatically on the next launch).
 
 ### Fixed
