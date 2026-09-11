@@ -1,10 +1,5 @@
-//! Modal subsystem: trait, dispatch stack, and individual modal
-//! implementations.
-//!
-//! The App's only handle to a modal is a [`Box<dyn Modal>`] on the
-//! [`ModalStack`]; pushing a modal makes it the topmost overlay,
-//! popping returns it.  Each modal implementation lives in its own
-//! file under `src/app/modal/`.
+//! Modal subsystem: the [`Modal`] trait, the [`ModalStack`] the App dispatches through,
+//! and one adapter per modal under `src/app/modal/`.
 
 pub mod chrome;
 pub(crate) mod docs_link;
@@ -14,7 +9,6 @@ pub mod types;
 pub mod about;
 pub mod command_palette;
 pub mod config_warning;
-pub mod diagrams_enabled;
 pub mod diff_bulk_confirm;
 pub mod diff_intro;
 pub mod diff_quit_confirm;
@@ -26,6 +20,7 @@ pub mod dirty_guard;
 pub mod export;
 pub mod export_success;
 pub mod export_theme;
+pub mod figures_enabled;
 pub mod file_deleted;
 pub mod images_enabled;
 pub mod insert_table;
@@ -55,7 +50,6 @@ pub use types::{Modal, ModalOutcome, ModalRenderCtx};
 pub use about::AboutModal;
 pub use command_palette::CommandPaletteModal;
 pub use config_warning::ConfigWarningModal;
-pub use diagrams_enabled::DiagramsEnabledPromptModal;
 pub use diff_bulk_confirm::DiffBulkConfirmModal;
 pub use diff_intro::DiffIntroModal;
 pub use diff_quit_confirm::DiffQuitConfirmModal;
@@ -63,6 +57,7 @@ pub use diff_resolve_confirm::DiffResolveConfirmModal;
 pub use dirty_conflict::DirtyConflictModal;
 pub use dirty_guard::DirtyGuardModal;
 pub use export_success::ExportSuccessModal;
+pub use figures_enabled::FiguresEnabledPromptModal;
 pub use file_deleted::FileDeletedModal;
 pub use images_enabled::ImagesEnabledPromptModal;
 pub use insert_table::InsertTableModal;

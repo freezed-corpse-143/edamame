@@ -1,19 +1,8 @@
-//! Diff-mode intro modal widget.
-//!
-//! A framed, scrollable explanation of diff-review mode with a pinned
-//! footer: a "Don't show this again" on/off toggle on its own row sits
-//! directly above a centred `[ Continue ]` button.  The keybindings
-//! explanation stays in the scrollable body so a short terminal can page
-//! through it while the toggle and Continue button remain anchored.
-//!
-//! Built on the `scroll_container` chrome primitives (like
-//! [`crate::ui::welcome`] and the settings overlay) rather than the flat
-//! [`crate::ui::ModalView`], because a pinned interactive control row
-//! above the button row isn't expressible as a plain body + button-row
-//! layout.
-//!
-//! The widget is UI-only: the adapter `src/app/modal/diff_intro.rs`
-//! supplies the body text and persists the opt-out on close.
+//! Diff-mode intro modal: a scrollable explanation with a pinned footer holding a "Don't show
+//! this again" toggle above a `[ Continue ]` button.  Built on the `scroll_container` primitives
+//! rather than [`crate::ui::ModalView`] because that layout cannot express a pinned control row
+//! above the buttons.  The adapter `src/app/modal/diff_intro.rs` supplies the body and persists
+//! the opt-out.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -31,13 +20,12 @@ use crate::ui::scroll_container::{
     ModalKind, ScrollContainerState, MAX_PAD_H, VERTICAL_CHROME_ROWS,
 };
 
-/// Label on the opt-out toggle row.
 const TOGGLE_LABEL: &str = "Don't show this again";
-/// Gap (in cells) between the toggle label and the slider.
+/// Cells between the toggle label and the slider.
 const TOGGLE_LABEL_GAP: usize = 2;
 const CONTINUE_LABEL: &str = "Continue";
 
-/// The two focus targets: the opt-out toggle and the Continue button.
+/// The two focus targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffIntroFocus {
     Toggle,
@@ -58,8 +46,7 @@ impl DiffIntroFocus {
 pub enum DiffIntroResponse {
     /// Modal stays open; the caller just redraws.
     Continue,
-    /// Modal should close.  The caller reads [`DiffIntroState::dont_show_again`]
-    /// to decide whether to persist the opt-out.
+    /// Close; the caller reads [`DiffIntroState::dont_show_again`] to persist the opt-out.
     Close,
 }
 
@@ -67,15 +54,12 @@ pub enum DiffIntroResponse {
 #[derive(Debug, Clone)]
 pub struct DiffIntroState {
     pub focus: DiffIntroFocus,
-    /// Live value of the opt-out toggle.  `true` persists
-    /// `config.editor.show_diff_intro = false` on close.
+    /// `true` persists `config.editor.show_diff_intro = false` on close.
     pub dont_show_again: bool,
     pub scroll_state: ScrollContainerState,
-    /// Hit-rect of the toggle row, captured each render.
+    /// Click hit-rects, captured each render.
     pub toggle_rect: Option<Rect>,
-    /// Hit-rect of the Continue button, captured each render.
     pub continue_rect: Option<Rect>,
-    /// Hit-rect of the rendered `esc` close hint.
     pub esc_button_rect: Option<Rect>,
 }
 
@@ -98,10 +82,8 @@ impl DiffIntroState {
         }
     }
 
-    /// Apply a key event.  PgUp/PgDn/Home/End scroll the body; Up / Down
-    /// / Tab move focus between the toggle and Continue; Left / Right flip
-    /// the toggle (or move focus off Continue); Enter / Space / `y`
-    /// activate the focused target; Esc / `n` close.
+    /// Apply a key event: paging keys scroll the body, Up / Down / Tab move focus, Left / Right
+    /// flip the toggle (or move focus off Continue), Enter / Space / `y` activate, Esc / `n` close.
     pub fn handle_key(&mut self, key: &KeyEvent) -> DiffIntroResponse {
         if self.scroll_state.handle_paging_key(key) {
             return DiffIntroResponse::Continue;
@@ -128,8 +110,6 @@ impl DiffIntroState {
         }
     }
 
-    /// Activate the focused target: flip the toggle (modal stays open) or
-    /// confirm Continue (modal closes).
     fn activate(&mut self) -> DiffIntroResponse {
         match self.focus {
             DiffIntroFocus::Toggle => {
@@ -140,13 +120,12 @@ impl DiffIntroState {
         }
     }
 
-    /// Scroll the body by a mouse-wheel delta.
     pub fn handle_wheel(&mut self, delta: i32) {
         self.scroll_state.scroll_by(delta);
     }
 
-    /// Hit-test a left-click.  A click on the toggle row flips the toggle
-    /// (and focuses it); the Continue button or `esc` hint closes.
+    /// Hit-test a left-click: the toggle row flips (and focuses) the toggle; Continue or the
+    /// `esc` hint closes.
     pub fn handle_click(&mut self, col: u16, row: u16) -> DiffIntroResponse {
         if rect_contains(self.toggle_rect, col, row) {
             self.focus = DiffIntroFocus::Toggle;
@@ -166,16 +145,14 @@ fn rect_contains(rect: Option<Rect>, col: u16, row: u16) -> bool {
     rect.is_some_and(|r| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
 }
 
-/// View widget — drawn each frame from the adapter-supplied body lines.
+/// View widget, drawn each frame from the adapter-supplied body lines.
 pub struct DiffIntroView<'a> {
     pub theme: &'a Theme,
-    /// Explanatory body lines (keybindings list, etc.).
     pub body: &'a [Line<'a>],
 }
 
 impl<'a> DiffIntroView<'a> {
-    /// Build the centred toggle group (label + on/off slider) and its
-    /// total rendered width.
+    /// The toggle group (label + slider) and its rendered width.
     fn toggle_line(&self, state: &DiffIntroState) -> (Line<'static>, u16) {
         let focused = state.focus == DiffIntroFocus::Toggle;
         let label_style = controls::control_label_style(focused, false, self.theme);
@@ -204,13 +181,10 @@ impl<'a> StatefulWidget for DiffIntroView<'a> {
         let body_w = self.body.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
         let content_width = body_w.max(toggle_w).max(continue_w);
 
-        // Pinned-bottom region: blank spacer + toggle row + spacer +
-        // Continue button row.  The leading blank sets the opt-out toggle
-        // apart from the keybindings body above it.
+        // Blank spacer + toggle row + spacer + Continue row.
         let pinned_bottom: u16 = 4;
 
-        // Compute the body's wrap width the same way `ModalView` does so
-        // the pre-render height matches the post-render wrap.
+        // Same wrap-width derivation as `ModalView`, so pre-render height matches the real wrap.
         let prospective_modal_width = content_width.saturating_add(2 * MAX_PAD_H).min(area.width);
         let prospective_pad_h = compute_pad_h(prospective_modal_width, content_width, MAX_PAD_H);
         let prospective_inner_w = prospective_modal_width
@@ -281,7 +255,6 @@ impl<'a> StatefulWidget for DiffIntroView<'a> {
         }
 
         // ── Pinned footer: blank, toggle row, spacer, Continue button ────
-        // A blank spacer row separates the opt-out toggle from the body.
         let blank_y = inner.y + text_body_height;
         Paragraph::new("").style(self.theme.modal_bg).render(
             Rect {
@@ -293,7 +266,6 @@ impl<'a> StatefulWidget for DiffIntroView<'a> {
             buf,
         );
         let footer_y = blank_y + 1;
-        // Toggle row, centred.
         let toggle_x = inner
             .x
             .saturating_add(inner.width.saturating_sub(toggle_w) / 2);
@@ -324,7 +296,6 @@ impl<'a> StatefulWidget for DiffIntroView<'a> {
             height: 1,
         });
 
-        // Continue button row (skips the spacer row at footer_y + 1).
         let continue_area = Rect {
             x: inner.x,
             y: footer_y + 2,
@@ -397,7 +368,6 @@ mod tests {
         let r = s.handle_key(&key(KeyCode::Enter));
         assert_eq!(r, DiffIntroResponse::Continue);
         assert!(s.dont_show_again);
-        // Space flips it back off without closing.
         let r = s.handle_key(&key(KeyCode::Char(' ')));
         assert_eq!(r, DiffIntroResponse::Continue);
         assert!(!s.dont_show_again);

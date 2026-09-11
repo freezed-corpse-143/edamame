@@ -16,6 +16,24 @@ Each released version's section is also what ships as the GitHub release notes: 
 
 - An image that arrives in the document *after* it was opened — a pasted screenshot, or an `![](…)` you type — now raises the images question like one that was there at load. Previously nothing asked, so the image stayed as its source line and never rendered.
 
+## [0.1.4] - 2026-09-11
+
+### Added
+
+- Manually-wrapped paragraphs now reflow to the editor width. A paragraph wrapped in the source is joined into a single line and wrapped to fit the editor, instead of showing one short row per source line. A hard break (two trailing spaces or a backslash) still splits. Can be turned off in settings (Reflow paragraphs).
+- edamame now displays LaTeX math. A `$$...$$` block renders as a formula image using pure Rust — no additional install needed. HTML export renders math as embedded images.
+
+### Changed
+
+- The editor is now capped at 100 columns by default, for more comfortable reading on wide terminals. Turn it off with the "Limit editor width" toggle in settings (Ctrl-P → Open settings). You can also change the character limit there.
+- Editing large documents does less work per keystroke: the render cache now uses a faster hash and no longer caches blocks that are cheap to redraw, which removes a slowdown on long list- and math-heavy files.
+- Math and diagrams have been combined as **Figures** in the diagrams consent setting, HTML export options, and the `[diagrams]` config section (an existing `[diagrams]` is rewritten to `[figures]` automatically on the next launch).
+
+### Fixed
+
+- Clicks now map to the correct character in table cells with formatting.
+- Mermaid diagrams no longer have missing text when rendered on some systems.
+
 ## [0.1.3] - 2026-09-02
 
 ### Fixed

@@ -1,10 +1,7 @@
 //! Insert Table modal.  Adapter wrapping [`crate::ui::InsertTableState`].
 //!
-//! On Insert the blank-line precondition is re-verified defensively
-//! (the App already checks it before opening the modal, but the user
-//! may have moved the cursor in the meantime).  Insertion goes
-//! through [`crate::editor::edit_ops::insert_table_at_cursor`] —
-//! same path the keymap binding uses.
+//! The blank-line precondition is re-verified on Insert: the App checks it before opening the
+//! modal, but the cursor may have moved since.
 
 use std::any::Any;
 
@@ -100,9 +97,8 @@ impl Modal for InsertTableModal {
 
 #[cfg(test)]
 mod tests {
-    //! Exercise the App-level Insert Table flow: pre-flight
-    //! blank-line guard, modal lifecycle, and the resulting buffer +
-    //! cursor state after Insert.
+    //! The App-level Insert Table flow: pre-flight blank-line guard, modal lifecycle, and the
+    //! resulting buffer + cursor state.
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -121,16 +117,13 @@ mod tests {
         let src = "para one\n\npara two\n";
         // Cursor on the blank line between the two paragraphs (byte 9).
         let mut app = app_with_buffer(src, 9);
-        // Dispatch the action through the same path a Ctrl+Shift+T or
-        // palette pick would take.
         let handled = app.handle_app_action(&Action::InsertTable, 40, 80);
         assert!(handled, "InsertTable should be handled at the App layer");
         assert!(
             app.modal_stack.contains::<InsertTableModal>(),
             "the rows/columns modal must be open after the pre-flight passes"
         );
-        // Defaults are rows=2, cols=3 — matching the spec.  Tab to the
-        // Insert button and press Enter.
+        // Defaults are rows=2, cols=3; Tab to the Insert button and press Enter.
         app.dispatch_modal_key(key(KeyCode::Tab), 40, 80); // Rows → Cols
         app.dispatch_modal_key(key(KeyCode::Tab), 40, 80); // Cols → Insert
         app.dispatch_modal_key(key(KeyCode::Enter), 40, 80);
@@ -153,9 +146,7 @@ mod tests {
             "buffer mismatch:\n{post}"
         );
 
-        // Cursor should be inside the first header cell — the byte 3
-        // chars around the cursor offset should look like `|<sp><sp>`
-        // (skip the leading `| `, sit on the middle space).
+        // The cursor should sit on the middle space of the first header cell's `|  `.
         let cursor_byte = app
             .editor
             .buffer
@@ -166,7 +157,6 @@ mod tests {
             "cursor should land in first header cell (byte {cursor_byte}); around: {:?}",
             &post[cursor_byte.saturating_sub(2)..(cursor_byte + 2).min(post.len())]
         );
-        // A success transient should fire so the user gets feedback.
         assert!(
             matches!(
                 app.transient.as_ref().map(|t| t.kind),
@@ -180,7 +170,7 @@ mod tests {
     #[test]
     fn insert_table_in_mid_paragraph_warns_and_leaves_buffer_untouched() {
         let src = "this is a paragraph\nwith two lines\n";
-        // Cursor in the middle of the first line.
+        // Cursor mid-line.
         let mut app = app_with_buffer(src, 5);
         let before = app.editor.buffer.contents();
         let handled = app.handle_app_action(&Action::InsertTable, 40, 80);
@@ -227,8 +217,7 @@ mod tests {
     fn insert_table_at_eof_without_trailing_newline_warns_then_succeeds_after_enter() {
         let src = "no trailing newline";
         let mut app = app_with_buffer(src, src.len());
-        // Force Rendered mode so `Action::Newline` doesn't bounce the
-        // cursor via the Preview→Rendered scroll-sync.
+        // Rendered mode, so `Action::Newline` doesn't bounce the cursor via the scroll-sync.
         app.editor.mode = Mode::Rendered;
         app.handle_app_action(&Action::InsertTable, 40, 80);
         assert!(
@@ -239,21 +228,15 @@ mod tests {
             app.modal_stack.contains::<NoticeModal>(),
             "blank-line guard must push a NoticeModal"
         );
-        // Dismiss the notice so the second dispatch can open the
-        // InsertTableModal cleanly.
         app.dispatch_modal_key(key(KeyCode::Esc), 40, 80);
 
-        // Add a newline at the cursor: the cursor was on the last byte
-        // of a non-blank line; `Newline` inserts `\n`, moving the
-        // cursor onto a fresh empty trailing line that *is* blank.  The
-        // second InsertTable should now pass pre-flight.
+        // The newline moves the cursor onto a fresh empty trailing line, so pre-flight passes.
         crate::editor::edit_ops::apply(&mut app.editor, Action::Newline, 40, 80);
         app.handle_app_action(&Action::InsertTable, 40, 80);
         assert!(
             app.modal_stack.contains::<InsertTableModal>(),
             "modal should open after a newline made the cursor line blank"
         );
-        // Press Enter immediately to confirm the defaults.
         app.dispatch_modal_key(key(KeyCode::Enter), 40, 80);
         let post = app.editor.buffer.contents();
         assert!(
@@ -269,7 +252,6 @@ mod tests {
         let before = app.editor.buffer.contents();
         app.handle_app_action(&Action::InsertTable, 40, 80);
         assert!(app.modal_stack.contains::<InsertTableModal>());
-        // Esc dismisses without inserting.
         app.dispatch_modal_key(key(KeyCode::Esc), 40, 80);
         assert!(!app.modal_stack.contains::<InsertTableModal>());
         assert_eq!(app.editor.buffer.contents(), before);

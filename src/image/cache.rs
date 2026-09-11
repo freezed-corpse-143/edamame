@@ -1,12 +1,8 @@
-//! Decoded-image cache retained across reparses.
+//! Decoded-image cache retained across reparses; see docs/dev/media-export.md.
 //!
-//! `ParsedDoc` is rebuilt on every buffer mutation, so keeping decoded
-//! image bytes (and their expensive `StatefulProtocol` encodings) on the
-//! parse tree would mean re-decoding on every keystroke.  Instead we
-//! cache by URL on `EditorState`: the URL set rarely changes during
-//! editing, and protocols are keyed additionally by target cell
-//! dimensions so a terminal resize invalidates only the affected
-//! entries, not unrelated text.
+//! `ParsedDoc` is rebuilt on every buffer mutation, so decoded bytes and their expensive
+//! `StatefulProtocol` encodings live on `EditorState` keyed by URL instead.  Protocols are keyed
+//! additionally by target cell dimensions, so a resize invalidates only the affected entries.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{mpsc, Arc};
@@ -19,31 +15,16 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::thread::{ResizeRequest, ResizeResponse, ThreadProtocol};
 use ratatui_image::{Resize, StatefulImage};
 
-/// Encode `image` as halfblocks at `rect` using `picker` and return a
-/// `Buffer` containing the rendered cells.
+/// Encode `image` as halfblocks at `rect`, returning the rendered cells.
 ///
-/// **Only `picker`'s font size is used; its protocol is forced to
-/// `Halfblocks` regardless of what it carries.** Passing a Kitty or
-/// iTerm2 picker does not produce a Kitty or iTerm2 encoding — it
-/// produces halfblocks at that picker's cell aspect ratio, which is the
-/// entire point: the scratch has to be *position-independent* cells for
-/// `paint_halfblocks_partial` to clip it by row, while still matching
-/// the native protocol's aspect ratio so an image doesn't change shape
-/// when it crosses the native↔halfblocks boundary mid-scroll.  A native
-/// encoding would instead put the whole image in one cell as a single
-/// escape sequence surrounded by `skip` cells, which cannot be clipped
-/// at all — the image would flash on the frames that copy row 0 and
-/// vanish otherwise.  `Capabilities` already pins its
-/// `halfblocks_picker` to `Halfblocks`; re-forcing it here keeps the
-/// invariant local to the one function that depends on it.
+/// **Only `picker`'s font size is used; the protocol is forced to `Halfblocks`.** The scratch
+/// must be position-independent cells so `paint_halfblocks_partial` can clip it by row, while
+/// keeping the native protocol's aspect ratio so the image doesn't change shape crossing the
+/// native↔halfblocks boundary mid-scroll.  A native encoding puts the whole image in one cell as
+/// a single escape sequence, which cannot be clipped at all.
 ///
-/// Cheap enough (low single-digit ms on pre-resized images) that it is
-/// usable on either the UI thread or a worker.  The decode worker calls
-/// this immediately after pre-resizing so that by the time
-/// `AppEvent::ImageReady` fires, the scratch is already built and the
-/// UI thread's first paint is a pure cache hit.  `get_protocol_pair`
-/// retains the fallback sync path for the terminal-resize case where
-/// the pre-rendered scratch's `(width, height)` no longer matches.
+/// Cheap (low single-digit ms on pre-resized images), so either thread may call it; the decode
+/// worker does so right after pre-resizing, leaving the UI thread's first paint a cache hit.
 pub fn render_halfblocks_scratch(picker: &Picker, image: DynamicImage, rect: Rect) -> Buffer {
     let mut picker = picker.clone();
     picker.set_protocol_type(ProtocolType::Halfblocks);
@@ -55,18 +36,12 @@ pub fn render_halfblocks_scratch(picker: &Picker, image: DynamicImage, rect: Rec
     buf
 }
 
-/// Free-function twin of [`ImageCache::aspect_rows`] that operates on a
-/// borrowed `DynamicImage`.  The decode worker calls this to compute the
-/// scratch's target height before it has handed the image off to the
-/// cache.
+/// Free-function twin of [`ImageCache::aspect_rows`] over a borrowed image, for the decode
+/// worker's scratch-height calculation.
 ///
-/// Mirrors the paint path's `Resize::Fit(None)`, which scales an image
-/// *down* to fit the cell envelope but never *up*: the reserved height is
-/// therefore capped at the image's own pixel height.  Without this cap a
-/// small image (a 190×65 logo, a 24×24 icon, a downscaled-to-natural SVG)
-/// would reserve as many rows as it *would* occupy if blown up to the
-/// column width, leaving a tall blank band below the image that Fit
-/// actually renders at natural size.
+/// Mirrors the paint path's `Resize::Fit(None)`, which scales down but never up, so the height is
+/// capped at the image's own pixel height — without that cap a small image reserves the rows it
+/// *would* fill at column width, leaving a blank band below it.
 pub fn aspect_rows_of(
     image: &DynamicImage,
     max_width_cells: u16,
@@ -82,10 +57,6 @@ pub fn aspect_rows_of(
         return 0;
     }
     let h_if_width_binds = (u64::from(ih) * u64::from(box_w_px)) / u64::from(iw);
-    // Cap at the natural height too: `Resize::Fit(None)` never upscales, so
-    // an image narrower than the column is painted at natural size, not
-    // stretched to fill the width.  Reserving the width-bound height here
-    // would over-reserve and leave a blank gap below the image.
     let fitted_h_px = h_if_width_binds.min(u64::from(box_h_px)).min(u64::from(ih));
     let rows = fitted_h_px.div_ceil(u64::from(fh));
     (rows.clamp(1, u64::from(max_height_cells)) as usize).max(1)
@@ -93,65 +64,38 @@ pub fn aspect_rows_of(
 
 /// Status of a decode attempt for a URL.
 pub enum DecodeStatus {
-    /// Decode has been dispatched to a worker thread (or is about to be)
-    /// and is in flight.  `paint_images` shows the `[Image: alt]`
-    /// placeholder while `Pending`.
+    /// Decode in flight; `paint_images` shows the `[Image: alt]` placeholder meanwhile.
     Pending,
-    /// Decode succeeded.  The pixel buffer is kept (inside an `Arc` so
-    /// rebuilding a `StatefulProtocol` at a new size doesn't duplicate
-    /// the decoded bytes) so we can rebuild the protocol at a different
-    /// size without re-running the slow PNG/JPEG decode.
+    /// Decode succeeded.  The pixels are kept in an `Arc` so a protocol can be rebuilt at a new
+    /// size without re-running the slow PNG/JPEG decode or duplicating the bytes.
     Ready(Arc<DynamicImage>),
-    /// Decode failed (IO, remote-blocked, corrupt bytes).  Never retried
-    /// automatically — the user has to reopen the document or move a
-    /// file into place for the cache to be invalidated.  The message is
-    /// captured for future surfacing (e.g. status-bar diagnostics) but
-    /// has no live consumer yet.
+    /// Decode failed (IO, remote-blocked, corrupt bytes).  Never retried automatically.  The
+    /// message is captured for future surfacing but has no consumer yet.
     Failed(#[allow(dead_code)] String),
 }
 
-/// Metadata for a resize-encode request that is currently being worked on
-/// by the encoder thread.  Used to route the `ResizeResponse` back to the
-/// originating `ThreadProtocol`: ratatui-image's `ResizeResponse` carries
-/// only a protocol-local id (with no public accessor), so we maintain a
-/// FIFO of our own request metadata and pop the front when each response
-/// arrives.  The underlying worker is serial, so FIFO order is exact.
+/// Metadata for an in-flight resize-encode request.  ratatui-image's `ResizeResponse` carries
+/// only a protocol-local id with no public accessor, so responses are routed back by keeping our
+/// own FIFO — exact, because the worker is serial.
 struct PendingResize {
     url: String,
     width: u16,
     height: u16,
 }
 
-/// Record of a native-protocol transmission that is *still on screen*.
+/// Record of a native-protocol transmission that is *still on screen*, so an unchanged image at
+/// an unchanged rect can be marked `skip` instead of re-rendered.
 ///
-/// The Sixel and iTerm2 protocols "deliver the full raw png image on
-/// every render" (ratatui-image's own words): `Iterm2::render` writes the
-/// entire base64 payload into one cell's `symbol`.  Two consequences make
-/// re-emitting that cell expensive and *visibly* wrong:
+/// Sixel and iTerm2 re-deliver the whole PNG on every render, writing the entire base64 payload
+/// into one cell's `symbol`.  Re-emitting that is doubly wrong: the escape starts with an ECH
+/// sweep, so the terminal blanks and redraws (a flash); and `Buffer::diff` carries
+/// `invalidated = max(symbol.width(), invalidated) - 1` forward, so a 100 000-column payload
+/// symbol forces **every** later cell — including another image's payload — to re-emit each
+/// frame, which reads as a ~2 Hz flicker.
 ///
-/// 1. The escape begins with an ECH sweep of its own rows, so the
-///    terminal blanks the area and redraws the PNG — a flash.
-/// 2. `ratatui::buffer::Buffer::diff` sets
-///    `invalidated = max(symbol.width(), invalidated) - 1` per cell, and
-///    that symbol's display width is the length of the base64 payload
-///    (100 000+ columns).  `invalidated` then stays positive for the
-///    whole rest of the buffer, so **every** later cell is re-emitted
-///    whether or not it changed — including a second image's payload
-///    cell.  One full-resolution image therefore forces every image
-///    below it to retransmit on every single frame; at the cursor-blink
-///    cadence that reads as a ~2 Hz flicker.
-///
-/// So we track what we last handed the terminal and, when it is still
-/// accurate, mark the whole rect `skip` instead of re-rendering: ratatui
-/// emits nothing for the region and the image stays put.  The record is
-/// only honored on the *immediately* following frame, so any frame that
-/// paints the halfblocks scratch there (scroll, modal, partial
-/// visibility), suppresses the block, or scrolls it off screen
-/// invalidates it automatically.
-///
-/// Kitty needs none of this — it transmits once and paints cheap unicode
-/// placeholder rows thereafter — but the bookkeeping is protocol-blind
-/// and costs it nothing.
+/// A record is honored only on the *immediately* following frame, so any frame that paints the
+/// scratch there, suppresses the block, or scrolls it off screen invalidates it automatically.
+/// Kitty needs none of this, but the bookkeeping is protocol-blind and costs it nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativePaint {
     /// Screen rect the escape was rendered at.
@@ -162,92 +106,50 @@ pub struct NativePaint {
     pub frame: u64,
 }
 
-/// Both encoded representations of the same image at the same target
-/// size.
+/// Both encoded representations of one image at one target size.
 ///
-/// `native` holds the terminal's preferred graphics protocol (Kitty /
-/// Sixel / iTerm2) wrapped in a `ThreadProtocol` so its first encode —
-/// potentially tens to hundreds of milliseconds for large images — runs
-/// on the dedicated encoder worker thread, not on the UI thread.
-/// `native` is `None` when the detected image protocol IS halfblocks,
-/// because in that case halfblocks-scratch alone is the rendering.
+/// `native` is the terminal's graphics protocol (Kitty / Sixel / iTerm2) in a `ThreadProtocol`,
+/// so its first encode — up to hundreds of milliseconds — runs on the encoder worker.  It is
+/// `None` when the detected protocol IS halfblocks, since the scratch is then the rendering.
 ///
-/// `halfblocks_scratch` is a pre-rendered `Buffer` containing the
-/// halfblocks cells.  It is built SYNCHRONOUSLY on the cold path
-/// (tolerable: halfblocks encoding is fast on pre-resized images) so
-/// that as soon as a decode completes, the image can be shown
-/// immediately as halfblocks — no placeholder flash.  While `native`
-/// continues to encode off-thread, paint_images renders from this
-/// scratch buffer; once `native_ready` becomes true, paint_images
-/// upgrades to the full-quality native protocol.
-///
-/// `native_ready` is set by `apply_resize_response` after the worker
-/// successfully encodes `native` at the pair's dimensions.  It gates
-/// the native render path, preventing a placeholder flash between the
-/// cold-path build and the worker's completion.
-///
-/// `last_native_paint` records what was last handed to the terminal via
-/// the native protocol, so an unchanged image at an unchanged rect isn't
-/// retransmitted on every frame — see [`NativePaint`].
+/// `halfblocks_scratch` is built synchronously on the cold path (fast on pre-resized images) so a
+/// finished decode shows immediately with no placeholder flash; paint upgrades to `native` once
+/// `native_ready` is set by `apply_resize_response`.
 pub struct ProtocolPair {
     pub native: Option<ThreadProtocol>,
     pub native_ready: bool,
-    /// Bumped every time the worker hands back a freshly encoded native
-    /// protocol.  Together with the screen rect it identifies "the bytes
-    /// currently on screen" for [`Self::last_native_paint`].
+    /// Bumped whenever the worker hands back freshly encoded native bytes; with the screen rect
+    /// it identifies "the bytes currently on screen" for [`Self::last_native_paint`].
     ///
-    /// Defense in depth rather than a live mechanism: the same branch of
-    /// `apply_resize_response` that bumps this also clears
-    /// `last_native_paint`, so in practice the comparison in
-    /// `paint_native` never sees a generation mismatch.  It is kept so a
-    /// future path that swaps the encoded bytes *without* clearing the
-    /// record can't silently license a stale skip.
+    /// Defense in depth: the branch that bumps it also clears `last_native_paint`, so
+    /// `paint_native` never sees a mismatch today — it exists so a future path that swaps the
+    /// bytes *without* clearing the record can't license a stale skip.
     pub native_generation: u64,
-    /// The last frame on which the native escape was written into the
-    /// frame buffer, and what it carried.  See [`NativePaint`].
+    /// The last frame the native escape was written on, and what it carried.  See [`NativePaint`].
     pub last_native_paint: Option<NativePaint>,
-    /// Pre-rendered halfblocks cells for this `(url, width, height)`.
-    /// Populated synchronously in the cold path of `get_protocol_pair`.
-    /// Used as the fallback rendering while `native` encodes, during
-    /// active scroll on non-Kitty terminals, and during partial
-    /// visibility.
+    /// Pre-rendered halfblocks cells for this `(url, width, height)`: the fallback rendering while
+    /// `native` encodes, during scroll on non-Kitty terminals, and during partial visibility.
     pub halfblocks_scratch: Option<Buffer>,
 }
 
 /// Cache of decoded images + per-size protocol encodings.
 #[derive(Default)]
 pub struct ImageCache {
-    /// URL → decode status.  Populated by `request` (as `Pending`),
-    /// updated to `Ready` or `Failed` by `set_decoded` / `set_failed`.
+    /// URL → decode status.
     decoded: HashMap<String, DecodeStatus>,
-    /// (URL, cell-width, cell-height) → encoded protocol pair.  Built
-    /// lazily the first time an image is drawn at a given size; dropped
-    /// when the entry is no longer referenced by a visible snapshot.
-    /// Kept as a plain `HashMap` (no LRU eviction) because the
-    /// working-set size is bounded by the number of visible images.
+    /// (URL, cell-width, cell-height) → encoded protocol pair, built lazily on first draw at that
+    /// size.  A plain `HashMap` with no LRU: the working set is bounded by the visible images.
     protocols: HashMap<(String, u16, u16), ProtocolPair>,
-    /// Halfblocks scratches pre-built on the decode worker thread and
-    /// waiting for their first `get_protocol_pair` call to claim them.
-    /// On cold-path construction we `remove` the matching entry instead
-    /// of running `render_halfblocks_scratch` synchronously on the UI
-    /// thread.  Entries that never match (e.g. terminal resized between
-    /// decode and first paint) stay here until `set_decoded` or
-    /// `invalidate_protocols` clears them.
+    /// Halfblocks scratches pre-built on the decode worker, awaiting the `get_protocol_pair` call
+    /// that claims them.  Entries that never match (terminal resized between decode and first
+    /// paint) stay until `set_decoded` or `invalidate_protocols` clears them.
     prebuilt_scratches: HashMap<(String, u16, u16), Buffer>,
-    /// Outstanding encode requests, FIFO in dispatch order.  Popped by
-    /// `apply_resize_response` to locate the target `ThreadProtocol`.
+    /// Outstanding encode requests, FIFO in dispatch order.
     pending: VecDeque<PendingResize>,
-    /// Sender into the encoder worker.  Cloned into each `ThreadProtocol`
-    /// we build so that calling `thread_protocol.resize_encode(...)`
-    /// ships the blocking encode off to the worker.  `None` disables
-    /// image rendering entirely (tests, terminals without image support);
-    /// `get_protocol_pair` then returns `None` and callers show the
-    /// `[Image: alt]` placeholder.
+    /// Sender into the encoder worker, cloned into each `ThreadProtocol`.  `None` disables image
+    /// rendering entirely (tests, terminals without image support).
     resize_tx: Option<mpsc::Sender<ResizeRequest>>,
-    /// Monotonic frame counter, bumped once per `terminal.draw` by
-    /// `App::draw_frame`.  `ProtocolPair::last_native_paint` records the
-    /// frame it was written on, and a record is only reusable on the
-    /// frame immediately after — see [`NativePaint`].
+    /// Monotonic frame counter, bumped once per `terminal.draw`.  See [`NativePaint`].
     frame_seq: u64,
 }
 
@@ -256,15 +158,10 @@ impl ImageCache {
         Self::default()
     }
 
-    /// Attach the sender for the encoder worker's channel.  Called by
-    /// `App::run` once the worker thread has been spawned.  Without a
-    /// sender attached, `get_protocol_pair` returns `None` and callers
-    /// show the `[Image: alt]` placeholder.
+    /// Attach the encoder worker's sender, from `App::run` once the worker is spawned.
     ///
-    /// Attaching (or changing) the sender drops any previously-cached
-    /// protocols — their internal `Sender<ResizeRequest>` is tied to the
-    /// old channel and would otherwise ship requests into a dead
-    /// endpoint.  Decoded pixels are retained.
+    /// Doing so drops every cached protocol: their internal sender is tied to the old channel and
+    /// would ship requests into a dead endpoint.  Decoded pixels are retained.
     pub fn attach_resize_sender(&mut self, tx: mpsc::Sender<ResizeRequest>) {
         self.resize_tx = Some(tx);
         self.protocols.clear();
@@ -272,23 +169,17 @@ impl ImageCache {
         self.prebuilt_scratches.clear();
     }
 
-    /// Whether an encoder-worker sender has been attached.
-    ///
-    /// Exists for the App-level test that a document swap re-attaches
-    /// it: without one, `get_protocol_pair` returns `None` and every
-    /// image in that document paints as a placeholder no matter how
-    /// well it decodes.
+    /// Whether an encoder-worker sender has been attached.  Exists for the App-level test that a
+    /// document swap re-attaches it — without one every image paints as a placeholder.
     pub fn has_resize_sender(&self) -> bool {
         self.resize_tx.is_some()
     }
 
     // ── Native-transmission bookkeeping ───────────────────────────────
 
-    /// Advance the frame counter.  Called once per `terminal.draw` from
-    /// `App::draw_frame`, *not* from the paint pass — Raw and Diff modes
-    /// draw frames without calling `paint_images` at all, and counting
-    /// only painted frames would make a pre-Raw transmission look
-    /// adjacent to the first frame back in Rendered.
+    /// Advance the frame counter.  Driven from `App::draw_frame`, *not* the paint pass: Raw and
+    /// Diff modes draw without painting images, and counting only painted frames would make a
+    /// pre-Raw transmission look adjacent to the first frame back in Rendered.
     pub fn begin_frame(&mut self) {
         self.frame_seq = self.frame_seq.wrapping_add(1);
     }
@@ -297,22 +188,17 @@ impl ImageCache {
         self.frame_seq
     }
 
-    /// Forget every recorded native transmission, forcing each image to
-    /// re-transmit on its next paint.  Called whenever something outside
-    /// the paint pass invalidates the terminal's screen contents: a
-    /// resize, or the `terminal.clear()` after the external editor
-    /// returns.
+    /// Forget every recorded native transmission, forcing a re-transmit on the next paint.  For
+    /// anything that invalidates the screen outside the paint pass: a resize, or the
+    /// `terminal.clear()` after the external editor returns.
     pub fn invalidate_native_paints(&mut self) {
         for pair in self.protocols.values_mut() {
             pair.last_native_paint = None;
         }
     }
 
-    /// Mark `url` as `Pending` iff it has no prior entry.  Returns true
-    /// when a new decode job should be dispatched for this URL.
-    ///
-    /// Once a URL is `Ready` or `Failed`, `request` is a no-op: we never
-    /// auto-retry.
+    /// Mark `url` as `Pending` iff it has no prior entry, returning true when a decode job should
+    /// be dispatched.  A `Ready` or `Failed` URL is a no-op: there is no auto-retry.
     pub fn request(&mut self, url: &str) -> bool {
         if self.decoded.contains_key(url) {
             return false;
@@ -321,19 +207,15 @@ impl ImageCache {
         true
     }
 
-    /// Record a successful decode.  Called on `AppEvent::ImageReady` from
-    /// integration tests in `tests/`.  Production code uses
-    /// `set_decoded_with_prebuilt` so the halfblocks scratch is also
-    /// captured.
+    /// Record a successful decode.  Used by tests; production goes through
+    /// [`Self::set_decoded_with_prebuilt`] so the halfblocks scratch is captured too.
     #[allow(dead_code)]
     pub fn set_decoded(&mut self, url: &str, image: DynamicImage) {
         self.set_decoded_with_prebuilt(url, image, None);
     }
 
-    /// `set_decoded` plus stash a halfblocks scratch the decode worker
-    /// already rendered.  The next `get_protocol_pair` call for the same
-    /// `(url, width, height)` will claim the prebuilt buffer instead of
-    /// running the encode synchronously on the UI thread.
+    /// [`Self::set_decoded`] plus a halfblocks scratch the decode worker already rendered; the
+    /// next `get_protocol_pair` at the same dims claims it instead of encoding on the UI thread.
     pub fn set_decoded_with_prebuilt(
         &mut self,
         url: &str,
@@ -343,8 +225,6 @@ impl ImageCache {
         self.decoded
             .insert(url.to_owned(), DecodeStatus::Ready(Arc::new(image)));
         self.protocols.retain(|(u, _, _), _| u != url);
-        // Drop any stale prebuilt scratches for this URL before taking
-        // the new one.
         self.prebuilt_scratches.retain(|(u, _, _), _| u != url);
         if let Some((rect, buf)) = prebuilt_scratch {
             self.prebuilt_scratches
@@ -352,8 +232,7 @@ impl ImageCache {
         }
     }
 
-    /// Record a decode failure.  Displayed status (for debugging) is the
-    /// error message we pass in.
+    /// Record a decode failure.
     pub fn set_failed(&mut self, url: &str, message: String) {
         self.decoded
             .insert(url.to_owned(), DecodeStatus::Failed(message));
@@ -361,24 +240,18 @@ impl ImageCache {
         self.prebuilt_scratches.retain(|(u, _, _), _| u != url);
     }
 
-    /// Look up the decode status for `url`.  Used by integration tests in
-    /// `tests/`.
+    /// Look up the decode status for `url`.  Used by integration tests.
     #[allow(dead_code)]
     pub fn status(&self, url: &str) -> Option<&DecodeStatus> {
         self.decoded.get(url)
     }
 
-    /// Get a mutable protocol pair for `(url, width, height)`, building
-    /// the native (`ThreadProtocol`, async encoding) and pre-rendering
-    /// the halfblocks scratch (sync, one-time) on a cold miss.
+    /// Mutable protocol pair for `(url, width, height)`, building the async native protocol and
+    /// the sync halfblocks scratch on a cold miss.
     ///
-    /// Returns `None` when the URL is `Pending` or `Failed`, when no
-    /// `native_picker` is supplied (terminal doesn't support images), or
-    /// when no encoder-worker `resize_tx` is attached.
-    ///
-    /// When `native_picker`'s protocol IS halfblocks, the pair's
-    /// `native` is `None` — only `halfblocks_scratch` is used, since
-    /// halfblocks is both the preferred and fallback rendering.
+    /// `None` when the URL is `Pending` or `Failed`, when no `native_picker` is supplied (no image
+    /// support), or when no `resize_tx` is attached.  When the native protocol IS halfblocks the
+    /// pair's `native` stays `None` — the scratch is both the preferred and fallback rendering.
     pub fn get_protocol_pair(
         &mut self,
         url: &str,
@@ -401,14 +274,9 @@ impl ImageCache {
             let full_rect = Rect::new(0, 0, width, height);
             let is_halfblocks_native = native_picker.protocol_type() == ProtocolType::Halfblocks;
 
-            // Prefer the scratch the decode worker already rendered
-            // for this `(url, width, height)`.  `remove` takes it so we
-            // don't hold the buffer twice.  When the worker didn't
-            // produce one (no picker/dims at dispatch time) or the
-            // dims don't match (terminal resized between decode and
-            // first paint), fall back to a sync encode on the UI
-            // thread — cost of ~5-20 ms, same as pre-Phase-7a
-            // behaviour, and rare enough not to regress scroll.
+            // Prefer the worker's prebuilt scratch, taken by `remove` so it isn't held twice.
+            // A missing or wrong-dimension one falls back to a ~5-20 ms sync encode here, rare
+            // enough not to regress scroll.
             let halfblocks_scratch = if let Some(buf) = self.prebuilt_scratches.remove(&key) {
                 Some(buf)
             } else if is_halfblocks_native {
@@ -422,9 +290,8 @@ impl ImageCache {
                     .map(|p| render_halfblocks_scratch(p, (*image_arc).clone(), full_rect))
             };
 
-            // Native: build a ThreadProtocol so the slow Kitty/Sixel/iTerm2
-            // encode runs on the worker.  Skipped when native IS halfblocks
-            // — the scratch above IS the rendering in that case.
+            // A ThreadProtocol runs the slow native encode on the worker; unnecessary when the
+            // native protocol is halfblocks, since the scratch above is then the rendering.
             let native = if is_halfblocks_native {
                 None
             } else {
@@ -446,10 +313,8 @@ impl ImageCache {
         self.protocols.get_mut(&key)
     }
 
-    /// Look up an existing protocol pair without the Picker-dependent
-    /// cold-path rebuild that `get_protocol_pair` performs.  Callers
-    /// should have ensured the pair exists (e.g. by calling
-    /// `get_protocol_pair` earlier in the same frame).
+    /// Look up an existing pair without `get_protocol_pair`'s Picker-dependent cold-path
+    /// rebuild.  Callers should have ensured it exists earlier in the same frame.
     pub fn protocol_pair_mut(
         &mut self,
         url: &str,
@@ -459,10 +324,8 @@ impl ImageCache {
         self.protocols.get_mut(&(url.to_owned(), width, height))
     }
 
-    /// Record that a `resize_encode` request for the pair's native
-    /// protocol was just dispatched to the encoder worker.  The matching
-    /// `ResizeResponse` will be routed back to the same
-    /// `ThreadProtocol` by `apply_resize_response`.
+    /// Record a `resize_encode` request dispatched to the encoder worker, so
+    /// [`Self::apply_resize_response`] can route its response back.
     pub fn track_pending_resize(&mut self, url: &str, width: u16, height: u16) {
         self.pending.push_back(PendingResize {
             url: url.to_owned(),
@@ -471,24 +334,17 @@ impl ImageCache {
         });
     }
 
-    /// Drop the oldest pending-request entry without applying a
-    /// response.  Called when the encoder worker reports an error — we
-    /// still need to pop the FIFO so the next successful response lines
-    /// up with its originating protocol.
+    /// Drop the oldest pending entry without applying a response — for a worker error, where the
+    /// FIFO must still advance so the next response lines up with its originating protocol.
     pub fn drop_pending_front(&mut self) {
         self.pending.pop_front();
     }
 
-    /// Route an encoded `ResizeResponse` back to its originating
-    /// `ThreadProtocol` by popping the oldest pending-request entry.
-    /// The worker channel is single-threaded and FIFO, so the response
-    /// order matches the request order.
+    /// Route an encoded `ResizeResponse` back to its originating `ThreadProtocol` by popping the
+    /// oldest pending entry; the worker is serial, so the orders match.
     ///
-    /// If the target pair has since been dropped (e.g. the URL's decoded
-    /// image was replaced), the response is silently discarded.  The
-    /// `ThreadProtocol::update_resized_protocol` call additionally
-    /// rejects responses whose internal id is stale (superseded by a
-    /// later request on the same protocol).
+    /// A response whose pair has since been dropped is discarded, and
+    /// `update_resized_protocol` additionally rejects responses superseded by a later request.
     pub fn apply_resize_response(&mut self, resp: ResizeResponse) {
         let Some(pending) = self.pending.pop_front() else {
             return;
@@ -498,8 +354,7 @@ impl ImageCache {
             if let Some(native) = pair.native.as_mut() {
                 if native.update_resized_protocol(resp) {
                     pair.native_ready = true;
-                    // New bytes: whatever is on screen for this pair is
-                    // now stale, so the next paint must transmit.
+                    // New bytes: whatever is on screen is stale, so the next paint must transmit.
                     pair.native_generation = pair.native_generation.wrapping_add(1);
                     pair.last_native_paint = None;
                 }
@@ -507,26 +362,21 @@ impl ImageCache {
         }
     }
 
-    /// Drop every protocol entry, e.g. on terminal resize.  Pending
-    /// requests remain in the queue (the worker will still produce
-    /// responses for them); those responses become orphan pops and are
-    /// silently discarded by `apply_resize_response`.  Used by tests in
-    /// this crate.
+    /// Drop every protocol entry, e.g. on terminal resize.  Pending requests stay queued; their
+    /// responses become orphan pops that `apply_resize_response` discards.  Used by tests.
     #[allow(dead_code)]
     pub fn invalidate_protocols(&mut self) {
         self.protocols.clear();
-        // Prebuilt scratches are keyed by the old `(width, height)` too,
-        // so their target rect is stale after a resize.  Drop them; the
-        // next decode cycle repopulates at the new dims.
+        // Prebuilt scratches are keyed by the old dims, so they are stale after a resize.
         self.prebuilt_scratches.clear();
     }
 
-    /// Compute the number of rendered rows a decoded image will occupy
-    /// when scaled to fit within `max_width_cells × max_height_cells`
-    /// cells with `font_size` pixels per cell (width, height), preserving
-    /// aspect ratio.  Returns `None` when the image hasn't been decoded
-    /// yet.  Used by tests in this crate.
-    #[allow(dead_code)]
+    /// Rows a decoded image occupies when fitted into `max_width_cells × max_height_cells` at
+    /// `font_size` pixels per cell.  `None` for anything but a `Ready` decode — both `Pending`
+    /// *and* `Failed` answer `None`, unlike [`Self::reserved_rows`], which collapses `Failed` to
+    /// the single placeholder row.  The math preview band relies on that difference: an invalid
+    /// formula (a `Failed` decode) must hold the block's last resolved height rather than snap to
+    /// one row mid-typing, so it asks here, not through `reserved_rows`.
     pub fn aspect_rows(
         &self,
         url: &str,
@@ -545,17 +395,9 @@ impl ImageCache {
         ))
     }
 
-    /// Row count the renderer should reserve for this image's block.
-    ///
-    /// * `Ready` → `Some(aspect_rows)` so wide images don't leave blank
-    ///   rows underneath.
-    /// * `Failed` → `Some(1)` so the block collapses to just the
-    ///   `[Image: alt]` placeholder row; no blank space is reserved for
-    ///   an image that won't load (e.g. `RemoteBlocked` after the user
-    ///   declined the remote-image prompt).
-    /// * `Pending` / not yet requested → `None`.  The renderer falls
-    ///   back to the configured `image_max_height` while the decode is
-    ///   in flight so layout is stable until real dimensions are known.
+    /// Rows the renderer should reserve for this image's block: the fitted height when `Ready`,
+    /// `Some(1)` when `Failed` (collapsing to the placeholder row), and `None` while `Pending`,
+    /// where the renderer falls back to `image_max_height` so layout stays stable.
     pub fn reserved_rows(
         &self,
         url: &str,
@@ -575,32 +417,25 @@ impl ImageCache {
         }
     }
 
-    /// Clear `Failed` entries so a subsequent `request` can retry.  Called
-    /// by the App after the user promotes the remote-image policy —
-    /// entries that failed with `RemoteBlocked` can now succeed.
+    /// Clear `Failed` entries so a later `request` retries — for when the user promotes the
+    /// remote-image policy and a `RemoteBlocked` failure could now succeed.
     pub fn clear_failures_for_remote_reopening(&mut self) {
         self.decoded
             .retain(|_, status| !matches!(status, DecodeStatus::Failed(_)));
     }
 
-    /// Drop a single URL's entries (decode status, protocols, scratches)
-    /// so a later `request` treats it as never seen.  Called by the App
-    /// when a worker's `ImageReady` result arrives that the *current*
-    /// settings forbid (the worker captured the policy at spawn time) —
-    /// the per-frame dispatch then re-resolves the URL if the settings
-    /// permit it again.
+    /// Drop one URL's entries so a later `request` treats it as never seen.  Used when a
+    /// worker's result arrives that the *current* settings forbid (the worker captured the policy
+    /// at spawn time); the per-frame dispatch re-resolves it if the settings permit again.
     pub fn forget(&mut self, url: &str) {
         self.decoded.remove(url);
         self.protocols.retain(|(u, _, _), _| u != url);
         self.prebuilt_scratches.retain(|(u, _, _), _| u != url);
     }
 
-    /// Drop every entry (decoded pixels, protocols, scratches) whose URL
-    /// is remote (`http://` / `https://`).  Called by the App when the
-    /// remote-image policy changes so the next dispatch re-resolves each
-    /// remote URL under the new policy — a decoded image disappears when
-    /// the policy tightens, and a memoised `RemoteBlocked` failure can
-    /// retry when it loosens.
+    /// Drop every entry for a remote URL, so the next dispatch re-resolves it under a changed
+    /// remote-image policy: decoded images disappear when it tightens, memoized `RemoteBlocked`
+    /// failures retry when it loosens.
     pub fn evict_remote(&mut self) {
         self.decoded
             .retain(|url, _| !crate::image::loader::is_remote(url));
@@ -608,20 +443,12 @@ impl ImageCache {
             .retain(|(url, _, _), _| !crate::image::loader::is_remote(url));
         self.prebuilt_scratches
             .retain(|(url, _, _), _| !crate::image::loader::is_remote(url));
-        // `pending` is deliberately left untouched: the encode worker
-        // will still produce a response for every request already
-        // shipped, and `apply_resize_response` pairs responses with
-        // requests by FIFO order.  Responses for evicted URLs become
-        // orphan pops and are silently discarded, same as after
-        // `invalidate_protocols`.
+        // `pending` is deliberately untouched: responses for evicted URLs become orphan pops,
+        // which is what keeps the FIFO pairing correct.
     }
 
-    /// Drop every entry whose URL is not in `live`.  Called by the App
-    /// after each reparse to prune diagrams whose synthetic URL changed
-    /// (content-edit inside a ```mermaid block → new sha → fresh cache
-    /// key) along with any other no-longer-referenced URLs.  Without
-    /// this, editing a single diagram repeatedly would grow `decoded`
-    /// and `protocols` without bound.
+    /// Drop every entry whose URL is not in `live`, run after each reparse.  Editing inside a
+    /// mermaid block mints a new synthetic URL each time, so without this the maps grow unbounded.
     pub fn gc(&mut self, live: &std::collections::HashSet<String>) {
         self.decoded.retain(|url, _| live.contains(url));
         self.protocols.retain(|(url, _, _), _| live.contains(url));
@@ -646,32 +473,23 @@ impl ImageCache {
 }
 
 #[cfg(test)]
-// `Picker::from_fontsize` is deprecated in ratatui-image 9 but the
-// non-deprecated alternatives (`Picker::halfblocks`) don't let us set a
-// specific font-size, which matters for some of the assertions below.
+// `Picker::from_fontsize` is deprecated in ratatui-image 9, but `Picker::halfblocks` can't set a
+// specific font size, which several assertions below depend on.
 #[allow(deprecated)]
 mod tests {
     use super::*;
 
-    /// A picker guaranteed to encode **halfblocks**, at a font size the
-    /// assertions below can reason about.
-    ///
-    /// `Picker::from_fontsize` on its own is environment-dependent: it
-    /// infers its protocol from `$TERM_PROGRAM` / `$LC_TERMINAL`, so it
-    /// yields Halfblocks in Ghostty or kitty but **iTerm2** in iTerm2,
-    /// WezTerm, VS Code, Warp, Hyper, Tabby, rio, mintty and Bobcat.
-    /// Tests built on the bare constructor therefore pass or fail
-    /// depending on which terminal `cargo test` was launched from.
+    /// A picker guaranteed to encode **halfblocks** at a known font size.  The bare
+    /// `Picker::from_fontsize` infers its protocol from `$TERM_PROGRAM` / `$LC_TERMINAL`, so
+    /// tests built on it pass or fail depending on the terminal `cargo test` ran from.
     fn halfblocks_picker() -> Picker {
         let mut picker = Picker::from_fontsize((1, 2).into());
         picker.set_protocol_type(ProtocolType::Halfblocks);
         picker
     }
 
-    /// A picker whose protocol is deliberately *not* halfblocks, so the
-    /// native-plus-scratch branch of `get_protocol_pair` can be exercised
-    /// on any machine.  iTerm2 is the cheapest to encode of the three
-    /// native protocols and needs no terminal support to construct.
+    /// A deliberately non-halfblocks picker, so the native-plus-scratch branch is exercisable on
+    /// any machine.  iTerm2 is the cheapest native protocol to encode and needs no real support.
     fn native_picker() -> Picker {
         let mut picker = Picker::from_fontsize((1, 2).into());
         picker.set_protocol_type(ProtocolType::Iterm2);
@@ -682,11 +500,8 @@ mod tests {
 
     #[test]
     fn small_image_reserves_natural_height_not_width_filled() {
-        // A 190×65 logo (mijowi.svg) in an 80×40-cell envelope at (8,16):
-        // box is 640×640 px.  Width-filled it would be 65*640/190 = 219 px
-        // = 14 rows, but `Resize::Fit(None)` never upscales, so it paints
-        // at its natural 65 px (≈5 rows).  The reservation must match the
-        // paint, not the hypothetical width-fill.
+        // A 190×65 logo in a 640×640 px box: width-filled it would be 14 rows, but Fit never
+        // upscales, so it paints at its natural 65 px and must reserve only that.
         let img = DynamicImage::new_rgba8(190, 65);
         let rows = aspect_rows_of(&img, 80, 40, (8, 16));
         assert_eq!(rows, 65_u32.div_ceil(16) as usize);
@@ -694,11 +509,10 @@ mod tests {
 
     #[test]
     fn wide_image_still_binds_on_width() {
-        // A 1920×1080 photo is wider than the column, so Fit downscales it
-        // to fill the width — the natural-height cap must not interfere.
+        // Wider than the column, so Fit downscales to the width and the natural-height cap must
+        // not interfere: 1080 * 640 / 1920 = 360 px → ceil(360/16) = 23 rows.
         let img = DynamicImage::new_rgba8(1920, 1080);
         let rows = aspect_rows_of(&img, 80, 40, (8, 16));
-        // 1080 * 640 / 1920 = 360 px → ceil(360/16) = 23 rows.
         assert_eq!(rows, 23);
     }
 
@@ -726,7 +540,6 @@ mod tests {
             cache.status("local/c.png"),
             Some(DecodeStatus::Ready(_))
         ));
-        // Evicted URLs can be re-requested under the new policy.
         assert!(cache.request("https://example.com/a.png"));
     }
 
@@ -748,7 +561,6 @@ mod tests {
             cache.status("a.png"),
             Some(DecodeStatus::Ready(_))
         ));
-        // Even after Ready, requesting again is a no-op (no retry).
         assert!(!cache.request("a.png"));
     }
 
@@ -764,10 +576,8 @@ mod tests {
         assert!(!cache.request("a.png"));
     }
 
-    /// Build a cache with a drained mpsc receiver so `get_protocol_pair`
-    /// can successfully clone the resize sender.  The receiver is leaked
-    /// via `std::mem::forget` — we don't care about the sent requests,
-    /// only that the channel stays alive for the duration of the test.
+    /// A cache whose resize channel stays alive (the receiver is leaked, since only the
+    /// channel's liveness matters) so `get_protocol_pair` can clone the sender.
     fn cache_with_sender() -> ImageCache {
         let (tx, rx) = mpsc::channel::<ResizeRequest>();
         let mut cache = ImageCache::new();
@@ -786,17 +596,12 @@ mod tests {
             .get_protocol_pair("a.png", 10, 10, Some(&picker), Some(&picker))
             .is_some());
         assert_eq!(cache.protocol_count(), 1);
-        // A new set_decoded clears any protocol pairs for that URL.
         cache.set_decoded("a.png", DynamicImage::new_rgba8(2, 2));
         assert_eq!(cache.protocol_count(), 0);
     }
 
     #[test]
     fn set_decoded_with_prebuilt_stashes_scratch_for_matching_dims() {
-        // When the decode worker hands back a pre-rendered scratch, the
-        // cache stashes it so the first `get_protocol_pair` call at the
-        // same `(url, width, height)` consumes it without running
-        // `render_halfblocks_scratch` on the UI thread.
         let mut cache = cache_with_sender();
         cache.request("a.png");
         let rect = Rect::new(0, 0, 8, 4);
@@ -808,7 +613,6 @@ mod tests {
         );
         assert_eq!(cache.prebuilt_scratch_count(), 1);
 
-        // Consume it via get_protocol_pair with matching dims.
         let picker = halfblocks_picker();
         let pair = cache
             .get_protocol_pair("a.png", 8, 4, Some(&picker), Some(&picker))
@@ -820,11 +624,8 @@ mod tests {
 
     #[test]
     fn set_decoded_with_prebuilt_falls_back_to_sync_on_mismatched_dims() {
-        // If the UI thread later requests a different `(width, height)`
-        // (e.g. terminal resized between decode dispatch and first
-        // paint), the prebuilt entry isn't found and the cold-path sync
-        // render runs.  The prebuilt stays in the map until
-        // `invalidate_protocols` or a later `set_decoded` clears it.
+        // A request at different dims (terminal resized between decode and first paint) misses
+        // the prebuilt entry, runs the sync render, and leaves the prebuilt in place.
         let mut cache = cache_with_sender();
         cache.request("a.png");
         let prebuilt_rect = Rect::new(0, 0, 8, 4);
@@ -835,15 +636,12 @@ mod tests {
             Some((prebuilt_rect, prebuilt)),
         );
 
-        // Request at a different width; scratch still produced, but via
-        // sync render (not from the prebuilt map).
         let picker = halfblocks_picker();
         let pair = cache
             .get_protocol_pair("a.png", 16, 4, Some(&picker), Some(&picker))
             .expect("pair for ready image");
         assert!(pair.halfblocks_scratch.is_some());
-        // The un-claimed prebuilt remains — future paint at matching
-        // dims could still claim it.
+        // The un-claimed prebuilt remains, for a future paint at matching dims.
         assert_eq!(cache.prebuilt_scratch_count(), 1);
     }
 
@@ -873,7 +671,6 @@ mod tests {
             .expect("pair for ready image");
         cache.invalidate_protocols();
         assert_eq!(cache.protocol_count(), 0);
-        // Decoded entry survives.
         assert!(matches!(
             cache.status("a.png"),
             Some(DecodeStatus::Ready(_))
@@ -882,9 +679,6 @@ mod tests {
 
     #[test]
     fn protocol_pair_from_halfblocks_native_skips_native_thread_protocol() {
-        // When the terminal's native protocol IS halfblocks, there is no
-        // slow native encode to ship off-thread — `native` stays `None`
-        // and `halfblocks_scratch` IS the rendering.
         let mut cache = cache_with_sender();
         cache.request("a.png");
         cache.set_decoded("a.png", DynamicImage::new_rgba8(4, 4));
@@ -898,10 +692,6 @@ mod tests {
 
     #[test]
     fn protocol_pair_with_non_halfblocks_native_builds_both() {
-        // A graphics terminal gets a `ThreadProtocol` for the slow native
-        // encode *and* a halfblocks scratch for the partial-render
-        // fallback.  `Picker::set_protocol_type` lets us construct the
-        // native side without a real graphics terminal.
         let mut cache = cache_with_sender();
         cache.request("b.png");
         cache.set_decoded("b.png", DynamicImage::new_rgba8(4, 4));
@@ -918,12 +708,8 @@ mod tests {
         assert!(pair.halfblocks_scratch.is_some(), "fallback scratch built");
     }
 
-    /// `render_halfblocks_scratch` must produce halfblock *cells* even
-    /// when handed a picker carrying a native protocol.  A native picker
-    /// would encode the whole image into a single cell as one escape
-    /// sequence, which `paint_halfblocks_partial` cannot clip by row —
-    /// the image would flash on the frames that copy row 0 and vanish
-    /// otherwise.  This is the guard for the iTerm2 scroll bug.
+    /// Guard for the iTerm2 scroll bug: a native picker must still yield halfblock *cells*, or
+    /// the whole image lands in one unclippable escape sequence and flickers during scroll.
     #[test]
     fn scratch_holds_halfblock_cells_even_from_a_native_picker() {
         let rect = Rect::new(0, 0, 8, 4);
@@ -933,11 +719,8 @@ mod tests {
             image::Rgba([40, 80, 120, 255]),
         ));
         let buf = render_halfblocks_scratch(&native_picker(), img, rect);
-        // Halfblocks paints the image color into *every* cell of the
-        // rect (as fg/bg of a `▀`, or of a space where a cell's two
-        // pixel rows share a color, as they do for a uniform image).  A
-        // native encode would instead put one escape sequence in cell
-        // (0, 0) and leave every other cell default-and-skipped.
+        // Halfblocks paints the color into *every* cell; a native encode would put one escape
+        // sequence in cell (0, 0) and leave the rest default-and-skipped.
         let expected = ratatui::style::Color::Rgb(40, 80, 120);
         for y in 0..rect.height {
             for x in 0..rect.width {
@@ -962,10 +745,8 @@ mod tests {
 
     #[test]
     fn get_protocol_pair_returns_none_without_resize_sender() {
-        // No sender attached (this is the default before App::run spawns
-        // the encoder worker, and also the state in tests that don't
-        // exercise image rendering).  get_protocol_pair must return None
-        // rather than construct a ThreadProtocol with a dead channel.
+        // With no sender (the default before `App::run` spawns the worker), the pair must be
+        // `None` rather than a `ThreadProtocol` over a dead channel.
         let mut cache = ImageCache::new();
         cache.request("a.png");
         cache.set_decoded("a.png", DynamicImage::new_rgba8(1, 1));
@@ -987,11 +768,8 @@ mod tests {
 
     #[test]
     fn apply_resize_response_pops_pending_fifo_even_when_target_gone() {
-        // When a pair is invalidated before its ResizeResponse comes back,
-        // apply_resize_response must still pop the front of the pending
-        // FIFO — otherwise subsequent responses would be routed to the
-        // wrong protocol.  We exercise this via `track_pending_resize`
-        // plus an `invalidate_protocols` that removes the pair.
+        // A pair invalidated before its response returns must still pop the FIFO, or later
+        // responses route to the wrong protocol.
         let mut cache = cache_with_sender();
         cache.request("a.png");
         cache.set_decoded("a.png", DynamicImage::new_rgba8(4, 4));
@@ -1001,13 +779,8 @@ mod tests {
             .expect("pair built");
         cache.track_pending_resize("a.png", 8, 4);
         assert_eq!(cache.pending.len(), 1);
-        // Invalidate before the "response" arrives.
         cache.invalidate_protocols();
-        // Without a ResizeResponse value (which we can't construct in a
-        // test — it's crate-private-ish), assert the pending state
-        // directly.  The real routing is exercised by the property that
-        // `pop_front` is called on `apply_resize_response`, which we
-        // verify via the public `pending_count` helper below.
+        // A `ResizeResponse` can't be constructed in a test, so assert the pending state directly.
         assert_eq!(cache.pending_count(), 1);
     }
 
@@ -1020,11 +793,7 @@ mod tests {
 
     #[test]
     fn aspect_rows_wide_image_returns_fewer_rows_than_max() {
-        // A 1600×400 image with 10×20 px cells:
-        //   box_w_px = 80 * 10 = 800
-        //   box_h_px = 24 * 20 = 480
-        //   width binds: ih * box_w_px / iw = 400 * 800 / 1600 = 200 px
-        //   rows = ceil(200 / 20) = 10
+        // 1600×400 in an 800×480 px box: width binds at 200 px → ceil(200/20) = 10 rows.
         let mut cache = ImageCache::new();
         cache.request("wide.png");
         cache.set_decoded("wide.png", DynamicImage::new_rgba8(1600, 400));
@@ -1033,8 +802,7 @@ mod tests {
 
     #[test]
     fn aspect_rows_tall_image_clamps_to_max_height() {
-        // A 400×1600 image in the same 80×24 box — height binds and
-        // the fitted cell count exceeds max_height, so we clamp.
+        // Height binds and overflows max_height, so the row count clamps.
         let mut cache = ImageCache::new();
         cache.request("tall.png");
         cache.set_decoded("tall.png", DynamicImage::new_rgba8(400, 1600));
@@ -1043,11 +811,8 @@ mod tests {
 
     #[test]
     fn aspect_rows_square_image_kept_at_natural_height() {
-        // A 400×400 image, box 80×24 cells, 10×20 px cells:
-        //   box_w_px = 800, box_h_px = 480
-        //   width-fill would give ih*box_w/iw = 400*800/400 = 800 px,
-        //   but `Resize::Fit(None)` never upscales past the 400 px the
-        //   image actually has → 400 px → ceil(400/20) = 20 rows.
+        // Width-fill would give 800 px, but Fit never upscales past the image's own 400 px →
+        // ceil(400/20) = 20 rows.
         let mut cache = ImageCache::new();
         cache.request("sq.png");
         cache.set_decoded("sq.png", DynamicImage::new_rgba8(400, 400));
@@ -1056,10 +821,7 @@ mod tests {
 
     #[test]
     fn aspect_rows_small_image_reserves_natural_height() {
-        // A 10×2 image at 10×20 px cells, box 80×24:
-        //   width-fill would give 2*800/10 = 160 px (8 rows), but Fit
-        //   paints it at its own 2 px, so we reserve ceil(2/20) = 1 row
-        //   instead of a 7-row blank band below a 2 px-tall image.
+        // Width-fill would give 8 rows; Fit paints the 2 px image at natural size, so 1 row.
         let mut cache = ImageCache::new();
         cache.request("thin.png");
         cache.set_decoded("thin.png", DynamicImage::new_rgba8(10, 2));

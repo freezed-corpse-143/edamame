@@ -1,8 +1,6 @@
-//! First-run welcome modal.  Adapter that wraps
-//! [`crate::ui::WelcomeState`] — owns the in-flight tri-state choices,
-//! routes Theme-button presses to [`crate::app::App::open_theme_picker`]
-//! (which stacks the picker on top of this modal and pops back to it on
-//! close), and persists the chosen settings on Save.
+//! First-run welcome modal: an adapter over [`crate::ui::WelcomeState`] that
+//! holds the in-flight choices, routes the Theme button to
+//! [`crate::app::App::open_theme_picker`], and persists on Save.
 
 use std::any::Any;
 
@@ -23,43 +21,33 @@ pub struct WelcomeModal {
 }
 
 impl WelcomeModal {
-    /// Construct the welcome modal from detected capabilities and the
-    /// current config.  Returns `None` when the user has dismissed the
-    /// welcome via the "Don't show this again" toggle on a previous
-    /// run (`config.editor.show_welcome` is false).
+    /// The first-run instance, or `None` once `config.editor.show_welcome` is
+    /// off.
     pub fn from_state(caps: &Capabilities, config: &Config) -> Option<Self> {
         if !config.editor.show_welcome {
             return None;
         }
-        // Not dismissable: on a genuine first run Save is the only
-        // resolution, and the "Show on next launch" toggle stands in for
-        // Cancel.  Nothing is at risk — there is no prior choice to
-        // overwrite.
+        // Not dismissable: on a first run Save is the only resolution, the
+        // "Show on next launch" toggle stands in for Cancel, and there is no
+        // prior choice to overwrite.
         Some(Self::build(caps, config, false))
     }
 
-    /// Construct the welcome modal unconditionally, ignoring
-    /// `config.editor.show_welcome`.  Used by the on-demand paths —
-    /// `Action::OpenWelcome` and the capabilities notice's
-    /// "Adjust settings" button — where the user explicitly asked for
-    /// this surface, so the first-run gate doesn't apply.  Because the
-    /// state is rebuilt from the *live* `caps`, reopening it after a
-    /// terminal change re-derives `full_color` / `image_capable` and
-    /// re-applies the below-truecolor forcing.
+    /// The on-demand instance (`Action::OpenWelcome`, the capabilities notice's
+    /// "Adjust settings"), built unconditionally and from the *live* `caps`, so
+    /// reopening after a terminal change re-derives `full_color` /
+    /// `image_capable`.
     ///
-    /// Dismissable, unlike the first-run instance.  Reopening carries a
-    /// risk the first run doesn't: the user already has choices on disk,
-    /// and below truecolor `WelcomeState::new` forces images and
-    /// diagrams to `Never` while [`Self::save_outcome`] persists that
-    /// forcing.  Without an `Esc` that writes nothing, merely *looking*
-    /// at this surface from a weaker terminal would overwrite the
+    /// Dismissable, unlike the first-run instance: the user already has choices
+    /// on disk, and below truecolor `WelcomeState::new` forces images and
+    /// diagrams to `Never`.  Without an `Esc` that writes nothing, merely
+    /// *looking* at this surface from a weaker terminal would overwrite the
     /// settings chosen on a capable one.
     pub fn new(caps: &Capabilities, config: &Config) -> Self {
         Self::build(caps, config, true)
     }
 
-    /// Park focus on the Save button so a test can activate it without
-    /// depending on how many Tab presses the current row set requires.
+    /// Park focus on Save, so a test needn't count Tab presses.
     #[cfg(test)]
     pub(crate) fn focus_save_for_test(&mut self) {
         self.state.focused = crate::ui::WelcomeFocus::Save;
@@ -71,7 +59,7 @@ impl WelcomeModal {
                 caps,
                 config.images.enabled,
                 config.images.remote_policy,
-                config.diagrams.enabled,
+                config.figures.enabled,
                 config.modal.handler == VIM_HANDLER,
                 config.editor.check_for_updates,
             )
@@ -103,9 +91,9 @@ impl Modal for WelcomeModal {
                 ModalOutcome::ContinueAnd(Box::new(|app| app.open_theme_picker()))
             }
             WelcomeResponse::Save => self.save_outcome(),
-            // Plain `Close`, deliberately: no config write, and no
-            // fingerprint seeding either — an on-demand opening is not
-            // the first-visit notice and shouldn't silence it.
+            // Plain `Close`, deliberately: no config write, and no fingerprint
+            // seeding — an on-demand opening is not the first-visit notice and
+            // shouldn't silence it.
             WelcomeResponse::Cancel => ModalOutcome::Close,
         }
     }
@@ -121,9 +109,7 @@ impl Modal for WelcomeModal {
                 ModalOutcome::ContinueAnd(Box::new(|app| app.open_theme_picker()))
             }
             WelcomeResponse::Save => self.save_outcome(),
-            // Plain `Close`, deliberately: no config write, and no
-            // fingerprint seeding either — an on-demand opening is not
-            // the first-visit notice and shouldn't silence it.
+            // As in `handle_key`: no config write, no fingerprint seeding.
             WelcomeResponse::Cancel => ModalOutcome::Close,
         }
     }
@@ -133,10 +119,7 @@ impl Modal for WelcomeModal {
     }
 
     fn dismissable(&self) -> bool {
-        // Single source of truth with the `Esc` arm and the rendered
-        // `esc` affordance — all three read `state.dismissable`.  False
-        // on a first run (Save is the only resolution), true on every
-        // on-demand opening.
+        // Shared with the `Esc` arm and the rendered affordance.
         self.state.dismissable
     }
 
@@ -150,28 +133,16 @@ impl Modal for WelcomeModal {
 }
 
 impl WelcomeModal {
-    /// Build a `CloseAnd` outcome that writes the user's choices into
-    /// the config and persists.  Image-related fields follow the three
-    /// cases `WelcomeState` distinguishes:
+    /// Build a `CloseAnd` outcome that writes the user's choices and persists.
     ///
-    /// - **Image-capable** (an image protocol *and* 24-bit color, see
-    ///   `WelcomeState::image_capable`) — all three fields are the user's
-    ///   choice and all three are written.
-    /// - **Not image-capable** (below truecolor, or truecolor with no
-    ///   image protocol) — none of the three is written.  The displayed
-    ///   `Never` that `WelcomeState::new` forces below truecolor is a
-    ///   *session* fact, enforced by `App::media_renderable`, which
-    ///   refuses to decode there regardless of what `config` says.
-    ///   Persisting it would be both redundant and destructive: one
-    ///   `config.toml` is typically shared (dotfiles) with a capable
-    ///   terminal, and writing `Never` would overwrite the `Always` the
-    ///   user chose there — the same reasoning that keeps the
-    ///   indexed-color theme substitution out of `Config::save`.  So the
-    ///   existing values travel intact to a future capable terminal.
-    ///
-    /// This is why the modal can be safely reopened on demand (see
-    /// `WelcomeState::dismissable`): neither Save nor Esc can now
-    /// downgrade a config because of the terminal it was opened on.
+    /// The three image fields are written only on an image-capable terminal (an
+    /// image protocol *and* 24-bit color).  Elsewhere the `Never` that
+    /// `WelcomeState::new` forces is a *session* fact — `App::media_renderable`
+    /// refuses to decode there whatever `config` says — and persisting it would
+    /// overwrite the `Always` chosen on a capable terminal sharing the same
+    /// dotfile.  Same reasoning that keeps the indexed-color theme substitution
+    /// out of `Config::save`, and what makes the modal safe to reopen on
+    /// demand.
     fn save_outcome(&self) -> ModalOutcome {
         let images = self.state.images;
         let remote = self.state.remote;
@@ -182,27 +153,20 @@ impl WelcomeModal {
         let image_capable = self.state.image_capable;
         let fingerprint = self.fingerprint.clone();
         ModalOutcome::CloseAnd(Box::new(move |app| {
-            // Only an image-capable terminal writes the media fields;
-            // see the doc comment for why the forced-off values below
-            // truecolor must stay session-only.
+            // See the doc comment: forced-off values stay session-only.
             if image_capable {
                 app.config.images.enabled = images;
                 app.config.images.remote_policy = remote;
-                app.config.diagrams.enabled = diagrams;
+                app.config.figures.enabled = diagrams;
             }
-            // Vim is terminal-independent, so apply it unconditionally —
-            // this both persists `modal.handler` and activates / clears
-            // the running session's modal-editing state.
+            // Terminal-independent, and this both persists `modal.handler` and
+            // updates the running session's modal-editing state.
             app.set_vim_enabled(use_vim);
-            // Likewise terminal-independent: an update check is a
-            // network preference, not a rendering capability, so it is
-            // never part of the below-truecolor forcing above.
+            // Likewise: a network preference, not a rendering capability.
             app.config.editor.check_for_updates = check_for_updates;
             app.config.editor.show_welcome = !dont_show_again;
-            // The welcome modal already showed the capability summary for
-            // this terminal, so seed the seen-fingerprints set with it —
-            // otherwise the standalone capabilities notice would fire on
-            // the very next launch.
+            // This modal already showed the capability summary, so seed the
+            // seen set or the standalone notice fires on the next launch.
             if !app
                 .config
                 .editor
@@ -237,11 +201,8 @@ mod tests {
         }
     }
 
-    /// A `make_app()` plus the config-isolation guard, as one call.
-    /// Save runs a real `Config::save`, and nothing redirects
-    /// `~/.config/edamame` in a test run — unguarded, these tests
-    /// rewrite the developer's own config file.  Returned as a tuple so
-    /// the guard outlives the test body.
+    /// `make_app()` plus the config-isolation guard: Save runs a real
+    /// `Config::save`, which unguarded rewrites the developer's own config.
     fn isolated_app() -> (crate::test_env::ConfigIsolation, crate::app::App) {
         let iso = crate::test_env::config_isolation();
         let app = make_app();
@@ -265,9 +226,8 @@ mod tests {
 
     #[test]
     fn save_persists_the_check_for_updates_choice() {
-        // `save_outcome` captures four adjacent `bool`s by name into one
-        // closure, so this pins that the update toggle lands in its own
-        // field rather than a neighbour's.
+        // `save_outcome` captures four adjacent `bool`s into one closure, so
+        // pin that this toggle lands in its own field.
         let (_iso, mut app) = isolated_app();
         assert!(app.config.editor.check_for_updates, "on by default");
         let mut modal = WelcomeModal::new(&caps_full(), &app.config);
@@ -278,8 +238,7 @@ mod tests {
             .handle_key(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert!(!modal.state.check_for_updates, "the row flipped");
 
-        // The vim toggle sits directly above it in the same capture
-        // block and must be unaffected.
+        // The vim toggle sits directly above it and must be unaffected.
         let vim_before = app.config.modal.handler.clone();
         save(&mut modal, &mut app);
         assert!(!app.config.editor.check_for_updates);
@@ -296,10 +255,8 @@ mod tests {
 
     #[test]
     fn the_update_check_choice_survives_a_weak_terminal() {
-        // Images and diagrams are force-set to `Never` below truecolor
-        // and deliberately not persisted.  An update check is a network
-        // preference, not a rendering capability, so it must be written
-        // whatever the terminal can draw.
+        // Images and figures are forced to `Never` below truecolor and not
+        // persisted; a network preference must be written regardless.
         let (_iso, mut app) = isolated_app();
         let caps = Capabilities {
             color_depth: ColorDepth::Ansi256,

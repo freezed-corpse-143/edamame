@@ -1,27 +1,12 @@
-//! `LinkView` — per-frame layout snapshot for clickable-link hit
-//! testing.
+//! Per-frame layout snapshots for clickable-link hit testing, analogous to `ui::table_view`
+//! and `ui::image_view`.
 //!
-//! Analogous to `ui::table_view` and `ui::image_view`: the renderer still
-//! emits one `Line<'static>` per rendered line (styling underlined link
-//! spans with `Theme::link_text`), and this module walks the AST + the
-//! corresponding rendered lines to record the screen rect each link
-//! occupies.  The snapshots are stored on `RenderedViewState` /
-//! `PreviewState` so the next mouse event can hit-test against them —
-//! the same pattern used for table handles and images.
-//!
-//! The snapshots are AST-backed: we walk `Block::Heading`, `Paragraph`,
-//! `List`, `Table`, and `BlockQuote` to extract every link-styled run
-//! ([`LinkRun`]) in document order and pair it with the rendered line(s)
-//! for its block.  The rendered-column range is then read back from the
-//! styled `Line<'static>`'s UNDERLINED + `link_text` span(s).  An inline
-//! image's placeholder underlines its alt text too, so it earns a
-//! `LinkRun` of its own that consumes a run without emitting a snapshot
-//! — otherwise every link after an inline image pairs with the wrong URL.
-//!
-//! For the raw-reveal fallback path (when the cursor block is being
-//! shown as raw text and the AST-styled spans aren't present), callers
-//! should fall back to `mouse_ops::link_at_offset` against the raw
-//! block source.
+//! Snapshots are AST-backed: every link-styled run ([`LinkRun`]) is collected in document order
+//! and paired, by index, with the UNDERLINED span runs on the block's rendered lines.  An
+//! inline image's placeholder is underlined too, so it gets a `LinkRun` of its own that
+//! consumes a run without emitting a snapshot; otherwise every link after an inline image pairs
+//! with the wrong URL.  For a raw-revealed cursor block, callers fall back to
+//! `mouse_ops::link_at_offset` against the source instead.
 
 use std::path::Path;
 
@@ -33,54 +18,33 @@ use crate::editor::link::LinkTarget;
 use crate::editor::EditorState;
 use crate::markdown::{Block, Inline};
 
-/// One link-styled run the renderer emits, in document order.
-///
-/// The renderer paints an inline image's `[Image: alt]` placeholder with
-/// `Theme::image_placeholder` — the link foreground, with the alt text
-/// underlined — so every consumer that finds runs by style sees one
-/// there.  Carrying the placeholder as its own variant is what keeps a
-/// run's index and the AST's index the same number; see
-/// [`collect_link_runs_from_block`].
+/// One link-styled run the renderer emits, in document order.  The image-placeholder variant
+/// keeps run indices aligned with the AST; see [`collect_link_runs_from_block`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkRun {
-    /// A real `Inline::Link`.
     Link {
-        /// Raw URL from the Markdown source.
         url: String,
-        /// The optional link title (Markdown: `[text](url "title")`).
+        /// The optional `[text](url "title")` title.
         title: Option<String>,
     },
     /// An `Inline::Image` placeholder: styled like a link, but not one.
     ImagePlaceholder,
 }
 
-/// Per-frame geometry for one visible link.
-///
-/// `rect` is in terminal cells, relative to the document area's origin.
-/// Width is in char columns on a single visual row — links that wrap
-/// across multiple visual rows produce one snapshot per row so the
-/// per-row hit-test stays simple.
+/// Per-frame geometry for one visible link, in terminal cells.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkLayoutSnapshot {
-    /// Screen rect occupied by the link's rendered text span.
     pub rect: Rect,
-    /// Resolved `LinkTarget` (classification is done once at snapshot
-    /// build time so every click path consults the same answer).
+    /// Classified once at build time so every click path consults the same answer.
     pub target: LinkTarget,
-    /// Raw URL from the Markdown source, preserved for hover tooltips
-    /// and for error messages on open failure.
+    /// Raw URL, kept for hover tooltips and open-failure messages.
     pub url: String,
-    /// The optional link title (Markdown: `[text](url "title")`).
-    /// Surfaced as a hover tooltip.
+    /// Optional link title, surfaced as a hover tooltip.
     pub title: Option<String>,
 }
 
 impl LinkLayoutSnapshot {
-    /// Return the hovered snapshot if `(col, row)` falls within its
-    /// rect.  Callers typically walk a `&[LinkLayoutSnapshot]` with
-    /// `iter().find_map(|s| s.hit_test(col, row))` to get the active
-    /// link, since multiple snapshots can exist for wrapped / stacked
-    /// links. Used by tests in this module.
+    /// `Some(self)` if `(col, row)` falls within `rect`.  Used by tests in this module.
     #[allow(dead_code)]
     pub fn hit_test(&self, col: u16, row: u16) -> Option<&Self> {
         if col >= self.rect.x
@@ -95,13 +59,8 @@ impl LinkLayoutSnapshot {
     }
 }
 
-/// Refresh `snapshots` in place when the cache key (`scroll`, `area`,
-/// `parsed_version`) differs from the previous frame's, otherwise
-/// leave the vector untouched.  Mirrors `image_view::build_snapshots_cached`.
-/// The underlying `build_snapshots` walks `parsed.blocks` and calls
-/// `visual_rows_for_line` for every visible line, so skipping it when
-/// layout hasn't changed is a major per-frame win on large
-/// link-heavy documents.
+/// Rebuild `snapshots` only when `(scroll, area, parsed_version)` changed since the previous
+/// frame.  Mirrors `image_view::build_snapshots_cached`.
 pub fn build_snapshots_cached(
     state: &EditorState,
     area: Rect,
@@ -117,12 +76,8 @@ pub fn build_snapshots_cached(
     *cache_key = Some(key);
 }
 
-/// Build snapshots for every visible link in the rendered document.
-///
-/// `scroll` is the first visual row index on screen.  `area` is the
-/// document area rect.  The returned vector preserves document order —
-/// earlier links appear earlier — so hit-testing (which uses `find_map`)
-/// naturally favours the first matching snapshot when two overlap.
+/// Build snapshots for every visible link, in document order (so `find_map` hit-testing favors
+/// the earlier of two overlapping snapshots).  `scroll` is the first visual row on screen.
 pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<LinkLayoutSnapshot> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
@@ -133,13 +88,6 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Li
         .and_then(|p| p.parent())
         .map(Path::to_owned);
 
-    // `ParsedDoc` retains the post-processed AST (`blocks`) and the
-    // matching byte ranges (`real_ranges`) from the last re-parse, so
-    // we pair AST link occurrences with rendered-line geometry without
-    // a per-frame parse of the full buffer.  Previously this
-    // function called `buffer.contents()` + `markdown::parse()` +
-    // `top_level_block_ranges()` on every draw — a dominant hotspot on
-    // large documents.
     let mut out = Vec::new();
     for (block, range) in state
         .parsed
@@ -157,10 +105,6 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Li
         if block_end_rows <= scroll {
             continue;
         }
-        // y_offset: visual rows of the block's first line above `scroll`.
-        // For blocks already in the visible area this is positive; for
-        // blocks that start off the bottom of the viewport we still need
-        // to walk them so wrapped links on later lines are caught.
         extract_block_links(
             block,
             &rendered_range,
@@ -174,9 +118,8 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Li
     out
 }
 
-/// Recursive walk: extract links from a block's inlines and pair each
-/// with a rendered-line rect.  `rendered_range` is the rendered-line
-/// range the block occupies.
+/// Extract a block's links and pair each with a rendered-line rect.  `rendered_range` is the
+/// rendered-line range the block occupies.
 fn extract_block_links(
     block: &Block,
     rendered_range: &std::ops::Range<usize>,
@@ -186,10 +129,7 @@ fn extract_block_links(
     base_dir: Option<&Path>,
     out: &mut Vec<LinkLayoutSnapshot>,
 ) {
-    // Early-exit: most blocks (tables, code, plain paragraphs) carry no
-    // links.  Collecting URLs first lets us skip the per-line geometry
-    // walk for those blocks entirely — the dominant win on link-sparse
-    // documents like plan.md.
+    // Collecting runs first skips the per-line geometry walk for the (common) link-free block.
     let mut link_runs: Vec<LinkRun> = Vec::new();
     collect_link_runs_from_block(block, &mut link_runs);
     if !link_runs
@@ -199,10 +139,7 @@ fn extract_block_links(
         return;
     }
 
-    // Compute the block's first line's screen-y in O(1) via the
-    // ParsedDoc's prefix-sum cache.  Replaces the historical
-    // `for idx in 0..rendered_range.start` walk that called
-    // `visual_rows_for_line` per line — quadratic on large documents.
+    // First-line screen y in O(1) via the prefix-sum cache; a per-line walk was quadratic.
     let width = area.width as usize;
     let total = state.parsed.lines.len();
     let block_start_rows = state
@@ -215,8 +152,6 @@ fn extract_block_links(
         let rows_used = state.parsed.visual_rows_for_line_at(idx, width).max(1);
         let y_start = y_cursor;
         y_cursor += rows_used as isize;
-        // Skip lines that are entirely above or below the visible
-        // viewport — no snapshots to emit for them.
         if y_cursor <= 0 {
             continue;
         }
@@ -226,9 +161,6 @@ fn extract_block_links(
         line_positions.push((idx, y_start.max(0) as u16, rows_used as u16));
     }
 
-    // Walk each visible line of the block, extracting UNDERLINED spans
-    // in order.  For each UNDERLINED-span slice we pop the next URL
-    // from `link_urls` and produce one snapshot per visual row.
     let mut link_iter = link_runs.into_iter().peekable();
     for (line_idx, y_start, rows_used) in line_positions {
         let Some(line) = state.parsed.lines.get(line_idx) else {
@@ -236,8 +168,8 @@ fn extract_block_links(
         };
         let underlined_ranges = underlined_char_ranges(line);
         for (start_col, end_col) in underlined_ranges {
-            // Every run consumes an entry, image placeholders included —
-            // that is what keeps the pairing aligned past an inline image.
+            // Every run consumes an entry, image placeholders included, to keep the pairing
+            // aligned past an inline image.
             let Some(run) = link_iter.next() else {
                 return;
             };
@@ -245,11 +177,8 @@ fn extract_block_links(
                 continue;
             };
             let target = LinkTarget::parse(&url, base_dir);
-            // For wrap-aware placement, split the char range across the
-            // line's visual rows.  `rows_used` is the line's total
-            // rows; we synthesise a single snapshot covering the flat
-            // char range and let hit-testing use the full height —
-            // acceptable until we need per-row precision.
+            // One snapshot covering the flat char range at the line's full row height;
+            // per-row precision for wrapped links is not needed yet.
             let width = end_col.saturating_sub(start_col);
             if width == 0 {
                 continue;
@@ -270,10 +199,8 @@ fn extract_block_links(
     }
 }
 
-/// Return `[(start_col, end_col)]` char-column ranges for every run of
-/// consecutive `UNDERLINED` spans in `line`.  Adjacent underlined spans
-/// are coalesced so a link text that includes bold / italic substyling
-/// still produces a single run.
+/// Char-column ranges of every run of consecutive `UNDERLINED` spans in `line`; adjacent spans
+/// coalesce so bold/italic substyling inside a link still yields one run.
 fn underlined_char_ranges(line: &Line<'_>) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut col = 0usize;
@@ -296,28 +223,17 @@ fn underlined_char_ranges(line: &Line<'_>) -> Vec<(usize, usize)> {
     out
 }
 
-/// Public wrapper around [`collect_link_runs_from_block`] for callers
-/// outside this module (notably `mouse_ops::links::link_at_rendered_pos`).
-/// The private function is kept so the build-pass call-site doesn't need
-/// to shuffle through the public API.
+/// Public wrapper around [`collect_link_runs_from_block`] for `mouse_ops::links`.
 pub fn collect_link_runs_from_block_public(block: &Block, out: &mut Vec<LinkRun>) {
     collect_link_runs_from_block(block, out);
 }
 
-/// Collect one [`LinkRun`] per link-styled run the renderer will emit for
-/// `block`, walking nested block / inline structures (list items, table
-/// cells, block quotes).  Preserves document order, so the N-th entry
-/// here pairs with the N-th run a consumer finds on the rendered lines.
+/// Collect one [`LinkRun`] per link-styled run the renderer will emit for `block`, in document
+/// order, so the N-th entry pairs with the N-th underlined run on the rendered lines.
 ///
-/// `Inline::Image` earns an entry of its own even though it is not a
-/// link: the renderer paints its placeholder with `Theme::image_placeholder`,
-/// which carries the link foreground *and* underlines the alt text, so
-/// both consumers see a run there.  Without a placeholder entry to
-/// consume it, every link after an inline image pairs with the wrong
-/// URL (`![logo](l.png) see [docs](d.md)` had the image opening `d.md`
-/// and the real link opening nothing).  An image *inside* a link is not
-/// counted twice — the walk does not descend into a link's own text,
-/// and the renderer emits one run for the pair.
+/// `Inline::Image` gets an entry because its placeholder is painted with the link fg and an
+/// underlined alt text, so consumers see a run there.  An image *inside* a link is not counted
+/// twice: the walk does not descend into a link's own text, and the renderer emits one run.
 fn collect_link_runs_from_block(block: &Block, out: &mut Vec<LinkRun>) {
     match block {
         Block::Heading { inlines, .. } | Block::Paragraph { inlines } => {
@@ -374,6 +290,7 @@ fn collect_link_runs_from_inlines(inlines: &[Inline], out: &mut Vec<LinkRun>) {
             | Inline::Code(_)
             | Inline::HtmlComment(_)
             | Inline::FootnoteReference { .. }
+            | Inline::Math { .. }
             | Inline::SoftBreak
             | Inline::HardBreak => {}
         }
@@ -427,16 +344,10 @@ mod tests {
         assert!(build_snapshots(&st, area, 0).is_empty());
     }
 
-    /// A link below the initial scroll offset must produce a snapshot
-    /// whose `rect.y` equals the exact screen row of the link's
-    /// rendered line.  Validates that the `ParsedDoc` prefix-sum
-    /// math (which replaced the historical per-block 0..start walk)
-    /// produces the same y-coordinates as the explicit walk did.
+    /// Pins the prefix-sum y math: each paragraph is one line plus a gap line, so the link
+    /// sits at rendered line 24 and lands on screen row 4 after scrolling by 20.
     #[test]
     fn link_below_scroll_lands_on_correct_row() {
-        // 12 short paragraphs followed by a link — the link sits at
-        // rendered line 24 (each paragraph emits one line plus one
-        // blank-line gap line, so paragraph k starts at row 2k).
         let mut src = String::new();
         for i in 0..12 {
             src.push_str(&format!("Paragraph {i}.\n\n"));
@@ -444,9 +355,6 @@ mod tests {
         src.push_str("Read [this](https://example.com)\n");
         let st = state(&src);
         let area = Rect::new(0, 0, 80, 6);
-        // Scroll past the first 10 paragraphs.  visual_rows_before(20)
-        // is 20 (each line is single-row at width 80), so the link
-        // line — at rendered index 24 — should land on screen row 4.
         let snaps = build_snapshots(&st, area, 20);
         assert_eq!(snaps.len(), 1, "exactly one link snapshot expected");
         assert_eq!(snaps[0].rect.y, 4, "link y must equal line_index - scroll");

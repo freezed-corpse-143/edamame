@@ -1153,6 +1153,11 @@ fn type_at_viewport_bottom_wraps_and_scrolls_in_rendered_mode() {
         }
     }
     let mut st = state(&src);
+    // This exercises scroll-on-wrap with the deferred-reparse flush, using a soft-broken block as
+    // a stack of one-per-source-line rendered rows.  Reflow (default on) would instead join them
+    // into one flow, changing the geometry the setup depends on — disable it, the mechanic under
+    // test is independent of reflow.
+    st.set_reflow(false);
     apply(&mut st, Action::EnterEditMode);
     st.scroll = 0;
 

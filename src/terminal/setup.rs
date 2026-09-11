@@ -12,55 +12,37 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-/// Result of terminal setup: the ratatui `Terminal` plus a flag indicating
-/// whether the kitty keyboard enhancement protocol is actually available.
+/// The ratatui `Terminal` plus whether the kitty keyboard protocol is really
+/// available.
 ///
-/// The flag comes from `supports_keyboard_enhancement()`, **not** from the
-/// result of pushing the flags.  `PushKeyboardEnhancementFlags` is a one-way
-/// escape sequence: a terminal that doesn't implement the protocol simply
-/// ignores it and sends nothing back, so `execute!` returns `Ok` there too
-/// (it reports whether the *write* succeeded, nothing about the terminal).
-/// Deriving the flag from the push therefore reported `true` everywhere,
-/// which is why the capability summary used to claim the kitty protocol on
-/// Apple Terminal.
+/// That flag comes from `supports_keyboard_enhancement()`, **not** from pushing
+/// the flags: `PushKeyboardEnhancementFlags` is write-only, so `execute!`
+/// returns `Ok` on a terminal that ignored it entirely.  Deriving it from the
+/// push reported `true` everywhere, including Apple Terminal.
 pub struct TerminalSetup {
     pub terminal: Terminal<CrosstermBackend<Stdout>>,
     pub keyboard_enhancement: bool,
 }
 
-/// Set up the terminal for TUI rendering.
-///
-/// Enables raw mode, the alternate screen buffer, and — on terminals that
-/// support it — the kitty keyboard protocol so key combinations like
-/// `Shift+Enter` and `Alt+Shift+Backspace` can be disambiguated from their
-/// legacy escape-code equivalents.
+/// Set up the terminal for TUI rendering: raw mode, alternate screen, and — where
+/// supported — the kitty keyboard protocol, so chords like `Shift+Enter` can be
+/// told apart from their legacy escape-code equivalents.
 pub fn setup() -> Result<TerminalSetup> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    // Bracketed paste turns a terminal-native paste (Ctrl-Shift-V,
-    // middle-click, etc.) into a single `Event::Paste(String)` so we can
-    // insert the pasted content atomically — the only path that works when
-    // the host terminal can reach the system clipboard but this process
-    // cannot (SSH, Wayland without data-control, WSL, etc.).
+    // Turns a terminal-native paste into one `Event::Paste`, the only path that
+    // works when the host terminal can reach the clipboard but this process
+    // cannot (SSH, Wayland without data-control, WSL).
     let _ = execute!(stdout, EnableBracketedPaste);
-    // Best-effort: terminals that don't implement xterm focus reporting
-    // silently ignore the enable sequence.  When supported, the terminal
-    // emits `Event::FocusGained` / `Event::FocusLost` as the user switches
-    // windows, which the editor uses to hide its cursor while unfocused.
+    // Best-effort focus reporting; the editor hides its cursor while
+    // unfocused.
     let _ = execute!(stdout, EnableFocusChange);
-    // Ask the terminal whether it speaks the kitty keyboard protocol before
-    // pushing any flags at it.  This is kitty's own recommended detection
-    // procedure (crossterm sends `CSI ? u` followed by a primary-device-
-    // attributes query and sees which reply arrives first), and it is the
-    // only way to learn the answer: the push itself is write-only and can
-    // never report a terminal that ignored it.
-    //
-    // Must run after `enable_raw_mode` and before the App spawns its event
-    // reader thread — the query reads the reply off the tty, so a competing
-    // reader would eat it.  Terminals that answer neither query cost the
-    // 2 s timeout inside crossterm, but any terminal that answers DA1 —
-    // which includes Apple Terminal — returns immediately.
+    // kitty's own detection procedure, and the only way to learn the answer:
+    // the push is write-only.  Must run after `enable_raw_mode` and before the
+    // App spawns its event reader — the query reads its reply off the tty, so a
+    // competing reader would eat it.  A terminal answering neither query costs
+    // crossterm's 2 s timeout; anything answering DA1 returns at once.
     let keyboard_enhancement = crossterm::terminal::supports_keyboard_enhancement()
         .inspect_err(|e| tracing::warn!(error = %e, "keyboard enhancement probe failed"))
         .unwrap_or(false);
@@ -78,52 +60,38 @@ pub fn setup() -> Result<TerminalSetup> {
     })
 }
 
-/// Enable xterm mouse reporting so the app receives `Event::Mouse` events.
-///
-/// Called from `main` after capability detection when `capabilities.mouse` is
-/// true.  Terminals that don't actually support mouse reporting silently drop
-/// the enable sequence; the capability check prevents trying at all on
-/// `TERM=linux` / `TERM=dumb` where the escape bytes would end up echoed as
-/// literal output.
+/// Enable xterm mouse reporting.  Gated on `capabilities.mouse` by the caller:
+/// on `TERM=linux` / `TERM=dumb` the escape bytes would be echoed as literal
+/// output.
 pub fn enable_mouse() -> Result<()> {
     execute!(std::io::stdout(), EnableMouseCapture)?;
     Ok(())
 }
 
-/// Disable mouse capture.  Called by `restore()` (best-effort) so the terminal
-/// is never left reporting mouse events after the app exits.
+/// Disable mouse capture, so the terminal never keeps reporting after exit.
 pub fn disable_mouse() {
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
 }
 
-/// Supported pointer shapes for [`set_pointer_shape`].
-///
-/// These map to CSS cursor names (the convention used by modern OSC 22
-/// terminals: Ghostty, kitty recent versions, wezterm).  Older terminals like
-/// xterm use X11 cursor-font names (`xterm`, `hand2`, `left_ptr`) — we emit
-/// both: the X11 name first, then a follow-up OSC 22 with the CSS name, so
-/// whichever the terminal understands wins.  Terminals that don't implement
-/// OSC 22 at all silently drop the sequence.
+/// Supported pointer shapes for [`set_pointer_shape`].  Modern OSC 22 terminals
+/// take CSS cursor names, older ones X11 cursor-font names, so both are emitted
+/// and whichever the terminal understands wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerShape {
     /// I-beam cursor: shown when the pointer is over editable text.
     Text,
     /// Pointing-hand cursor: shown over clickable elements (checkboxes, links).
     Hand,
-    /// Default arrow cursor: used to restore the terminal's native cursor on
+    /// Default arrow cursor; restores the terminal's native cursor on
     /// shutdown.
     Default,
 }
 
-/// Emit the OSC 22 escape sequence that asks the terminal to change the
-/// pointer (mouse) cursor shape.  Best-effort — terminals that don't
-/// implement OSC 22 ignore the sequence.
+/// Ask the terminal to change the mouse pointer shape.  Best-effort; both name
+/// dialects are emitted (see [`PointerShape`]), which costs ~20 bytes per update
+/// and avoids probing which the host prefers.
 pub fn set_pointer_shape(shape: PointerShape) {
     use std::io::Write;
-    // Emit both the X11 cursor-font name and the CSS name.  Any terminal that
-    // implements OSC 22 will pick whichever of the two it recognises; the
-    // other is ignored.  Emitting both costs ~20 bytes of escape per update
-    // and avoids having to probe which dialect the host terminal prefers.
     let (x11, css) = match shape {
         PointerShape::Text => ("xterm", "text"),
         PointerShape::Hand => ("hand2", "pointer"),
@@ -134,10 +102,8 @@ pub fn set_pointer_shape(shape: PointerShape) {
     let _ = stdout.flush();
 }
 
-/// Restore the terminal to its normal state.
-///
-/// Must be called before the process exits, even on error, to avoid leaving
-/// the terminal in raw mode.
+/// Restore the terminal.  Must run before the process exits, even on error, or
+/// the terminal is left in raw mode.
 pub fn restore() -> Result<()> {
     set_pointer_shape(PointerShape::Default);
     disable_mouse();
@@ -149,17 +115,11 @@ pub fn restore() -> Result<()> {
     Ok(())
 }
 
-/// Re-enter the TUI after a temporary suspension (e.g. shelling out to
-/// `$EDITOR`).  Mirrors [`setup`] minus the `Terminal` construction —
-/// the caller already owns a `Terminal` and just needs the underlying
-/// terminal state restored to alt-screen / raw-mode.  `mouse` and
-/// `keyboard_enhancement` should be the same flags that were passed to
-/// the original setup so transient terminal features stay consistent.
-///
-/// Best-effort: errors during alt-screen re-enter propagate, but the
-/// optional features (bracketed paste, kitty keyboard, mouse) are
-/// silently ignored on failure to match the original setup's
-/// permissiveness.
+/// Re-enter the TUI after a suspension (shelling out to `$EDITOR`): [`setup`]
+/// minus the `Terminal` construction, which the caller still owns.  Pass the
+/// same flags the original setup got, so transient features stay consistent.
+/// Alt-screen errors propagate; the optional features fail silently, as in
+/// `setup`.
 pub fn re_enter(mouse: bool, keyboard_enhancement: bool) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();

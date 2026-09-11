@@ -1,8 +1,5 @@
-// The binary is a thin shell over the library crate — it deliberately
-// declares no modules of its own.  Re-declaring them here would compile
-// a second, private copy of the entire tree, which is how `app`'s unit
-// tests previously ended up reachable only via `cargo test --bin
-// edamame`.  See `src/lib.rs`.
+// A thin shell over the library crate, declaring no modules of its own: re-declaring them here
+// would compile a second private copy of the tree, hiding its unit tests from `cargo test --lib`.
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -12,22 +9,16 @@ use edamame::cli::{self, Invocation, RunOpts};
 use edamame::config::{self, Config, LoadedConfig};
 use edamame::terminal::{self, Capabilities, ColorDepth, TerminalSetup};
 
-/// Exit status for a command line we couldn't parse.  2 is the
-/// long-standing convention for a usage error (as distinct from 1, a
-/// program that ran and failed).
+/// Usage-error exit status, by long-standing convention (1 means ran-and-failed).
 const EXIT_USAGE: i32 = 2;
 
-/// What [`run`] should put on screen.  The two arms share every step of
-/// startup — config, terminal, capability probe, `App::new` — and differ
-/// only in what is handed to the `App` afterwards, which is why this is
-/// a parameter rather than a second copy of that sequence.
+/// What [`run`] should put on screen.  A parameter rather than two copies of startup: the arms
+/// share every step and differ only in what reaches the `App` afterwards.
 enum Session {
     /// Normal editing session; `None` opens an empty, unnamed buffer.
     Open(Option<PathBuf>),
-    /// Read-only `--diff` review.  Carries the file *contents*, already
-    /// read and compared by `main`: reading them before terminal setup
-    /// means an unreadable path or an identical pair reports on the
-    /// normal screen instead of flashing an alternate one first.
+    /// Read-only `--diff` review, carrying the *contents* — read and compared by `main` before
+    /// terminal setup, so an unreadable path or identical pair reports on the normal screen.
     Diff {
         old: String,
         new: String,
@@ -36,19 +27,15 @@ enum Session {
 }
 
 fn main() -> Result<()> {
-    // ── Parse CLI arguments ────────────────────────────────────────
-    // `args_os`, not `args`: the latter panics on a non-UTF-8 argument,
-    // which is a legal file name on Linux.  See `cli::args`.
+    // `args_os`, not `args`: the latter panics on a non-UTF-8 argument, a legal Linux file name.
     let invocation = Invocation::parse(std::env::args_os().skip(1)).unwrap_or_else(|e| {
         eprintln!("edamame: {e}\n\n{}", cli::USAGE);
         std::process::exit(EXIT_USAGE);
     });
 
     match invocation {
-        // The informational flags answer and exit without ever touching
-        // the config directory or the alternate screen — `--doctor`
-        // enters and leaves it to run the capability probe, but draws
-        // no frame and prints only after restoring.
+        // The informational flags never touch the config directory.  `--doctor` enters the
+        // alternate screen for its probe but draws no frame and prints after restoring.
         Invocation::Help => {
             print!("{}", cli::help_text());
             Ok(())
@@ -60,35 +47,20 @@ fn main() -> Result<()> {
         Invocation::Doctor => cli::run_doctor(),
         Invocation::Run { file, opts } => run(Session::Open(file), opts),
         Invocation::Diff { old, new, opts } => {
-            // ── Three ways a pair is declined, all of them exit 0 ──
+            // Three ways a pair is declined, all of them exit 0: under `--trust-exit-code` a
+            // non-zero status abandons every file behind it.  Ending the walk deliberately is a
+            // signal, not a status — see `difftool::stop_walk`.
             //
-            // A pair edamame has nothing to say about must not look
-            // like a failure: under `--trust-exit-code` a non-zero
-            // status abandons every file behind it, and even without
-            // that flag an error message per skipped file is noise.  So
-            // each of these reports on stderr and returns success.
-            // Ending the walk deliberately is a signal, not a status —
-            // see `difftool::stop_walk`.
-            //
-            // Not Markdown.  git invokes a difftool on every changed
-            // path, and edamame has nothing to offer a `.rs` or a
-            // `.png`: it would render them as unstyled plain text,
-            // which is worse than `git diff`'s own output, and cost an
-            // `Esc` per file to page past.  Checked before the files
-            // are read, so a binary file is declined by its name and
-            // never reaches a UTF-8 decode.
-            // Named by `diff_label`, not by the path: git's side of the
-            // pair is a temp copy under its own scratch directory, and
-            // a walk that prints those reads as noise rather than as a
-            // list of the files it passed over.
+            // Not Markdown.  git invokes a difftool on every changed path, and edamame has
+            // nothing to offer a `.rs` or a `.png`.  Checked before the read, so a binary file is
+            // declined by its name and never reaches a UTF-8 decode.  Named by `diff_label`
+            // because git's side of the pair is a temp copy under its own scratch directory.
             let label = diff_label(&old, &new);
             if !is_markdown_pair(&old, &new) {
                 eprintln!("edamame: {label} is not Markdown — skipped");
                 return Ok(());
             }
-            // Unreadable — a `.md` that isn't valid UTF-8, or a path
-            // that has gone away between git writing it and us opening
-            // it.
+            // Unreadable — not valid UTF-8, or gone since git wrote it.
             let sides = read_side(&old).and_then(|o| read_side(&new).map(|n| (o, n)));
             let (old_text, new_text) = match sides {
                 Ok(pair) => pair,
@@ -97,12 +69,8 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
             };
-            // Identical.  git only invokes a difftool for paths it
-            // believes differ, but it decides that from the index — a
-            // mode-only change, or a filter that normalises the bytes,
-            // still reaches us with two identical files.  Opening an
-            // empty review would leave the user pressing Esc to learn
-            // nothing.
+            // Identical.  git decides "differs" from the index, so a mode-only change or a
+            // normalizing filter still reaches us with two identical files.
             if old_text == new_text {
                 eprintln!("edamame: {label} has no differences to review");
                 return Ok(());
@@ -119,32 +87,22 @@ fn main() -> Result<()> {
     }
 }
 
-/// Start the editor: load config, set up the terminal, probe
-/// capabilities, run the app, restore.
+/// Load config, set up the terminal, probe capabilities, run the app, restore.
 fn run(session: Session, opts: RunOpts) -> Result<()> {
-    // A `--diff` review opens no file: `file_path` is what the watcher
-    // watches and what a save would write to, and both of those would
-    // point at temp files git deletes the moment we exit.  The status
-    // bar gets a display-only label instead (`App::diff_label`).
+    // A `--diff` review opens no file: `file_path` drives the watcher and any save, and both
+    // would point at temp files git deletes the moment we exit.  It gets a display label instead.
     let file_path = match &session {
         Session::Open(path) => path.clone(),
         Session::Diff { .. } => None,
     };
 
     // ── Split a `file.md#section` deep link and validate the file ──
-    // `file.md#section` on the command line opens the file and lands on
-    // that heading — the CLI half of deep linking.  Split here rather
-    // than in `Invocation::parse`: `#` is a legal character in a file
-    // name, so the rule asks the disk before taking one away from a
-    // path (see `cli::split_startup_anchor`), and the parser is pure.
+    // Split here rather than in `Invocation::parse`: `#` is legal in a file name, so the rule asks
+    // the disk before taking one away from a path, and the parser is pure.
     //
-    // Both the split and the validation happen *before* `terminal::setup`
-    // on purpose.  A directory or a binary file makes `Buffer::load_file`
-    // (inside `App::new`) fail, and that failure used to propagate out of
-    // `run` with raw mode and the alternate screen already engaged and
-    // nothing restoring them — a wrecked shell.  Refusing the file here
-    // reports on the normal screen and exits before the terminal is ever
-    // touched.
+    // Both steps happen *before* `terminal::setup` on purpose.  A directory or binary file makes
+    // `Buffer::load_file` fail from inside `App::new`, and that failure has no path back to
+    // `terminal::restore` — it left the shell wrecked.  Refusing here reports on the normal screen.
     let (file_path, startup_anchor) = match file_path {
         Some(path) => {
             let (path, anchor) = cli::split_startup_anchor(&path);
@@ -158,47 +116,25 @@ fn run(session: Session, opts: RunOpts) -> Result<()> {
     };
 
     // ── Load configuration ─────────────────────────────────────────
-    // Three files: config.toml (editor/modal/table/image + active theme
-    // name), keybindings.toml (overrides), themes/<active>.toml (style
-    // table).
+    // Scaffold FIRST, so a first-run user's `load` finds the theme file already written.
+    // `ensure_default_files` never overwrites, and a scaffolding failure still falls back to the
+    // compiled `Theme::default()`.
     //
-    // Order matters: scaffold the default files FIRST so a first-run user
-    // gets a themed editor on their first launch (otherwise `load` reads
-    // the theme file before it has been written).  `ensure_default_files`
-    // never overwrites existing user files, so this is safe on every
-    // subsequent run.  The `load` fallback also covers the missing-file
-    // case — if scaffolding fails (e.g. unwritable XDG dir) the compiled
-    // `Theme::default()` is used.
+    // Both steps need the color depth: the scaffolder seeds a 256-color theme on an indexed
+    // terminal, and `Config::load` picks the same capability-appropriate built-in for a missing
+    // theme file.  The full probe writes escape sequences and must run after `terminal::setup` —
+    // too late — so this is a one-bit early read from the environment only, giving the same answer
+    // the probe will compute later.  The probe stays the source of truth for everything else.
     //
-    // We need to know the terminal's color depth *before* both of those
-    // steps: the scaffolder seeds `theme = "256 Dark"` instead of the
-    // truecolor default on an indexed-color terminal, and `Config::load`
-    // picks the same capability-appropriate built-in when the active theme
-    // file is missing on disk.  The full capability probe
-    // (`Capabilities::detect`) writes escape sequences to the terminal and
-    // must therefore run *after* `terminal::setup` — too late for this
-    // decision.  `detect_color_depth_from_env` inspects `$COLORTERM`,
-    // `$TERM`, and a handful of terminal-specific env vars only (no I/O),
-    // so it's safe to call at this point and gives us the same answer the
-    // full probe will compute later.  The full probe remains the source of
-    // truth for everything else (mouse, keyboard enhancements, image
-    // support, etc.); this is a one-bit early read, not a parallel
-    // implementation.
-    //
-    // `--no-config` short-circuits all three files: no scaffolding and
-    // no reads here, and `suppress_config_writes` below closes the write
-    // half for every site in the process (see `config::persistence`).
-    // `LoadedConfig::default()` is the same in-memory fallback `load`
-    // failures already use, so this is an existing tested path rather
-    // than a second definition of "the built-in defaults".
+    // `--no-config` short-circuits all three files; `disable_config_dir` below closes the write
+    // half for the whole process.
     let truecolor_at_load = Capabilities::detect_color_depth_from_env() == ColorDepth::TrueColor;
     let loaded = if opts.no_config {
         LoadedConfig::default()
     } else {
         Config::ensure_default_files(truecolor_at_load);
         Config::load(truecolor_at_load, true).unwrap_or_else(|e| {
-            // Config errors are non-fatal; use defaults and note the problem.
-            // Can't use tracing here since subscriber isn't set up yet.
+            // Non-fatal.  Not `tracing` — the subscriber isn't set up yet.
             eprintln!("Warning: failed to load config: {e}. Using defaults.");
             LoadedConfig::default()
         })
@@ -212,21 +148,13 @@ fn run(session: Session, opts: RunOpts) -> Result<()> {
 
     // ── Apply run flags on top of the loaded config ────────────────
     if opts.no_config {
-        // Take the config directory out of play for the rest of the
-        // process — reads as well as writes — before `App` exists and so
-        // before anything can save or enumerate it.  Skipping the load
-        // above is only the startup half: the theme picker and the
-        // export-stylesheet list read the directory again mid-session.
+        // Takes the directory out of play for reads too, before `App` exists.  Skipping the load
+        // is only the startup half — the theme picker and stylesheet list read it mid-session.
         config::disable_config_dir();
 
-        // The welcome modal exists to capture first-run choices *to
-        // disk*, and a first run opens it non-dismissable (there is no
-        // prior choice to protect, so it has no Cancel).  With saving
-        // suppressed it has nothing to capture — leaving it on would put
-        // an unskippable prompt at the head of every triage run for no
-        // outcome.  The capabilities notice is left alone: it is
-        // dismissable, and what it reports is exactly what someone
-        // running `--no-config` is usually trying to find out.
+        // The welcome modal captures first-run choices *to disk* and opens non-dismissable, so
+        // with saving suppressed it is an unskippable prompt with no outcome.  The capabilities
+        // notice stays: it is dismissable, and it reports what `--no-config` users came for.
         config.editor.show_welcome = false;
     }
     config.dev.logging |= opts.log;
@@ -244,19 +172,11 @@ fn run(session: Session, opts: RunOpts) -> Result<()> {
         keyboard_enhancement,
     } = terminal::setup()?;
 
-    // Install a panic hook so the terminal is always restored, even on panic.
-    //
-    // The hook runs *before* unwinding and cannot see whether anyone is
-    // going to catch the panic, so it has to be told.  Seven call sites
-    // wrap `catch_unwind` around third-party code that touches untrusted
-    // document content or the live terminal — the highlighter's tokenizer
-    // and its warm worker, the Mermaid renderer and its font warmup, the
-    // image decode and scratch-encode workers, and the capability probe —
-    // and each marks its thread with a `terminal::ExpectedPanic` guard.  Restoring the terminal for one of
-    // those left the app *still running* with no alt screen and no raw
-    // mode: strictly worse than the clean crash this hook exists to give.
-    // Chaining to the default hook is suppressed for the same reason —
-    // it prints the payload to stderr, straight through the TUI.
+    // Restore the terminal on panic.  The hook runs *before* unwinding and cannot see whether
+    // anyone will catch the panic, so guarded sections tell it via `terminal::ExpectedPanic`:
+    // restoring for one of those left the app still running with no alt screen and no raw mode,
+    // strictly worse than the clean crash this hook exists to give.  Chaining to the default hook
+    // is suppressed for the same reason — it prints the payload straight through the TUI.
     let orig_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if terminal::panic_is_expected() {
@@ -268,17 +188,14 @@ fn run(session: Session, opts: RunOpts) -> Result<()> {
     }));
 
     // ── Detect capabilities ───────────────────────────────────────
-    // Must run AFTER EnterAlternateScreen so Picker::from_query_stdio is
-    // talking to the live terminal, and BEFORE app.run() spawns its event
-    // reader thread (competing reads would eat the escape-sequence replies).
+    // AFTER EnterAlternateScreen, so the probe talks to the live terminal; BEFORE `app.run`
+    // spawns its event reader, whose competing reads would eat the escape-sequence replies.
     let capabilities = Capabilities::detect(keyboard_enhancement);
     log_capabilities(&capabilities);
 
     // ── Enable mouse reporting ────────────────────────────────────
-    // Only on terminals that advertise mouse support — sending the enable
-    // sequence to a terminal that doesn't understand it (TERM=linux, dumb)
-    // leaves the bytes echoed as literal output.  Any failure is non-fatal:
-    // the app still runs, just without mouse input.
+    // Only where advertised: a terminal that doesn't understand the enable sequence echoes it as
+    // literal output.  Failure is non-fatal.
     if capabilities.mouse {
         if let Err(e) = terminal::enable_mouse() {
             tracing::warn!(error = %e, "failed to enable mouse capture");
@@ -286,11 +203,8 @@ fn run(session: Session, opts: RunOpts) -> Result<()> {
     }
 
     // ── Run the app ───────────────────────────────────────────────
-    // The deep-link anchor was split off and the file validated before
-    // terminal setup (see the top of `run`).  `App::new` can still fail
-    // for reasons the pre-flight can't foresee, so restore the terminal
-    // before propagating rather than trusting the panic hook, which only
-    // fires on an actual panic.
+    // `App::new` can still fail for reasons the pre-flight can't foresee, so restore before
+    // propagating — the panic hook only fires on an actual panic.
     let mut app = match App::new(
         config,
         keybindings,
@@ -307,11 +221,8 @@ fn run(session: Session, opts: RunOpts) -> Result<()> {
     };
     if let Session::Diff { old, new, label } = session {
         app.set_diff_label(Some(label));
-        // `main` already established that the two sides differ, so
-        // `DiffState::new` cannot decline — but restore the terminal
-        // before erroring rather than trusting that, since the panic
-        // hook is the only other thing standing between a bug here and
-        // a wrecked shell.
+        // `main` established the sides differ, so this cannot decline — but restore before
+        // erroring rather than trust that.
         if !app.enter_read_only_diff(old, new) {
             terminal::restore()?;
             anyhow::bail!("no differences to review");
@@ -323,34 +234,21 @@ fn run(session: Session, opts: RunOpts) -> Result<()> {
     // ── Restore terminal ──────────────────────────────────────────
     terminal::restore()?;
 
-    // Drop the appender guard unconditionally, and here rather than at
-    // the end of the function: dropping it flushes and closes the log
-    // file, and the difftool-abort path below leaves via
-    // `std::process::exit`, which runs no destructors.  Logging is
-    // enabled by `[dev] logging = true` as well as by `--log`, so
-    // deferring the drop into the `--log` branch silently discarded the
-    // tail of a config-enabled session's log.
+    // Dropped here, unconditionally: the drop flushes and closes the log, and the difftool-abort
+    // path below leaves via `std::process::exit`, which runs no destructors.  Logging is also
+    // enabled by config, so deferring into the `--log` branch discarded those sessions' tails.
     //
-    // The guard, not `log_dir()`, is what says a log exists: `log_dir`
-    // only resolves a path, while `setup_logging` also returns `None`
-    // when creating that directory failed — in which case no subscriber
-    // was ever installed and naming the file would send the user after
-    // something that isn't there.
+    // The guard, not `log_dir()`, is what says a log exists — `setup_logging` returns `None` when
+    // the directory couldn't be created, and naming a file then sends the user after nothing.
     let logging_started = log_guard.is_some();
     drop(log_guard);
 
-    // Point `--log` at what it produced.  After `restore`, so the line
-    // lands on the user's normal screen rather than being swallowed with
-    // the alternate one — and after the drop above, so the file is
-    // flushed and closed by the time we name it.
+    // After `restore`, so the line lands on the normal screen, and after the drop, so the file is
+    // closed by the time it is named.
     if opts.log {
         match Config::log_dir().filter(|_| logging_started) {
-            // The appender rolls daily, so the file name carries a date
-            // we'd need a date library to render.  Naming the directory
-            // and the pattern is exact without that dependency — and
-            // "written under" doesn't read as a file path the way the
-            // bare directory did (`cat`ting it was the obvious next
-            // move, and it is a directory).
+            // The appender rolls daily, so the name carries a date we'd need a date library to
+            // render; naming the directory plus the pattern is exact without that dependency.
             Some(dir) => eprintln!(
                 "edamame: debug log written under {} (debug.log.<date>)",
                 dir.display()
@@ -360,44 +258,27 @@ fn run(session: Session, opts: RunOpts) -> Result<()> {
     }
 
     run_result?;
-    // `Esc` out of a difftool review returns normally, and git moves to
-    // the next file.  `Quit` (`Ctrl-Q`) means "Quit diff", which
-    // an exit code cannot express — git discards a diff tool's status
-    // unless `--trust-exit-code` was asked for — so the walk is ended by
-    // signalling the process group instead.  After `terminal::restore`
-    // and after the log guard, because nothing below this line runs.
+    // `Esc` returns normally and git moves on; `Quit` means "quit the whole walk", which an exit
+    // code cannot express — git discards a difftool's status without `--trust-exit-code` — so the
+    // process group is signalled instead.  Last, because nothing below this line runs.
     if diff_stop_walk && difftool::under_git_difftool() {
         difftool::stop_walk();
     }
     Ok(())
 }
 
-/// Refuse a file edamame cannot open, *before* the terminal is set up.
+/// Refuse a file edamame cannot open — a directory or a non-text file — *before* the terminal is
+/// set up, since the same failure from inside `App::new` has no path back to `terminal::restore`.
 ///
-/// edamame is a text editor, so the two things it must turn away are a
-/// directory and a file that isn't text.  Both make `Buffer::load_file`
-/// fail from inside `App::new`, which runs after raw mode and the
-/// alternate screen are engaged — and that failure has no path back to
-/// `terminal::restore`, so it left the shell unusable (a directory was
-/// the common way to trip it).  Checking here reports on the normal
-/// screen and exits cleanly.
+/// A *non-existent* path passes: `App::new` opens it as a new buffer, like `vim`.  There is
+/// deliberately no extension gate — a file the user named explicitly is opened whatever it is
+/// called, Markdown being a superset of plain text.  The `--diff` path is the opposite, and *is*
+/// gated, because git invokes it unattended on every changed file.
 ///
-/// A *non-existent* path is allowed through: `App::new` opens it as a
-/// new, empty buffer that the first save creates, matching `vim` /
-/// `nano`.  There is deliberately no extension gate — a file the user
-/// named explicitly is opened whatever it is called (`README`, `.txt`,
-/// `.mdx`), since Markdown is a superset of plain text and any text file
-/// renders sensibly.  That is the opposite of the `--diff` path, which
-/// *is* extension-gated because git invokes it unattended on every
-/// changed file (see `difftool::is_markdown_pair`).
-///
-/// The UTF-8 check reads the file, which `App::load_file` then reads
-/// again; the second read is cheap for Markdown-sized files and buys a
-/// pre-terminal decision without threading the loaded bytes through
-/// `App::new`.
+/// The UTF-8 check re-reads the file `App::load_file` will read again; cheap at Markdown sizes,
+/// and it buys a pre-terminal decision without threading bytes through `App::new`.
 fn preflight_open(path: &std::path::Path) -> Result<(), String> {
-    // A path that doesn't exist (or can't be stat'd) is a new file;
-    // `App::new` handles it.  Only an existing target is validated.
+    // A path that can't be stat'd is a new file; `App::new` handles it.
     let Ok(meta) = std::fs::metadata(path) else {
         return Ok(());
     };
@@ -412,25 +293,15 @@ fn preflight_open(path: &std::path::Path) -> Result<(), String> {
 
 // ── Logging setup ─────────────────────────────────────────────────────────────
 
-/// Initialise the file-based tracing subscriber.
+/// Initialize the file-based tracing subscriber, returning the writer guard that must stay alive
+/// for the program's duration (dropping it flushes and closes the log).
 ///
-/// Returns the non-blocking writer guard; dropping it flushes and closes the
-/// log file. The guard must be kept alive for the duration of the program.
-///
-/// **Level.** The default filter is a bare `debug`, and both halves of that
-/// are deliberate.  `tracing_subscriber::fmt()`'s own default is `info`,
-/// which silently discarded every `debug!` in the crate into a file named
-/// `debug.log` — the whole point of `[dev] logging` / `--log` is the
-/// diagnostic trail (image decode dispatch and results, watcher events,
-/// link handling), and essentially all of it is logged at `debug`.  It is
-/// *unscoped* because the obvious `edamame=debug` would miss most of that
-/// trail: `EnvFilter` matches on target, and the diagnostic call sites set
-/// their own — `image`, `watcher`, `link`, `mouse`, `app` — none of which
-/// live under the crate's target path.  Nothing in the dependency graph
-/// pulls `tracing` (`cargo tree -i tracing` lists only this crate and the
-/// subscriber), so an unscoped filter can't be flooded by a chatty
-/// dependency.  `RUST_LOG` overrides it when a contributor wants something
-/// narrower, or a `trace`.
+/// **The default filter is a bare `debug`, and both halves of that are deliberate.** `fmt()`'s own
+/// default is `info`, which discards every `debug!` — and essentially the whole diagnostic trail
+/// is at `debug`.  It is *unscoped* because `EnvFilter` matches on target and the diagnostic call
+/// sites set their own (`image`, `watcher`, `link`, `mouse`, `app`), none under the crate's target
+/// path; nothing in the dependency graph pulls `tracing`, so it cannot be flooded.  `RUST_LOG`
+/// overrides it.
 fn setup_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let log_dir = Config::log_dir()?;
     if std::fs::create_dir_all(&log_dir).is_err() {
@@ -453,7 +324,7 @@ fn setup_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     Some(guard)
 }
 
-/// Write a one-line summary of the detected terminal capabilities to the log.
+/// One-line summary of the detected capabilities, for the log.
 fn log_capabilities(caps: &Capabilities) {
     tracing::info!(
         color_depth = ?caps.color_depth,

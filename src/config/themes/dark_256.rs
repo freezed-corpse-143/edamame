@@ -2,10 +2,8 @@ use ratatui::style::{Color, Modifier, Style};
 
 use crate::config::theme::{Palette, Theme};
 
-/// Edamame's default palette: warm orange brand on a near-black
-/// background, with a fresh edamame-bean green for success and a
-/// cool purple for chrome (contrasting with the warm `primary` so the
-/// alternating heading ramp reads as two distinct families).
+/// Edamame's default palette: warm orange brand on near-black, edamame-bean green for success, and
+/// a cool purple for chrome so the alternating heading ramp reads as two hue families.
 pub fn palette() -> Palette {
     Palette {
         text: Color::Indexed(253),
@@ -15,32 +13,21 @@ pub fn palette() -> Palette {
         surface: Color::Indexed(236),
         surface_elevated: Color::Indexed(237),
 
-        // Orange — brand identity, headings, mode chip.
         primary: Color::Indexed(208),
-        // Mid purple — structural chrome (rules, blockquote bar,
-        // section headings, search-highlight bg).  Cool hue chosen
-        // to contrast with the warm `primary` orange.
         secondary: Color::Indexed(97),
-        // Mid blue — list markers, table header, selection bg.
-        // Dark enough to carry `text` (253) as a fg when used as
-        // selection bg, saturated enough to read as a fg color on
-        // the document surface.
+        // Dark enough to carry `text` (253) when used as selection bg, saturated enough to read as
+        // a foreground on the document surface.
         accent: Color::Indexed(25),
-        // Bright blue — link foreground.
         link: Color::Indexed(39),
 
         success: Color::Indexed(76),
         warning: Color::Indexed(220),
         error: Color::Indexed(196),
 
-        // Inline code and code-block language line.  Lighter purple
-        // than `secondary` so inline-code reads distinct from
-        // chrome / section-heading color.
+        // Lighter purple than `secondary`, so inline code reads distinct from chrome.
         code: Color::Indexed(140),
 
-        // Reserved for a future diff view; not consumed yet.  Picked
-        // distinct from `success` / `error` so the palette has no
-        // duplicate slot values.
+        // Distinct from `success` / `error` so no two palette slots share a value.
         diff_add: Color::Indexed(34),
         diff_delete: Color::Indexed(160),
 
@@ -48,17 +35,14 @@ pub fn palette() -> Palette {
     }
 }
 
-/// Built-in theme: builds a [`Theme`] from [`palette`] and pins the
-/// `h1`–`h6` heading ramp to curated 256-cube shades.  The default
-/// `Theme::from_palette` darkening only works for RGB colors;
-/// stepping indexed colors through the 6×6×6 cube shifts hue, so
-/// 256-color built-ins curate the ramp explicitly.
+/// [`Theme::from_palette`] plus a curated `h1`–`h6` ramp: its darkening only works for RGB colors,
+/// and stepping indexed colors through the 6×6×6 cube shifts hue, so 256-color built-ins pin their
+/// own shades.
 pub fn theme() -> Theme {
     let mut t = Theme::from_palette(&palette());
     let bold = Modifier::BOLD;
     let underline = Modifier::UNDERLINED;
-    // Heading ramp: alternates primary (orange) and secondary (purple),
-    // dulling / darkening with each level.
+    // Alternates primary (orange) and secondary (purple), dulling with each level.
     let h1 = Color::Indexed(208); // primary, bright
     let h2 = Color::Indexed(99); // secondary, bright violet
     let h3 = Color::Indexed(172); // primary, medium
@@ -73,10 +57,8 @@ pub fn theme() -> Theme {
     t.h5 = Style::default().fg(h5).add_modifier(bold | underline);
     t.h6 = Style::default().fg(h6).add_modifier(bold | underline);
 
-    // Code surface: a slightly-lifted neutral grey distinct from
-    // `bg_muted` (235, the striped-row bg) so a code span inside a
-    // stripe still reads as code.  Indexed-cube stepping of `code`
-    // (140, mid purple) shifts hue, so we pick the shade by hand.
+    // A lifted neutral grey, distinct from the striped-row bg (235) so a code span inside a stripe
+    // still reads as code.  Hand-picked because cube-stepping `code` (140) would shift hue.
     let code_bg = Color::Indexed(238);
     t.code_span = Style::default().fg(palette().code).bg(code_bg);
     t.code_span_dim = Style::default()
@@ -86,15 +68,10 @@ pub fn theme() -> Theme {
     t.code_block_border = Style::default().fg(palette().text).bg(code_bg);
     t.code_block_text = Style::default().fg(palette().text).bg(code_bg);
 
-    // Syntax highlighting, hand-picked against `code_bg` (238) for the
-    // same reason the heading ramp and `selection_muted` are: the
-    // derived path lifts a too-dark token colour toward `text` with
-    // `blend`, which is a no-op for indexed colours, so this theme has
-    // to answer for its own numbers.  Every entry clears 4.5:1 on 238
-    // (`syntax_contrast_clears_the_floor_for_every_builtin_theme`);
-    // each is the bright-tint sibling of the palette slot the RGB
-    // derivation would have used, because the mid shades those slots
-    // hold are picked to read on `bg` (233), not on the code surface.
+    // Hand-picked against `code_bg` (238) because the derived path lifts dark tokens with `blend`,
+    // a no-op for indexed colors.  Every entry clears 4.5:1 there
+    // (`syntax_contrast_clears_the_floor_for_every_builtin_theme`), each the bright-tint sibling of
+    // the slot the RGB derivation would use — those mid shades are picked to read on `bg` (233).
     t.syntax_keyword = Style::default()
         .fg(Color::Indexed(214)) // orange, bright sibling of primary 208
         .add_modifier(bold);
@@ -107,44 +84,28 @@ pub fn theme() -> Theme {
     t.syntax_function = Style::default().fg(Color::Indexed(117)); // light blue, cf. link 39
     t.syntax_attribute = Style::default().fg(Color::Indexed(217)); // light red, cf. error 196
 
-    // Blockquote surface: the faintest lift the greyscale ramp offers
-    // over `bg` (233) — one step below the striped-row bg (235) and
-    // well below the code surface (238), so a code span inside a quote
-    // still reads as code.  Derived from `secondary` (97, mid purple)
-    // via `blend`, which is a no-op for indexed colors and would have
-    // left the wash as that full-strength purple.
+    // The faintest greyscale lift over `bg`, below both the stripe (235) and code (238) surfaces.
+    // The derived version blends `secondary` and would leave a full-strength purple wash.
     t.blockquote_text = Style::default().bg(Color::Indexed(234));
 
-    // Muted selection (non-focused search matches).  The derived
-    // version blends `surface` toward `accent`, which is a no-op for
-    // indexed colors — it would leave the highlight as the bare
-    // `surface` grey (236), barely separable from `bg` (233).  Pick a
-    // dark navy instead: clearly a highlight against the near-black
-    // page, and clearly recessive against the focused match's brighter
-    // `accent` blue (25).
+    // The derived blend would leave the bare `surface` grey (236), barely separable from `bg`.
+    // A dark navy reads as a highlight while staying recessive against the focused match's 25.
     let selection_muted_bg = Color::Indexed(18);
     t.selection_muted = Style::default().bg(selection_muted_bg).fg(palette().text);
 
-    // Diff washes.  Same `blend` no-op as `selection_muted`, but worse:
-    // every `diff_*_line` / `diff_*_inline` style collapses to the bare
-    // `surface` grey, and `diff_view` paints add / delete rows with *no
-    // gutter* — "distinguished by background color alone" — so on an
-    // indexed terminal an addition and a deletion render identically.
+    // Diff washes.  The `blend` no-op is worse here than for `selection_muted`: every `diff_*`
+    // style would collapse to the bare `surface` grey, and `diff_view` paints add / delete rows
+    // with no gutter, so an addition and a deletion would render identically.
     //
-    // Two things constrain the shades.  (1) A line wash sits behind
-    // whatever the markdown painted, so heading orange / code purple
-    // have to stay legible on top of it; only the cube's darkest tints
-    // leave them room.  (2) The cube's greens carry far more luminance
-    // than its reds: against `text` (253), 22 measures 5.7:1 but 28 only
-    // 3.4:1 and 34 just 2.1:1, while 52 / 88 / 124 all stay above 5:1.
+    // Two constraints. (1) A wash sits behind whatever the markdown painted, so heading orange and
+    // code purple must stay legible on it — only the darkest tints leave room. (2) The cube's
+    // greens carry far more luminance than its reds: against `text` (253), 22 measures 5.7:1 but 28
+    // only 3.4:1 and 34 just 2.1:1, while 52 / 88 / 124 all stay above 5:1.
     //
-    // So the washes take the faintest hued shade of each hue — 22 / 52,
-    // which are also the darkest the 6×6×6 cube can express (nothing
-    // sits between them and black in-hue).  That leaves no second wash
-    // level for green, so focused and non-focused rows share a wash and
-    // focus is carried instead by the inline highlights below and by the
-    // decision divider (elevated bg, `>` caret, bold).  Prioritising the
-    // wash hierarchy over legibility would mean 28 behind body text.
+    // Hence 22 / 52, the faintest (and darkest expressible) shade of each hue.  That leaves no
+    // second green level, so focused and non-focused rows share a wash and focus is carried by the
+    // inline highlights below and the decision divider instead; the alternative is 28 behind body
+    // text.
     let add_wash = Color::Indexed(22); // #005f00
     let delete_wash = Color::Indexed(52); // #5f0000
     t.diff_add_line = Style::default().bg(add_wash);
@@ -152,12 +113,9 @@ pub fn theme() -> Theme {
     t.diff_delete_line = Style::default().bg(delete_wash);
     t.diff_delete_line_unfocused = Style::default().bg(delete_wash);
 
-    // Inline (within-line) change highlights sit *on* the wash, so they
-    // step one shade deeper; the non-focused pair drops the bold, as in
-    // the derived styles.  The focused pair is a saturated fill, and
-    // pins the foreground `best_contrast` would have picked if it could
-    // measure indexed colors — near-black on the bright green (6.4:1),
-    // `text` on the dark red (5.3:1).
+    // Inline highlights sit *on* the wash, so they step a shade deeper.  The focused pair is a
+    // saturated fill pinning the foreground `best_contrast` would pick if it could measure indexed
+    // colors — near-black on the bright green (6.4:1), `text` on the dark red (5.3:1).
     t.diff_add_inline_unfocused = Style::default().bg(Color::Indexed(28));
     t.diff_delete_inline_unfocused = Style::default().bg(Color::Indexed(88));
     t.diff_add_inline = Style::default()
@@ -169,10 +127,8 @@ pub fn theme() -> Theme {
         .fg(palette().text)
         .add_modifier(Modifier::BOLD);
 
-    // Bottom region in diff mode — green tint on the status line, red on
-    // the hint line, mirroring the adds-below / deletes-above stacking.
-    // Reuses the faint wash shades so the bars read as the same language
-    // as the document rows.
+    // Green on the status line, red on the hint line, mirroring the adds-below / deletes-above
+    // stacking, in the same wash shades as the document rows.
     t.status_bar_diff = Style::default().bg(add_wash).fg(palette().text);
     t.hint_bar_diff = Style::default().bg(delete_wash).fg(palette().text);
     t

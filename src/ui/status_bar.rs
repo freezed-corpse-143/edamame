@@ -15,34 +15,21 @@ pub struct StatusBarState<'a> {
     pub mode: Mode,
     /// File name or path (display string only).
     pub filename: &'a str,
-    /// Total number of *source* lines in the document — the count shown as
-    /// "N lines", and the same coordinate space as [`cursor_line`] beside it
-    /// and as the line-number gutter.  Deliberately not the renderer's row
-    /// count: a 6-line document that renders as 10 rows (a table renders
-    /// roughly two rows per data row) has 6 lines, and reporting 10 next to a
-    /// `6:1` cursor read-out contradicts it.
+    /// *Source* line count ("N lines") — the same coordinate space as [`cursor_line`] and the
+    /// gutter, deliberately not the renderer's wrapped row count.
     ///
     /// [`cursor_line`]: Self::cursor_line
     pub line_count: usize,
-    /// Total scrollable rows in the active mode, at the current viewport
-    /// width — the denominator of the scroll percentage, and the same
-    /// coordinate space as [`scroll`].  This one *is* the renderer's output
-    /// (wrapped): the percentage answers "how far down the thing I'm
-    /// scrolling am I", which has nothing to do with source lines.
+    /// Total scrollable rows in the active mode at the current width — the denominator of the
+    /// scroll percentage, in the same space as [`scroll`]. This one *is* the renderer's output.
     ///
     /// [`scroll`]: Self::scroll
     pub scroll_total: usize,
-    /// Height of the *document* viewport in rows — how far past [`scroll`]
-    /// the last visible row sits, and so the reach of the percentage's
-    /// numerator.  Deliberately passed in rather than taken from the widget's
-    /// own `area`, which is the one-row status bar: measuring against that
-    /// reports the row at the *top* of the screen, so a document scrolled
-    /// fully to the bottom reads well under 100%.
-    ///
-    /// [`scroll`]: Self::scroll
+    /// Height of the *document* viewport, passed in rather than read from the widget's own
+    /// one-row `area`; measuring against that reports the top row, so a document scrolled to
+    /// the bottom reads well under 100%.
     pub viewport_rows: usize,
-    /// Whether the buffer has unsaved changes.  Renders as a single
-    /// colored `*` glued to the right edge of the filename.
+    /// Renders as a colored `*` glued to the filename.
     pub modified: bool,
     /// Current scroll offset (wrapped visual rows from the top).
     pub scroll: usize,
@@ -50,21 +37,13 @@ pub struct StatusBarState<'a> {
     pub cursor_line: Option<usize>,
     /// Cursor column (1-indexed, `None` in Preview mode).
     pub cursor_col: Option<usize>,
-    /// Heading-ancestor chain of the cursor's current position, in
-    /// document order (shallowest → deepest).  Renders as a `›`-joined
-    /// breadcrumb after the filename.  Empty when the cursor sits
-    /// before the first heading or the document has none.
+    /// Heading-ancestor chain at the cursor, shallowest → deepest; rendered as a `›`-joined
+    /// breadcrumb after the filename.
     pub section_path: Vec<String>,
-    /// `(resolved, total)` hunk counts in diff mode; `None` in every
-    /// other mode.  Rendered adjacent to the mode badge as
-    /// `resolved/total` — a progress counter that climbs from `0/n` to
-    /// `n/n` as hunks are accepted or rejected.
+    /// `(resolved, total)` hunk counts in diff mode, rendered beside the mode badge.
     pub diff_progress: Option<(usize, usize)>,
-    /// When the vim handler is active, the sub-mode badge text
-    /// (`NORMAL` / `INSERT` / `VISUAL` / `V-LINE`).  Takes precedence
-    /// over the rendering-mode badge; `None` for the default handler.
-    /// The one exception is [`Mode::Diff`], whose badge outranks this
-    /// one — see the precedence note in `render`.
+    /// Vim sub-mode badge (`NORMAL` / `INSERT` / …); outranks the rendering-mode badge except
+    /// in [`Mode::Diff`] — see `render`.
     pub vim_mode_label: Option<&'a str>,
 }
 
@@ -76,14 +55,11 @@ pub struct StatusBar<'a> {
     pub theme: &'a Theme,
 }
 
-/// Cells used by one breadcrumb segment's separator `" › "`.  Each
-/// segment's total cost in the fit calculation is `SEP_COST +
-/// width(text)`.
+/// Cells of one breadcrumb separator `" › "`; a segment costs `SEP_COST + width(text)`.
 const SEP_COST: usize = 3;
 
-/// Minimum visible-char count required to bother prefix-truncating a
-/// segment that doesn't fit whole.  Below this the segment is dropped
-/// entirely — `…a` carries almost no information.
+/// Below this many visible chars a prefix-truncated segment is dropped instead — `…a` carries
+/// almost no information.
 const MIN_TRUNC_VISIBLE_CELLS: usize = 3;
 
 impl<'a> Widget for StatusBar<'a> {
@@ -93,24 +69,14 @@ impl<'a> Widget for StatusBar<'a> {
 
         // ── Left side (fixed, committed first) ──────────────────────
         //
-        // The mode badge, filename, and optional `*` dirty marker are
-        // committed before we decide how much room remains for the
-        // breadcrumb.  The breadcrumb absorbs whatever is left over
-        // after subtracting the right-side info segments.
-        // In diff mode the whole bar shifts to the diff color so the
-        // mode change is unmissable.
+        // Committed first; the breadcrumb absorbs whatever is left after the right side.
         let bar_style = if matches!(s.mode, Mode::Diff) {
             theme.status_bar_diff
         } else {
             theme.status_bar
         };
-        // In diff mode the informational spans (filename, selection,
-        // cursor, line count) carry their own `surface` background by
-        // default, which would punch the normal bar hue through the
-        // recolored diff bar.  Recolor just their backgrounds to the
-        // diff bar's bg so the whole region reads as one washed bar;
-        // their foregrounds (and the accent mode/progress badges) are
-        // left untouched.
+        // The info spans carry their own `surface` bg, which would punch the normal hue
+        // through the diff bar; recolor just their backgrounds.
         let bar_bg = if matches!(s.mode, Mode::Diff) {
             bar_style.bg
         } else {
@@ -121,22 +87,10 @@ impl<'a> Widget for StatusBar<'a> {
             None => st,
         };
 
-        // Mode badge — color swaps per-mode so each mode reads at a
-        // glance (orange = Rendered, yellow = Raw, muted = Preview).
-        // Kept as an accent badge even in diff mode.  When the vim
-        // handler is active its sub-mode badge wins, using the
-        // `status_mode_vim_*` colors (NORMAL = primary, INSERT = success,
-        // VISUAL/V-LINE = secondary) that the editor cursor also mirrors.
-        //
-        // `Mode::Diff` outranks the vim badge, though: the diff-review
-        // keymap owns every key for the duration of the review — the
-        // `vim_deferred` guard in `App::dispatch_single_key` bypasses the
-        // vim handler outright — so a `NORMAL` badge there would advertise
-        // a handler that isn't live (`i` / `v` / `:` all no-op).  The
-        // badge names whichever keymap is actually reading the user's
-        // keystrokes, which in diff is the same `DIFF` the default
-        // handler shows.  Resolved here rather than at the call site so
-        // it can't be bypassed by a `StatusBarState` built elsewhere.
+        // The vim sub-mode badge wins over the mode badge, except in `Mode::Diff`: the
+        // diff-review keymap owns every key (`vim_deferred` in `App::dispatch_single_key`),
+        // so a `NORMAL` badge would advertise a handler that isn't live. Resolved here so a
+        // `StatusBarState` built elsewhere can't bypass it.
         let vim_label = s.vim_mode_label.filter(|_| !matches!(s.mode, Mode::Diff));
         let (mode_text, mode_style) = match vim_label {
             Some(label) => (format!(" {} ", label), vim_badge_style(theme, label)),
@@ -145,7 +99,6 @@ impl<'a> Widget for StatusBar<'a> {
         let mode_width = UnicodeWidthStr::width(mode_text.as_str());
         let mode_span = Span::styled(mode_text, mode_style);
 
-        // Diff-mode progress counter, rendered adjacent to the badge.
         // Accent badge — not washed with the bar bg.
         let diff_text = match s.diff_progress {
             Some((resolved, total)) => format!(" {}/{} ", resolved, total),
@@ -158,12 +111,7 @@ impl<'a> Widget for StatusBar<'a> {
         let filename_width = UnicodeWidthStr::width(filename_lead.as_str());
         let filename_span = Span::styled(filename_lead, with_bar_bg(theme.status_filename));
 
-        // `*` glued to the right edge of the filename, colored via the
-        // already-defined `status_modified` slot (warning fg, bold) so
-        // the marker reads at a glance without taking the 11 cells the
-        // old `[modified]` text used to.  No separating space — the
-        // breadcrumb's first `" › "` (or the gap's surface fill when
-        // there's no breadcrumb) provides whatever spacing follows.
+        // No separating space: the breadcrumb's first `" › "` (or the gap fill) provides it.
         let modified_span = s
             .modified
             .then(|| Span::styled("*".to_string(), theme.status_modified));
@@ -179,10 +127,8 @@ impl<'a> Widget for StatusBar<'a> {
         let cursor_width = UnicodeWidthStr::width(cursor_text.as_str());
         let cursor_span = Span::styled(cursor_text, with_bar_bg(theme.status_info));
 
-        // Measured against the *last visible* row, so a document whose end is
-        // on screen reads 100% — `scroll` alone would report the top row and
-        // never reach it.  An empty document has nothing left to scroll to,
-        // and a zero-height viewport nothing to measure; read both as 100%.
+        // Measured against the *last visible* row so a document whose end is on screen reads
+        // 100%; an empty document or zero-height viewport reads 100% too.
         let pct = match s.scroll_total {
             0 => 100,
             total => {
@@ -198,21 +144,14 @@ impl<'a> Widget for StatusBar<'a> {
 
         // ── Breadcrumb (fits into whatever's left) ──────────────────
         //
-        // Reserve at least 1 cell of gap between the breadcrumb and the
-        // right-side info so they never visually touch.  When the
-        // budget is too small, the breadcrumb collapses to empty and
-        // the gap expands to fill.
+        // At least one cell of gap before the right-side info.
         let breadcrumb_budget = (area.width as usize)
             .saturating_sub(left_committed_width)
             .saturating_sub(right_width)
             .saturating_sub(1);
         let breadcrumb_segments = fit_breadcrumb(&s.section_path, breadcrumb_budget);
 
-        // Style each segment by its position in the chain: every
-        // segment except the last is an ancestor (dimmed); the last
-        // segment is the deepest enclosing heading — the "you are
-        // here" anchor — and gets the accented bold treatment that
-        // makes it pop against the dim chain.
+        // Ancestors dim; the last segment is the "you are here" anchor.
         let mut breadcrumb_spans: Vec<Span<'_>> = Vec::with_capacity(breadcrumb_segments.len() * 2);
         let mut breadcrumb_width = 0usize;
         let last_idx = breadcrumb_segments.len().saturating_sub(1);
@@ -253,37 +192,19 @@ impl<'a> Widget for StatusBar<'a> {
     }
 }
 
-/// Map a vim sub-mode badge label onto its `status_mode_vim_*` style.
-/// These are the canonical per-vim-mode colors (NORMAL = primary,
-/// INSERT = success, VISUAL / V-LINE = secondary); the editor cursor
-/// mirrors the same fields, so chip and cursor always agree.
+/// Vim sub-mode badge style; the editor cursor mirrors the same fields so chip and cursor
+/// agree.
 fn vim_badge_style(theme: &Theme, label: &str) -> Style {
     match label {
         "INSERT" => theme.status_mode_vim_insert,
         "VISUAL" | "V-LINE" => theme.status_mode_vim_visual,
-        // NORMAL (and any future label, e.g. Operator-pending).
         _ => theme.status_mode_vim_normal,
     }
 }
 
-/// Choose which breadcrumb segments to render under a horizontal budget.
-///
-/// `chain` is in document order (shallowest → deepest).  Returns the
-/// segments to render in the same order; segments are dropped from the
-/// shallow end first so the user's current section (the deepest entry)
-/// stays visible.  When even one full segment plus its `" › "` won't
-/// fit, the leftmost remaining segment may be replaced with a
-/// prefix-truncated `"…suffix"` form so the user still reads as much
-/// of the heading text as space allows.
-///
-/// Display algorithm:
-/// 1. Walk `chain` deepest → shallowest, including each segment whole
-///    while `SEP_COST + width(text)` fits in the remaining budget.
-/// 2. When the next segment doesn't fit, see if a prefix-truncated
-///    version (`"…<last N cells>"`) fits with at least
-///    [`MIN_TRUNC_VISIBLE_CELLS`] visible cells after the `…`.  If so,
-///    include it; otherwise stop.
-/// 3. Reverse so the result is in document order.
+/// Choose which breadcrumb segments fit `budget`, in document order. Segments drop from the
+/// shallow end so the current section stays visible; the leftmost survivor may be
+/// prefix-truncated to `"…suffix"` if at least [`MIN_TRUNC_VISIBLE_CELLS`] remain.
 fn fit_breadcrumb(chain: &[String], budget: usize) -> Vec<String> {
     let mut included: Vec<String> = Vec::new();
     let mut used = 0usize;
@@ -295,16 +216,13 @@ fn fit_breadcrumb(chain: &[String], budget: usize) -> Vec<String> {
             used += full_cost;
             continue;
         }
-        // Try a prefix-truncated form: " › …<suffix>".  Cost is
-        // SEP_COST + 1 (for `…`) + suffix_width.
+        // Prefix-truncated form costs SEP_COST + 1 (`…`) + suffix width.
         let leftover = budget
             .saturating_sub(used)
             .saturating_sub(SEP_COST)
             .saturating_sub(1);
         if leftover >= MIN_TRUNC_VISIBLE_CELLS {
             let suffix = last_cells(text, leftover);
-            // Only useful if we actually captured *some* characters —
-            // otherwise the `…` carries no information.
             if !suffix.is_empty() {
                 included.push(format!("…{}", suffix));
             }
@@ -315,9 +233,7 @@ fn fit_breadcrumb(chain: &[String], budget: usize) -> Vec<String> {
     included
 }
 
-/// Return the suffix of `text` whose display width is `<= cells`.
-/// Walks characters from the end so wide graphemes (CJK, emoji) are
-/// counted by their cell width, not their byte length.
+/// Suffix of `text` whose display width is `<= cells`, measured by cell width.
 fn last_cells(text: &str, cells: usize) -> String {
     let chars: Vec<(char, usize)> = text
         .chars()
@@ -341,11 +257,7 @@ mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
 
-    /// A plain state with every optional field empty: no cursor
-    /// position, no breadcrumb, no diff progress, no vim badge.  Tests
-    /// that need one of those spell out just that field and fill the
-    /// rest with `..base_state(..)`, so a new `StatusBarState` field
-    /// costs one line here instead of one per test.
+    /// Every optional field empty; tests spell out just the field they need.
     fn base_state(mode: Mode, filename: &str) -> StatusBarState<'_> {
         StatusBarState {
             mode,
@@ -363,9 +275,7 @@ mod tests {
         }
     }
 
-    /// Render `state` into a one-row bar `width` cells wide and scrape
-    /// the row back as a string (first char of each cell).  The single
-    /// place these tests touch `TestBackend`.
+    /// Render into a one-row bar and scrape the row back (first char of each cell).
     fn render_bar(state: StatusBarState<'_>, width: u16) -> String {
         let theme = Box::leak(Box::new(Theme::default()));
         let backend = TestBackend::new(width, 1);
@@ -416,9 +326,7 @@ mod tests {
 
     #[test]
     fn diff_badge_outranks_the_vim_sub_mode_badge() {
-        // The diff-review keymap owns every key while `Mode::Diff` is
-        // active (`vim_deferred` in `App::dispatch_single_key`), so a
-        // `NORMAL` badge would advertise a handler that isn't live.
+        // See the precedence note in `render`.
         let output = render_bar(
             StatusBarState {
                 diff_progress: Some((3, 7)),
@@ -435,7 +343,6 @@ mod tests {
             !output.contains("NORMAL"),
             "vim sub-mode badge leaked into diff mode: {output:?}"
         );
-        // The progress counter stays adjacent to the badge it belongs to.
         assert!(
             output.contains("3/7"),
             "diff progress must ride beside the badge: {output:?}"
@@ -444,8 +351,6 @@ mod tests {
 
     #[test]
     fn vim_badge_still_wins_outside_diff_mode() {
-        // The suppression is scoped to diff — every other mode keeps the
-        // sub-mode badge in the rendering mode's place.
         let output = render_bar(
             StatusBarState {
                 vim_mode_label: Some("NORMAL"),
@@ -498,9 +403,7 @@ mod tests {
 
     #[test]
     fn line_count_and_percentage_use_separate_counts() {
-        // 6 source lines rendering as 10 scrollable rows, scrolled to the
-        // last row: the count must read the source lines, the percentage
-        // must still reach 100% at the bottom.
+        // 6 source lines rendering as 10 rows, scrolled to the last row.
         let output = render_bar(
             StatusBarState {
                 line_count: 6,
@@ -530,9 +433,7 @@ mod tests {
         );
         assert!(output.contains("100%"), "output was: {output:?}");
     }
-
-    /// …and it is not stuck at 100%: the same viewport at the top of the same
-    /// document reports the fraction it can actually see.
+    /// `scroll_to_bottom` parks `scroll` well short of `scroll_total`.
     #[test]
     fn percentage_reports_the_viewport_fraction_at_the_top() {
         let output = render_bar(
@@ -547,9 +448,7 @@ mod tests {
         assert!(output.contains("20%"), "output was: {output:?}");
     }
 
-    /// A degenerate zero-row viewport must not read 0% for a document whose
-    /// first row is nominally visible — `max(1)` keeps the numerator at the
-    /// pre-`viewport_rows` behavior rather than collapsing it.
+    /// `max(1)` keeps a zero-row viewport from reading 0%.
     #[test]
     fn zero_height_viewport_still_counts_the_top_row() {
         let output = render_bar(
@@ -572,7 +471,6 @@ mod tests {
             "expected `f.md*`, output was: {:?}",
             output
         );
-        // Old text marker must be gone.
         assert!(
             !output.contains("[modified]"),
             "stale `[modified]` text leaked: {:?}",
@@ -618,8 +516,6 @@ mod tests {
 
     #[test]
     fn breadcrumb_drops_shallowest_when_overlong() {
-        // Width is tight enough that "Top" must drop, but the deepest
-        // pair fits — should land as `notes.md › Mid › Deep`.
         let output = make_bar_with_path(
             Mode::Rendered,
             "notes.md",
@@ -642,11 +538,7 @@ mod tests {
 
     #[test]
     fn breadcrumb_prefix_truncates_leftmost_when_partial_fit() {
-        // Wide enough that "Item 1" fits whole but "Checkpoint 1" only
-        // partially — the leftmost segment should appear with a `…`
-        // prefix capturing as much suffix as fits.  Width 50 leaves an
-        // 18-cell breadcrumb budget: 9 for " › Item 1" + 9 for
-        // " › …int 1".
+        // Width 50 leaves an 18-cell budget: 9 for " › Item 1" + 9 for " › …int 1".
         let output = make_bar_with_path(
             Mode::Rendered,
             "notes.md",
@@ -677,15 +569,13 @@ mod tests {
     #[test]
     fn fit_breadcrumb_fits_full_chain_when_budget_is_ample() {
         let chain = vec!["A".to_string(), "B".to_string(), "C".to_string()];
-        // Each segment costs " › X" = 4 cells; 3 segments = 12; plenty.
         assert_eq!(fit_breadcrumb(&chain, 80), chain);
     }
 
     #[test]
     fn fit_breadcrumb_drops_shallowest_first() {
         let chain = vec!["Top".to_string(), "Middle".to_string(), "Deep".to_string()];
-        // Budget fits " › Deep" (7) + " › Middle" (9) = 16 but not
-        // " › Top" (6) on top, which would need 22.
+        // " › Deep" (7) + " › Middle" (9) = 16; " › Top" would need 22.
         let fit = fit_breadcrumb(&chain, 16);
         assert_eq!(fit, vec!["Middle".to_string(), "Deep".to_string()]);
     }
@@ -693,10 +583,7 @@ mod tests {
     #[test]
     fn fit_breadcrumb_prefix_truncates_leftmost_when_partial() {
         let chain = vec!["Checkpoint 1".to_string(), "Item 1".to_string()];
-        // " › Item 1" = 9 cells; budget 16 leaves 7 cells for the
-        // truncated leftmost segment.  Overhead is SEP_COST (3) + `…`
-        // (1) = 4 cells, leaving 3 cells of suffix from "Checkpoint 1"
-        // — the last three columns are "t 1".
+        // " › Item 1" = 9; 16 - 9 - SEP_COST - `…` = 3 cells of suffix.
         let fit = fit_breadcrumb(&chain, 16);
         assert_eq!(fit, vec!["…t 1".to_string(), "Item 1".to_string()]);
     }
@@ -704,9 +591,7 @@ mod tests {
     #[test]
     fn fit_breadcrumb_drops_when_too_few_visible_chars_remain() {
         let chain = vec!["Checkpoint 1".to_string(), "Item 1".to_string()];
-        // " › Item 1" = 9; budget 11 leaves 2 cells — below
-        // MIN_TRUNC_VISIBLE_CELLS = 3, so the leftmost segment is
-        // dropped entirely instead of yielding `…X`.
+        // 11 - 9 = 2 cells, below MIN_TRUNC_VISIBLE_CELLS.
         let fit = fit_breadcrumb(&chain, 11);
         assert_eq!(fit, vec!["Item 1".to_string()]);
     }
@@ -714,8 +599,7 @@ mod tests {
     #[test]
     fn fit_breadcrumb_returns_empty_when_deepest_alone_overflows() {
         let chain = vec!["A really long heading title".to_string()];
-        // Budget too small to even prefix-truncate to MIN_TRUNC=3 cells
-        // (need 3 + 1 + 3 = 7).
+        // Needs 3 + 1 + 3 = 7 to truncate.
         assert!(fit_breadcrumb(&chain, 6).is_empty());
     }
 
@@ -739,11 +623,7 @@ mod tests {
 
     #[test]
     fn last_cells_respects_wide_characters() {
-        // `漢` is 2 cells wide.  Budget 3 fits the trailing space (1)
-        // plus one half-width char before it, but `漢` (2) won't fit
-        // alongside the space.  Walking right-to-left: take ' ' (used
-        // 1), next is `字` (2), used would be 3, OK; next `漢` (2),
-        // used would be 5, exceeds — stop.  Result: `字 `.
+        // `漢` and `字` are 2 cells each.
         assert_eq!(last_cells("漢字 ", 3), "字 ");
     }
 }

@@ -1,13 +1,7 @@
-//! Table-aware editing helpers.
-//!
-//! Wraps the byte-oriented primitives in [`crate::editor::table_edit`] into
-//! stateful operations on `EditorState`.  Conversion between byte offsets
-//! (used by `table_edit`) and rope char offsets (used by `EditorState`) is
-//! handled here so the rest of the editor never has to think about it.
-//!
-//! All public functions in this module are `pub(super)` — visible to the
-//! sibling `edit_ops` module and the `editor` parent only, so call sites
-//! remain unchanged.
+//! Table-aware editing helpers: the byte-oriented primitives in
+//! [`crate::editor::table_edit`] wrapped as stateful operations on
+//! `EditorState`.  Byte ↔ rope-char conversion lives here, so the rest of the
+//! editor never has to think about it.
 
 use crate::document::{next_grapheme_offset, prev_grapheme_offset};
 use crate::editor::edit_ops::{apply_byte_delta, cursor_byte, set_cursor_byte};
@@ -19,26 +13,23 @@ use crate::editor::{EditorState, Mode};
 
 /// Look up the table surrounding the cursor.
 ///
-/// Suppressed in [`Mode::Raw`]: in raw mode the user must be able to type
-/// `|` literally, walk through cell boundaries one char at a time, and have
-/// Tab/Enter insert a literal tab/newline rather than jumping cells.
-/// Returning `None` here short-circuits every table-aware code path without
-/// any callsite changes.
+/// Suppressed in [`Mode::Raw`], where `|` must be typeable, cell boundaries must
+/// step one char at a time, and Tab/Enter must insert literally.  Returning
+/// `None` short-circuits every table-aware path with no callsite changes.
 pub(super) fn current_table(state: &EditorState) -> Option<TableInfo> {
     table_at(state, cursor_byte(state))
 }
 
-/// Look up the table containing byte offset `byte`, for the callers that ask
-/// about a position other than the cursor's (the vim range guards sweep a
-/// selection).  Same `Mode::Raw` suppression as [`current_table`].
+/// Look up the table containing byte offset `byte`, for callers asking about a
+/// position other than the cursor's (the vim range guards sweep a selection).
+/// Same `Mode::Raw` suppression as [`current_table`].
 ///
-/// **Only the table's own lines are copied out of the rope.**  This sits on
-/// the per-keystroke motion path via `vim_ops::table::cell_scope`, and
-/// `Buffer::contents()` would allocate a copy of the *whole document* on
-/// every `w` / `$` / `f`.  `find_table_at` only ever looks at the contiguous
-/// run of table-looking lines around its cursor, so handing it exactly that
-/// run — and shifting the byte offsets it reports back into document space —
-/// is the same answer for a cost proportional to the table.
+/// **Only the table's own lines are copied out of the rope.**  This sits on the
+/// per-keystroke motion path, where `Buffer::contents()` would copy the whole
+/// document on every `w` / `$` / `f`.  `find_table_at` only looks at the
+/// contiguous run of table-looking lines anyway, so handing it exactly that run
+/// — and shifting the offsets back into document space — is the same answer at a
+/// cost proportional to the table.
 pub(super) fn table_at(state: &EditorState, byte: usize) -> Option<TableInfo> {
     if state.mode == Mode::Raw {
         return None;
@@ -55,9 +46,8 @@ pub(super) fn table_at(state: &EditorState, byte: usize) -> Option<TableInfo> {
 }
 
 /// The contiguous run of table-looking lines around `byte`, as
-/// `(base_byte, text)`.  `None` when `byte`'s own line isn't one — the same
-/// first test [`find_table_at`] makes, so declining here never hides a table
-/// it would have found.
+/// `(base_byte, text)`.  `None` when `byte`'s own line isn't one — the same test
+/// [`find_table_at`] makes first, so this never hides a table it would find.
 fn table_line_run(state: &EditorState, byte: usize) -> Option<(usize, String)> {
     let rope = state.buffer.rope();
     let len_bytes = rope.len_bytes();
@@ -102,10 +92,8 @@ pub(super) fn cursor_in_table(state: &EditorState) -> bool {
     current_table(state).is_some()
 }
 
-/// Is the cursor currently sitting on the alignment row (`|---|---|`) of a
-/// GFM table?  Used to skip that row during vertical cursor movement — the
-/// alignment row is a structural artefact and should never be a navigation
-/// target.
+/// Is the cursor on a table's alignment row (`|---|---|`)?  Vertical movement
+/// skips it: it is a structural artifact, never a navigation target.
 pub(super) fn cursor_on_alignment_row(state: &EditorState) -> bool {
     let Some(info) = current_table(state) else {
         return false;
@@ -117,11 +105,8 @@ pub(super) fn cursor_on_alignment_row(state: &EditorState) -> bool {
         .unwrap_or(false)
 }
 
-/// Look up the cursor's `(table, byte, row, col)` quadruple in a single
-/// call.  Replaces the repeated triple-`let` block that used to appear at
-/// the top of every `table_*` helper.  The `byte` element is the cursor's
-/// byte offset and is consumed by some helpers (e.g. `table_move_row` for
-/// `apply_byte_delta`); when not needed, destructure with `_byte`.
+/// The cursor's `(table, byte, row, col)` quadruple, the prelude to every
+/// `table_*` helper.  Destructure `byte` as `_byte` where it isn't needed.
 fn cursor_table_cell(state: &EditorState) -> Option<(TableInfo, usize, usize, usize)> {
     let info = current_table(state)?;
     let byte = cursor_byte(state);
@@ -129,9 +114,8 @@ fn cursor_table_cell(state: &EditorState) -> Option<(TableInfo, usize, usize, us
     Some((info, byte, row, col))
 }
 
-/// Skip the alignment row when moving downward through table rows: row 1
-/// becomes row 2, every other row passes through unchanged.  Used wherever
-/// "move down one row" needs to step *past* the alignment artefact.
+/// Skip the alignment row when moving down: row 1 becomes row 2, all else
+/// passes through.
 fn skip_alignment_row(row: usize) -> usize {
     if row == 1 {
         2
@@ -140,16 +124,13 @@ fn skip_alignment_row(row: usize) -> usize {
     }
 }
 
-/// Horizontal cursor motion inside a table cell.  Steps one grapheme within
-/// the current cell; on a cell-boundary, jumps to the cell-end of the
-/// adjacent cell (skipping the alignment row); at the table's outer edge,
-/// stays put rather than walking onto the trailing `|` or newline — these
-/// are never valid cursor positions.
+/// Horizontal cursor motion inside a table cell: one grapheme within the cell,
+/// or on a boundary the cell-end of the adjacent cell (skipping the alignment
+/// row).  At the table's outer edge it stays put rather than walking onto the
+/// trailing `|` or newline, which are never valid cursor positions.
 ///
-/// Returns `true` when the move was handled (cursor updated, or deliberately
-/// clamped at a table edge).  Returns `false` when the caller should fall
-/// back to ordinary cursor movement — the cursor isn't in a table, or sits
-/// on the alignment row (which stays hand-editable via char-step).
+/// `false` tells the caller to fall back to ordinary movement — the cursor isn't
+/// in a table, or sits on the alignment row, which stays hand-editable.
 pub(super) fn table_move_horizontal(state: &mut EditorState, forward: bool) -> bool {
     let Some((info, byte, row, col)) = cursor_table_cell(state) else {
         return false;
@@ -171,8 +152,7 @@ pub(super) fn table_move_horizontal(state: &mut EditorState, forward: bool) -> b
                     set_cursor_byte(state, target);
                 }
             }
-            // At far edge of the table: stay put rather than walking onto
-            // the trailing `|` or newline.
+            // At the table edge, stay put.
             return true;
         }
         let new_char = next_grapheme_offset(&state.buffer, state.cursor.offset);
@@ -194,9 +174,8 @@ pub(super) fn table_move_horizontal(state: &mut EditorState, forward: bool) -> b
     true
 }
 
-/// Find the cell adjacent to `(row, col)` in the given direction.  Wraps
-/// across row boundaries, skipping the alignment row.  Returns `None` at
-/// the outer edges of the table.
+/// The cell adjacent to `(row, col)`, wrapping across rows and skipping the
+/// alignment row.  `None` at the table's outer edges.
 fn adjacent_cell(
     info: &TableInfo,
     row: usize,
@@ -228,11 +207,9 @@ fn adjacent_cell(
     }
 }
 
-/// When the cursor is inside a table, move it to the cell directly above or
-/// below (preserving the column and skipping the alignment row) and land on
-/// the end-of-content of that cell.  Returns `true` when the move happened;
-/// `false` tells the caller to fall back to ordinary vertical motion (e.g.
-/// when the cursor is at the top/bottom edge of the table).
+/// Move to the cell above or below, preserving the column, skipping the
+/// alignment row, and landing on cell-end.  `false` tells the caller to fall
+/// back to ordinary vertical motion.
 pub(super) fn try_move_cell_vertical(
     state: &mut EditorState,
     down: bool,
@@ -268,10 +245,9 @@ pub(super) fn try_move_cell_vertical(
     true
 }
 
-/// Move the cursor to the end-of-content of `(row_idx, col_idx)` in the
-/// table described by a *fresh* re-parse.  Re-parsing is required when the
-/// buffer has changed since `info` was produced.  Landing on cell-end means
-/// the user can immediately start typing to append to the cell.
+/// Move to the end-of-content of `(row_idx, col_idx)`, re-parsing the table
+/// because the buffer may have changed since a caller's `info` was produced.
+/// Cell-end means the user can start typing straight away.
 pub(super) fn jump_to_cell(
     state: &mut EditorState,
     row_idx: usize,
@@ -310,14 +286,13 @@ pub(super) fn table_next_cell(
         jump_to_cell(state, row, next_col, viewport_height, viewport_width);
         return;
     }
-    // Last cell of the row — advance to first cell of next data row,
-    // skipping the alignment row (which the cursor never lands on via Tab).
+    // Advance to the next data row, which Tab never lands on the alignment
+    // row of.
     let next_row = skip_alignment_row(row + 1);
     if next_row < info.rows.len() {
         jump_to_cell(state, next_row, 0, viewport_height, viewport_width);
         return;
     }
-    // End of table — append a new row below.
     let (byte_delta, new_row_idx) = table_edit::insert_row(&info, row, true);
     let insertion_byte = byte_delta.offset;
     apply_byte_delta(state, byte_delta, insertion_byte);
@@ -338,9 +313,9 @@ pub(super) fn table_prev_cell(
         jump_to_cell(state, row, col - 1, viewport_height, viewport_width);
         return;
     }
-    // First cell of this row — jump to last cell of previous row.
+    // Jump to the last cell of the previous row, stepping over the alignment
+    // row to the header.
     let prev_row = row.saturating_sub(1);
-    // Skip alignment row (index 1) by stepping back to header.
     let prev_row = if prev_row == 1 { 0 } else { prev_row };
     if prev_row < info.rows.len() && prev_row != row {
         let last_col = info.col_count.saturating_sub(1);
@@ -363,7 +338,6 @@ pub(super) fn table_next_row(
         jump_to_cell(state, target, col, viewport_height, viewport_width);
         return;
     }
-    // Append a new row.
     let (byte_delta, new_row_idx) = table_edit::insert_row(&info, row, true);
     let insertion_byte = byte_delta.offset;
     apply_byte_delta(state, byte_delta, insertion_byte);
@@ -379,7 +353,7 @@ pub(super) fn table_prev_row(
     let Some((info, _byte, row, col)) = cursor_table_cell(state) else {
         return;
     };
-    // From row 2 (first data row) go to header row 0, skipping alignment at 1.
+    // From the first data row, go to the header, skipping alignment at 1.
     let target = if row == 2 { 0 } else { row.saturating_sub(1) };
     if target == 1 || target >= info.rows.len() {
         return;
@@ -409,8 +383,6 @@ pub(super) fn table_move_row(
         return;
     };
     apply_byte_delta(state, byte_delta, byte);
-    // The row the user is "carrying" moved; land at the same column in the
-    // new position.
     jump_to_cell(state, other, col, viewport_height, viewport_width);
 }
 
@@ -440,8 +412,8 @@ pub(super) fn table_move_column(
     jump_to_cell(state, row, other, viewport_height, viewport_width);
 }
 
-/// Insert a new empty row above or below the cursor's row.  Inserting
-/// "above" the header or alignment row is clamped to the first data row.
+/// Insert an empty row; inserting above the header or alignment row is clamped
+/// to the first data row.
 pub(super) fn table_insert_row(
     state: &mut EditorState,
     below: bool,
@@ -474,8 +446,8 @@ pub(super) fn table_insert_column(
     jump_to_cell(state, row, new_col, viewport_height, viewport_width);
 }
 
-/// Delete the cursor's row.  Header and alignment rows are protected.  If
-/// the cursor was on the last data row, the cursor moves to the row above.
+/// Delete the cursor's row, leaving the header and alignment rows alone.  From
+/// the last data row the cursor moves up.
 pub(super) fn table_delete_row(
     state: &mut EditorState,
     viewport_height: usize,
@@ -484,7 +456,6 @@ pub(super) fn table_delete_row(
     let Some((info, _byte, row, col)) = cursor_table_cell(state) else {
         return;
     };
-    // Only data rows (index >= 2) may be deleted.
     if info.rows[row].kind != RowKind::Data {
         return;
     }
@@ -493,8 +464,7 @@ pub(super) fn table_delete_row(
     };
     let delta_offset = byte_delta.offset;
     apply_byte_delta(state, byte_delta, delta_offset);
-    // After deletion, land on the row that took the deleted row's place, or
-    // if the deleted row was the last data row, on the row above it.
+    // Land on the row that took this one's place, or the row above.
     let target_row = if row < info.rows.len() - 1 {
         row
     } else {
@@ -503,8 +473,8 @@ pub(super) fn table_delete_row(
     jump_to_cell(state, target_row, col, viewport_height, viewport_width);
 }
 
-/// Delete the cursor's column.  Refuses to delete the last remaining column
-/// (that would destroy the table structure).
+/// Delete the cursor's column, refusing the last one — that would destroy the
+/// table structure.
 pub(super) fn table_delete_column(
     state: &mut EditorState,
     viewport_height: usize,
@@ -518,8 +488,6 @@ pub(super) fn table_delete_column(
     };
     let delta_offset = byte_delta.offset;
     apply_byte_delta(state, byte_delta, delta_offset);
-    // After deletion, land on the column that now occupies this position,
-    // clamped to the new column count.
     let new_col = col.min(info.col_count.saturating_sub(2));
     jump_to_cell(state, row, new_col, viewport_height, viewport_width);
 }

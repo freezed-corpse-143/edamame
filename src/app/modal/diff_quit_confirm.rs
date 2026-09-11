@@ -1,9 +1,5 @@
-//! Confirmation gate shown when the user tries to quit (`Action::Quit`)
-//! while a diff review is in progress.  The review is unapplied work —
-//! quitting discards every decision plus the pending external change —
-//! so we warn first, mirroring the dirty-buffer [`super::QuitConfirmModal`].
-//! `[Discard & quit]` abandons the review and exits the app;
-//! `[Keep reviewing]` (default) or `Esc` returns to the review.
+//! Quit confirmation while a diff review is in progress: the review is unapplied work, so
+//! this mirrors the dirty-buffer [`super::QuitConfirmModal`].
 
 use std::any::Any;
 
@@ -17,8 +13,7 @@ use super::types::{Modal, ModalKind, ModalOutcome, ModalRenderCtx};
 use crate::app::App;
 use crate::ui::{ModalButton, ModalResponse};
 
-/// `[Keep reviewing, Discard & quit]`, with `Keep reviewing`
-/// default-focused so a bare Enter is the safe, non-destructive choice.
+/// `Keep reviewing` is index 0 so a bare Enter is the safe choice.
 const DISCARD_IDX: usize = 1;
 
 pub struct DiffQuitConfirmModal {
@@ -37,9 +32,7 @@ impl DiffQuitConfirmModal {
         }
     }
 
-    /// Map a resolved response to an outcome.  Shared by the key and
-    /// click paths so a mouse click on a button behaves exactly like
-    /// pressing it.
+    /// Map a chrome response to an outcome; shared by the key and click paths.
     fn resolve(&self, response: ModalResponse) -> ModalOutcome {
         match response {
             ModalResponse::Continue => ModalOutcome::Continue,
@@ -48,7 +41,6 @@ impl DiffQuitConfirmModal {
                 app.exit_diff_mode_discarding();
                 app.should_quit = true;
             })),
-            // `Keep reviewing` (or any stray index) just dismisses.
             ModalResponse::ButtonPressed(_) => ModalOutcome::Close,
         }
     }
@@ -129,7 +121,6 @@ mod tests {
     fn keep_reviewing_dismisses_without_quitting() {
         let mut app = make_app();
         let mut modal = DiffQuitConfirmModal::new();
-        // Default focus is `Keep reviewing` (index 0); Enter dismisses.
         let out = modal.handle_key(key(KeyCode::Enter), &mut app, 40, 80);
         assert!(matches!(out, ModalOutcome::Close));
     }
@@ -146,7 +137,6 @@ mod tests {
     fn discard_and_quit_closes_with_callback() {
         let mut app = make_app();
         let mut modal = DiffQuitConfirmModal::new();
-        // Tab onto `Discard & quit` (index 1), then Enter.
         modal.handle_key(key(KeyCode::Tab), &mut app, 40, 80);
         let out = modal.handle_key(key(KeyCode::Enter), &mut app, 40, 80);
         assert!(matches!(out, ModalOutcome::CloseAnd(_)));

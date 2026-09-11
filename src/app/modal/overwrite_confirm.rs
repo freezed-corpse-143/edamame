@@ -1,24 +1,9 @@
-//! Confirmation prompt shown when a "Save As" / `:w <path>` write would
-//! clobber a *different* existing file (the buffer's own path is a
-//! normal in-place save and never reaches here — see
-//! [`crate::document::Buffer::would_overwrite`]).
+//! Confirmation prompt shown when a "Save As" / `:w <path>` write would clobber a
+//! *different* existing file (an in-place save of the buffer's own path never reaches
+//! here — see [`crate::document::Buffer::would_overwrite`]).
 //!
-//! `[Overwrite]` writes the buffer to the chosen path and runs any
-//! deferred continuation (the `after_save` of a save-then-quit flow).
-//! The write is one of two modes ([`WriteMode`]): *adopt* the path as the
-//! buffer's home ([`App::save_buffer_as`], for Save As / `:saveas`) or
-//! write a detached *copy* ([`crate::document::Buffer::save_copy`], for
-//! vim `:w <path>`).  `[Cancel]` (and `Esc`) abandon the write *and* drop
-//! the continuation, leaving the user back in the editor.
-//!
-//! Reached three ways, all of which hand off ownership of the path and
-//! the continuation so this modal can complete the write on its own:
-//! - the [`super::SaveAsModal`] closes and pushes this (adopt) when its
-//!   typed path collides,
-//! - the vim re-point path ([`App::save_buffer_as_confirmed`]) pushes it
-//!   (adopt) when `:saveas <path>` (without `!`) collides, and
-//! - the vim copy path ([`App::save_copy_confirmed`]) pushes it (copy)
-//!   when `:w <path>` (without `!`) collides.
+//! Pushers hand off ownership of both the path and the deferred continuation, so the
+//! modal completes the write on its own; `[Cancel]` drops both.
 
 use std::any::Any;
 use std::path::PathBuf;
@@ -39,8 +24,7 @@ use crate::ui::{ModalButton, ModalResponse};
 pub enum WriteMode {
     /// Re-point the buffer at the path (Save As / `:saveas`).
     Adopt,
-    /// Write a detached snapshot, leaving the buffer's path unchanged
-    /// (vim `:w <path>`).
+    /// Write a detached snapshot, leaving the buffer's path unchanged (vim `:w <path>`).
     Copy,
 }
 
@@ -48,25 +32,21 @@ pub struct OverwriteConfirmModal {
     body: Vec<Line<'static>>,
     buttons: Vec<ModalButton>,
     chrome: ModalChrome,
-    /// Destination to write once the user confirms.
     path: PathBuf,
-    /// Whether confirming adopts the path or writes a detached copy.
     mode: WriteMode,
-    /// Continuation to run after a confirmed write succeeds (e.g. quit
-    /// for `:wq <path>`, navigate for the dirty-guard flow).  Dropped if
-    /// the user cancels.
+    /// Continuation to run after a confirmed write succeeds (quit for `:wq <path>`,
+    /// navigate for the dirty-guard flow).  Dropped if the user cancels.
     after_save: Option<AfterSave>,
 }
 
 impl OverwriteConfirmModal {
-    /// Confirm an *adopt* write (Save As / `:saveas`): the buffer is
-    /// re-pointed at `path`.
+    /// Confirm an *adopt* write (Save As / `:saveas`): the buffer is re-pointed at `path`.
     pub fn new(path: PathBuf, after_save: Option<AfterSave>) -> Self {
         Self::with_mode(path, WriteMode::Adopt, after_save)
     }
 
-    /// Confirm a *copy* write (vim `:w <path>`): a snapshot is written and
-    /// the buffer keeps its current path.
+    /// Confirm a *copy* write (vim `:w <path>`): a snapshot is written and the buffer
+    /// keeps its current path.
     pub fn for_copy(path: PathBuf, after_save: Option<AfterSave>) -> Self {
         Self::with_mode(path, WriteMode::Copy, after_save)
     }
@@ -87,16 +67,11 @@ impl OverwriteConfirmModal {
         }
     }
 
-    /// Map a resolved response to an outcome.  Shared by the key and
-    /// click paths so a mouse click behaves exactly like the keypress.
+    /// Shared by the key and click paths so a mouse click behaves exactly like the key.
     fn resolve(&mut self, response: ModalResponse) -> ModalOutcome {
         match response {
             ModalResponse::Continue => ModalOutcome::Continue,
             ModalResponse::Cancelled => ModalOutcome::Close,
-            // [Overwrite]: write the buffer to the chosen path and run
-            // the deferred continuation.  A write error here is unusual
-            // (the path was confirmed to exist) — surface it as a sticky
-            // notice rather than silently dropping the action.
             ModalResponse::ButtonPressed(0) => {
                 let path = self.path.clone();
                 let mode = self.mode;
@@ -123,8 +98,6 @@ impl OverwriteConfirmModal {
                     }
                 }))
             }
-            // [Cancel] or any other button: abandon the write and the
-            // continuation, leaving the user where they were.
             ModalResponse::ButtonPressed(_) => ModalOutcome::Close,
         }
     }
@@ -201,7 +174,6 @@ mod tests {
             target.clone(),
             Some(Box::new(|app| app.should_quit = true)),
         )));
-        // Default focus is [Overwrite]; Enter confirms.
         app.dispatch_modal_key(key(KeyCode::Enter), 40, 80);
 
         assert!(!app.modal_stack.contains::<OverwriteConfirmModal>());
@@ -234,12 +206,10 @@ mod tests {
             )));
         app.dispatch_modal_key(key(KeyCode::Enter), 40, 80);
 
-        // The copy lands on disk…
         assert_eq!(
             std::fs::read_to_string(&target).expect("file written"),
             "live contents",
         );
-        // …but the buffer keeps editing the original, still dirty.
         assert_eq!(app.editor.buffer.path(), Some(original.as_path()));
         assert!(app.editor.dirty, "a copy must not clear the dirty flag");
     }

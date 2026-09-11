@@ -1,13 +1,6 @@
-//! Export a theme to a user-editable `.toml` file ("Create custom theme").
-//!
-//! Three focus targets: a fuzzy-searchable theme-list picker (the shared
-//! [`SearchableList`] component, defaulting to the active theme), a single-line
-//! name input (defaults to the selected theme's name), and an `Export` button.
-//! Tab / Shift-Tab cycles focus; Up/Down inside the list moves selection and
-//! inside the input or button moves focus to the previous/next target.
-//!
-//! UI-only — the adapter in `app/modal/export_theme.rs` writes the resulting
-//! `<name>.toml` and applies the new theme.
+//! Export a theme to a user-editable `.toml` file ("Create custom theme"): a [`SearchableList`]
+//! theme picker, a name input seeded from the selection, and an `Export` button.  UI-only — the
+//! adapter in `app/modal/export_theme.rs` writes the file and applies the new theme.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -28,14 +21,12 @@ use crate::ui::searchable_list::{
 
 const BUTTON_LABELS: &[&str] = &["Export"];
 const MAX_LIST_ROWS: u16 = 12;
-/// Placeholder shown in the empty search field.
 const PLACEHOLDER: &str = "Type to filter themes…";
-/// Fixed total width of the name-input row (including both padding cells).
+/// Total width of the name-input row, padding cells included.
 const NAME_INPUT_WIDTH: u16 = 28;
 /// Pinned rows above the list: heading, search input, divider.
 const PINNED_TOP: u16 = 3;
 
-/// Focus targets in the modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportThemeField {
     ThemeList,
@@ -74,19 +65,16 @@ pub enum ExportThemeResponse {
 }
 
 pub struct ExportThemeState {
-    /// Theme list + fuzzy filter (shared component).
     list: SearchableList<String>,
-    /// New name entered by the user.
     pub name: String,
-    /// Character-index cursor into `name`.
+    /// Char-index cursor into `name`.
     pub cursor: usize,
     pub focus: ExportThemeField,
     pub last_error: Option<String>,
     pub esc_button_rect: Option<Rect>,
-    /// Flipped to `true` the first time the user types/backspaces in the Name
-    /// field.  Once set, moving the list selection no longer re-syncs Name.
+    /// Set on the first edit of the Name field; after that, list moves no longer re-seed it.
     name_user_edited: bool,
-    /// Horizontal scroll offset (in chars) for the name input.
+    /// Horizontal scroll offset (chars) of the name input.
     name_scroll: usize,
 }
 
@@ -118,7 +106,6 @@ impl ExportThemeState {
         self.list.items().to_vec()
     }
 
-    /// Scroll the theme list (mouse wheel).
     pub fn scroll_by(&mut self, delta: i32) {
         self.list.scroll_by(delta);
     }
@@ -128,7 +115,6 @@ impl ExportThemeState {
         self.list.focused_item()
     }
 
-    /// Apply a key event.
     pub fn handle_key(&mut self, key: &KeyEvent, existing: &[String]) -> ExportThemeResponse {
         if key
             .modifiers
@@ -137,7 +123,6 @@ impl ExportThemeState {
             return ExportThemeResponse::Continue;
         }
 
-        // PageUp/PgDn/Home/End scroll the list only when it has focus.
         if matches!(self.focus, ExportThemeField::ThemeList)
             && matches!(
                 key.code,
@@ -220,15 +205,12 @@ impl ExportThemeState {
                 ExportThemeResponse::Continue
             }
             KeyCode::Char(c) if matches!(self.focus, ExportThemeField::ThemeList) => {
-                // Delegate the keystroke to the list so the component owns the
-                // query edit + filtering.
                 let synthetic = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
                 self.list_key(&synthetic);
                 ExportThemeResponse::Continue
             }
             KeyCode::Enter => match self.focus {
-                // Enter on the picker advances to the Name field rather than
-                // firing Export — gives the user a chance to rename first.
+                // Enter on the picker advances to Name rather than exporting, so the user can rename.
                 ExportThemeField::ThemeList => {
                     self.focus = ExportThemeField::Name;
                     ExportThemeResponse::Continue
@@ -242,15 +224,13 @@ impl ExportThemeState {
         }
     }
 
-    /// Route a key to the list component and re-seed the name from the new
-    /// selection (filtering / navigation both re-sync the unedited name).
+    /// Route a key to the list and re-seed the unedited name from the new selection.
     fn list_key(&mut self, key: &KeyEvent) {
         self.list.handle_key(key);
         self.last_error = None;
         self.sync_name_from_selection();
     }
 
-    /// Insert a bracketed paste into the focused field.
     pub fn paste(&mut self, text: &str) {
         let clean = crate::ui::sanitize_paste(text);
         if clean.is_empty() {
@@ -274,8 +254,7 @@ impl ExportThemeState {
         }
     }
 
-    /// Hit-test a click against the rendered list; a click on a theme row
-    /// selects it (and re-seeds the name).
+    /// A click on a theme row selects it and re-seeds the name.
     pub fn handle_click(&mut self, col: u16, row: u16) {
         if let ListEvent::Submitted(i) = self.list.handle_click(col, row) {
             self.list.focus_item(i);
@@ -290,8 +269,7 @@ impl ExportThemeState {
             self.last_error = Some("No theme selected".to_owned());
             return ExportThemeResponse::Continue;
         };
-        // Strip whitespace and leading dots so the file name can't be `.`,
-        // `..`, or a hidden dotfile.
+        // Leading dots stripped so the file name can't be `.`, `..`, or a dotfile.
         let new_name = self.name.trim().trim_start_matches('.').to_owned();
         if new_name.is_empty() {
             self.last_error = Some("Name required".to_owned());
@@ -328,7 +306,6 @@ impl ExportThemeState {
     }
 }
 
-/// Default name for a copied theme: `"{source} copy"`.
 fn default_copy_name(source: &str) -> String {
     format!("{source} copy")
 }
@@ -360,11 +337,7 @@ impl<'a> StatefulWidget for ExportThemeView<'a> {
     type State = ExportThemeState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        // Layout:
-        //   pinned_top: heading + search input + divider
-        //   scrolling: theme list (capped at MAX_LIST_ROWS)
-        //   pinned_bottom: spacer + label + name row + spacer + button
-        //                + (optional) error row.
+        // pinned_bottom: spacer + label + name row + spacer + button + optional error row.
         let error_row = if state.last_error.is_some() { 1 } else { 0 };
         let pinned_bottom: u16 = 5 + error_row;
 
@@ -413,7 +386,6 @@ impl<'a> StatefulWidget for ExportThemeView<'a> {
             return;
         }
 
-        // Heading row.
         Paragraph::new(Line::from(Span::styled(
             "Choose an existing theme to export from:",
             self.theme.modal_section_heading,
@@ -429,8 +401,6 @@ impl<'a> StatefulWidget for ExportThemeView<'a> {
             buf,
         );
 
-        // Input + divider + list, rendered by the shared component starting at
-        // the row below the heading.
         let list_height = inner.height - PINNED_TOP - pinned_bottom;
         let focused_list = matches!(state.focus, ExportThemeField::ThemeList);
         let empty_text = if state.list.items().is_empty() {
@@ -461,8 +431,6 @@ impl<'a> StatefulWidget for ExportThemeView<'a> {
                     focused,
                     width,
                 } => {
-                    // When the list isn't focused, render the selection in the
-                    // "selected but unfocused" style (outlined, not filled).
                     if focused && !focused_list {
                         Line::from(vec![
                             Span::styled("  ".to_owned(), theme.modal_item),
@@ -485,14 +453,11 @@ impl<'a> StatefulWidget for ExportThemeView<'a> {
             },
         );
 
-        // Bottom region.
         let mut row_y = inner.y + PINNED_TOP + list_height;
-        // Spacer.
         if row_y < inner.y + inner.height {
             fill_row(buf, inner, row_y, self.theme);
             row_y += 1;
         }
-        // Label for the name input.
         if row_y < inner.y + inner.height {
             Paragraph::new(Line::from(Span::styled(
                 "New theme name:",
@@ -510,7 +475,6 @@ impl<'a> StatefulWidget for ExportThemeView<'a> {
             );
             row_y += 1;
         }
-        // Name input row.
         if row_y < inner.y + inner.height {
             render_name_row(
                 buf,
@@ -525,7 +489,6 @@ impl<'a> StatefulWidget for ExportThemeView<'a> {
             );
             row_y += 1;
         }
-        // Optional error row.
         if let Some(err) = state.last_error.as_deref() {
             if row_y < inner.y + inner.height {
                 Paragraph::new(Line::from(Span::styled(
@@ -546,12 +509,10 @@ impl<'a> StatefulWidget for ExportThemeView<'a> {
                 row_y += 1;
             }
         }
-        // Spacer before button row.
         if row_y < inner.y + inner.height {
             fill_row(buf, inner, row_y, self.theme);
             row_y += 1;
         }
-        // Button row.
         if row_y < inner.y + inner.height {
             let focused_idx = if matches!(state.focus, ExportThemeField::Export) {
                 0
@@ -610,8 +571,7 @@ fn render_name_row(
     spans.push(Span::styled(" ", value_style));
 
     if focused {
-        // 1 leading-padding cell + N character cells + 1 cursor-glyph cell + 1
-        // trailing-padding cell.  `visible` chars fit when inner.width = N + 3.
+        // Width = 1 pad + N chars + 1 cursor glyph + 1 pad, so N = width - 3.
         let visible = (inner.width as usize).saturating_sub(3);
         if cursor < *name_scroll {
             *name_scroll = cursor;

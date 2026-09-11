@@ -1,24 +1,11 @@
-//! Backslash escapes for search queries.
-//!
-//! Search stays **literal substring** matching — there is deliberately no
-//! regex in the `/` path (regex is confined to `:s`/`:%s`, see
-//! `editor::vim_ops::vim_regex`).  But a literal matcher still needs a way
-//! to express characters a single-line text field can't hold, above all the
-//! line break: `/  \n` must find every line ending in two spaces.
-//!
-//! The convention is vim's: a backslash always introduces an escape, so a
-//! **literal backslash must be written `\\`**, and an escape we don't
-//! recognize is an error rather than a silently-literal `\d`.  Erroring is
-//! the point — a user who types `\d` expecting a digit class should be told
-//! the search is not a regex, not quietly handed zero matches.
-//!
-//! [`decode`] runs on text the *user typed*; [`escape`] is its inverse, for
-//! text **edamame** supplies to a search (the `*` / `#` keyword under the
-//! cursor, a pasted payload) which must not have its backslashes reinterpreted.
+//! Backslash escapes for search queries. Search is literal substring matching (regex is
+//! confined to `:s`), but the query needs a way to express a line break: `/  \n`. A
+//! backslash always introduces an escape (a literal one is `\\`), and an unknown escape is
+//! an error rather than silently literal, so `\d` tells the user search is not a regex.
+//! [`decode`] runs on user-typed text; [`escape`] is its inverse for text edamame supplies
+//! (`*` / `#` keyword, a paste).
 
-/// A malformed escape in a search query.  Its `Display` is the text shown
-/// on the hint line / in the search modal's error row, matching the
-/// `ExError` convention in `editor::vim_ops::ex`.
+/// A malformed escape in a search query; `Display` is the hint-line text.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EscapeError {
     #[error("Unsupported escape: \\{0} (use \\\\ for a literal backslash)")]
@@ -27,12 +14,8 @@ pub enum EscapeError {
     Trailing,
 }
 
-/// Decode the backslash escapes in a user-typed search query into the
-/// literal needle the matcher searches for.
-///
-/// `\n` → line feed, `\t` → tab, `\r` → carriage return, `\\` → a single
-/// backslash.  Every other `\<c>` is [`EscapeError::Unsupported`], and a
-/// query ending in a lone backslash is [`EscapeError::Trailing`].
+/// Decode a user-typed query into the literal needle: `\n`, `\t`, `\r`, `\\`; anything else
+/// is [`EscapeError::Unsupported`], a lone trailing backslash [`EscapeError::Trailing`].
 pub fn decode(input: &str) -> Result<String, EscapeError> {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars();
@@ -53,10 +36,7 @@ pub fn decode(input: &str) -> Result<String, EscapeError> {
     Ok(out)
 }
 
-/// Encode a literal string so [`decode`] round-trips it back unchanged —
-/// the inverse of `decode`, for text edamame supplies rather than the user
-/// types.  Without it, `*` on a word containing a backslash would search
-/// for something the user never wrote (or fail to parse at all).
+/// Encode a literal so [`decode`] round-trips it unchanged.
 pub fn escape(literal: &str) -> String {
     let mut out = String::with_capacity(literal.len());
     for c in literal.chars() {
@@ -91,16 +71,12 @@ mod tests {
 
     #[test]
     fn an_escaped_backslash_does_not_start_a_new_escape() {
-        // `\\n` is a literal backslash followed by the letter n — NOT a
-        // newline.  Getting this wrong is the classic escape-decoder bug.
         assert_eq!(decode(r"\\n").unwrap(), r"\n");
         assert_eq!(decode(r"\\\n").unwrap(), "\\\n");
     }
 
     #[test]
     fn unknown_and_trailing_escapes_error() {
-        // Search is literal, not regex: `\d` must say so rather than
-        // silently matching a backslash and a d.
         assert_eq!(decode(r"\d"), Err(EscapeError::Unsupported('d')));
         assert_eq!(decode(r"a\"), Err(EscapeError::Trailing));
         assert_eq!(decode(r"\"), Err(EscapeError::Trailing));

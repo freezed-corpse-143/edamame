@@ -1,21 +1,11 @@
-//! GFM table detection, parsing, and structure-editing primitives.
+//! GFM table detection, parsing, and structure-editing primitives: which cell the cursor is in,
+//! cell navigation, and row/column insert / delete / move.
 //!
-//! The cursor lives in the rope buffer; this module reads the buffer text,
-//! identifies the table around the cursor (if any), parses its rows, and
-//! provides helpers to:
+//! Every structure edit is a single `EditDelta`, so it undoes as one step.
 //!
-//! - detect which row/column the cursor is in
-//! - navigate between cells (Tab/Shift+Tab/Enter)
-//! - insert/delete/move whole rows and columns
-//!
-//! Every structure edit is expressed as a single `EditDelta` so it round-trips
-//! through `History` as one atomic `Undo` step.
-//!
-//! The parser here is byte-oriented and pragmatic — it does not round-trip
-//! through `pulldown-cmark`; instead it scans line by line for the well-known
-//! `| cell | cell |` shape with an alignment row (`|---|---|`) as the second
-//! line.  This keeps navigation cheap and avoids having to reconcile a parsed
-//! AST back to exact byte offsets.
+//! The parser is byte-oriented and does not go through `pulldown-cmark` — it scans lines for the
+//! `| cell | cell |` shape with an alignment row second.  That keeps navigation cheap and avoids
+//! reconciling a parsed AST back to exact byte offsets.
 
 use crate::document::EditDelta;
 use crate::markdown::table_layout;
@@ -50,23 +40,20 @@ pub struct TableRow {
     pub kind: RowKind,
 }
 
-/// The byte range of a single cell's content within a row.  Offsets are
-/// relative to the start of the row's `raw` string (not absolute buffer
-/// offsets).  The range is inclusive of any leading/trailing padding spaces.
+/// A single cell's content range, relative to the start of the row's `raw` string (not the
+/// buffer) and inclusive of padding spaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableCell {
     /// Byte offset within `raw` of the char immediately after the leading `|`.
     pub content_start: usize,
     /// Byte offset within `raw` of the char immediately before the trailing `|`.
     pub content_end: usize,
-    /// The cell's content as it appears in the raw line (may contain leading
-    /// and trailing padding spaces and escaped `\|`).
+    /// The cell as it appears in the raw line, padding and escaped `\|` included.
     pub raw: String,
 }
 
 impl TableCell {
-    /// Content with leading/trailing whitespace stripped.  Used when rebuilding
-    /// a row from structurally-modified cells.
+    /// Content with surrounding whitespace stripped, for rebuilding a modified row.
     #[allow(dead_code)]
     pub fn trimmed(&self) -> &str {
         self.raw.trim()
@@ -82,11 +69,8 @@ pub enum RowKind {
 
 // ─── Detection ───────────────────────────────────────────────────────────────
 
-/// Return `true` if `block_source` is the raw text of a GFM table block — at
-/// least two lines where the first looks like a table row and the second is a
-/// valid alignment row.  Used by `RenderedView` to shift the raw→rendered line
-/// mapping by one to account for the top border that the renderer prepends
-/// before the header row.
+/// True when `block_source` is a GFM table block.  `RenderedView` uses it to shift the
+/// raw→rendered line mapping by one, for the top border the renderer prepends.
 pub fn is_table_block(block_source: &str) -> bool {
     let mut lines = block_source.split('\n');
     match (lines.next(), lines.next()) {
@@ -95,14 +79,8 @@ pub fn is_table_block(block_source: &str) -> bool {
     }
 }
 
-/// Find the GFM table that contains byte offset `cursor_byte` in `source`.
-/// Returns `None` if no table surrounds the cursor line.
-///
-/// A run of lines qualifies as a table when:
-///   - the cursor line looks like a table line (starts and ends with `|` after
-///     trimming whitespace),
-///   - the run contains at least two lines (header + alignment),
-///   - the second line is a valid alignment row (each cell matches `:?-+:?`).
+/// Find the GFM table containing `cursor_byte`.  A run of `|`-delimited lines qualifies when it
+/// has at least two lines and the second is a valid alignment row (cells matching `:?-+:?`).
 pub fn find_table_at(source: &str, cursor_byte: usize) -> Option<TableInfo> {
     if source.is_empty() {
         return None;
@@ -124,7 +102,6 @@ pub fn find_table_at(source: &str, cursor_byte: usize) -> Option<TableInfo> {
         if first_start == 0 {
             break;
         }
-        // Previous line ends at first_start - 1 ('\n' or EOF).
         let prev_end = first_start - 1;
         let prev_start = line_start_byte(bytes, prev_end);
         let prev = &source[prev_start..prev_end];
@@ -138,7 +115,6 @@ pub fn find_table_at(source: &str, cursor_byte: usize) -> Option<TableInfo> {
     // Scan downward for consecutive table lines.
     let mut last_end = line_end;
     loop {
-        // Next line starts at last_end + 1 if there is a newline there.
         if last_end >= source.len() {
             break;
         }
@@ -158,7 +134,7 @@ pub fn find_table_at(source: &str, cursor_byte: usize) -> Option<TableInfo> {
         }
     }
 
-    // We have a run from first_start..last_end.  Parse all lines.
+    // Parse every line of the run.
     let mut rows: Vec<TableRow> = Vec::new();
     let mut cursor = first_start;
     while cursor < last_end {
@@ -192,7 +168,6 @@ pub fn find_table_at(source: &str, cursor_byte: usize) -> Option<TableInfo> {
         return None;
     }
 
-    // Establish row kinds and column count from the alignment row.
     rows[0].kind = RowKind::Header;
     rows[1].kind = RowKind::Alignment;
     for r in rows.iter_mut().skip(2) {
@@ -200,9 +175,7 @@ pub fn find_table_at(source: &str, cursor_byte: usize) -> Option<TableInfo> {
     }
     let col_count = rows[1].cells.len();
 
-    // Normalize every row's `cells` to have exactly `col_count` entries.  Short
-    // rows get padded with empty cells; excess cells are kept (we preserve the
-    // author's raw content rather than silently dropping data).
+    // Short rows get padded to `col_count`; excess cells are kept rather than dropping content.
     let overall_start = rows.first().map(|r| r.start).unwrap_or(first_start);
     let overall_end = rows.last().map(|r| r.end).unwrap_or(last_end);
 
@@ -214,10 +187,8 @@ pub fn find_table_at(source: &str, cursor_byte: usize) -> Option<TableInfo> {
     })
 }
 
-/// Locate the cursor's row and column within a table.  Returns
-/// `(row_idx, col_idx, char_col_in_raw)` where `char_col_in_raw` is the char
-/// offset from the start of the row line.  Returns `None` when `cursor_byte`
-/// falls outside the table.
+/// The cursor's `(row_idx, col_idx)` within a table, or `None` when `cursor_byte` falls outside
+/// it.
 pub fn cursor_cell(info: &TableInfo, cursor_byte: usize) -> Option<(usize, usize)> {
     for (i, row) in info.rows.iter().enumerate() {
         if cursor_byte >= row.start && cursor_byte < row.end {
@@ -242,15 +213,12 @@ pub fn cursor_cell(info: &TableInfo, cursor_byte: usize) -> Option<(usize, usize
     None
 }
 
-/// Return the byte offset at which the cursor should land when jumping into
-/// the given cell: the first byte of the cell's content, skipping one leading
-/// space (which `| foo |`-style padding always has).
+/// Where the cursor lands when jumping into a cell: the first byte of its content, past the one
+/// leading padding space.
 pub fn cell_cursor_offset(info: &TableInfo, row_idx: usize, col_idx: usize) -> Option<usize> {
     let row = info.rows.get(row_idx)?;
     let col = col_idx.min(row.cells.len().saturating_sub(1));
     let cell = row.cells.get(col)?;
-    // Skip the first space after `|` if present so the cursor lands on the
-    // first real content character.
     let mut offset_in_raw = cell.content_start;
     if row.raw.as_bytes().get(offset_in_raw) == Some(&b' ') {
         offset_in_raw += 1;
@@ -258,10 +226,8 @@ pub fn cell_cursor_offset(info: &TableInfo, row_idx: usize, col_idx: usize) -> O
     Some(row.start + offset_in_raw)
 }
 
-/// Return the byte offset at which the cursor should land when entering a
-/// cell from above or below: just past the last non-whitespace character of
-/// the cell's content.  For empty cells this falls back to the same
-/// "typing position" `cell_cursor_offset` would produce.
+/// Where the cursor lands when entering a cell from above or below: just past its last
+/// non-whitespace character, falling back to [`cell_cursor_offset`] for an empty cell.
 pub fn cell_end_cursor_offset(info: &TableInfo, row_idx: usize, col_idx: usize) -> Option<usize> {
     let row = info.rows.get(row_idx)?;
     let col = col_idx.min(row.cells.len().saturating_sub(1));
@@ -281,14 +247,11 @@ pub fn cell_end_cursor_offset(info: &TableInfo, row_idx: usize, col_idx: usize) 
 
 // ─── Structure edits ─────────────────────────────────────────────────────────
 
-/// Produce an `EditDelta` that inserts a new empty row either above or below
-/// the cursor's row.  The cursor should afterward be placed at the first cell
-/// of the new row via `cell_cursor_offset`.
+/// Insert a new empty row above or below `row_idx`.  Place the cursor afterwards with
+/// [`cell_cursor_offset`].
 pub fn insert_row(info: &TableInfo, row_idx: usize, below: bool) -> (EditDelta, usize) {
     let target_idx = if below { row_idx + 1 } else { row_idx };
-    // Alignment row must remain at index 1.  If the insertion point would
-    // precede it, insert immediately after it instead — you can't have data
-    // above the alignment row in a well-formed GFM table.
+    // The alignment row must stay at index 1, so an earlier target inserts just after it.
     let target_idx = target_idx.max(2).min(info.rows.len());
 
     let new_row = empty_row_text(info.col_count);
@@ -298,10 +261,8 @@ pub fn insert_row(info: &TableInfo, row_idx: usize, below: bool) -> (EditDelta, 
         info.end
     };
 
-    // Ensure the previous row ends with a newline so the new row starts on a
-    // fresh line.  (It always will, because all rows in a table end with `\n`
-    // — except possibly the final row when the buffer has no trailing newline.
-    // In that case we prepend a `\n` to the new row instead.)
+    // Every row ends with `\n` except possibly the last, when the buffer has no trailing
+    // newline; there, prepend one to the new row instead.
     let needs_newline_before = target_idx == info.rows.len()
         && info
             .rows
@@ -336,9 +297,7 @@ pub fn delete_row(info: &TableInfo, row_idx: usize) -> Option<EditDelta> {
     })
 }
 
-/// Swap two adjacent rows (used by move-row-up / move-row-down).  Both rows
-/// must be in the `2..` range (data rows).  The cursor remains in the same
-/// cell of the moved row — the caller is responsible for updating it.
+/// Swap two adjacent data rows (index `2..`).  The caller updates the cursor.
 pub fn swap_rows(info: &TableInfo, a: usize, b: usize) -> Option<EditDelta> {
     if a == b {
         return None;
@@ -360,9 +319,7 @@ pub fn swap_rows(info: &TableInfo, a: usize, b: usize) -> Option<EditDelta> {
         .into_iter()
         .map(|idx| format_row_with_nl(&info.rows[idx]))
         .collect();
-    // Guard: if the final row had no newline, swapping must preserve that —
-    // otherwise we silently add a newline to EOF.  Detect via whether `end`
-    // is EOF and the original row_hi didn't end with `\n`.
+    // A final row with no newline must stay that way — `format_row_with_nl` preserves it.
     let _ = (start, end, row_lo);
 
     Some(EditDelta {
@@ -372,9 +329,8 @@ pub fn swap_rows(info: &TableInfo, a: usize, b: usize) -> Option<EditDelta> {
     })
 }
 
-/// Insert a new empty column adjacent to `col_idx`.  Every row (header,
-/// alignment, and data) is rewritten to include the new cell.  The alignment
-/// row's new cell uses `---` (default left-align).
+/// Insert a new empty column adjacent to `col_idx`, rewriting every row.  The alignment row's
+/// new cell uses `---` (left-align).
 pub fn insert_column(info: &TableInfo, col_idx: usize, right: bool) -> EditDelta {
     let target_col = if right { col_idx + 1 } else { col_idx };
     let target_col = target_col.min(info.col_count);
@@ -463,24 +419,12 @@ pub fn swap_columns(info: &TableInfo, a: usize, b: usize) -> Option<EditDelta> {
 
 // ─── Column-width persistence ────────────────────────────────────────────────
 
-/// Produce an `EditDelta` that inserts or replaces the
-/// `<!-- tui-columns: [..] -->` HTML-comment row immediately after the table.
-///
-/// Given the byte range just past the table's final `\n` (`info.end`), scan
-/// forward in `source` to determine whether a `tui-columns` comment already
-/// exists on the next non-blank line.  When one is found we replace it;
-/// otherwise we insert a fresh comment line.
-///
-/// The delta preserves the single-`EditDelta` contract so the resize action
-/// plus the comment update undo/redo as one step.
+/// Insert or replace the `<!-- tui-columns: [..] -->` comment row immediately after the table,
+/// as one `EditDelta` so the resize and the comment update undo together.
 pub fn write_column_widths(source: &str, info: &TableInfo, widths: &[Option<usize>]) -> EditDelta {
     let mut comment = table_layout::format_column_widths_comment(widths);
     comment.push('\n');
 
-    // The table's trailing newline is already included in `info.end` (when
-    // present).  Determine whether the immediately following line is an
-    // existing `tui-columns` comment — if so, replace it in place; otherwise
-    // insert a new line before whatever comes next.
     if let Some(existing) = find_existing_widths_comment(source, info.end) {
         let removed_end = advance_past_one_newline(source, existing.end);
         EditDelta {
@@ -489,9 +433,7 @@ pub fn write_column_widths(source: &str, info: &TableInfo, widths: &[Option<usiz
             inserted: comment,
         }
     } else {
-        // Insert immediately after `info.end` — this is already the byte
-        // offset just past the trailing `\n` of the last table row, so the
-        // comment starts on a fresh line.
+        // `info.end` is already past the last row's trailing `\n`, so this starts a fresh line.
         EditDelta {
             offset: info.end,
             removed: String::new(),
@@ -500,13 +442,9 @@ pub fn write_column_widths(source: &str, info: &TableInfo, widths: &[Option<usiz
     }
 }
 
-/// Byte range (start..end, exclusive of trailing `\n`) of any existing
-/// `<!-- tui-columns: [..] -->` line found at exactly `search_start`.
-///
-/// Returns `None` if the line at `search_start` isn't a recognisable
-/// `tui-columns` comment.  We deliberately don't scan past intervening
-/// blank lines — the comment MUST be the line immediately following the
-/// table for the round-trip parser to pair it correctly.
+/// Byte range (excluding the trailing `\n`) of a `<!-- tui-columns: [..] -->` line at exactly
+/// `search_start`.  Intervening blank lines are deliberately not skipped: the comment must be the
+/// line immediately after the table for the round-trip parser to pair it correctly.
 fn find_existing_widths_comment(
     source: &str,
     search_start: usize,
@@ -543,14 +481,12 @@ impl TableRow {
         self.end > self.start + self.raw.len()
     }
 
-    /// True if the row ends with a newline in the source, OR if a subsequent
-    /// row exists in the table (which means there must have been a newline
-    /// separating them — even for the last row in the middle of the table).
+    /// True if the row ends with a newline in the source, or a later row exists (which implies
+    /// one separated them).
     fn raw_ends_with_newline_or_next_exists(&self, info: &TableInfo) -> bool {
         if self.raw_ends_with_newline() {
             return true;
         }
-        // Not the final row? Then there's a newline after it in the source.
         info.rows
             .last()
             .map(|last| last.start != self.start)
@@ -558,9 +494,8 @@ impl TableRow {
     }
 }
 
-/// Parse the row's raw text into cells.  A cell is the text between
-/// unescaped `|` characters, **excluding** the outer leading/trailing `|`s
-/// (which must be present for a GFM table line in this implementation).
+/// Split a row's raw text into cells: the text between unescaped `|` characters, excluding the
+/// outer `|`s (which this implementation requires).
 fn parse_cells(raw: &str) -> Vec<TableCell> {
     let mut cells = Vec::new();
     let bytes = raw.as_bytes();
@@ -600,10 +535,8 @@ fn parse_cells(raw: &str) -> Vec<TableCell> {
     cells
 }
 
-/// Return which column the character at `char_col` (relative to the row's raw
-/// string) belongs to, based on unescaped `|` positions.  Bytes before the
-/// first `|` are treated as column 0; bytes after the last `|` as the final
-/// column.
+/// Which column the byte at `rel_byte` (relative to the row's raw string) belongs to.  Bytes
+/// before the first `|` count as column 0, those past the last as the final column.
 fn column_for_offset(raw: &str, rel_byte: usize) -> usize {
     let bytes = raw.as_bytes();
     let len = bytes.len();
@@ -629,7 +562,6 @@ pub fn is_table_line(line: &str) -> bool {
     if !t.starts_with('|') || !t.ends_with('|') {
         return false;
     }
-    // Require at least two `|`s (i.e. at least one cell).
     let unescaped_pipes = count_unescaped_pipes(t);
     unescaped_pipes >= 2
 }
@@ -648,11 +580,8 @@ fn count_unescaped_pipes(s: &str) -> usize {
 /// True when a line is a valid GFM alignment row, e.g. `|---|:-:|---:|`.
 fn is_alignment_row(line: &str) -> bool {
     let t = line.trim();
-    // A valid alignment row needs at least `|x|` (3 bytes) — a literal
-    // single `|` (which `starts_with('|')` AND `ends_with('|')` both
-    // accept) would otherwise panic on the `[1..len-1]` slice below.
-    // This came up live: a user mid-edit can leave the alignment row
-    // as a lone `|` for one keystroke before re-typing the dashes.
+    // At least `|x|`: a lone `|` (which a user leaves mid-edit) satisfies both `starts_with`
+    // and `ends_with` and would panic on the `[1..len-1]` slice below.
     if t.len() < 3 || !t.starts_with('|') || !t.ends_with('|') {
         return false;
     }
@@ -721,9 +650,7 @@ fn format_row_with_nl(row: &TableRow) -> String {
     s
 }
 
-/// Insert an empty cell at `col_idx` within `cells`.  For an alignment row,
-/// the new cell uses `---`.  For a header or data row, the new cell is a
-/// padded space.
+/// Insert an empty cell at `col_idx`: `---` for an alignment row, padding spaces otherwise.
 fn insert_blank_cell(cells: &[TableCell], col_idx: usize, kind: RowKind) -> Vec<TableCell> {
     let new_cell_raw = match kind {
         RowKind::Alignment => " --- ".to_owned(),
@@ -753,20 +680,16 @@ fn rebuild_row(cells: &[TableCell]) -> String {
     s
 }
 
-/// Concatenate the raw bytes of every row in the table, including trailing
-/// newlines where present.
+/// Concatenate every row's raw text, trailing newlines included.
 fn collect_raw(info: &TableInfo) -> String {
     info.rows.iter().map(format_row_with_nl).collect()
 }
 
 // ─── Table insertion ─────────────────────────────────────────────────────────
 
-/// True when the line of `source` containing byte `cursor_byte` is blank —
-/// i.e. consists of nothing but whitespace.  `cursor_byte` past the last
-/// byte of `source` is treated as belonging to the final line; a buffer
-/// that doesn't end with `\n` therefore reports `false` for cursors at
-/// EOF when the final line carries content (the "file ends without
-/// trailing newline" case the pre-flight catches).
+/// True when the line containing `cursor_byte` is whitespace-only.  A `cursor_byte` past the end
+/// belongs to the final line, so a buffer with no trailing newline reports `false` at EOF — the
+/// "file ends without trailing newline" case the insert-table pre-flight catches.
 pub fn cursor_line_is_blank(source: &str, cursor_byte: usize) -> bool {
     let bytes = source.as_bytes();
     let pos = cursor_byte.min(bytes.len());
@@ -775,22 +698,12 @@ pub fn cursor_line_is_blank(source: &str, cursor_byte: usize) -> bool {
     source[start..end].trim().is_empty()
 }
 
-/// Emit a fresh GFM pipe table at the cursor, assuming the
-/// pre-flight has already verified the cursor is on a blank line.
+/// Emit a fresh GFM pipe table at the cursor, which the pre-flight has verified is on a blank
+/// line.  Returns the delta plus the post-edit byte offset of the first header cell's content.
 ///
-/// Returns `(delta, cursor_byte)` where `cursor_byte` is the post-edit
-/// byte offset of the first header cell's content position.  The
-/// caller applies the delta with `edit_ops::apply_byte_delta` and then
-/// re-maps `cursor_byte` to a char offset.
-///
-/// CommonMark requires a blank line before and after a table.  The
-/// cursor's own blank line — preserved unchanged after the insertion
-/// at `line_start` — supplies the trailing separator in every case
-/// (it sits between the new table and whatever line follows, blank
-/// or otherwise; if the cursor's line is the buffer's last line,
-/// there is no following block to separate from).  Only the leading
-/// padding may be missing: a `\n` is prepended when the line above
-/// the cursor's blank line carries content.
+/// CommonMark needs a blank line either side.  The cursor's own blank line, preserved after the
+/// insertion at `line_start`, always supplies the trailing one; only the leading `\n` may be
+/// missing, and is prepended when the line above carries content.
 pub fn insert_table(
     source: &str,
     cursor_byte: usize,
@@ -802,15 +715,9 @@ pub fn insert_table(
     let pos = cursor_byte.min(bytes.len());
     let line_start = line_start_byte(bytes, pos);
 
-    // Determine whether a non-blank line sits immediately above the
-    // cursor's blank line.  When `line_start == 0`, no prior line
-    // exists and the prefix is unnecessary regardless.
     let need_prefix = if line_start == 0 {
         false
     } else {
-        // The byte just before `line_start` is the trailing `\n` of
-        // the previous line.  Walk back from there to the start of
-        // that previous line.
         let prev_end = line_start.saturating_sub(1); // index of `\n`
         let prev_start = line_start_byte(bytes, prev_end.saturating_sub(1));
         !source[prev_start..prev_end].trim().is_empty()
@@ -827,11 +734,8 @@ pub fn insert_table(
     }
     inserted.push_str(&table_text);
 
-    // Cursor target: the content position of the first header cell.
-    // `empty_row_text` lays the row out as `|   |   |...`, so the
-    // first cell's content_start sits one byte past the leading `|`,
-    // and `cell_cursor_offset`-style placement skips one space.  In
-    // bytes: prefix_len + 1 (the `|`) + 1 (skip leading space) = +2.
+    // First header cell content: `empty_row_text` lays out `|   |   |…`, so +1 for the `|` and
+    // +1 to skip the leading padding space.
     let prefix_len = if need_prefix { 1 } else { 0 };
     let cursor_target = line_start + prefix_len + 2;
 
@@ -961,7 +865,6 @@ mod tests {
     fn cell_cursor_offset_lands_on_content() {
         let src = "| a | b |\n|---|---|\n| 11 | 22 |\n";
         let info = find_table_at(src, 0).unwrap();
-        // Row 2 (first data row), column 1 (second cell): "22"
         let offset = cell_cursor_offset(&info, 2, 1).unwrap();
         assert_eq!(&src[offset..offset + 2], "22");
     }
@@ -970,11 +873,9 @@ mod tests {
     fn cell_end_cursor_offset_lands_past_last_non_whitespace() {
         let src = "| a | b |\n|---|---|\n| 11 | 22 |\n";
         let info = find_table_at(src, 0).unwrap();
-        // Row 2, column 0 ("11"): cursor should land just past the last '1'.
+        // Just past the last '1' of " 11 ", i.e. on its trailing space.
         let offset = cell_end_cursor_offset(&info, 2, 0).unwrap();
-        // The byte at `offset` should be the trailing space of " 11 ".
         assert_eq!(&src[offset..offset + 1], " ");
-        // Confirm the previous byte is the last content char.
         assert_eq!(&src[offset - 1..offset], "1");
     }
 
@@ -983,7 +884,6 @@ mod tests {
         let src = "| a | b |\n|---|---|\n|   |   |\n";
         let info = find_table_at(src, 0).unwrap();
         let offset = cell_end_cursor_offset(&info, 2, 0).unwrap();
-        // Empty cell: should match cell_cursor_offset (one past the `|`).
         let start_offset = cell_cursor_offset(&info, 2, 0).unwrap();
         assert_eq!(offset, start_offset);
     }
@@ -995,13 +895,10 @@ mod tests {
         let (delta, target_idx) = insert_row(&info, 2, true); // below row 2
         assert_eq!(target_idx, 3);
 
-        // Apply the delta manually:
         let mut new_src = String::new();
         new_src.push_str(&src[..delta.offset]);
         new_src.push_str(&delta.inserted);
         new_src.push_str(&src[delta.offset..]);
-
-        // Expect the new row right after "1 | 2".
         assert!(new_src.contains("| 1 | 2 |\n|   |   |\n"));
     }
 
@@ -1048,7 +945,6 @@ mod tests {
         new_src.push_str(&delta.inserted);
         new_src.push_str(&src[delta.offset + delta.removed.len()..]);
 
-        // Re-parse and check col count.
         let info2 = find_table_at(&new_src, 0).unwrap();
         assert_eq!(info2.col_count, 3);
     }
@@ -1085,7 +981,6 @@ mod tests {
         new_src.push_str(&src[delta.offset + delta.removed.len()..]);
 
         let info2 = find_table_at(&new_src, 0).unwrap();
-        // Header should have become "b a"
         assert_eq!(info2.rows[0].cells[0].trimmed(), "b");
         assert_eq!(info2.rows[0].cells[1].trimmed(), "a");
     }
@@ -1113,7 +1008,6 @@ mod tests {
         let src = "| a | b |\n|---|---|\n| 1 | 2 |\n<!-- tui-columns: [5, 7] -->\n";
         let info = find_table_at(src, 0).unwrap();
         let delta = write_column_widths(src, &info, &[Some(10), Some(20)]);
-        // Replace the existing comment line in place.
         let mut new_src = String::new();
         new_src.push_str(&src[..delta.offset]);
         new_src.push_str(&delta.inserted);
@@ -1132,9 +1026,7 @@ mod tests {
 
     #[test]
     fn column_for_offset_respects_escaped_pipes() {
-        // Row: "| a \| x | b |"
-        //       01234567890123
-        // Columns: col 0 = " a \| x " (offsets 1..9), col 1 = " b " (10..13)
+        // col 0 = " a \| x " (offsets 1..9), col 1 = " b " (10..13)
         let row = r"| a \| x | b |";
         assert_eq!(column_for_offset(row, 4), 0); // inside first cell
         assert_eq!(column_for_offset(row, 10), 1); // inside second cell
@@ -1158,8 +1050,6 @@ mod tests {
 
     #[test]
     fn cursor_line_is_blank_rejects_eof_when_final_line_has_content() {
-        // No trailing newline — cursor at len() lands on the final
-        // non-blank line.
         let src = "no trailing newline";
         assert!(!cursor_line_is_blank(src, src.len()));
     }
@@ -1167,20 +1057,17 @@ mod tests {
     #[test]
     fn insert_table_between_paragraphs_pads_with_blank_lines() {
         let src = "para one\n\npara two\n";
-        // Byte 9 is the start of the blank line between the two
-        // paragraphs.
+        // Byte 9 starts the blank line between the paragraphs.
         let cursor = 9usize;
         assert!(cursor_line_is_blank(src, cursor));
         let (delta, cursor_target) = insert_table(src, cursor, 2, 3);
 
-        // Build the post-edit source.
         let mut post = String::new();
         post.push_str(&src[..delta.offset]);
         post.push_str(&delta.inserted);
         post.push_str(&src[delta.offset..]);
 
-        // The cursor's pre-existing blank line carries the trailing
-        // gap, so only the leading `\n` is added by the helper.
+        // The pre-existing blank line carries the trailing gap; only the leading `\n` is added.
         assert_eq!(
             post,
             "para one\n\
@@ -1192,8 +1079,6 @@ mod tests {
              \n\
              para two\n"
         );
-        // Cursor target should land in the first header cell — between
-        // the leading `| ` and the trailing ` |`.
         let around: &str = &post[cursor_target - 2..cursor_target + 2];
         assert_eq!(
             around, "|   ",
@@ -1208,11 +1093,9 @@ mod tests {
         assert!(cursor_line_is_blank(src, cursor));
         let (delta, _cursor_target) = insert_table(src, cursor, 1, 2);
         assert_eq!(delta.offset, 0);
-        // The first byte must be a `|` — no `\n` prefix when cursor is
-        // already at the top of the buffer.
+        // No `\n` prefix at the top of the buffer; the cursor's blank line still supplies the
+        // trailing separator before "paragraph".
         assert!(delta.inserted.starts_with('|'));
-        // The cursor's blank line — preserved post-insertion — supplies
-        // the trailing separator before "paragraph".
         let mut post = String::new();
         post.push_str(&src[..delta.offset]);
         post.push_str(&delta.inserted);
@@ -1226,7 +1109,6 @@ mod tests {
     #[test]
     fn insert_table_at_end_of_buffer_with_blank_trailing_line() {
         let src = "para\n\n";
-        // Cursor on the trailing empty line (byte 6).
         let cursor = src.len();
         assert!(cursor_line_is_blank(src, cursor));
         let (delta, _) = insert_table(src, cursor, 1, 1);
@@ -1236,9 +1118,7 @@ mod tests {
             "leading newline missing, got {:?}",
             delta.inserted
         );
-        // The helper never appends a trailing newline of its own —
-        // the cursor's existing blank line plays that role when one
-        // is needed.
+        // The helper appends no trailing newline of its own.
         let trailing_newlines = delta
             .inserted
             .chars()

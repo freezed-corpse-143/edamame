@@ -1,13 +1,6 @@
-//! 200 ms quiet-window debouncer used by the watcher worker.
-//!
-//! Pure state machine over wall-clock instants — no I/O.  The worker
-//! calls [`Debouncer::record`] on every incoming notify event and
-//! consults [`Debouncer::deadline`] to compute the next channel
-//! `recv_timeout`; when that timeout fires, [`Debouncer::fire_if_due`]
-//! returns true and the worker performs a single disk read.
-//!
-//! Splitting the debouncer out keeps the timing logic testable
-//! without standing up a notify backend.
+//! Quiet-window debouncer for the watcher worker: a pure state machine over instants. The
+//! worker [`Debouncer::record`]s each notify event, uses [`Debouncer::deadline`] as its
+//! `recv_timeout`, and reads the file once when [`Debouncer::fire_if_due`] returns true.
 
 use std::time::{Duration, Instant};
 
@@ -24,30 +17,23 @@ impl Debouncer {
         }
     }
 
-    /// Record that an event arrived at `now`.  Sliding window: a fresh
-    /// event during an existing pending interval restarts the timer,
-    /// so a rapid burst of events fires exactly once after the burst
-    /// finishes.
+    /// Sliding window: an event during a pending interval restarts the timer, so a burst
+    /// fires exactly once after it finishes.
     pub fn record(&mut self, now: Instant) {
         self.pending_since = Some(now);
     }
 
-    /// The instant at which the pending fire is due, if any.  Used by
-    /// the worker to set the channel `recv_timeout`.
     pub fn deadline(&self) -> Option<Instant> {
         self.pending_since.map(|t| t + self.window)
     }
 
-    /// True when a fire is pending (regardless of whether the
-    /// deadline has elapsed yet).
-    #[allow(dead_code)] // used by tests; reserved for future use
+    /// True while a fire is pending, whether or not the deadline has elapsed.
+    #[allow(dead_code)] // used by tests
     pub fn is_pending(&self) -> bool {
         self.pending_since.is_some()
     }
 
-    /// If a fire is pending and `now` has reached the deadline,
-    /// clear the pending state and return `true`.  Otherwise return
-    /// `false` without mutating state.
+    /// Clears the pending state and returns `true` once `now` reaches the deadline.
     pub fn fire_if_due(&mut self, now: Instant) -> bool {
         let Some(deadline) = self.deadline() else {
             return false;
@@ -60,8 +46,7 @@ impl Debouncer {
         }
     }
 
-    /// Drop any pending fire without firing.  Used when the worker
-    /// performs a forced reconcile or unwatch.
+    /// Drop any pending fire without firing (forced reconcile, unwatch).
     pub fn clear(&mut self) {
         self.pending_since = None;
     }
@@ -112,16 +97,11 @@ mod tests {
 
     #[test]
     fn record_during_pending_extends_window() {
-        // Sliding window: a burst of events keeps pushing the
-        // deadline forward, so the fire only happens after the
-        // burst finishes.
         let mut d = Debouncer::new(window());
         let t0 = Instant::now();
         d.record(t0);
         let t1 = t0 + Duration::from_millis(100);
         d.record(t1);
-        // The original deadline has not yet elapsed, but the new one
-        // is later — verify the slide.
         assert_eq!(d.deadline(), Some(t1 + window()));
         assert!(!d.fire_if_due(t0 + window()));
     }

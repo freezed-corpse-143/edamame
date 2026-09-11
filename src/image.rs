@@ -1,10 +1,5 @@
-//! Image loading and caching.
-//!
-//! This module is the document-layer half of image rendering: resolving
-//! URLs to decoded `DynamicImage`s.  The UI-layer half — turning a
-//! decoded image into terminal cells — lives in `ui::image_view`, which
-//! drives `ratatui-image`'s `StatefulProtocol` using the decoded bytes
-//! we produce here.
+//! Image loading and caching: the document-layer half of image rendering (URL → decoded
+//! `DynamicImage`). The UI half (decoded image → terminal cells) lives in `ui::image_view`.
 
 pub mod cache;
 pub mod loader;

@@ -1,33 +1,19 @@
-//! Grapheme-cluster boundary helpers over `Buffer`.
-//!
-//! `Cursor::offset` is a Rust `char` (Unicode scalar value) index into the
-//! rope.  But for navigation and editing we want to step over user-perceived
-//! characters — *grapheme clusters* — so flag emoji, skin-tone modifiers,
-//! ZWJ sequences, and combining marks behave as one keystroke per character
-//! to the user.  These helpers convert "the next grapheme from here" into
-//! a char offset the buffer can index with.
-//!
-//! Implementation: read a short windowed slice from the rope around the
-//! query offset and let `unicode_segmentation` segment it.  The window is
-//! generously sized (32 chars) to cover every standardized grapheme cluster
-//! including long ZWJ sequences (e.g. family emoji).
+//! Grapheme-cluster boundary helpers over `Buffer`: convert "the next/previous grapheme from
+//! this char offset" into a char offset the rope can index, so navigation and editing step over
+//! user-perceived characters (ZWJ sequences, modifiers, combining marks) rather than scalar values.
 
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::document::Buffer;
 
-/// Maximum chars we read on either side of the query offset.  Grapheme
-/// clusters in practice top out around 7 chars (family emoji
-/// `👨‍👩‍👧‍👦`); 32 leaves comfortable headroom for any reasonable
-/// extension without paying for a full-rope materialization.
+/// Chars read on either side of the query offset before segmenting. Real clusters top out around
+/// 7 chars (family emoji); 32 is headroom without materializing the whole rope.
 const GRAPHEME_WINDOW: usize = 32;
 
 /// Char offset of the grapheme-cluster boundary that follows `char_offset`.
 ///
-/// Returns `buf.len_chars()` when already at end of buffer.  When
-/// `char_offset` is itself in the middle of a grapheme (rare — shouldn't
-/// happen if all cursor moves go through these helpers), returns the end
-/// of that containing grapheme, which is the natural "step forward" answer.
+/// Returns `buf.len_chars()` at end of buffer. An offset inside a grapheme yields the end of
+/// that grapheme.
 pub fn next_grapheme_offset(buf: &Buffer, char_offset: usize) -> usize {
     let len = buf.len_chars();
     if char_offset >= len {
@@ -82,7 +68,6 @@ mod tests {
 
     #[test]
     fn next_treats_single_codepoint_emoji_as_one_step() {
-        // 🥇 is one Rust char and one grapheme — same step in both views.
         let buf = b("🥇");
         assert_eq!(next_grapheme_offset(&buf, 0), 1);
         assert_eq!(prev_grapheme_offset(&buf, 1), 0);
@@ -95,13 +80,11 @@ mod tests {
         assert_eq!(buf.len_chars(), 8);
         assert_eq!(next_grapheme_offset(&buf, 0), 7);
         assert_eq!(prev_grapheme_offset(&buf, 7), 0);
-        // Step over the trailing 'x' as its own grapheme.
         assert_eq!(next_grapheme_offset(&buf, 7), 8);
     }
 
     #[test]
     fn next_treats_combining_mark_as_single_grapheme() {
-        // 'e' + U+0301 (combining acute) = "é" as 2 chars / 1 grapheme.
         let buf = b("e\u{0301}!");
         assert_eq!(buf.len_chars(), 3);
         assert_eq!(next_grapheme_offset(&buf, 0), 2);
@@ -110,7 +93,6 @@ mod tests {
 
     #[test]
     fn next_treats_skin_tone_modifier_as_one_grapheme() {
-        // 👍 + 🏽 = 2 chars / 1 grapheme.
         let buf = b("👍\u{1F3FD}!");
         assert_eq!(next_grapheme_offset(&buf, 0), 2);
         assert_eq!(prev_grapheme_offset(&buf, 2), 0);

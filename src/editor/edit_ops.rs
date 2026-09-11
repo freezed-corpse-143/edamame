@@ -10,15 +10,10 @@ use crate::editor::table_edit_ops::{
 };
 use crate::editor::{EditorState, Mode};
 
-/// True when `action` is a hot-path typing action that applies a
-/// single edit and doesn't read `state.parsed`.  Used by `apply` to
-/// skip the pre-action parse flush for in-line edits: `apply_delta`
-/// only defers the re-parse when the edit doesn't cross a line,
-/// and the rendered view reads the cursor block's raw text directly
-/// from the buffer via `cursor_block_line_range` — so no stale
-/// `source_map` is observed.  Cross-line edits (Newline, etc.) are
-/// listed too: their `apply_delta` path re-parses inline, so
-/// there's nothing to flush at entry.
+/// True when `action` is a hot-path typing action that applies a single edit and doesn't read
+/// `state.parsed`.  Lets `apply` skip the pre-action parse flush: the rendered view reads the
+/// cursor block's raw text straight from the buffer, so no stale `source_map` is observed, and
+/// cross-line edits (Newline, …) re-parse inline inside `apply_delta`.
 fn is_hot_typing_action(action: &Action) -> bool {
     matches!(
         action,
@@ -45,23 +40,14 @@ pub fn apply(
     viewport_height: usize,
     viewport_width: usize,
 ) -> bool {
-    // Flush any deferred re-parse before handling non-typing actions,
-    // which typically read `state.parsed.source_map` /
-    // `state.parsed.lines` (scroll, selection, mode transitions, list
-    // / table structure, undo/redo, cursor movement).  This is the
-    // sync point for the "re-parse on cursor move" invariant: the
-    // cursor has already been moved off the typed-on line, or the
-    // user triggered a selection / mode change that depends on a
-    // fresh parse.  Hot typing actions skip this — `apply_delta`
-    // decides inline whether the edit requires an immediate parse.
+    // The sync point for the "re-parse on cursor move" invariant: non-typing actions read
+    // `state.parsed`, so the deferred re-parse must land first.
     if !is_hot_typing_action(&action) {
         state.flush_parsed_if_dirty();
     }
 
-    // Snapshot pre-action state so we can decide after the match whether an
-    // auto-renumber pass is warranted.  Undo/Redo must NOT trigger renumber —
-    // their whole job is to restore the previous buffer exactly, so any
-    // inconsistent numbering the user specifically reverted to must stick.
+    // Undo/Redo must NOT trigger the post-match renumber: they restore the previous buffer
+    // exactly, so numbering the user deliberately reverted to must stick.
     let buffer_len_before = state.buffer.len_chars();
     let history_depth_before = state.history.undo_depth();
     let suppress_autonumber = matches!(action, Action::Undo | Action::Redo);
@@ -72,8 +58,7 @@ pub fn apply(
 
         // ── Mode transitions ──────────────────────────────────────
         Action::EnterEditMode => {
-            // A read-only document rests in Preview: leaving it is what
-            // the whole reading mode is defined by refusing.
+            // A read-only document rests in Preview; leaving it is what read-only refuses.
             if state.mode == Mode::Preview && !state.readonly {
                 sync_cursor_to_scroll(state, viewport_height);
                 state.mode = Mode::Rendered;
@@ -86,10 +71,8 @@ pub fn apply(
             state.visual_selection = None;
         }
         Action::ToggleRawMode => {
-            // Same reason `EnterEditMode` is refused: Rendered and Raw
-            // both draw a cursor and reveal raw source under it, which
-            // is the editing presentation a read-only document never
-            // enters.
+            // Refused for the same reason as `EnterEditMode`: Rendered and Raw are the editing
+            // presentation a read-only document never enters.
             if state.readonly {
                 return false;
             }
@@ -97,12 +80,9 @@ pub fn apply(
                 sync_cursor_to_scroll(state, viewport_height);
             }
             state.visual_selection = None;
-            // Capture the cursor's screen row before the mode switch.  The
-            // two editing modes use different scroll units (rendered lines
-            // vs. buffer lines), so without an adjustment the same `scroll`
-            // value lands the user in a different part of the document and
-            // the cursor often jumps off-screen.  Skip when transitioning
-            // from Preview — there's no editing cursor to anchor on.
+            // Rendered and Raw scroll in different units (rendered lines vs. buffer lines), so the
+            // same `scroll` value lands elsewhere in the document; anchor on the screen row
+            // instead.  Preview has no editing cursor to anchor on.
             let preserve_screen_row = if state.mode == Mode::Preview {
                 None
             } else {
@@ -113,29 +93,19 @@ pub fn apply(
                 Mode::Preview => Mode::Rendered,
                 Mode::Rendered => Mode::Raw,
                 Mode::Raw => Mode::Rendered,
-                // Diff mode is its own state machine — `ToggleRawMode`
-                // is filtered out by `diff_safe_action` so this arm is
-                // unreachable in normal dispatch, but stay safe and
-                // no-op rather than panic.
+                // Unreachable in normal dispatch (`diff_safe_action` filters this out); no-op.
                 Mode::Diff => Mode::Diff,
             };
-            // Raw → Rendered: if the cursor was sitting inside an HTML
-            // comment (visible in Raw, invisible in Rendered), snap it to
-            // the start of the next visible block so hybrid rendering has
-            // a well-defined cursor position.
+            // A cursor inside an HTML comment is visible in Raw but not in Rendered; snap it to
+            // the next visible block so hybrid rendering has a well-defined position.
             if was_raw && state.mode == Mode::Rendered {
                 snap_cursor_out_of_hidden_block(state, viewport_width);
                 state.update_cursor_block();
             }
             if let Some(row) = preserve_screen_row {
                 state.set_scroll_for_cursor_screen_row(row, viewport_width);
-                // Don't call `ensure_cursor_visible` here — it's tuned to
-                // make the cursor's whole BLOCK fit (it scrolls up if the
-                // block starts above `scroll`), which clobbers the helper
-                // when the cursor sits inside a tall block (a long
-                // paragraph, a table) that legitimately overflows the
-                // viewport.  The helper already places the cursor's line
-                // at the requested row.
+                // Deliberately no `ensure_cursor_visible`: it tries to fit the whole *block*, which
+                // clobbers this placement whenever the cursor's block overflows the viewport.
             }
         }
 
@@ -143,9 +113,7 @@ pub fn apply(
         Action::MoveLeft => {
             enter_edit_if_preview(state, viewport_height);
             state.selection = None;
-            // Raw mode: every character is a valid cursor position — including
-            // table borders and the alignment row.  The user owns the risk of
-            // breaking formatting by editing the raw source directly.
+            // In Raw every character is a valid cursor position, table chrome included.
             if state.mode == Mode::Raw
                 || (!table_move_horizontal(state, /*forward=*/ false)
                     && !list_move_horizontal(state, /*forward=*/ false))
@@ -176,7 +144,7 @@ pub fn apply(
             }
             state.selection = None;
             if state.mode == Mode::Raw {
-                // Plain visual/logical line step — don't skip the alignment row.
+                // Plain line step — don't skip the alignment row.
                 if state.visual_line_nav && viewport_width > 0 {
                     state.move_up_visual(viewport_width);
                 } else {
@@ -321,9 +289,7 @@ pub fn apply(
         }
         Action::SelectAll => {
             if state.mode == Mode::Preview {
-                // Preview mode: select the entire rendered document via a
-                // `VisualSelection` that spans from the first rendered line
-                // (col 0) to the last rendered line's final char.
+                // Preview selects rendered text, so span the whole rendered line list.
                 let lines = &state.parsed.lines;
                 if !lines.is_empty() {
                     let last = lines.len() - 1;
@@ -360,21 +326,17 @@ pub fn apply(
         Action::ScrollToTop => state.scroll_to_top(),
         Action::ScrollToBottom => {
             state.scroll_to_bottom(viewport_height, viewport_width);
-            // scroll_to_bottom uses viewport-height based max (last line at
-            // bottom), so no clamping needed here.
         }
 
         // ── Editing ───────────────────────────────────────────────
         Action::InsertChar(ch) => {
             if state.mode == Mode::Preview {
-                // First keypress from preview: enter edit mode but don't insert.
+                // First keypress from Preview enters edit mode but does not insert.
                 sync_cursor_to_scroll(state, viewport_height);
                 state.mode = Mode::Rendered;
                 return false;
             }
-            // Typing `|` inside a table cell must insert an escaped `\|` so
-            // the author doesn't inadvertently split the cell.  Outside a
-            // table, `|` is a regular character.
+            // `|` inside a table cell is escaped so it doesn't split the cell.
             if ch == '|' && cursor_in_table(state) {
                 insert_text(state, "\\|");
             } else {
@@ -387,12 +349,7 @@ pub fn apply(
                 state.mode = Mode::Rendered;
                 return false;
             }
-            // Tab dispatches by context:
-            //   - inside a table → advance to the next cell (auto-creating a
-            //     row when pressed in the last cell of the last row)
-            //   - inside a list  → indent the current item one level,
-            //     producing a new nested list (ordered lists reset to 1)
-            //   - otherwise       → insert `INDENT_WIDTH` spaces
+            // Tab dispatches by context: next table cell, else indent the list item, else spaces.
             if cursor_in_table(state) {
                 table_next_cell(state, viewport_height, viewport_width);
             } else if !list_indent(state) {
@@ -406,9 +363,7 @@ pub fn apply(
                 state.mode = Mode::Rendered;
                 return false;
             }
-            // Enter inside a table moves the cursor down one row, auto-
-            // creating a new row when pressed on the last data row so the
-            // user never has to leave the table to append rows.
+            // Enter inside a table steps down a row, appending one on the last data row.
             if cursor_in_table(state) {
                 table_next_row(state, viewport_height, viewport_width);
             } else if !list_handle_newline(state) {
@@ -422,9 +377,7 @@ pub fn apply(
             } else if state.mode == Mode::Rendered && list_backspace_consumes_marker(state) {
                 // Handled: the whole marker was deleted as a single atomic edit.
             } else if state.cursor.offset > 0 {
-                // Delete the entire preceding grapheme cluster — flag emoji,
-                // ZWJ sequences, and combining marks vanish in one keystroke
-                // rather than leaving fragments behind.
+                // Whole grapheme cluster, so ZWJ sequences and combining marks leave no fragments.
                 let end = state.cursor.offset;
                 let offset = prev_grapheme_offset(&state.buffer, end);
                 let removed = state.buffer.slice_to_string(offset, end);
@@ -454,7 +407,6 @@ pub fn apply(
             enter_edit_if_preview(state, viewport_height);
             state.selection = None;
             let end = state.cursor.offset;
-            // Move left: skip whitespace, then skip word chars.
             let mut temp = state.cursor;
             temp.move_word_left(&state.buffer);
             let start = temp.offset;
@@ -474,7 +426,6 @@ pub fn apply(
             state.selection = None;
             let start = state.cursor.offset;
             let mut temp = state.cursor;
-            // Skip non-whitespace (the word), then skip trailing whitespace.
             temp.move_word_right(&state.buffer);
             let end = temp.offset;
             if start < end {
@@ -526,10 +477,8 @@ pub fn apply(
 
         // ── Clipboard ─────────────────────────────────────────────
         Action::Copy => {
-            // In Preview mode, the selection is over rendered characters
-            // (no raw Markdown markers), so copy the rendered text exactly
-            // as the user sees it.  In Rendered/Raw mode, copy the raw
-            // buffer slice covered by the raw selection.
+            // Preview selects rendered characters (no Markdown markers); the editing modes
+            // select raw buffer text.  Copy whichever the user actually sees.
             let text = if state.mode == Mode::Preview {
                 if let Some(vs) = state.visual_selection {
                     crate::editor::mouse_ops::visual_selection_to_rendered_text(
@@ -537,7 +486,6 @@ pub fn apply(
                         &state.parsed.lines,
                     )
                 } else {
-                    // No selection — copy the rendered line under the scroll top.
                     state
                         .parsed
                         .lines
@@ -553,7 +501,6 @@ pub fn apply(
             } else if let Some(sel) = &state.selection {
                 sel.selected_text(&state.buffer)
             } else {
-                // Copy current line.
                 let (line, _) = state.cursor.line_col(&state.buffer);
                 state.buffer.line(line).unwrap_or_default()
             };
@@ -565,7 +512,6 @@ pub fn apply(
                 copy_to_clipboard(state, text.clone());
                 delete_selection_text(state, &sel);
             } else {
-                // Cut current line.
                 let (line, _) = state.cursor.line_col(&state.buffer);
                 let start = state.buffer.line_to_char(line);
                 let end = if line + 1 < state.buffer.line_count() {
@@ -603,8 +549,6 @@ pub fn apply(
                 } else {
                     insert_text(state, &text);
                 }
-                // Ordered-list renumbering runs automatically at end of
-                // `apply()` when the buffer has changed.
             }
         }
 
@@ -703,53 +647,34 @@ pub fn apply(
         Action::TableInsertBreak => {
             enter_edit_if_preview(state, viewport_height);
             if cursor_in_table(state) {
-                // Inside a table, Shift+Enter inserts a GFM `<br>` so the
-                // cell can contain a visual line break without terminating
-                // the row.
+                // A GFM `<br>` breaks the line without terminating the row.
                 insert_text(state, "<br>");
             } else {
-                // Outside a table, fall back to a normal newline.
                 insert_text(state, "\n");
             }
         }
         _ => {}
     }
 
-    // After any action that mutated the buffer (detected by a change in length
-    // or a new history entry), run a renumber pass so the raw Markdown of any
-    // surrounding ordered list stays monotonic.  We skip this for Undo/Redo so
-    // those actions remain exact inverses of the recorded deltas, and we skip
-    // it when the mode is not Rendered (Raw mode is deliberately raw).
+    // Keep any surrounding ordered list's source numbering monotonic.  Skipped for Undo/Redo
+    // (they must stay exact inverses) and outside Rendered (Raw is deliberately raw).
     let edited = state.buffer.len_chars() != buffer_len_before
         || state.history.undo_depth() != history_depth_before;
     if !suppress_autonumber && state.mode == Mode::Rendered && edited {
         list_renumber_at_cursor(state);
     }
 
-    // After any action that may have left the cursor on a list marker
-    // (`- `, `1. `, `- [ ] `, …) — e.g. `DeleteLine` positions the cursor at
-    // the start of the following line, which is the marker — snap it onto the
-    // item's content start so the user's next keystroke lands where they see
-    // the caret, not in the marker.  Skipped in Raw mode: there the cursor
-    // is expected to reach every byte.
+    // An action may have parked the cursor on a list marker (`DeleteLine` lands it on the next
+    // line's marker); snap onto the content so the next keystroke goes where the caret is drawn.
+    // Not in Raw, where the cursor is expected to reach every byte.
     if state.mode == Mode::Rendered && !suppress_autonumber {
         clamp_cursor_out_of_marker(state);
     }
 
-    // After an edit, the cursor may have moved onto a new line or onto a
-    // newly-wrapped visual row past the viewport bottom (e.g. typing the
-    // character that pushes the line into a second visual row).  Pull
-    // scroll along so the cursor stays visible.  The cursor-movement
-    // arms above already do this for navigation actions; this catches
-    // pure edit actions (InsertChar / Newline / Backspace / …) which
-    // don't.
-    //
-    // In Rendered mode, `ensure_cursor_visible` reads `parsed.lines` and
-    // the visual-row cache to detect wrap.  In-line edits leave both
-    // stale (the deferred-reparse optimization), so the wrap check would
-    // miss the visual row the just-typed char produced.  Flush before
-    // the visibility check.  Raw mode reads the live buffer directly,
-    // so no flush is needed there.
+    // Pure edit actions can push the cursor onto a newly-wrapped row past the viewport bottom;
+    // the movement arms above already handle navigation.  In Rendered, `ensure_cursor_visible`
+    // detects wrap from `parsed.lines`, which an in-line edit leaves stale — flush first.  Raw
+    // reads the live buffer, so it needs no flush.
     if edited && state.mode != Mode::Preview {
         if state.mode != Mode::Raw {
             state.flush_parsed_if_dirty();
@@ -762,17 +687,11 @@ pub fn apply(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// The single door out of Preview and into an editing mode — twenty-six
-/// call sites, one function, `Action::Paste` among them.
+/// The single door out of Preview into an editing mode, used by every mutating action.
 ///
-/// **The `readonly` guard is the mode-level backstop**, the twin of
-/// [`EditorState::apply_delta`]'s text-level one: a read-only document
-/// rests in [`Mode::Preview`], which is already the codebase's
-/// browse-only presentation (no cursor drawn, no raw reveal, no
-/// checkbox or table controls in `mouse_ops::apply_preview_action`).
-/// Refusing the transition here makes all twenty-six no-ops at once, so
-/// the guarantee is *made* rather than maintained by an audit of every
-/// mutating path.
+/// The `readonly` guard here is the mode-level backstop, twin of [`EditorState::apply_delta`]'s
+/// text-level one: refusing the transition makes every call site a no-op at once, so read-only is
+/// *made* rather than maintained by auditing each mutating path.
 fn enter_edit_if_preview(state: &mut EditorState, viewport_height: usize) {
     if state.readonly {
         return;
@@ -784,24 +703,18 @@ fn enter_edit_if_preview(state: &mut EditorState, viewport_height: usize) {
     }
 }
 
-/// After a horizontal cursor movement, if visual-line navigation is enabled,
-/// replace the raw `preferred_col` (set by the cursor method) with the visual
-/// column on the current visual sub-line.  This keeps the "preferred column"
-/// that subsequent vertical moves try to maintain aligned with what the user
-/// actually sees on screen.
+/// Under visual-line nav, restate `preferred_col` in visual columns so subsequent vertical moves
+/// aim at the column the user sees rather than the raw one.
 fn sync_preferred_visual(state: &mut EditorState, viewport_width: usize) {
     if state.visual_line_nav && viewport_width > 0 {
         state.cursor.preferred_col = state.current_visual_col(viewport_width);
     }
 }
 
-/// Move the cursor to the start of the block at the current scroll position,
-/// but only if the cursor is not already within the visible viewport.
-/// Called when transitioning from Preview mode to an editing mode so the
-/// cursor appears near the visible area rather than wherever it last was.
+/// Move the cursor to the first visible block, unless it is already on screen.  Called on the
+/// Preview → editing transition so the cursor appears near what the user is looking at.
 fn sync_cursor_to_scroll(state: &mut EditorState, viewport_height: usize) {
     let scroll = state.scroll;
-    // If the cursor's rendered position is already within the viewport, leave it.
     let cursor_byte = state.buffer.rope().char_to_byte(state.cursor.offset);
     let cursor_lines = state.parsed.source_map.rendered_lines_for_byte(cursor_byte);
     if !cursor_lines.is_empty() {
@@ -810,7 +723,6 @@ fn sync_cursor_to_scroll(state: &mut EditorState, viewport_height: usize) {
             return;
         }
     }
-    // Cursor is outside the visible area; move it to the first visible block.
     if let Some(byte) = state
         .parsed
         .source_map
@@ -821,21 +733,13 @@ fn sync_cursor_to_scroll(state: &mut EditorState, viewport_height: usize) {
     }
 }
 
-/// Coalesced version of a run of `Action::InsertChar(c)` events.  Builds
-/// a single string from `chars` (with the same table-pipe escaping that
-/// the per-keystroke `Action::InsertChar` path applies) and routes it
-/// through `state.apply_delta` as ONE delta — so a held-key autorepeat
-/// burst becomes one buffer mutation, one history entry, and one
-/// `parsed_version` bump instead of N.
+/// Coalesced version of a run of `Action::InsertChar` events: a held-key autorepeat burst becomes
+/// one delta, one history entry, and one `parsed_version` bump instead of N.  Applies the same
+/// table-pipe escaping as the per-keystroke path.
 ///
-/// Preconditions (enforced by the run-membership predicate in the
-/// dispatcher):
-/// * `chars` is non-empty.
-/// * `state.mode != Mode::Preview` — Preview's first keystroke transitions
-///   without inserting; the caller dispatches that single event normally
-///   and only the post-transition events flow through here.
-/// * `state.selection` is `None` — a selection-deleting insert ends its
-///   own run before coalescing extends it.
+/// Preconditions, enforced by the dispatcher's run-membership predicate: `chars` non-empty,
+/// `state.mode != Mode::Preview` (Preview's first keystroke only transitions), `selection` is
+/// `None` (a selection-deleting insert ends its own run).
 pub fn apply_insert_run(
     state: &mut EditorState,
     chars: &[char],
@@ -856,10 +760,7 @@ pub fn apply_insert_run(
     }
     insert_text(state, &text);
 
-    // Mirror the post-action upkeep from `apply()`: renumber ordered
-    // lists when typing inside one, snap the cursor off any list marker
-    // it may have landed on, and re-flush + ensure-visible so the
-    // cursor stays on-screen even when the burst added a wrapped row.
+    // Mirror the post-action upkeep from `apply()`.
     if state.mode == Mode::Rendered {
         list_renumber_at_cursor(state);
         clamp_cursor_out_of_marker(state);
@@ -870,21 +771,12 @@ pub fn apply_insert_run(
     state.ensure_cursor_visible(viewport_height, viewport_width);
 }
 
-/// Coalesced version of a run of `Action::DeleteCharBack` /
-/// `Action::DeleteCharForward` events.  Walks `count` graphemes from the
-/// current cursor position in the requested direction and removes them
-/// as a single delta.
+/// Coalesced delete run: removes `count` graphemes in one delta.  Same preconditions as
+/// [`apply_insert_run`], plus `count >= 1`.
 ///
-/// Preconditions (enforced by the dispatcher):
-/// * `count >= 1`.
-/// * `state.mode != Mode::Preview`.
-/// * `state.selection` is `None`.
-///
-/// List-marker erase and task-checkbox erase are NOT short-circuited
-/// here — those are one-shot transitions, not autorepeat candidates.
-/// The dispatcher arranges for the first delete to fire through the
-/// regular `apply()` path, where `list_backspace_consumes_marker` runs;
-/// any subsequent same-kind events fall into this run.
+/// List-marker and task-checkbox erase are deliberately absent — they are one-shot transitions,
+/// so the dispatcher routes the first delete through `apply()` (where
+/// `list_backspace_consumes_marker` runs) and only later events into this run.
 pub fn apply_delete_run(
     state: &mut EditorState,
     count: usize,
@@ -919,10 +811,7 @@ pub fn apply_delete_run(
         return;
     }
     let removed = state.buffer.slice_to_string(start, end);
-    // `apply_delta` sets cursor to `delta.redo_cursor()` (= `start`,
-    // since `inserted` is empty), which is the correct post-delete
-    // position for both backward and forward — no manual cursor
-    // pre-set needed.
+    // `apply_delta` lands the cursor at `start`, correct for both directions — no pre-set needed.
     state.apply_delta(EditDelta {
         offset: start,
         removed,
@@ -942,7 +831,6 @@ pub fn apply_delete_run(
 /// Insert `text` at the current cursor position, pushing through history.
 fn insert_text(state: &mut EditorState, text: &str) {
     let offset = state.cursor.offset;
-    // If there's a selection, replace it.
     if let Some(sel) = state.selection.take() {
         let (start, end) = sel.range();
         let removed = state
@@ -982,22 +870,13 @@ fn delete_selection_text(state: &mut EditorState, sel: &Selection) {
     }
 }
 
-/// Wrap the active selection in `marker` (`**` for bold, `*` for italic),
-/// or unwrap it when the selection is already exactly that emphasis.
-/// Re-selects the inner text afterward so wraps can be chained (e.g. bold
-/// then italic).  No-op without a non-empty selection — which is the case
-/// in Preview mode, where the live selection is `None`.
+/// Wrap the active selection in `marker`, or unwrap it when the selection is already exactly that
+/// emphasis (markers inside the selection, or immediately outside it).  Re-selects the inner text
+/// so wraps can be chained.  No-op without a non-empty selection, as in Preview.
 ///
-/// Three unwrap/wrap shapes are recognized:
-/// * inner markers included — `**x**` selected → `x`;
-/// * markers just outside the selection — `x` selected within `**x**` → `x`;
-/// * otherwise plain wrap — `x` → `**x**`.
-///
-/// Selections that span a block boundary (contain a newline) are refused:
-/// CommonMark emphasis can't cross a blank line, so wrapping them would
-/// only emit literal asterisks.  Selections that *contain* other inline
-/// formatting are wrapped verbatim — handling those correctly needs an
-/// AST-aware transform, which is out of scope for this convenience action.
+/// Multi-line selections are refused: CommonMark emphasis can't cross a blank line, so wrapping
+/// would only emit literal asterisks.  Selections containing other inline formatting are wrapped
+/// verbatim — doing better needs an AST-aware transform.
 fn toggle_wrap(state: &mut EditorState, marker: &str) {
     let Some(sel) = state.selection else {
         return;
@@ -1012,8 +891,7 @@ fn toggle_wrap(state: &mut EditorState, marker: &str) {
         return;
     }
 
-    // Markers are ASCII, so byte length == char count — the same value is
-    // valid for both rope-char offsets and `&str` byte slicing.
+    // Markers are ASCII, so byte length == char count: valid for both rope offsets and slicing.
     let mlen = marker.len();
 
     let (remove_start, removed, inserted, inner_start, inner_len) =
@@ -1048,13 +926,9 @@ fn toggle_wrap(state: &mut EditorState, marker: &str) {
     state.cursor.offset = inner_end;
 }
 
-/// True when `text` is *exactly* `marker…marker` with no further `marker`
-/// in between.  For italic (`*`) the bold case (`**…**`) is rejected so
-/// toggling italic over bold text wraps it rather than stripping one of the
-/// two bold markers.  The interior-marker check keeps a selection that
-/// merely *starts and ends* with emphasis — e.g. `**a** and **b**` — from
-/// being mis-unwrapped into malformed markdown; it falls through to a
-/// verbatim wrap instead.
+/// True when `text` is *exactly* `marker…marker` with no further `marker` in between.  Italic
+/// (`*`) rejects the bold case so toggling italic over bold wraps rather than stripping one bold
+/// marker, and the interior check stops `**a** and **b**` from unwrapping into malformed markdown.
 fn is_marker_wrapped(text: &str, marker: &str) -> bool {
     let mlen = marker.len();
     if text.len() < 2 * mlen || !text.starts_with(marker) || !text.ends_with(marker) {
@@ -1067,10 +941,8 @@ fn is_marker_wrapped(text: &str, marker: &str) -> bool {
     !text[mlen..text.len() - mlen].contains(marker)
 }
 
-/// True when the buffer has `marker` immediately outside `[start, end)` on
-/// both sides — i.e. the selection's inner text is already wrapped.  For
-/// italic (`*`) the bold case (`**…**`) is rejected, mirroring
-/// [`is_marker_wrapped`].
+/// True when `marker` sits immediately outside `[start, end)` on both sides.  Rejects the bold
+/// case for italic, same rule as [`is_marker_wrapped`].
 fn outside_wrapped(buf: &Buffer, start: usize, end: usize, marker: &str) -> bool {
     let mlen = marker.len();
     if start < mlen || end + mlen > buf.len_chars() {
@@ -1082,8 +954,7 @@ fn outside_wrapped(buf: &Buffer, start: usize, end: usize, marker: &str) -> bool
         return false;
     }
     if marker == "*" {
-        // A `*` immediately beyond the candidate marker means the real
-        // markers are `**` (bold), not `*` (italic).
+        // A `*` beyond the candidate marker means the real markers are `**`, not `*`.
         let bold_before = start >= 2 && buf.slice_to_string(start - 2, start - 1) == "*";
         let bold_after = end + 2 <= buf.len_chars() && buf.slice_to_string(end + 1, end + 2) == "*";
         if bold_before || bold_after {
@@ -1095,59 +966,36 @@ fn outside_wrapped(buf: &Buffer, start: usize, end: usize, marker: &str) -> bool
 
 /// Whether the OS-level clipboard paths are live.
 ///
-/// **False in unit tests, always.** The OS clipboard is process-global
-/// mutable state shared by every test thread, so leaving it live makes
-/// clipboard tests race each other: one test's `Copy` lands between
-/// another's `Copy` and its `Paste`, and the second test reads the first
-/// one's payload. It also lets the *developer's* own clipboard leak into
-/// assertions. AGENTS.md's rule — "tests assert against the kill-ring, not
-/// the OS clipboard, to avoid cross-test races" — is what this constant
-/// enforces; without it the rule is only a convention that the `Paste`
-/// path quietly breaks, because `Paste` reads the OS clipboard first.
-///
-/// Suppressing it here also keeps OSC 52 escape sequences out of test
-/// output, where they would otherwise be written straight to stdout.
-///
-/// Integration tests in `tests/` link the library compiled *without*
-/// `cfg(test)`, so this does not cover them — CI runs those with
-/// `--no-default-features`, which drops the `arboard` path entirely.
+/// **False in unit tests, always.** The OS clipboard is process-global state shared by every test
+/// thread, so a live one makes clipboard tests race (and leaks the developer's own clipboard into
+/// assertions); this constant is what enforces "tests assert against the kill-ring". It also keeps
+/// OSC 52 escapes out of test stdout.  Integration tests in `tests/` link the library without
+/// `cfg(test)` and are covered instead by CI's `--no-default-features`, which drops `arboard`.
 const OS_CLIPBOARD: bool = !cfg!(test);
 
-/// Write `text` to the OS clipboard (best-effort via arboard AND OSC 52)
-/// and always mirror into the in-process kill-ring so internal paste still
-/// works when neither external path is available.
+/// Write `text` to the OS clipboard (best-effort via arboard *and* OSC 52) and always mirror it
+/// into the kill-ring so internal paste works when neither external path is available.
 ///
-/// `text` is the rope's `\n`-only form.  The kill-ring keeps it verbatim
-/// (internal paste re-normalizes anyway, and staying `\n`-only matches the
-/// buffer), but the *external* clipboard receives the buffer's on-disk
-/// newline convention — the symmetric counterpart of the save-time
-/// translation.  This fires for any CRLF-detected buffer regardless of
-/// host platform (a CRLF file opened on Linux copies `\r\n` too), not
-/// just on Windows.  Without it, copying a CRLF document would hand other
-/// applications bare `\n`, which some render as a single line.
+/// `text` arrives in the rope's `\n`-only form and the kill-ring keeps it that way, but the
+/// external clipboard gets the buffer's on-disk newline convention — the counterpart of the
+/// save-time translation, keyed off the buffer (a CRLF file opened on Linux copies `\r\n` too),
+/// not the host platform.  Otherwise some applications render a copied CRLF document as one line.
 fn copy_to_clipboard(state: &mut EditorState, text: String) {
     if OS_CLIPBOARD {
         let external = crate::document::buffer::encode_newlines(&text, state.buffer.line_ending());
         #[cfg(feature = "clipboard")]
         copy_to_system_clipboard(external.clone());
-        // OSC 52 also reaches the terminal emulator's clipboard — the only
-        // path that works over SSH, on Wayland without
-        // `wayland-data-control`, and in WSL.  Any terminal that doesn't
-        // understand the escape silently ignores it, so emitting
-        // unconditionally is safe.
+        // OSC 52 is the only path that works over SSH, on Wayland without `wayland-data-control`,
+        // and in WSL.  Terminals that don't understand it ignore it, so emit unconditionally.
         osc52_copy(&external);
     }
     state.kill_ring = text;
 }
 
-/// Platform-aware copy.  On Linux the Wayland/X11 clipboard only holds data
-/// while a process owns the selection, and arboard prints a warning to
-/// *stderr* if the `Clipboard` is dropped too quickly after `set_text` —
-/// which corrupts the TUI.  Spawn a thread that owns the clipboard until
-/// another program takes over (or until the process exits).
-///
-/// On macOS and Windows the OS clipboard persists across process exit, so
-/// the simple path is fine and we don't need a background thread.
+/// Linux copy.  Wayland/X11 hold clipboard data only while a process owns the selection, and
+/// arboard prints to *stderr* — corrupting the TUI — if the `Clipboard` drops too soon after
+/// `set_text`; hence a thread that owns the selection until another program takes over.  macOS and
+/// Windows clipboards persist past process exit and use the simple path below.
 #[cfg(all(feature = "clipboard", target_os = "linux"))]
 fn copy_to_system_clipboard(text: String) {
     use arboard::SetExtLinux;
@@ -1165,10 +1013,7 @@ fn copy_to_system_clipboard(text: String) {
     }
 }
 
-/// Write `text` to the terminal emulator's clipboard via the OSC 52 escape
-/// sequence (`ESC ] 52 ; c ; <base64> BEL`).  Works across SSH, Wayland and
-/// WSL as long as the host terminal supports the escape; unsupported
-/// terminals silently ignore it.
+/// Write `text` to the terminal's clipboard via OSC 52 (`ESC ] 52 ; c ; base64 BEL`).
 fn osc52_copy(text: &str) {
     use std::io::Write;
     let encoded = base64_encode(text.as_bytes());
@@ -1177,8 +1022,7 @@ fn osc52_copy(text: &str) {
     let _ = stdout.flush();
 }
 
-/// Minimal RFC-4648 base64 encoder.  Written out by hand to avoid adding a
-/// dependency for a one-caller helper.
+/// Minimal RFC-4648 base64 encoder, hand-written to avoid a dependency for one caller.
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -1202,18 +1046,15 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// Read from the OS clipboard if available; fall back to kill-ring.
-/// Public so a caller that needs to reshape the payload before it lands
-/// — the App's vim VisualLine paste, which makes it linewise — can read
-/// the same source the plain `Action::Paste` arm does.
+/// Read from the OS clipboard if available, else the kill-ring.  Public so callers that reshape
+/// the payload first (the App's linewise vim VisualLine paste) read the same source as
+/// `Action::Paste`.
 pub fn clipboard_text(state: &EditorState) -> String {
     #[cfg(feature = "clipboard")]
     if OS_CLIPBOARD {
         if let Ok(mut cb) = arboard::Clipboard::new() {
             if let Ok(text) = cb.get_text() {
-                // External text may carry CRLF (the Windows clipboard
-                // convention); collapse to the internal `\n`-only form so
-                // the rope invariant holds and a later CRLF save does not
+                // Collapse external CRLF so the rope invariant holds and a CRLF save does not
                 // double the `\r`.  The kill-ring is already `\n`-only.
                 return crate::document::buffer::normalize_newlines(text);
             }
@@ -1222,10 +1063,8 @@ pub fn clipboard_text(state: &EditorState) -> String {
     state.kill_ring.clone()
 }
 
-/// Insert `text` at the cursor (or over the current selection) as if it came
-/// from a paste action.  Used by the bracketed-paste handler in `App` so
-/// terminal-level pastes (Ctrl-Shift-V, right-click-paste, etc.) land in the
-/// buffer without needing the OS clipboard to be reachable from this process.
+/// Insert `text` at the cursor (or over the selection) as if pasted.  Used by `App`'s
+/// bracketed-paste handler, so terminal-level pastes need no reachable OS clipboard.
 pub fn paste_text(
     state: &mut EditorState,
     text: &str,
@@ -1235,9 +1074,7 @@ pub fn paste_text(
     if text.is_empty() {
         return;
     }
-    // A terminal bracketed paste can carry CRLF; collapse to the internal
-    // `\n`-only form so the rope invariant holds (and a CRLF save does not
-    // double the `\r`), matching the OS-clipboard path in `clipboard_text`.
+    // Same CRLF collapse as `clipboard_text`.
     let text = crate::document::buffer::normalize_newlines(text.to_owned());
     let text = text.as_str();
     let buffer_len_before = state.buffer.len_chars();
@@ -1270,13 +1107,9 @@ pub fn paste_text(
     state.ensure_cursor_visible(viewport_height, viewport_width);
 }
 
-/// Wrapper around [`table_edit::insert_table`] that mutates
-/// `EditorState` and lands the cursor in the new table's first header
-/// cell.  The caller is expected to have run the blank-line pre-flight
-/// already (the App-level handler does this before opening the modal),
-/// so this function unconditionally inserts.  In Preview mode the
-/// caller flips the editor into Rendered first, mirroring how typing
-/// actions transition out of Preview.
+/// [`table_edit::insert_table`] applied to `EditorState`, landing the cursor in the new table's
+/// first header cell.  Inserts unconditionally: the App-level handler runs the blank-line
+/// pre-flight before opening the modal.
 pub fn insert_table_at_cursor(
     state: &mut EditorState,
     rows: usize,
@@ -1292,44 +1125,32 @@ pub fn insert_table_at_cursor(
     state.ensure_cursor_visible(viewport_height, viewport_width);
 }
 
-/// Placeholder text shared by the image / link snippets.  Left selected
-/// after a selection-wrapping insert so the user's next keystrokes
-/// replace it with the real destination.
+/// Placeholder shared by the image / link snippets, left selected after insert so the user's next
+/// keystrokes replace it.
 pub const URL_PLACEHOLDER: &str = "file path or URL";
 
-/// True when the block under the cursor can host inline Markdown — an
-/// image or link snippet inserted there will parse as markup rather
-/// than literal text.  Denies code blocks, raw HTML, HTML comments,
-/// horizontal rules, and existing image / diagram blocks; a blank line
-/// (no real block) and every inline-bearing block (paragraph, heading,
-/// list, quote, table, footnote definition) are allowed.
+/// True when the block under the cursor can host inline Markdown, i.e. an image or link snippet
+/// there parses as markup rather than literal text.
 ///
-/// Classification is by *top-level* block: a code fence nested inside
-/// a list item or block quote is not detected.  That matches the
-/// fidelity of the other location guards (`cursor_line_is_blank`,
-/// `cursor_in_table`), which also reason at the top level.
-// Library-only surface: the snippet inserts run the offset-based guard
-// internally, so the binary never calls the cursor-based wrapper — it
-// exists for the block-classification integration tests.
+/// Classification is by *top-level* block, so a code fence nested in a list item is not detected —
+/// the same fidelity as the other location guards (`cursor_line_is_blank`, `cursor_in_table`).
+// Library-only: the binary reaches the offset-based guard directly; this wrapper exists for the
+// block-classification integration tests.
 #[allow(dead_code)]
 pub fn cursor_block_allows_inline_markdown(state: &mut EditorState) -> bool {
     let offset = state.cursor.offset;
     block_allows_inline_markdown_at(state, offset)
 }
 
-/// Offset-based body of [`cursor_block_allows_inline_markdown`] — the
-/// snippet insert classifies at the offset the snippet will actually
-/// land on (the selection start when wrapping), which is not always
-/// the cursor.
+/// Offset-based body of [`cursor_block_allows_inline_markdown`]: a wrapping insert lands at the
+/// selection start, not the cursor.
 fn block_allows_inline_markdown_at(state: &mut EditorState, char_offset: usize) -> bool {
     use crate::markdown::Block;
-    // An in-line typing burst defers the re-parse; flush so the block
-    // classification below can't run against stale ranges.
+    // A typing burst defers the re-parse; flush so classification sees fresh ranges.
     state.flush_parsed_if_dirty();
     let byte = state.buffer.rope().char_to_byte(char_offset);
     let Some(block) = state.parsed.real_block_for_byte(byte) else {
-        // Blank line (a virtual block) or EOF — a snippet here becomes
-        // its own paragraph, the ideal spot for an image.
+        // Blank line or EOF: the snippet becomes its own paragraph, ideal for an image.
         return true;
     };
     !matches!(
@@ -1339,15 +1160,12 @@ fn block_allows_inline_markdown_at(state: &mut EditorState, char_offset: usize) 
             | Block::HtmlComment(_)
             | Block::HorizontalRule
             | Block::ImageBlock { .. }
-            // Frontmatter is YAML / TOML, not prose — inline Markdown
-            // there is data corruption, not emphasis.
+            // Frontmatter is YAML / TOML: inline Markdown there is corruption, not emphasis.
             | Block::MetadataBlock { .. }
     )
 }
 
-/// Insert an image snippet (`![alt text](file path or URL)`) at the
-/// cursor.  See [`insert_inline_snippet`] for the selection-wrapping,
-/// placeholder-selection, and pre-flight behavior.
+/// Insert an image snippet at the cursor.  See [`insert_inline_snippet`] for the behavior.
 pub fn insert_image_at_cursor(
     state: &mut EditorState,
     viewport_height: usize,
@@ -1363,9 +1181,7 @@ pub fn insert_image_at_cursor(
     )
 }
 
-/// Insert a link snippet (`[link text](file path or URL)`) at the
-/// cursor.  See [`insert_inline_snippet`] for the selection-wrapping,
-/// placeholder-selection, and pre-flight behavior.
+/// Insert a link snippet at the cursor.  See [`insert_inline_snippet`] for the behavior.
 pub fn insert_link_at_cursor(
     state: &mut EditorState,
     viewport_height: usize,
@@ -1423,26 +1239,17 @@ fn frame_own_paragraph(buffer: &crate::document::Buffer, offset: usize, referenc
     out
 }
 
-/// Shared body of the image / link snippet inserts.  Returns `false` —
-/// leaving mode, selection, and buffer untouched — when the target
-/// block can't host inline Markdown (see
-/// [`cursor_block_allows_inline_markdown`]); the App-level handler
-/// flashes a warning on that path.  The pre-flight runs here, after the
-/// Preview cursor→scroll sync and against the actual insert offset, so
-/// the block it classifies is always the block the snippet lands in.
+/// Shared body of the image / link snippet inserts.  Returns `false` — mode, selection and buffer
+/// untouched — when the target block can't host inline Markdown (see
+/// [`cursor_block_allows_inline_markdown`]); the App-level handler flashes a warning there.
 ///
-/// - With a single-line selection, the selected text becomes the
-///   visible text — `sel` → `{prefix}[sel](file path or URL)` — and the
-///   URL placeholder is left selected so the user types the destination
-///   next (typing replaces a selection, matching [`toggle_wrap`]).
-/// - Otherwise the full snippet is inserted at the cursor with the
-///   text placeholder selected instead.  A multi-line selection is
-///   dropped rather than wrapped (link text can't span blocks) so no
-///   buffer text is destroyed.
+/// A single-line selection becomes the visible text and the URL placeholder is left selected;
+/// otherwise the whole snippet is inserted with the text placeholder selected.  A multi-line
+/// selection is dropped rather than wrapped — link text can't span blocks — so nothing is lost.
 ///
-/// `url` is `None` to insert and select the URL placeholder (the image /
-/// link snippet flows), or `Some(url)` to insert a fixed destination and
-/// leave the cursor just past the link (the clipboard paste flow).
+/// `url` is `None` to insert and select the URL placeholder (the image / link snippet flows), or
+/// `Some(url)` to insert a fixed destination and leave the cursor just past the link (the
+/// clipboard paste flow).
 fn insert_inline_snippet(
     state: &mut EditorState,
     prefix: &str,
@@ -1451,11 +1258,8 @@ fn insert_inline_snippet(
     viewport_height: usize,
     viewport_width: usize,
 ) -> bool {
-    // In Preview the cursor may be far from the viewport; sync it to the
-    // scroll position *before* the pre-flight so the guard classifies
-    // the block the snippet will actually land in.  Deliberately not
-    // `enter_edit_if_preview` yet — a denied insert must not leave
-    // Preview.
+    // Sync before the pre-flight so the guard classifies the block the snippet really lands in.
+    // Deliberately not `enter_edit_if_preview` yet: a denied insert must not leave Preview.
     if state.mode == Mode::Preview {
         sync_cursor_to_scroll(state, viewport_height);
     }
@@ -1479,9 +1283,8 @@ fn insert_inline_snippet(
     }
     state.selection = None;
     enter_edit_if_preview(state, viewport_height);
-    // `prefix`, the brackets, and the placeholders are all ASCII, so
-    // their byte lengths double as char counts; only the wrapped
-    // selection text needs a `chars().count()`.
+    // `prefix`, the brackets and the placeholders are ASCII, so byte lengths double as char
+    // counts; only the wrapped selection text needs `chars().count()`.
     let (offset, removed, visible_text, select_placeholder_url) = match wrap {
         Some((start, text)) => (start, text.clone(), text, true),
         None => (
@@ -1536,11 +1339,8 @@ fn insert_inline_snippet(
     true
 }
 
-/// Insert an auto-numbered `[^N]` footnote reference at the cursor.  Only
-/// the reference is inserted — the user writes the definition wherever
-/// they want.  Until a matching `[^N]:` definition exists the marker
-/// renders as literal text (CommonMark treats an undefined reference as
-/// plain text).
+/// Insert an auto-numbered `[^N]` footnote reference at the cursor; the user writes the definition
+/// wherever they like.  Until one exists the marker renders as literal text, per CommonMark.
 pub fn insert_footnote_at_cursor(
     state: &mut EditorState,
     viewport_height: usize,
@@ -1554,9 +1354,8 @@ pub fn insert_footnote_at_cursor(
     state.ensure_cursor_visible(viewport_height, viewport_width);
 }
 
-/// Re-sequence all numeric footnotes into order-of-first-reference.  Named
-/// labels are left untouched.  Returns `false` (no edit) when nothing
-/// needs renumbering.
+/// Re-sequence numeric footnotes into order of first reference, leaving named labels alone.
+/// Returns `false` when nothing needed renumbering.
 pub fn renumber_footnotes(
     state: &mut EditorState,
     viewport_height: usize,
@@ -1594,8 +1393,7 @@ pub fn delete_footnote_at_cursor(
     true
 }
 
-/// Set the cursor to a specific byte offset in the buffer.  Clamps to
-/// buffer bounds and keeps `preferred_col` coherent.
+/// Set the cursor to a byte offset, clamped to buffer bounds.
 pub(super) fn set_cursor_byte(state: &mut EditorState, target_byte: usize) {
     let source_len = state.buffer.contents().len();
     let clamped = target_byte.min(source_len);
@@ -1603,32 +1401,24 @@ pub(super) fn set_cursor_byte(state: &mut EditorState, target_byte: usize) {
     state.cursor.offset = char_off.min(state.buffer.len_chars());
 }
 
-/// Char offset of the cursor, as a byte offset into `buffer.contents()`.
-/// Visible to sibling editor modules so byte-oriented helpers (`table_edit`,
-/// `list_edit`) can read the cursor's source position without re-deriving it.
+/// The cursor as a byte offset into `buffer.contents()`, for the byte-oriented sibling helpers.
 pub(super) fn cursor_byte(state: &EditorState) -> usize {
     state.buffer.rope().char_to_byte(state.cursor.offset)
 }
 
-/// Move the cursor up/down by one line in a rendered view, skipping a
-/// table's alignment row and any hidden (zero-rendered-line) blocks so the
-/// cursor never stalls on a structural artefact.  Honours `visual_line_nav`
-/// (the default handler's wrapped-line nav).  The shared skip/step logic
-/// lives on [`EditorState::move_cursor_line`], which also gates the skip on
-/// the rendered-vs-`Raw` view so vim `j`/`k` and this path stay in lockstep.
+/// One-line vertical move that skips a table's alignment row and hidden blocks, so the cursor
+/// never stalls on a structural artifact.  The skip/step logic lives on
+/// [`EditorState::move_cursor_line`], shared with vim `j`/`k`.
 fn move_line_skipping_alignment(state: &mut EditorState, down: bool, viewport_width: usize) {
     let visual = state.visual_line_nav;
     state.move_cursor_line(down, visual, viewport_width);
 }
 
-/// True iff the cursor currently falls inside a block with zero rendered
-/// lines whose source text is an HTML comment.  Used by vertical-navigation
-/// and mode-transition code to skip over invisible source bytes so the
-/// cursor never stalls on a line the user can't see in hybrid view.
+/// True when the cursor is inside a zero-rendered-line block whose source is an HTML comment, so
+/// navigation can skip bytes the user can't see.
 ///
-/// Intentionally specific to comments rather than "any zero-own block":
-/// suppressed blank lines (when `preserve_blank_lines` is false) also have
-/// zero own but are bytes the cursor may legitimately want to land on.
+/// Deliberately narrower than "any zero-own block": suppressed blank lines also have zero own
+/// lines but are positions the cursor may legitimately occupy.
 pub(super) fn cursor_on_hidden_block(state: &EditorState) -> bool {
     let rope = state.buffer.rope();
     let cursor_byte = rope.char_to_byte(state.cursor.offset);
@@ -1646,11 +1436,8 @@ pub(super) fn cursor_on_hidden_block(state: &EditorState) -> bool {
     source[range.start..end].trim_start().starts_with("<!--")
 }
 
-/// Walk the cursor forward past any hidden (HTML-comment) blocks so
-/// subsequent rendering logic can assume the cursor's block has at least
-/// one rendered line.  Called on the Raw → Rendered / Preview mode
-/// transition, where the cursor may have been sitting inside a comment
-/// that's invisible in the destination mode.
+/// Walk the cursor forward past hidden (HTML-comment) blocks so rendering can assume its block has
+/// at least one rendered line.  Called on the Raw → Rendered transition.
 fn snap_cursor_out_of_hidden_block(state: &mut EditorState, viewport_width: usize) {
     let mut safety = 32usize;
     while cursor_on_hidden_block(state) && safety > 0 {
@@ -1661,24 +1448,22 @@ fn snap_cursor_out_of_hidden_block(state: &mut EditorState, viewport_width: usiz
             state.cursor.move_down(&state.buffer);
         }
         if state.cursor.offset == prev_offset {
-            // Already at the buffer's end — nowhere to skip to.  Leave the
-            // cursor where it is; the rendered view falls back gracefully.
+            // At the buffer's end, nowhere to skip to; the rendered view falls back gracefully.
             break;
         }
         safety -= 1;
     }
 }
 
-/// Apply a `table_edit`-produced `EditDelta` (whose offsets are **bytes**)
-/// to the editor state by first converting those offsets into rope char
-/// offsets.  The caller supplies the *post-edit* cursor byte position; we
-/// convert it too after the buffer has been mutated.
+/// Apply an `EditDelta` whose offsets are **bytes** (as produced by `table_edit` / `list_edit`),
+/// converting to rope char offsets.  `cursor_byte_target` is the *post-edit* cursor position and
+/// is converted against the mutated rope.
 pub(super) fn apply_byte_delta(
     state: &mut EditorState,
     byte_delta: EditDelta,
     cursor_byte_target: usize,
 ) {
-    // Convert byte offsets → char offsets using the *pre-edit* rope.
+    // Byte → char against the *pre-edit* rope.
     let offset_char = state.buffer.rope().byte_to_char(byte_delta.offset);
     let delta = EditDelta {
         offset: offset_char,
@@ -1686,7 +1471,6 @@ pub(super) fn apply_byte_delta(
         inserted: byte_delta.inserted,
     };
     state.apply_delta(delta);
-    // Now map the target byte onto the mutated rope.  Clamp to buffer bounds.
     let source = state.buffer.contents();
     let clamped_byte = cursor_byte_target.min(source.len());
     let char_off = state.buffer.rope().byte_to_char(clamped_byte);
@@ -1697,29 +1481,15 @@ pub(super) fn apply_byte_delta(
 
 // ── List editing helpers ──────────────────────────────────────────────────────
 //
-// `list_edit` (byte-oriented) mirrors `table_edit`.  These helpers look up the
-// list at the cursor, convert between byte and char offsets, and apply the
-// resulting `EditDelta`s through `apply_byte_delta`.
+// These look up the list at the cursor and route byte-oriented `list_edit` deltas through
+// `apply_byte_delta`, mirroring the `table_edit` helpers.
 
-/// If the cursor is inside a Markdown list, dispatch `Enter` to one of
-/// three list-aware handlers and return `true` to signal that the newline
-/// has been consumed.  The dispatch ladder implements the triple-`Enter`
-/// list-break gesture:
-///
-/// 1. **Item with content** → [`list_edit::continue_item`] inserts a new
-///    empty item directly below the cursor.
-/// 2. **Empty item with no blank line above it** →
-///    [`list_edit::space_out_empty_item`] pushes the empty marker (and
-///    the cursor on it) down one line, widening the gap above without
-///    yet ending the list.
-/// 3. **Empty item with a blank line above it** →
-///    [`list_edit::exit_list`] strips the empty marker and, in mid-list,
-///    inserts whatever is needed to complete a two-blank-line section
-///    break so the parser splits the surviving head and renumbered tail
-///    into two distinct lists.
-///
-/// Returns `false` when the cursor is not in a list — the caller should
-/// fall through to a plain newline insert.
+/// Dispatch `Enter` inside a list, returning `true` when the newline was consumed (`false` means
+/// the caller inserts a plain newline).  The ladder is the triple-`Enter` list-break gesture:
+/// item with content → [`list_edit::continue_item`]; empty item →
+/// [`list_edit::space_out_empty_item`]; empty item already preceded by a blank line →
+/// [`list_edit::exit_list`], which mid-list completes a two-blank-line break so the parser splits
+/// the surviving head and renumbered tail into separate lists.
 fn list_handle_newline(state: &mut EditorState) -> bool {
     let Some((source, info)) = current_list(state) else {
         return false;
@@ -1730,8 +1500,7 @@ fn list_handle_newline(state: &mut EditorState) -> bool {
     };
     let item = &info.items[item_idx];
 
-    // Cursor must be past the marker prefix for any list-aware handling.  If
-    // it's in the indent/marker itself, fall through to plain newline.
+    // Inside the indent/marker itself: fall through to a plain newline.
     if byte < item.marker_end {
         return false;
     }
@@ -1754,20 +1523,15 @@ fn list_handle_newline(state: &mut EditorState) -> bool {
     }
 }
 
-/// Indent the cursor's list item one level (adds `INDENT_WIDTH` spaces of
-/// indent, resets ordered numbering to 1, renumbers the surrounding outer
-/// list).  Returns `true` when handled so the caller can skip the fallback
-/// plain-tab insertion.
+/// Indent the cursor's list item one level, resetting ordered numbering to 1 and renumbering the
+/// outer list.  `true` when handled, so the caller skips the plain-tab fallback.
 fn list_indent(state: &mut EditorState) -> bool {
     let Some((source, info)) = current_list(state) else {
         return false;
     };
     let byte = cursor_byte(state);
-    // The first item of a list cannot be indented — it has no preceding
-    // sibling to nest under, so any extra indent degrades the marker (lazy
-    // paragraph continuation, or an indented code block at the top level).
-    // Swallow the Tab as handled: the plain-space fallback would corrupt
-    // the marker line the same way.
+    // The first item has no sibling to nest under, so extra indent degrades the marker into lazy
+    // continuation or a code block.  Swallow the Tab: the plain-space fallback corrupts it too.
     if list_edit::cursor_item_idx(&info, byte) == Some(0) {
         return true;
     }
@@ -1779,9 +1543,7 @@ fn list_indent(state: &mut EditorState) -> bool {
     true
 }
 
-/// Outdent the cursor's list item one level (removes up to `INDENT_WIDTH`
-/// leading spaces).  No-op (returns `false`) when the cursor isn't in a
-/// list or when the item is already at the outermost indent.
+/// Outdent the cursor's list item one level.  `false` when not in a list, or already outermost.
 fn list_outdent(state: &mut EditorState) -> bool {
     let Some((source, info)) = current_list(state) else {
         return false;
@@ -1807,23 +1569,15 @@ fn list_toggle_checkbox(state: &mut EditorState) {
     apply_byte_delta(state, res.delta, res.cursor_byte);
 }
 
-/// After an edit that may have landed in or adjacent to an ordered list
-/// (delete, paste, list-break, …), renumber the surrounding list so the
-/// sequence stays monotonic.  No-op for bullet lists, in Raw mode, or when the
-/// cursor is outside a list.
+/// Silent post-edit renumber of the ordered list around the cursor.  No-op for bullet lists, in
+/// Raw, or outside a list.
 ///
-/// Uses the pure, nesting-aware, loose-list-aware
-/// [`list_edit::renumber_list_block`]: it scans the buffer source (no reparse,
-/// so it is cheap enough to run on every keystroke) and renumbers every ordered
-/// run in the surrounding list block, spanning loose-list blank gaps so a
-/// blank-separated list — which pulldown-cmark renders as one continuous
-/// sequence — is renumbered as a whole.  A delete lands the cursor on the line
-/// below, which for a list whose items have nested children is the *child*, so
-/// the block walk (rather than a flat per-indent renumber) is what keeps the
-/// outer sequence correct.
+/// [`list_edit::renumber_list_block`] scans the source without reparsing (cheap enough per
+/// keystroke) and renumbers the whole surrounding *block*, spanning loose-list blank gaps because
+/// pulldown-cmark renders those as one sequence.  The block walk rather than a flat per-indent
+/// pass is what keeps the outer sequence right when a delete lands the cursor on a nested child.
 pub(crate) fn list_renumber_at_cursor(state: &mut EditorState) {
-    // Raw mode: defer to plain text, never rewrite markers (mirrors
-    // `current_list`'s bail-out, which the other list-edit paths use).
+    // Raw defers to plain text, same bail-out as `current_list`.
     if state.mode == Mode::Raw {
         return;
     }
@@ -1834,8 +1588,7 @@ pub(crate) fn list_renumber_at_cursor(state: &mut EditorState) {
     }
 }
 
-/// Outcome of [`fix_list_numbering`], so the App layer can pick the right
-/// flash message.
+/// Outcome of [`fix_list_numbering`], so the App layer can pick a flash message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixListNumbering {
     /// The cursor is not inside an ordered list (empty, plain text, or a
@@ -1847,31 +1600,23 @@ pub enum FixListNumbering {
     Fixed,
 }
 
-/// Renumber the ordered list under the cursor so its source numbering matches
-/// what is rendered, as one undoable edit.  This is the user-invokable "Fix
-/// list numbering" command; unlike [`list_renumber_at_cursor`] (the silent
-/// post-edit recovery hook) it reports *why* nothing changed so the caller can
-/// flash feedback.
+/// The user-invokable "Fix list numbering" command: one undoable edit that makes the source
+/// numbering match what is rendered.  Unlike [`list_renumber_at_cursor`] it reports *why* nothing
+/// changed so the caller can flash feedback.
 pub fn fix_list_numbering(
     state: &mut EditorState,
     viewport_height: usize,
     viewport_width: usize,
 ) -> FixListNumbering {
-    // Works in every view mode, including Raw.  Unlike the *automatic*
-    // list-edit paths (`current_list`, `list_renumber_at_cursor`) — which
-    // defer to plain text in Raw so the engine never rewrites markers the user
-    // is editing by hand — this is an *explicit* user command (like
-    // `renumber_footnotes`): running it is a deliberate request to rewrite the
-    // source, and Raw is exactly where the user sees that source.
+    // Works in Raw too, unlike the automatic paths that defer to plain text there: this is an
+    // explicit request to rewrite the source, and Raw is where the user sees it.
     let source = state.buffer.contents();
     let byte = cursor_byte(state);
-    // Classify the cursor's *immediate* list: a cursor on a nested ordered
-    // list inside a bullet list is still "in an ordered list".
+    // The cursor's *immediate* list: a nested ordered list inside a bullet list still counts.
     match list_edit::find_list_at(&source, byte).map(|info| info.kind) {
         Some(list_edit::MarkerKind::Ordered(_)) => {}
         _ => return FixListNumbering::NotOrdered,
     }
-    // Renumber the whole surrounding list block (loose-list gaps included).
     match list_edit::renumber_list_block(&source, byte) {
         Some(delta) => {
             apply_byte_delta(state, delta, byte);
@@ -1882,13 +1627,10 @@ pub fn fix_list_numbering(
     }
 }
 
-/// Look up the list surrounding the cursor, returning the source snapshot and
-/// parsed `ListInfo` so the caller need not re-fetch `buffer.contents()`.
+/// The list surrounding the cursor, with the source snapshot so the caller need not re-fetch it.
 fn current_list(state: &EditorState) -> Option<(String, ListInfo)> {
-    // Mirrors the Raw-mode bail-out in `current_table`: every list-aware
-    // editing path should defer to plain text behaviour in Raw mode so the
-    // user can edit markers and checkboxes directly without the engine
-    // "helpfully" rewriting them.
+    // Every list-aware editing path defers to plain text in Raw (mirroring `current_table`) so the
+    // user can edit markers and checkboxes by hand without the engine rewriting them.
     if state.mode == Mode::Raw {
         return None;
     }
@@ -1897,21 +1639,12 @@ fn current_list(state: &EditorState) -> Option<(String, ListInfo)> {
     list_edit::find_list_at(&source, byte).map(|info| (source, info))
 }
 
-/// If the cursor sits exactly at `content_start` of a list item, delete the
-/// entire marker prefix (the indent + `- ` / `N. `) so the user never has to
-/// remove the marker character-by-character.  The item's content stays on its
-/// own line and the cursor lands at the start of that line — the item is
-/// "un-bulleted", not merged into the item above.  A second backspace then
-/// falls through to the plain-text path and joins the lines, so the merge is
-/// still reachable, just never as the surprising first step.  Returns `true`
-/// when the edit was applied.
+/// Backspace at a list item's `content_start` deletes the whole marker prefix, un-bulleting the
+/// item in place rather than merging it into the one above.  A second backspace falls through to
+/// the plain-text join, so the merge stays reachable but is never the surprising first step.
 ///
-/// Task items get a two-step erase: the first backspace peels off only the
-/// `[ ] ` checkbox prefix (turning the task back into a plain bullet item),
-/// and a subsequent backspace falls through to the marker-eating path that
-/// removes the bullet itself.  This matches the user-facing rule that the
-/// checkbox is the "extra" decoration on a bullet — deleting it shouldn't
-/// also delete the bullet.
+/// Task items erase in two steps — checkbox prefix first, bullet second — because the checkbox is
+/// the extra decoration on a bullet, so removing it shouldn't remove the bullet too.
 fn list_backspace_consumes_marker(state: &mut EditorState) -> bool {
     let Some((source, info)) = current_list(state) else {
         return false;
@@ -1940,9 +1673,7 @@ fn list_backspace_consumes_marker(state: &mut EditorState) -> bool {
         return true;
     }
 
-    // Delete the marker prefix only — from the start of the item's line
-    // through `content_start`.  The preceding `\n` is deliberately left
-    // alone so the content keeps its own line.
+    // The preceding `\n` is deliberately left alone so the content keeps its own line.
     let delete_start = item.start;
     let removed = source[delete_start..item.content_start].to_owned();
     if removed.is_empty() {
@@ -1954,15 +1685,10 @@ fn list_backspace_consumes_marker(state: &mut EditorState) -> bool {
         inserted: String::new(),
     };
     apply_byte_delta(state, delta, delete_start);
-    // Ordered-list renumbering runs automatically at end of `apply()` when
-    // the buffer has changed, so no explicit call is needed here.
     true
 }
 
-/// If the cursor sits on a list-item marker (the indent + `- ` / `N. ` /
-/// `[ ] ` prefix), snap it to the item's `content_start`.  Called after
-/// editing actions that may leave the cursor on a marker (`DeleteLine`,
-/// `Paste` of non-list content into the middle of a list, etc.).
+/// Snap a cursor sitting on a list-item marker to the item's `content_start`.
 fn clamp_cursor_out_of_marker(state: &mut EditorState) {
     let Some((_, info)) = current_list(state) else {
         return;
@@ -1977,11 +1703,8 @@ fn clamp_cursor_out_of_marker(state: &mut EditorState) {
     }
 }
 
-/// Treat list-item markers as non-navigable when the cursor moves
-/// horizontally.  Within a list, the cursor only lands on positions between
-/// `content_start` and `line_end` for each item; stepping across those
-/// boundaries hops directly to the adjacent item (or out of the list when
-/// already at the first item's content start or the last item's line end).
+/// Treat list-item markers as non-navigable: horizontal movement stays between `content_start`
+/// and `line_end`, hopping to the adjacent item (or out of the list) at the boundaries.
 fn list_move_horizontal(state: &mut EditorState, forward: bool) -> bool {
     let Some((source, info)) = current_list(state) else {
         return false;
@@ -1992,10 +1715,8 @@ fn list_move_horizontal(state: &mut EditorState, forward: bool) -> bool {
     };
     let item = &info.items[item_idx];
 
-    // Multi-line items: the marker-hopping logic below is first-line
-    // geometry (`content_start` / `line_end`).  A cursor on a continuation
-    // line — or at the first line's end when continuation lines follow —
-    // moves char-by-char like plain text instead of hopping items.
+    // The hopping below is first-line geometry, so a cursor on (or moving onto) a continuation
+    // line steps char-by-char like plain text instead.
     let has_continuation = item.end > item.line_end + 1;
     if byte > item.line_end || (byte == item.line_end && has_continuation && forward) {
         return false;
@@ -2007,15 +1728,10 @@ fn list_move_horizontal(state: &mut EditorState, forward: bool) -> bool {
                 set_cursor_byte(state, next.content_start);
                 return true;
             }
-            // Last item: step past the list entirely.  info.end sits just
-            // past the final `\n`, which is where the first post-list line
-            // begins.
+            // `info.end` sits just past the final `\n`, where the first post-list line begins.
             set_cursor_byte(state, info.end.min(source.len()));
             return true;
         }
-        // Normal grapheme-step, but if we'd land before the next item's
-        // content (because we stepped onto a marker char, which shouldn't
-        // happen for correctly-skipped cursors), clamp to content_start.
         let new_char = next_grapheme_offset(&state.buffer, state.cursor.offset);
         state.cursor.offset = new_char;
         true
@@ -2026,11 +1742,10 @@ fn list_move_horizontal(state: &mut EditorState, forward: bool) -> bool {
                 set_cursor_byte(state, prev.line_end);
                 return true;
             }
-            // First item: step out past the list's starting `\n`, if any.
+            // First item: step out past the list's starting `\n`, if any; else stay put.
             if info.start > 0 {
                 set_cursor_byte(state, info.start - 1);
             }
-            // else stay put at content_start.
             return true;
         }
         let new_char = prev_grapheme_offset(&state.buffer, state.cursor.offset);
@@ -2052,9 +1767,6 @@ mod tests {
 
     #[test]
     fn paste_normalizes_crlf_to_lf() {
-        // A bracketed paste carrying CRLF (the Windows convention) must land
-        // in the rope as pure `\n` — the invariant every downstream consumer
-        // and the save-time translation now depend on.
         let mut state = EditorState::new(Buffer::from_str(""), theme());
         state.mode = Mode::Raw;
         paste_text(&mut state, "one\r\ntwo\r\n", 24, 80);
@@ -2068,9 +1780,7 @@ mod tests {
 
     #[test]
     fn paste_into_crlf_buffer_does_not_double_cr_on_save() {
-        // The corruption this guards against: a CRLF-detected buffer that
-        // receives pasted CRLF text would, without normalization, write
-        // `\r\r\n` when the save widens the already-`\r`-suffixed `\n`.
+        // Without normalization the save widens an already-`\r`-suffixed `\n` into `\r\r\n`.
         let dir = tempfile::tempdir().expect("tempdir");
         let src = dir.path().join("crlf.md");
         std::fs::write(&src, "a\r\nb\r\n").expect("seed");

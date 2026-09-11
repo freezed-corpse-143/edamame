@@ -15,12 +15,12 @@ If you're not sure which of those you have — or you have a question rather tha
 ```bash
 git clone https://github.com/mijowi/edamame
 cd edamame
-cargo run -- tests/fixtures/sample.md
+cargo run -- tests/fixtures/general.md
 ```
 
 edamame's MSRV is **Rust 1.90**, declared as `rust-version` in `Cargo.toml` and pinned by the `msrv` CI job. Note that the floor comes from a transitive dependency (`ratatui-image → icy_sixel → quantette`), not from edamame's own code — so please don't raise it casually to use a new language feature. If a dependency bump raises it, that's a decision to make explicitly, and the README and CI job need updating with it.
 
-`tests/fixtures/sample.md` and `sample_diagrams.md` exercise most of the rendering surface and are the quickest way to see a change in action.
+The files in `tests/fixtures` exercise most of the rendering surface and are the quickest way to see a change in action.
 
 For the best experience while developing, use a terminal with 24-bit color, an image protocol and the kitty keyboard protocol — kitty, Ghostty, WezTerm or foot. Some features are invisible without them.
 

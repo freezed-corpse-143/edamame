@@ -1,21 +1,9 @@
-//! Search-and-replace subsystem.
-//!
-//! Mirrors the `diff` module's shape: a session-state object
-//! ([`SearchState`], owned by `EditorState::search` while a search flow
-//! is active) plus a hard-bound key table ([`search_keys`]) that wins
-//! over the user keymap for the duration of the flow.
-//!
-//! Unlike diff mode, an active search does **not** change
-//! `EditorState::mode` — the document keeps rendering in whatever view
-//! mode it was in (Preview / Rendered / Raw) with match highlights
-//! painted on top.  The flow is gated on `search.is_some()` instead:
-//! the input handler intercepts the flow keys, and
-//! `app::actions::search_safe_action` default-denies every other
-//! action.
-//!
-//! Matching is literal substring, never regex — but the query is written
-//! with backslash escapes ([`escape`]) so it can express a line break
-//! (`/  \n`) that a single-row text field can't hold.
+//! Search-and-replace: [`SearchState`] (owned by `EditorState::search` while a flow is
+//! active) plus a hard-bound key table ([`search_keys`]) that wins over the user keymap.
+//! An active search does not change `EditorState::mode`; the flow is gated on
+//! `search.is_some()` and `app::actions::search_safe_action` default-denies other actions.
+//! Matching is literal substring, never regex, with backslash [`escape`]s for `\n` etc.
+//! See `docs/dev/search-replace.md`.
 
 pub mod escape;
 pub mod search_keys;

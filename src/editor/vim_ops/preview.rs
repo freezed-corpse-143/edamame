@@ -1,24 +1,14 @@
-//! Live `:s` substitution preview — neovim's `inccommand=nosplit`.
+//! Live `:s` substitution preview — neovim's `inccommand=nosplit`.  See
+//! `docs/dev/substitute-preview.md`.
 //!
-//! While the user types a `:s` / `:%s` / `:'<,'>s` command line, the
-//! document updates live: matches are highlighted, and once the second
-//! delimiter is typed the buffer visually shows the substituted text.
-//! Every keystroke goes through [`update_substitute_preview`], which
-//! **reverts** the previous preview (restoring the pristine buffer),
-//! re-parses the command, and applies a fresh preview — never diffing two
-//! previews against each other.  Esc reverts via
-//! [`clear_substitute_preview`]; Enter reverts first too, so the real
-//! [`execute_substitute`](super::ex::execute_substitute) runs against the
-//! untouched buffer and its undo / flash semantics stay byte-identical to
-//! a preview-less submit.
+//! Every keystroke goes through [`update_substitute_preview`], which **reverts** the previous
+//! preview and recomputes against the pristine buffer — never diffing two previews.  Enter reverts
+//! first too, so the real [`execute_substitute`](super::ex::execute_substitute) sees an untouched
+//! buffer and its undo / flash semantics match a preview-less submit.
 //!
-//! Preview edits go through the raw [`Buffer`] primitives — never
-//! `EditorState::apply_delta` — so no undo delta is recorded and `dirty`
-//! is untouched.  The stashed inverse delta is stamped with the
-//! `Buffer::version()` it was applied at; a revert on a mismatched
-//! version silently drops the preview instead of corrupting text (a
-//! safety valve behind the App-level gates: autosave, mouse, and search
-//! freshness are all suspended while a preview is active).
+//! Preview edits use the raw [`Buffer`] primitives, so no undo delta is recorded and `dirty` is
+//! untouched.  The stashed inverse delta is stamped with the `Buffer::version()` it was applied at;
+//! a revert on a mismatched version drops the preview rather than corrupting text.
 
 use fancy_regex::RegexBuilder;
 
@@ -30,50 +20,37 @@ use crate::editor::vim_ops::ex::{
 use crate::editor::vim_ops::vim_regex::translate_pattern;
 use crate::editor::EditorState;
 
-/// Preview matches / replacements past this count are left untouched —
-/// the delta still rewrites every *scanned* line correctly, later lines
-/// simply keep their original text until the user submits.
+/// Matches past this count are left untouched; the scanned lines are still rewritten correctly.
 const MAX_PREVIEW_MATCHES: usize = 1_000;
 
-/// `fancy-regex` backtrack limit for the preview engine only (the commit
-/// path keeps the crate default).  A pathological half-typed pattern
-/// (`(a+)+b`) must fail fast per keystroke, not hang the UI.
+/// `fancy-regex` backtrack limit for the preview only (the commit path keeps the crate default):
+/// a pathological half-typed pattern like `(a+)+b` must fail fast, not hang the UI.
 const BACKTRACK_LIMIT: usize = 100_000;
 
-/// Live `:s` preview state.  Lives on [`EditorState`] (like `search` and
-/// `yank_flash`) so the overlay painters read it off `&EditorState`.
+/// Live `:s` preview state, held on [`EditorState`] so the overlay painters can read it.
 pub struct SubstitutePreview {
-    /// Byte ranges to highlight, valid against the CURRENT (possibly
-    /// preview-modified) buffer: match ranges while the replacement field
-    /// is absent, the post-apply ranges of each inserted replacement
-    /// segment once it is present.  Sorted, non-overlapping.
+    /// Byte ranges to highlight, valid against the CURRENT (possibly preview-modified) buffer:
+    /// match ranges while the replacement field is absent, inserted-segment ranges once it is
+    /// present.  Sorted, non-overlapping.
     pub highlights: Vec<std::ops::Range<usize>>,
-    /// Inverse delta restoring the original text.  `None` while the
-    /// preview is highlight-only (nothing was edited).
+    /// Inverse delta restoring the original text.  `None` for a highlight-only preview.
     revert: Option<EditDelta>,
-    /// `Buffer::version()` immediately after the preview edit was applied.
-    /// A revert is refused (state silently dropped) on mismatch — a
-    /// mutation slipped past the gates and the original text is gone.
+    /// `Buffer::version()` just after the preview edit.  A mismatch means a mutation slipped past
+    /// the gates and the original text is gone, so the revert is refused.
     applied_version: u64,
-    /// Cursor char offset when the preview session started, restored on
-    /// cancel (and before submit, so `:s`'s current-line resolution sees
-    /// the original cursor).
+    /// Cursor offset at session start, restored on cancel and before submit (so `:s`'s
+    /// current-line resolution sees the original cursor).
     saved_cursor: usize,
-    /// Viewport scroll when the preview session started, restored on
-    /// cancel only (submit lets `execute_substitute` place the view).
+    /// Viewport scroll at session start, restored on cancel only.
     saved_scroll: usize,
 }
 
-/// Everything needed to apply one preview frame, computed against an
-/// unmodified buffer.  Pure data — the test surface for the preview.
+/// One preview frame, computed against an unmodified buffer.  Pure data — the test surface.
 pub struct PreviewPlan {
-    /// The combined substitution delta (char offsets).  `Some` only when
-    /// the replacement field is present (`:s/foo/…`); `None` for a
-    /// highlight-only preview (`:s/foo`).
+    /// Combined substitution delta (char offsets).  `None` for a highlight-only preview.
     pub delta: Option<EditDelta>,
-    /// Highlight byte ranges: pre-apply match ranges when `delta` is
-    /// `None`, post-apply inserted-segment ranges when it is `Some`
-    /// (zero-width segments — a deletion preview — are filtered out).
+    /// Highlight byte ranges: pre-apply match ranges when `delta` is `None`, post-apply
+    /// inserted-segment ranges otherwise (zero-width deletion segments filtered out).
     pub highlights: Vec<std::ops::Range<usize>>,
     /// First buffer line that matched, for scroll-into-view.
     pub first_line: usize,
@@ -81,11 +58,9 @@ pub struct PreviewPlan {
 
 // ── Compute ─────────────────────────────────────────────────────────────────
 
-/// Compute the preview for one substitution against the (pristine)
-/// buffer.  `Ok(None)` means "nothing to preview": empty pattern, empty
-/// buffer, or no matches.  Regex errors surface as `Err` — the caller
-/// treats them the same as `Ok(None)` (a half-typed pattern must never
-/// flash an error), but tests can tell them apart.
+/// Compute the preview for one substitution against the pristine buffer.  `Ok(None)` means
+/// "nothing to preview".  Regex errors surface as `Err`; the caller treats them like `Ok(None)`
+/// (a half-typed pattern must never flash an error), but tests can tell them apart.
 pub fn compute_preview_plan(
     buffer: &Buffer,
     cursor_line: usize,
@@ -96,8 +71,8 @@ pub fn compute_preview_plan(
         return Ok(None);
     }
     let translated = translate_pattern(&sub.pattern)?;
-    // `multi_line` must match the commit path's builder or the preview
-    // would anchor `^`/`$` differently from what Enter commits.
+    // `multi_line` must match the commit path's builder, or `^`/`$` would anchor differently
+    // from what Enter commits.
     let re = RegexBuilder::new(&translated)
         .case_insensitive(sub.ignore_case)
         .multi_line(true)
@@ -119,8 +94,7 @@ pub fn compute_preview_plan(
         };
         return Ok(Some(PreviewPlan {
             delta: Some(edit.delta),
-            // A deletion preview (`:%s/foo/`) inserts nothing — there is
-            // no cell to highlight, so zero-width segments are dropped.
+            // A deletion preview inserts nothing, so there is no cell to highlight.
             highlights: edit
                 .replaced_ranges
                 .into_iter()
@@ -130,13 +104,9 @@ pub fn compute_preview_plan(
         }));
     }
 
-    // Highlight-only: the replacement field hasn't been typed yet, so
-    // nothing is edited — just collect the ranges the substitution WOULD
-    // touch.  Driving the same walker as the replacement path is what
-    // makes "would" exact: the first-match-per-line rule and the region
-    // bound come from one implementation, so the highlights can't
-    // disagree with what Enter replaces.  Zero-width matches paint
-    // nothing but still set `first_line` (the view scrolls to them).
+    // Highlight-only: collect the ranges the substitution *would* touch.  Driving the same walker
+    // as the replacement path is what makes that exact — one implementation of the
+    // first-match-per-line rule and the region bound, so highlights can't disagree with Enter.
     let Some((first, last)) =
         resolve_substitute_lines(buffer, cursor_line, sub.range, visual_range)
     else {
@@ -169,12 +139,9 @@ pub fn compute_preview_plan(
 
 // ── Apply / revert ──────────────────────────────────────────────────────────
 
-/// Re-derive the preview from the current command-line text.  Reverts any
-/// existing preview first (so the plan is always computed against the
-/// pristine buffer), then parses `input`; on a complete-enough `:s` parse
-/// with at least one match, applies the new preview.  Any parse / regex
-/// error, non-substitute command, or matchless pattern silently ends the
-/// preview session (restoring the saved view) — no error spam mid-typing.
+/// Re-derive the preview from the current command-line text, reverting any existing preview first
+/// so the plan is computed against the pristine buffer.  Any parse / regex error, non-substitute
+/// command, or matchless pattern silently ends the session — no error spam mid-typing.
 pub fn update_substitute_preview(
     editor: &mut EditorState,
     input: &str,
@@ -186,11 +153,8 @@ pub fn update_substitute_preview(
         Some(prior) => {
             let saved = (prior.saved_cursor, prior.saved_scroll);
             if !apply_revert(editor, prior) {
-                // The revert was refused (version mismatch): a mutation
-                // slipped past the gates and the pristine text is gone.
-                // End the session outright — computing a "fresh" plan
-                // here would stack preview edits on top of the orphaned
-                // preview text and stash a revert against that.
+                // Revert refused (version mismatch): end the session outright, since a "fresh"
+                // plan would stack edits on the orphaned preview text and stash a revert to it.
                 return;
             }
             (saved.0, saved.1, true)
@@ -231,16 +195,10 @@ pub fn update_substitute_preview(
         None => (None, editor.buffer.version()),
     };
 
-    // Park the cursor at the first affected line and scroll it into view
-    // (nvim's inccommand shows the first change).  The cursor is restored
-    // from `saved_cursor` when the session ends, and every recompute uses
-    // `saved_cursor` for the `:s` current-line resolution, so the park
-    // never leaks into semantics.
-    // A multi-line match can shrink the line count, but `first_line` is
-    // where the first match *starts* and everything before it is
-    // byte-identical pre/post, so the index still names the same text;
-    // the `min` only guards a preview that consumed the tail of the
-    // buffer.
+    // Park the cursor at the first affected line, as nvim's inccommand does.  Every recompute and
+    // the session end use `saved_cursor`, so the park never leaks into semantics.  `first_line`
+    // still names the same text post-apply (everything before the first match is byte-identical);
+    // the `min` only guards a preview that consumed the tail of the buffer.
     let target = editor.buffer.line_to_char(
         plan.first_line
             .min(editor.buffer.line_count().saturating_sub(1)),
@@ -257,13 +215,10 @@ pub fn update_substitute_preview(
     });
 }
 
-/// Revert and drop the preview.  The cursor returns to its pre-preview
-/// offset (submit's current-line resolution needs it); `restore_view`
-/// additionally restores the scroll — `true` on cancel, `false` on the
-/// submit path, where `execute_substitute` places the view itself.  When
-/// the revert is refused (version mismatch), the saved view is NOT
-/// restored — the buffer holds foreign text the saved positions don't
-/// belong to.  Returns `true` when a preview session existed.
+/// Revert and drop the preview, returning whether a session existed.  The cursor always returns to
+/// its pre-preview offset (submit's current-line resolution needs it); `restore_view` additionally
+/// restores the scroll — false on submit, where `execute_substitute` places the view.  A refused
+/// revert restores neither: the buffer holds foreign text the saved positions don't belong to.
 pub fn clear_substitute_preview(editor: &mut EditorState, restore_view: bool) -> bool {
     let Some(preview) = editor.substitute_preview.take() else {
         return false;
@@ -276,12 +231,9 @@ pub fn clear_substitute_preview(editor: &mut EditorState, restore_view: bool) ->
     true
 }
 
-/// Apply the preview's inverse delta through the raw buffer primitives.
-/// Returns `false` when the revert is refused on a version mismatch —
-/// some mutation slipped past the gates and the stashed original no
-/// longer lines up, so dropping the preview (the caller already
-/// `take()`d it) beats corrupting text.  A highlight-only preview
-/// (`revert: None`) has nothing to undo and reports success.
+/// Apply the preview's inverse delta through the raw buffer primitives.  Returns `false` when a
+/// version mismatch refuses the revert: the stashed original no longer lines up, so dropping the
+/// preview beats corrupting text.  A highlight-only preview has nothing to undo and succeeds.
 fn apply_revert(editor: &mut EditorState, preview: SubstitutePreview) -> bool {
     let Some(revert) = preview.revert else {
         return true;
@@ -293,9 +245,8 @@ fn apply_revert(editor: &mut EditorState, preview: SubstitutePreview) -> bool {
     true
 }
 
-/// Apply `delta` via the raw [`Buffer`] edit primitives — no undo delta
-/// recorded, `dirty` untouched — then re-parse so the very next frame
-/// renders the new text.
+/// Apply `delta` via the raw [`Buffer`] primitives — no undo delta, `dirty` untouched — then
+/// re-parse so the next frame renders the new text.
 fn apply_raw(editor: &mut EditorState, delta: &EditDelta) {
     if !delta.removed.is_empty() {
         let end = delta.offset + delta.removed.chars().count();
@@ -372,7 +323,6 @@ mod tests {
         assert_eq!(delta.offset, 0);
         assert_eq!(delta.removed, "foo foo\nfoo");
         assert_eq!(delta.inserted, "xy xy\nxy");
-        // Ranges are absolute byte offsets in the rewritten text.
         assert_eq!(plan.highlights, vec![0..2, 3..5, 6..8]);
     }
 
@@ -405,7 +355,6 @@ mod tests {
         )
         .unwrap()
         .expect("matches exist");
-        // "héllo" is 6 bytes; the space pushes the second match to 7.
         assert_eq!(plan.highlights, vec![0..6, 7..13]);
         let src = buf.contents();
         for r in &plan.highlights {
@@ -491,12 +440,10 @@ mod tests {
         let mut st = editor("foo");
         update_substitute_preview(&mut st, "%s/foo/ba", None, 24, 80);
         assert_eq!(st.buffer.contents(), "ba");
-        // Next keystroke: longer replacement, derived from the ORIGINAL
-        // text, not from the previewed "ba".
+        // Derived from the ORIGINAL text, not from the previewed "ba".
         update_substitute_preview(&mut st, "%s/foo/bar", None, 24, 80);
         assert_eq!(st.buffer.contents(), "bar");
-        // Backspacing across the second delimiter walks back to
-        // deletion-preview, then to highlight-only on the original text.
+        // Backspacing past the second delimiter: deletion preview, then highlight-only.
         update_substitute_preview(&mut st, "%s/foo/", None, 24, 80);
         assert_eq!(st.buffer.contents(), "", "deletion preview");
         update_substitute_preview(&mut st, "%s/foo", None, 24, 80);
@@ -525,7 +472,7 @@ mod tests {
         let mut st = editor("foo");
         update_substitute_preview(&mut st, "%s/foo/bar/", None, 24, 80);
         assert_eq!(st.buffer.contents(), "bar");
-        // The user backspaces the line down to `:w` — not a substitution.
+        // Backspaced down to `:w` — not a substitution.
         update_substitute_preview(&mut st, "w", None, 24, 80);
         assert_eq!(st.buffer.contents(), "foo", "preview reverted");
         assert!(st.substitute_preview.is_none());
@@ -536,8 +483,7 @@ mod tests {
         let mut st = editor("foo");
         update_substitute_preview(&mut st, "%s/foo/bar/", None, 24, 80);
         assert_eq!(st.buffer.contents(), "bar");
-        // A mutation slips past the gates (nothing should allow this;
-        // the version stamp is the fail-safe).
+        // Nothing should allow this mutation; the version stamp is the fail-safe.
         st.buffer.insert(0, "X");
         clear_substitute_preview(&mut st, true);
         assert_eq!(
@@ -553,12 +499,8 @@ mod tests {
         let mut st = editor("foo");
         update_substitute_preview(&mut st, "%s/foo/bar/", None, 24, 80);
         assert_eq!(st.buffer.contents(), "bar");
-        // A mutation slips past the gates mid-session (nothing should
-        // allow this; the version stamp is the fail-safe).
+        // Nothing should allow this mutation; the version stamp is the fail-safe.
         st.buffer.insert(0, "X");
-        // The next keystroke's recompute must end the session — a
-        // "fresh" plan here would stack preview edits on top of the
-        // orphaned preview text and stash a revert against that.
         update_substitute_preview(&mut st, "%s/bar/QQ/", None, 24, 80);
         assert_eq!(
             st.buffer.contents(),

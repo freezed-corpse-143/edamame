@@ -1,13 +1,5 @@
-//! Generic message-only modal used for warnings, errors, and stub
-//! notices that were previously surfaced as hint-line flashes.  Carries
-//! one or more body lines and a [`ModalKind`] that drives the title
-//! colour and label; no footer buttons — the user dismisses with `Esc`
-//! or the `esc` close affordance.
-//!
-//! Replaces the old sticky `MessageKind::Error` flash and the
-//! auto-expiring `Warning` flash for genuine refusals (e.g. "Insert
-//! Table requires a blank line"): a modal can't be missed and doesn't
-//! depend on a per-theme warning colour being visually loud.
+//! Buttonless message modal for warnings, errors, and refusals; the [`ModalKind`] drives
+//! the title.  Used instead of a flash where the user must not miss the message.
 
 use std::any::Any;
 
@@ -29,10 +21,7 @@ pub struct NoticeModal {
 }
 
 impl NoticeModal {
-    /// Build a notice from a single message string.  Multi-line input
-    /// is split on `\n` at render time so each source line becomes its
-    /// own `Line` and `ModalView`'s wrap logic only has to handle
-    /// horizontal overflow.
+    /// Multi-line `text` is split on `\n` at render time.
     pub fn new(text: impl Into<String>, kind: ModalKind) -> Self {
         Self {
             title: title_for(kind),
@@ -42,19 +31,13 @@ impl NoticeModal {
         }
     }
 
-    /// Raw message text, retained verbatim for duplicate-detection in
-    /// [`crate::app::App::notify`].  Compared against the next incoming
-    /// notice so a retry loop doesn't pile identical modals on the
-    /// stack.  Deliberately not exposed via the [`Modal`] trait —
-    /// `notify` downcasts to `NoticeModal` so other modal types don't
-    /// accidentally participate in dedup and silently get suppressed.
+    /// Raw text, for duplicate detection in [`crate::app::App::notify`].  Deliberately not
+    /// on the [`Modal`] trait so no other modal type can be silently deduplicated.
     pub(crate) fn text(&self) -> &str {
         &self.text
     }
 
-    /// Split the raw message into per-line `Line`s for `ModalView`.
-    /// Empty input still yields one blank line so the modal renders a
-    /// non-zero body.
+    /// Empty input still yields one blank line so the body is non-zero.
     fn body_lines(&self) -> Vec<Line<'static>> {
         let lines: Vec<Line<'static>> =
             self.text.lines().map(|l| Line::raw(l.to_owned())).collect();

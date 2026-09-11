@@ -1,15 +1,14 @@
-//! "Go to section" modal — a fuzzy-searchable list of every heading in the
-//! current document.  Built on the shared [`SearchableList`] component
-//! ([`crate::ui::searchable_list`]); this module only supplies the
-//! per-document heading entries, the heading-styled row formatter, and the
-//! modal framing.  Each row renders in its heading-level style (fg + bold,
-//! indent by depth) so the list visually resembles the document's outline.
+//! "Go to section" modal — every heading in the document, over the shared
+//! [`SearchableList`] component ([`crate::ui::searchable_list`]).  This module
+//! supplies only the entries, the heading-styled row formatter, and the modal
+//! framing; each row takes its heading-level style so the list resembles the
+//! document's outline.
 //!
-//! Selection is live-previewed: the modal adapter maps the component's
+//! Selection is live-previewed: the modal adapter maps
 //! [`ListEvent::FocusChanged`](crate::ui::searchable_list::ListEvent::FocusChanged) to a debounced viewport reposition and
-//! [`ListEvent::Submitted`](crate::ui::searchable_list::ListEvent::Submitted) to an immediate jump.  All the bookkeeping
-//! (`target_scroll` precomputed per entry, current-section preselection)
-//! happens in `App::open_section_picker`.
+//! [`ListEvent::Submitted`](crate::ui::searchable_list::ListEvent::Submitted) to an immediate jump.  The bookkeeping
+//! (precomputed `target_scroll`, current-section preselection) is
+//! `App::open_section_picker`'s.
 
 use pulldown_cmark::HeadingLevel;
 use ratatui::{
@@ -26,13 +25,13 @@ use crate::ui::searchable_list::{
     draw_searchable_list_modal, FocusPolicy, ListModalOpts, RowCtx, SearchableList,
 };
 
-/// One heading in the document.  Constructed by
-/// [`App::open_section_picker`](crate::app::App) so the picker doesn't need to
-/// know how to walk `ParsedDoc` itself.
+/// One heading in the document, built by
+/// [`App::open_section_picker`](crate::app::App) so the picker needn't walk
+/// `ParsedDoc` itself.
 ///
-/// `target_scroll` is the `EditorState::scroll` value that puts the heading's
-/// first visual row at the top of the viewport.  It's precomputed at open time
-/// using the current mode + viewport width; the picker only echoes it back.
+/// `target_scroll` — the `EditorState::scroll` putting the heading's first
+/// visual row at the viewport top — is precomputed at open time from the
+/// current mode and width; the picker only echoes it back.
 #[derive(Debug, Clone)]
 pub struct HeadingEntry {
     pub level: HeadingLevel,
@@ -44,31 +43,26 @@ pub struct HeadingEntry {
 /// Placeholder shown in the empty search field.
 const PLACEHOLDER: &str = "Type to filter sections…";
 
-/// Width floor used when the heading list is empty so the modal doesn't snap
-/// narrower than `(no headings)`.
+/// Width floor so an empty list doesn't snap narrower than `(no headings)`.
 const NO_HEADINGS_WIDTH: u16 = 16;
 
-/// Blank rows kept above and below the picker on a terminal tall enough to
-/// spare them.
+/// Blank rows above and below the picker, on a terminal tall enough to spare
+/// them.
 const SECTION_PICKER_VERTICAL_PAD: u16 = 4;
 
-/// Terminal-height threshold below which the picker drops its vertical padding
-/// and grows edge-to-edge so the cramped screen isn't wasted.
+/// Below this height the picker drops its padding and grows edge-to-edge.
 const SHORT_TERMINAL_ROWS: u16 = 20;
 
-/// Build the picker's list component from a precomputed entry list.  `focused`
-/// names the index into `entries` that should be preselected (the nearest
-/// preceding heading to the cursor) so the modal opens on the section the user
-/// is already reading; the row is centred on first render.
+/// Build the picker's list.  `focused` preselects an entry — the heading nearest
+/// above the cursor — so the modal opens on the section being read, centered.
 pub fn build_section_list(
     entries: Vec<HeadingEntry>,
     focused: usize,
 ) -> SearchableList<HeadingEntry> {
     let mut list = SearchableList::new(entries, |e: &HeadingEntry| e.text.as_str())
         .with_focus_policy(FocusPolicy::ResetToTop);
-    // Clamp an out-of-range preselect to the last entry (matching the legacy
-    // `focused.min(n - 1)`); `focus_item` is otherwise a no-op for a missing
-    // index and would leave focus on the first row.
+    // Clamped because `focus_item` is a no-op for a missing index and would
+    // otherwise leave focus on the first row.
     let clamped = focused.min(list.items().len().saturating_sub(1));
     list.focus_item(clamped);
     list.request_center();
@@ -84,9 +78,8 @@ pub fn render_section_picker(
     theme: &Theme,
     cursor_visible: bool,
 ) -> Option<Rect> {
-    // The picker grows to fill the available height (the modal adapter has
-    // already trimmed the bottom region from `area`).  Padding insets the
-    // modal from the edges only when the terminal can spare the rows.
+    // The picker fills the available height; `area` has already had the bottom
+    // region trimmed by the modal adapter.
     let vertical_pad = if area.height < SHORT_TERMINAL_ROWS {
         0
     } else {
@@ -128,15 +121,14 @@ pub fn render_section_picker(
     )
 }
 
-/// Indent (in spaces) used to render `level` in the list.  H1 = 1 space,
-/// H2 = 2, …, H6 = 6 — visually mirrors the editor's heading prefix.
+/// Indent in spaces for `level`, mirroring the editor's heading prefix.
 /// `HeadingLevel` is `repr(usize)` with H1..H6 = 1..6.
 fn indent_for(level: HeadingLevel) -> usize {
     level as usize
 }
 
-/// Pre-render width estimate: max over every entry of `indent + text`, +2 for
-/// a small right margin so focused-row backgrounds don't read flush.
+/// Widest `indent + text` over the entries, plus a 2-cell right margin so a
+/// focused row's background doesn't read flush.
 fn picker_content_width(entries: &[HeadingEntry]) -> u16 {
     let mut max_w: u16 = 0;
     for e in entries {
@@ -148,10 +140,8 @@ fn picker_content_width(entries: &[HeadingEntry]) -> u16 {
     max_w.saturating_add(2)
 }
 
-/// Format one heading row.  Focused rows match the command palette's selection
-/// styling (`theme.modal_item_selected`).  Unfocused rows pick up the
-/// heading's per-level color + bold (with `UNDERLINED` stripped) so the list
-/// echoes the document's outline.  Long headings are truncated with `…`.
+/// Format one heading row: the palette's selection styling when focused, else
+/// the heading's own per-level color and bold, so the list echoes the outline.
 fn format_heading_row(
     entry: &HeadingEntry,
     focused: bool,
@@ -209,10 +199,9 @@ mod tests {
 
     #[test]
     fn open_with_preselected_focus_clamps_to_bounds() {
-        // Out-of-range preselect clamps to the last entry.
         let list = build_section_list(sample(), 99);
         assert_eq!(list.focused_item_index(), Some(3));
-        // An empty list opens with no focused item rather than panicking.
+        // An empty list focuses nothing rather than panicking.
         let list = build_section_list(Vec::new(), 0);
         assert_eq!(list.focused_item_index(), None);
     }

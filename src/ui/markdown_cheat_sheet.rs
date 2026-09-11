@@ -1,24 +1,14 @@
-//! Markdown syntax cheat sheet — surfaced via the command palette entry
-//! `Show Markdown Cheat Sheet`.
+//! Markdown syntax cheat sheet, surfaced from the command palette.
 //!
-//! The body is built as styled `Line`s drawn directly from the active
-//! [`Theme`], so the cheat sheet visually matches preview / rendered
-//! mode (bold for `**bold**`, code-span colors for `` `code` ``, link
-//! color for `[text](url)`, and so on).  We deliberately do *not*
-//! parse the source as Markdown: the whole point of the sheet is to
-//! show the raw syntax markers, which a real renderer would consume.
+//! The body is hand-built as styled `Line`s off the active [`Theme`] so it matches preview mode.
+//! The source is deliberately *not* parsed as Markdown: the sheet exists to show the raw syntax
+//! markers a renderer would consume.
 //!
-//! Spans that carry no domain styling — indentation, separators between
-//! examples, and otherwise plain rows — use [`Span::raw`] / [`Line::raw`]
-//! so they inherit the surrounding `Paragraph` style (the modal's
-//! `theme.status_bar` background).  Using `theme.normal` here would be
-//! wrong: it explicitly resets `bg` to `Color::Reset`, which on a real
-//! terminal repaints the cell with the default background and lets the
-//! editor's dark fill bleed through the modal.
+//! Unstyled spans use [`Span::raw`] / [`Line::raw`] so they inherit the modal's `status_bar`
+//! background.  `theme.normal` would be wrong: it resets `bg` to `Color::Reset`, letting the
+//! editor's fill bleed through the modal.
 //!
-//! Tables are intentionally absent: they have a dedicated insert/edit
-//! flow so hand-coding the pipe-grid form is rarely useful.  Footnotes
-//! ARE listed — references and definitions are rendered and navigable.
+//! Tables are intentionally absent — they have a dedicated insert/edit flow.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -26,42 +16,29 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::Theme;
 
-/// Columns every example row is indented by, and so the margin a block
-/// surface keeps on *both* sides of the body — see [`pad_surface_lines`].
+/// Indent of every example row, and so the margin a block surface keeps on *both* sides of the
+/// body — see [`pad_surface_lines`].
 const EXAMPLE_INDENT: usize = 2;
 
-/// Build the styled cheat-sheet body for a body area of `avail`
-/// columns, one logical row per line.  Returned `Line`s carry
-/// theme-driven styling so the popover looks like preview/rendered mode
-/// while still showing the raw Markdown syntax markers.
+/// Build the styled cheat-sheet body for a body area of `avail` columns, one row per line.
 ///
-/// `avail` reaches only the surface rows (see [`pad_surface_lines`]).
-/// Everything else is *content* and wraps like any other modal body: a
-/// wrapped example is still readable, and clipping one would hide the
-/// syntax the sheet exists to show.
+/// `avail` reaches only the surface rows (see [`pad_surface_lines`]).  Everything else wraps like
+/// any other modal body: a wrapped example is still readable, a clipped one hides syntax.
 pub fn body_lines(theme: &Theme, avail: u16) -> Vec<Line<'static>> {
     let (mut lines, surface_pad) = build(theme);
     pad_surface_lines(&mut lines, &surface_pad, avail);
     lines
 }
 
-/// The rows, plus the indices of the ones carrying a block surface and
-/// the fill style each one's pad takes.  Split out from [`body_lines`]
-/// so the width-dependent pass is separable from the content — and so a
-/// test can tell a wash row from a content row that merely happens to
-/// end in a coloured span (`==highlight==` does).
+/// The rows, plus the indices of those carrying a block surface and the fill style each pad takes.
+/// Split from [`body_lines`] so a test can tell a wash row from a content row that merely ends in
+/// a colored span (`==highlight==` does).
 #[allow(clippy::vec_init_then_push)] // grouped pushes mirror the on-screen sections
 fn build(theme: &Theme) -> (Vec<Line<'static>>, Vec<(usize, Style)>) {
     let mut out: Vec<Line<'static>> = Vec::new();
-    // Indices of lines that carry a block *surface* — a background the row
-    // is meant to be washed with rather than a color on its glyphs — paired
-    // with the fill style their trailing pad should use.  A fenced-code or
-    // Mermaid language row uses `code_block_lang` (lighter `surface` bg),
-    // body and closing-fence rows `code_block_text` (darker `muted` bg),
-    // mirroring the actual renderer, which paints the lang label on a
-    // lighter surface than the body; a block-quote row uses the quote wash.
-    // A trailing-padding pass at the end fills the modal body width, so each
-    // surface reads as one rectangle instead of ending at its own text.
+    // Rows carrying a block *surface* — a background wash rather than a glyph color — paired with
+    // the fill style their trailing pad takes.  Language rows use the lighter `code_block_lang`
+    // and body / fence rows the darker `code_block_text`, mirroring the real renderer.
     let mut surface_pad: Vec<(usize, Style)> = Vec::new();
 
     // ── Headings ──────────────────────────────────────────────────────
@@ -178,10 +155,7 @@ fn build(theme: &Theme) -> (Vec<Line<'static>>, Vec<(usize, Style)>) {
 
     // ── Block quote ───────────────────────────────────────────────────
     out.push(section(theme, "Block quote"));
-    // Both rows register for the trailing-pad pass: `blockquote_text` is a
-    // background wash, so without it the two rows paint ragged rectangles of
-    // different widths — and one derived from the editor `bg` rather than
-    // the modal's `surface_elevated`, which makes the mismatch obvious.
+    // Both rows need the trailing-pad pass, or the wash paints two ragged rectangles.
     surface_pad.push((out.len(), theme.blockquote_text));
     out.push(Line::from(vec![
         Span::raw("  "),
@@ -244,10 +218,8 @@ fn build(theme: &Theme) -> (Vec<Line<'static>>, Vec<(usize, Style)>) {
 
     // ── Hard line break ───────────────────────────────────────────────
     out.push(section(theme, "Hard line break"));
-    // Both forms are CommonMark hard breaks and both export as `<br />`.
-    // The qualifier is deliberate: `Renderer::render_paragraph` splits at
-    // soft breaks as well, so on screen every source line already gets its
-    // own row and the markers change nothing — they matter on export.
+    // Both forms export as `<br />`.  The on-screen qualifier is deliberate: the renderer splits
+    // at soft breaks too, so the markers change nothing on screen — they matter on export.
     out.push(Line::raw(
         "  Two spaces at end of line  ⏎   or a trailing  \\",
     ));
@@ -272,33 +244,43 @@ fn build(theme: &Theme) -> (Vec<Line<'static>>, Vec<(usize, Style)>) {
         Span::raw("  "),
         Span::styled("```", theme.code_block_text),
     ]));
+    out.push(blank());
+
+    // ── Math (display) ────────────────────────────────────────────────
+    // Mirrors the Mermaid block above: a paragraph that is only `$$…$$`
+    // renders as a display-math formula.  The opening `$$` uses the
+    // language surface (`code_block_lang`), the body and closing `$$` the
+    // darker code surface (`code_block_text`) — the same three-row shape,
+    // so `size_surface_lines` gives it the same padded background.
+    out.push(section(theme, "Math (display)"));
+    surface_pad.push((out.len(), theme.code_block_lang));
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("$$", theme.code_block_lang),
+    ]));
+    surface_pad.push((out.len(), theme.code_block_text));
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("E = mc^2", theme.code_block_text),
+    ]));
+    surface_pad.push((out.len(), theme.code_block_text));
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("$$", theme.code_block_text),
+    ]));
 
     (out, surface_pad)
 }
 
-/// Size each surface-carrying line to exactly the body width, so its
-/// background reads as one rectangle — matching how
-/// `Renderer::render_code_block` pads to `viewport_width` and how
-/// `line_render`'s trailing-cell fill extends a block quote's wash to the
-/// viewport edge.  Each entry pairs a row index with the fill style for
-/// that row's pad — a code block's language row uses `code_block_lang`
-/// (lighter), its body / fence rows `code_block_text` (darker), a quote row
-/// `blockquote_text`.
+/// Size each surface-carrying line to the body width so its background reads as one rectangle,
+/// mirroring how the real renderer pads a code block to the viewport.
 ///
-/// The width is the widest *unregistered* row — which is what the modal
-/// sizes itself to — but never more than the `avail` columns the body
-/// will actually get.  A wash wider than that is the one row here that
-/// must not wrap: it is a picture of a block, and a wrapped one repeats
-/// its surface on a second, ragged row instead of continuing anything.
-///
-/// It stops [`EXAMPLE_INDENT`] columns short of that width, which is
-/// where it *starts*: every example row on the sheet is indented by
-/// that much, so a wash running flush to the body's right edge is a
-/// rectangle with a margin down one side and none down the other —
-/// visibly crowding the frame however much padding the modal has.
+/// The width is the widest *unregistered* row (what the modal sizes itself to), capped at `avail`:
+/// a wash is a picture of a block, and wrapping one repeats its surface on a second ragged row
+/// instead of continuing anything.  It stops [`EXAMPLE_INDENT`] columns short of that width, which
+/// is where it starts, so the rectangle keeps an equal margin on both sides.
 fn pad_surface_lines(lines: &mut [Line<'static>], surface_pad: &[(usize, Style)], avail: u16) {
-    // A mask rather than a `contains` scan per row: this runs on every
-    // frame, and both sequences are the length of the whole sheet.
+    // A mask rather than a per-row `contains` scan: this runs every frame.
     let mut is_surface = vec![false; lines.len()];
     for &(i, _) in surface_pad {
         is_surface[i] = true;
@@ -319,17 +301,16 @@ fn pad_surface_lines(lines: &mut [Line<'static>], surface_pad: &[(usize, Style)]
             std::cmp::Ordering::Less => line
                 .spans
                 .push(Span::styled(" ".repeat(target_width - cur), fill_style)),
-            // Only reachable in a terminal too narrow for the example's
-            // own text.  Truncating keeps the rectangle honest; the row
-            // is a picture, so a lost tail costs less than a wrap.
+            // Only in a terminal too narrow for the example's own text; a lost tail costs less
+            // than a wrap.
             std::cmp::Ordering::Greater => truncate_line(line, target_width),
             std::cmp::Ordering::Equal => {}
         }
     }
 }
 
-/// Drop whatever of `line` sits past `width` display columns, span by
-/// span.  A span straddling the boundary is cut on a char boundary.
+/// Drop whatever of `line` sits past `width` display columns; a straddling span is cut on a char
+/// boundary.
 fn truncate_line(line: &mut Line<'static>, width: usize) {
     let mut used = 0;
     let mut kept: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
@@ -359,26 +340,18 @@ fn truncate_line(line: &mut Line<'static>, width: usize) {
     line.spans = kept;
 }
 
-/// Empty row — uses `Line::raw` rather than a styled blank so the
-/// modal's `status_bar` background fills the spacer.
+/// Empty row.  `Line::raw`, not a styled blank, so the modal background fills the spacer.
 fn blank() -> Line<'static> {
     Line::raw("")
 }
 
-/// Render a section heading row (e.g. `Headings`, `Inline`, `Lists`).
-/// Reuses the H2 style so the popover's section dividers carry the
-/// same visual weight as a real H2 in preview mode.
+/// A section heading row, styled as a modal-internal divider.
 fn section(theme: &Theme, label: &'static str) -> Line<'static> {
     Line::from(Span::styled(label, theme.modal_section_heading))
 }
 
-/// Style applied to the *text* of a checked task list item.  Mirrors
-/// the rendered behaviour of `RenderedView`: when
-/// `theme.task_strikethrough` is true the text is crossed out;
-/// otherwise it stays unstyled so the modal background shows through.
-/// We deliberately do not start from `theme.normal` — that struct
-/// resets `bg` to `Color::Reset`, which would punch through the
-/// modal's `status_bar` fill.
+/// Style for the *text* of a checked task item, mirroring `RenderedView`.  Deliberately not built
+/// from `theme.normal`, whose `bg(Color::Reset)` would punch through the modal fill.
 fn task_done_text_style(theme: &Theme) -> Style {
     if theme.task_strikethrough {
         Style::default().add_modifier(Modifier::CROSSED_OUT)
@@ -391,8 +364,7 @@ fn task_done_text_style(theme: &Theme) -> Style {
 mod tests {
     use super::*;
 
-    /// A body area wide enough for the sheet's own natural width, so a
-    /// test about content is not also a test about narrow layout.
+    /// Wide enough for the sheet's natural width, so a content test isn't also a layout test.
     const WIDE: u16 = 120;
 
     fn joined(theme: &Theme) -> String {
@@ -411,11 +383,12 @@ mod tests {
         assert!(s.contains("~~strike~~"));
         assert!(s.contains("==highlight=="));
         assert!(s.contains("Mermaid"));
+        assert!(s.contains("Math (display)"));
+        assert!(s.contains("E = mc^2"));
         assert!(s.contains("Links"));
         assert!(s.contains("Images"));
         assert!(s.contains("Footnotes"));
         assert!(s.contains("[^1]"));
-        // Header anchor + local file + http examples in the Links section.
         assert!(s.contains("#heading-anchor"));
         assert!(s.contains("./notes.md"));
         assert!(s.contains("https://example.com"));
@@ -423,9 +396,7 @@ mod tests {
 
     #[test]
     fn cheat_sheet_excludes_tables_but_includes_footnotes() {
-        // Tables are surfaced through dedicated editing flows, not
-        // hand-coded markdown, so they stay out of the sheet.  Footnotes
-        // ARE rendered and navigable now, so they must appear.
+        // Tables have dedicated editing flows, so they stay out of the sheet.
         let theme = Theme::default();
         let s = joined(&theme);
         assert!(
@@ -446,9 +417,7 @@ mod tests {
 
     #[test]
     fn cheat_sheet_excludes_html_passthrough() {
-        // The renderer does not honour raw HTML, so the cheat sheet
-        // should not advertise `<br>` / `<details>` / `<sub>`-style
-        // tags.  This keeps user expectations honest.
+        // The renderer does not honor raw HTML, so the sheet must not advertise HTML tags.
         let theme = Theme::default();
         let s = joined(&theme);
         for token in &["<br>", "<details>", "<sub>", "<sup>"] {
@@ -461,10 +430,7 @@ mod tests {
 
     #[test]
     fn cheat_sheet_styles_track_theme() {
-        // The whole point of the rewrite: spans pull their style from
-        // the theme rather than carrying hardcoded colors.  Verify by
-        // building the body with two themes and confirming the bold
-        // span on the inline row picks up the theme's `bold` style.
+        // Spans must pull their style from the theme rather than hardcoding colors.
         let a = Theme {
             bold: Style::default().add_modifier(Modifier::BOLD),
             ..Theme::default()
@@ -485,9 +451,6 @@ mod tests {
 
     #[test]
     fn section_headings_use_modal_section_heading_style() {
-        // Section labels in the popover use `modal_section_heading`
-        // so they read as a modal-internal divider rather than as a
-        // document H2 floating on top of the modal surface.
         let theme = Theme::default();
         let lines = body_lines(&theme, WIDE);
         let headings_label = find_span(&lines, "Headings").expect("Headings label");
@@ -504,11 +467,7 @@ mod tests {
 
     #[test]
     fn a_wash_never_exceeds_the_body_it_is_drawn_in() {
-        // A wash is a picture of a block, so a wrap would repeat its
-        // surface on a second ragged row rather than continue it.  It is
-        // capped at the body width instead — and because that width is
-        // the *padded* body, the wash stops inside the modal's padding
-        // rather than at the frame edge.
+        // Capped at the *padded* body width, so a wash never wraps or reaches the frame edge.
         for avail in [20u16, 40, 64, 120] {
             for line in surface_rows(avail) {
                 assert!(
@@ -522,9 +481,7 @@ mod tests {
 
     #[test]
     fn a_wash_keeps_the_same_margin_on_both_sides() {
-        // It begins at the example indent, so it ends that far from the
-        // body's right edge; flush against it, the rectangle reads as
-        // crowding the frame no matter what the modal's padding is.
+        // It begins at the example indent, so it must end that far from the right edge too.
         let avail = 40;
         for line in surface_rows(avail) {
             assert_eq!(line.width(), avail as usize - EXAMPLE_INDENT, "{line:?}");
@@ -533,10 +490,8 @@ mod tests {
 
     #[test]
     fn only_the_washes_are_capped_and_the_content_still_wraps() {
-        // The regression this guards: clipping the whole body to keep
-        // the washes intact also truncated every example on the sheet,
-        // which is the syntax it exists to show.  Content rows keep
-        // their full width and let the modal wrap them.
+        // Regression: clipping the whole body to keep the washes intact truncated every example,
+        // which is the syntax the sheet exists to show.
         let theme = Theme::default();
         let (_, surface_pad) = build(&theme);
         let surfaces: Vec<usize> = surface_pad.iter().map(|&(i, _)| i).collect();
@@ -555,23 +510,13 @@ mod tests {
 
     #[test]
     fn separator_spans_inherit_modal_background() {
-        // Indentation / separator spans must NOT carry a fg / modifier of
-        // their own — they need to inherit the modal's `status_bar` fill.
-        // `theme.normal` sets `bg(Color::Reset)`, which paints the
-        // terminal default and lets the editor's dark fill bleed
-        // through the modal; using `Span::raw` (style == default)
-        // keeps the modal background intact.  Whitespace spans MAY
-        // carry an explicit bg, however — that's how the code-block
-        // sections fill their surface color out to the modal width.
+        // A whitespace span must not reset the bg: `theme.normal`'s `bg(Color::Reset)` paints
+        // the terminal default and lets the editor fill bleed through the modal.  An explicit
+        // theme bg is fine — that is how the code-block surfaces fill out to the modal width.
         let theme = Theme::default();
         let lines = body_lines(&theme, WIDE);
         for span in lines.iter().flat_map(|l| l.spans.iter()) {
             if span.content.chars().all(char::is_whitespace) {
-                // The hazard guarded here is `theme.normal`'s
-                // `bg(Color::Reset)`, which would punch through the
-                // modal fill.  Either no bg at all (inherits the
-                // modal's `status_bar`) or an explicit theme bg is
-                // fine — fg / modifier on whitespace is invisible.
                 let bg_ok = match span.style.bg {
                     None => true,
                     Some(ratatui::style::Color::Reset) => false,
@@ -588,16 +533,11 @@ mod tests {
 
     #[test]
     fn code_block_lines_fill_to_body_width() {
-        // The Code block and Diagrams sections should pad each row out
-        // with `code_block_text` so the surface background fills the
-        // modal body — matching the actual renderer's behaviour.  All
-        // padded code-block rows must be the same width as the widest
-        // non-code-block row (the modal sizes itself to that width).
+        // Padded code-block rows must match the widest non-code-block row, which is the width
+        // the modal sizes itself to.
         let theme = Theme::default();
         let lines = body_lines(&theme, WIDE);
 
-        // Find rows that have a span styled with code_block_border /
-        // code_block_lang / code_block_text — i.e. the code-block rows.
         let is_code_block_line = |line: &Line<'_>| {
             line.spans.iter().any(|s| {
                 s.style == theme.code_block_border
@@ -623,9 +563,7 @@ mod tests {
                  right-hand margin: {:?}",
                 line,
             );
-            // The trailing span on each padded row should be the surface
-            // fill; otherwise the right-hand columns won't show the code
-            // background.
+            // The trailing span must be the surface fill, or the right-hand columns stay bare.
             let last = line.spans.last().expect("non-empty code-block row");
             assert!(
                 last.content.chars().all(char::is_whitespace),
@@ -640,11 +578,8 @@ mod tests {
         }
     }
 
-    /// `blockquote_text` is a background wash, so the two quote rows need the
-    /// same trailing-pad pass the code-block rows get.  Without it each row's
-    /// wash stops at its own text — two ragged rectangles of different widths,
-    /// in a color derived from the editor `bg` rather than the modal's
-    /// `surface_elevated`, which is what makes the mismatch visible.
+    /// The quote rows need the same trailing-pad pass the code-block rows get; without it each
+    /// wash stops at its own text, giving two ragged rectangles of different widths.
     #[test]
     fn block_quote_rows_are_padded_to_the_body_width() {
         let theme = Theme::default();

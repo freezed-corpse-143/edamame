@@ -11,28 +11,23 @@ use super::runner::{write_atomically, ExportOutcome};
 use crate::diagram;
 use crate::image::{rasterize_svg, SvgScaleMode, SvgSizing};
 
-/// The compiled-in stylesheet bundled with edamame.  Used when
-/// [`HtmlExportOptions::stylesheet`] is [`Stylesheet::Builtin`].
+/// The compiled-in stylesheet, used for [`Stylesheet::Builtin`].
 pub const BUILTIN_STYLESHEET: &str = include_str!("../../config/export/default.css");
 
 /// Source of the CSS embedded in the generated HTML document.
 #[derive(Debug, Clone)]
 pub enum Stylesheet {
-    /// Use the edamame-bundled stylesheet (`config/export/default.css`).
+    /// The bundled `config/export/default.css`.
     Builtin,
     /// Read a user CSS file at export time.
     Path(PathBuf),
-    /// Use the supplied CSS verbatim.  Primarily for tests and embeddings —
-    /// the binary only ever builds `Builtin` / `Path` (via
-    /// `from_config_value`), so this is lib-only surface in the bin build.
+    /// CSS verbatim.  Tests and embeddings only — the binary builds `Builtin` / `Path`.
     #[allow(dead_code)]
     Inline(String),
 }
 
 impl Stylesheet {
-    /// Parse the string form of `[export.html].stylesheet` from the
-    /// config.  The sentinel `"builtin"` maps to [`Stylesheet::Builtin`];
-    /// every other value is treated as a filesystem path.
+    /// Parse `[export.html].stylesheet`: the sentinel `"builtin"`, or a filesystem path.
     pub fn from_config_value(value: &str) -> Self {
         if value.eq_ignore_ascii_case("builtin") {
             Self::Builtin
@@ -56,27 +51,19 @@ impl Stylesheet {
 pub struct HtmlExportOptions {
     /// Source of the embedded CSS.
     pub stylesheet: Stylesheet,
-    /// When true, relative `![alt](path.png)` references are read from
-    /// disk and base64-embedded as `data:` URIs so the generated HTML
-    /// is self-contained.  Requires `source_dir` to be set.
-    ///
-    /// Remote URLs (`http://`, `https://`, `data:`) are left untouched
-    /// regardless of this flag.
+    /// Embed relative image references as `data:` URIs so the HTML is self-contained.  Requires
+    /// `source_dir`; remote and already-`data:` URLs are untouched either way.
     pub inline_images: bool,
-    /// Directory used to resolve relative image paths when
-    /// `inline_images` is true.  Typically the directory containing the
-    /// source `.md` file.  `None` disables the rewrite even if
-    /// `inline_images` is true.
+    /// Resolves relative image paths, and bounds them: see [`resolve_relative`].  `None`
+    /// disables the rewrite even when `inline_images` is true.
     pub source_dir: Option<PathBuf>,
-    /// Value inserted into the `<title>` element.  When `None`, a
-    /// sensible fallback (`"Document"`) is used.
+    /// `<title>` text; `None` falls back to `"Document"`.
     pub title: Option<String>,
-    /// When true (the default), fenced ```mermaid code blocks
-    /// are rendered to inline SVG and wrapped in
-    /// `<figure class="mermaid-diagram">`.  Falls back to the usual
-    /// `<pre><code class="language-mermaid">` on render failure so the
-    /// source is never lost.
-    pub render_diagrams: bool,
+    /// Render *figures* — fenced ```mermaid code blocks and `$$...$$` display math — to PNG
+    /// embedded in a `<figure>` (`mermaid-diagram` / `math-formula`), each falling back to its
+    /// source form on failure so the source is never lost.  Independent of this flag, inline `$…$`
+    /// is always emitted as literal source, matching the terminal preview.
+    pub render_figures: bool,
 }
 
 impl Default for HtmlExportOptions {
@@ -86,21 +73,16 @@ impl Default for HtmlExportOptions {
             inline_images: false,
             source_dir: None,
             title: None,
-            render_diagrams: true,
+            render_figures: true,
         }
     }
 }
 
-/// Render `markdown` to a standalone HTML document.
+/// Render `markdown` to a standalone HTML document, mirroring the in-app renderer's parser
+/// options so an export looks like the terminal preview.
 ///
-/// Mirrors the parser options used by the in-app renderer (tables, task
-/// lists, strikethrough, footnotes, smart punctuation, and — when this
-/// document opens with one — frontmatter) so exported documents look the
-/// same as the terminal preview.  Raw HTML events —
-/// both block-level (`Event::Html`) and inline (`Event::InlineHtml`) —
-/// are filtered out before serialization so attacker-controlled Markdown
-/// cannot inject `<script>` tags or other executable content into the
-/// exported file.
+/// **Raw HTML events are filtered out before serialization** — block *and* inline — so
+/// attacker-controlled Markdown cannot inject `<script>` or other executable content.
 pub fn render_html(markdown: &str, opts: &HtmlExportOptions) -> Result<String> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -108,28 +90,22 @@ pub fn render_html(markdown: &str, opts: &HtmlExportOptions) -> Result<String> {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_SMART_PUNCTUATION);
-    // Frontmatter must be recognised here for the same reason it is in the
-    // renderer: without it, a `---` block parses as a thematic break plus
-    // a setext H2 and the exported file opens with the file's YAML keys
-    // as its loudest heading.  pulldown-cmark's HTML writer emits nothing
-    // for a metadata block, which is the wanted behavior — the
-    // frontmatter is data *about* the document, not part of its body.
-    //
-    // The extension is enabled only when *this* document opens with the
-    // matching delimiter, and the decision comes from the shared
-    // `metadata_options_for` rather than a second copy of the rule: the
-    // extensions are not anchored to the start of the document on their
-    // own, so leaving them on unconditionally would let a mid-document
-    // `---` separator claim the section under it — and, because the
-    // writer emits nothing for a metadata block, drop that section from
-    // the export without a word.
+    // Recognize math so `$$…$$` reaches `replace_math` as `Event::DisplayMath` (rasterized to a
+    // figure) rather than surviving as literal text.  `replace_math` always runs when this is on —
+    // even with figures disabled — so inline `$…$` and un-rasterized display math collapse back to
+    // their literal source instead of pulldown's `<span class="math">` wrapper.
+    options.insert(Options::ENABLE_MATH);
+    // Without the frontmatter extension a `---` block parses as a thematic break plus a setext
+    // H2, and the export opens with the YAML keys as its loudest heading.  It is gated on *this*
+    // document's opening delimiter, through the shared `metadata_options_for`: the extensions are
+    // not anchored to the document start on their own, so leaving them on unconditionally would
+    // let a mid-document `---` claim the section under it — and the writer emits nothing for a
+    // metadata block, so that section would vanish from the export silently.
     options |= crate::markdown::parse_offsets::metadata_options_for(markdown);
 
     let parser = Parser::new_ext(markdown, options);
 
-    // Collect so the optional image-rewrite pass can mutate events in
-    // place.  The event stream for a document of any realistic size is
-    // small relative to the rope we start from, so this is fine.
+    // Collected so the image-rewrite pass can mutate events in place.
     let mut events: Vec<Event> = parser
         .filter(|e| !matches!(e, Event::Html(_) | Event::InlineHtml(_)))
         .collect();
@@ -140,15 +116,15 @@ pub fn render_html(markdown: &str, opts: &HtmlExportOptions) -> Result<String> {
         }
     }
 
-    if opts.render_diagrams {
+    if opts.render_figures {
         events = replace_mermaid_with_image(events);
     }
+    // Always run, so inline `$…$` and (with figures off) display math
+    // collapse to literal source rather than a bare `<span class="math">`.
+    events = replace_math(events, opts.render_figures);
 
-    // Neutralize dangerous link schemes (`javascript:`, `vbscript:`,
-    // non-image `data:`, …) before serialization.  pulldown-cmark's HTML
-    // writer performs no URL sanitization, so without this a
-    // `[x](javascript:…)` link survives verbatim into the exported `<a
-    // href>` and runs on click in a browser.
+    // pulldown-cmark's HTML writer performs no URL sanitization, so without this a
+    // `[x](javascript:…)` link survives into the exported `<a href>` and runs on click.
     sanitize_link_urls(&mut events);
 
     let mut body = String::new();
@@ -176,13 +152,10 @@ pub fn render_html(markdown: &str, opts: &HtmlExportOptions) -> Result<String> {
     ))
 }
 
-/// Spawn a worker thread that renders `markdown` to `target`.  The
-/// provided closure is invoked on the worker thread once the write
-/// completes (or fails); callers typically forward the outcome to the
-/// App's mpsc channel so the UI thread can surface a transient message.
+/// Render `markdown` to `target` on a worker thread, invoking the closure there with the outcome.
 ///
-/// The caller is responsible for running [`crate::export::preflight`]
-/// first — this function will clobber `target` if it exists.
+/// **The caller must run [`crate::export::preflight`] first** — this clobbers an existing
+/// `target`.
 pub fn spawn_html_export(
     markdown: String,
     target: PathBuf,
@@ -204,13 +177,11 @@ fn render_and_write(markdown: &str, target: &Path, opts: &HtmlExportOptions) -> 
 
 // ── Link URL sanitization ─────────────────────────────────────────────────
 
-/// Schemes permitted on an exported link destination.  Everything else —
-/// notably `javascript:`, `vbscript:`, and `data:` — is neutralized.
+/// Schemes permitted on an exported link destination; everything else is neutralized.
 const SAFE_LINK_SCHEMES: &[&str] = &["http", "https", "mailto", "tel"];
 
-/// Rewrite the destination of every `Tag::Link` whose URL carries a scheme
-/// outside [`SAFE_LINK_SCHEMES`] to a harmless `#`.  Relative paths,
-/// anchors, and fragment targets carry no scheme and are left untouched.
+/// Rewrite every link destination outside [`SAFE_LINK_SCHEMES`] to a harmless `#`.  Relative
+/// paths and anchors carry no scheme and are untouched.
 fn sanitize_link_urls(events: &mut [Event<'_>]) {
     for event in events.iter_mut() {
         if let Event::Start(Tag::Link { dest_url, .. }) = event {
@@ -221,12 +192,9 @@ fn sanitize_link_urls(events: &mut [Event<'_>]) {
     }
 }
 
-/// True when `url` is safe to emit verbatim into an `<a href>`: either it
-/// has no URL scheme (relative path, `#anchor`, `?query`) or its scheme is
-/// on the allowlist.  A "scheme" is an RFC-3986 token — `alpha *( alpha /
-/// digit / "+" / "-" / "." )` — terminated by `:` *before* any `/`, `?`,
-/// or `#`; a colon that appears after one of those is part of the path
-/// (e.g. `foo/bar:baz`) and does not make a scheme.
+/// True when `url` has no scheme at all or an allowlisted one.  A "scheme" is an RFC-3986 token
+/// terminated by `:` *before* any `/`, `?`, or `#`; a later colon is part of the path
+/// (`foo/bar:baz`) and makes no scheme.
 fn is_safe_link_url(url: &str) -> bool {
     let url = url.trim();
     let Some(idx) = url.find([':', '/', '?', '#']) else {
@@ -244,8 +212,7 @@ fn is_safe_link_url(url: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
     if !scheme_shaped {
-        // The colon isn't part of a real scheme (e.g. a port-looking
-        // path segment) → treat as relative.
+        // Not a real scheme (a port-looking path segment) → relative.
         return true;
     }
     SAFE_LINK_SCHEMES
@@ -255,24 +222,15 @@ fn is_safe_link_url(url: &str) -> bool {
 
 // ── Mermaid diagrams ──────────────────────────────────────────────────────
 
-/// Walk the event stream; for every `Start(CodeBlock(Fenced("mermaid")))`
-/// ... `End(CodeBlock)` triple, try to render the enclosed text as a
-/// mermaid diagram and substitute a single `Event::Html` carrying
-/// `<figure class="mermaid-diagram"><img …></figure>`.  On render failure
-/// (or on non-mermaid code blocks) the original events are preserved so
-/// pulldown-cmark emits the usual `<pre><code class="language-mermaid">`
-/// — the diagram source is never lost.
+/// Replace each mermaid fence with a single `Event::Html` figure, preserving the original events
+/// on render failure so the diagram source is never lost.
 ///
-/// The diagram is **rasterized to a PNG** and embedded as a `data:` image
-/// rather than inlined as raw `<svg>`.  Inline SVG can carry `<script>`,
-/// `foreignObject`, and `on*=` event handlers that execute when the
-/// exported file is opened in a browser; rasterizing flattens the diagram
-/// to pixels, so no executable markup from the (document-controlled,
-/// third-party-rendered) SVG can survive into the export.
+/// **The diagram is rasterized to a PNG `data:` image, never inlined as `<svg>`.**  Inline SVG can
+/// carry `<script>`, `foreignObject`, and `on*=` handlers that execute when the export is opened
+/// in a browser; flattening to pixels means no executable markup from the document-controlled,
+/// third-party-rendered SVG can survive.
 ///
-/// Matching is case-insensitive on the language tag, same as the in-app
-/// `promote_diagram_code_blocks` pass, so round-tripping between the
-/// editor and the exported HTML is consistent.
+/// Language matching is case-insensitive, like the in-app `promote_diagram_code_blocks`.
 fn replace_mermaid_with_image(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
     let mut out: Vec<Event<'_>> = Vec::with_capacity(events.len());
     let mut iter = events.into_iter();
@@ -289,10 +247,8 @@ fn replace_mermaid_with_image(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
             out.push(event);
             continue;
         }
-        // Collect the Text events until the matching CodeBlock end, then
-        // decide — render succeeded → emit a single Event::Html, render
-        // failed → replay the original Start + Texts + End so the
-        // fallback `<pre><code>` is emitted by the default serialiser.
+        // Collect Text events to the matching end, then either emit one `Event::Html` or replay
+        // the originals for the default serializer's fallback.
         let mut buffered: Vec<Event<'_>> = vec![event];
         let mut source = String::new();
         for inner in iter.by_ref() {
@@ -306,10 +262,7 @@ fn replace_mermaid_with_image(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
                     buffered.push(inner);
                 }
                 other => {
-                    // pulldown-cmark should never emit other events
-                    // inside a fenced code block, but if it does we
-                    // treat it like text for the renderer and preserve
-                    // it for the fallback.
+                    // Shouldn't occur inside a fenced code block; treat as text and preserve.
                     buffered.push(other);
                 }
             }
@@ -324,12 +277,7 @@ fn replace_mermaid_with_image(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
                 out.push(Event::Html(CowStr::Boxed(html.into_boxed_str())));
             }
             None => {
-                // Falls back to the default code-block serialisation.
-                // The mermaid source is preserved verbatim so the user
-                // (or a downstream mermaid.js) can still see / render
-                // it.  We deliberately swallow the error here — the
-                // per-diagram failure is not fatal to the document
-                // export.
+                // Fall back to the code block; a per-diagram failure is not fatal to the export.
                 out.extend(buffered);
             }
         }
@@ -337,16 +285,23 @@ fn replace_mermaid_with_image(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
     out
 }
 
-/// Render mermaid `source` to a PNG `data:` URI, or `None` on any failure
-/// (so the caller falls back to the escaped code block).  The SVG produced
-/// by the renderer never reaches the HTML — it is rasterized to pixels
-/// first (white background, like the TUI path), which strips any script /
-/// `foreignObject` / event-handler payload a hostile node label might have
-/// smuggled through the renderer's escaping.
+/// Render mermaid `source` to a PNG `data:` URI, or `None` on any failure.  The intermediate SVG
+/// never reaches the HTML — rasterizing strips any script / `foreignObject` / event-handler
+/// payload a hostile node label smuggled through the renderer's escaping.
 fn render_mermaid_png_data_uri(source: &str) -> Option<String> {
     let svg = diagram::render_mermaid_svg(source).ok()?;
+    svg_to_png_data_uri(&svg)
+}
+
+/// Rasterize an already-rendered diagram/math SVG to a PNG `data:` URI on
+/// a white background (`None` on any failure).  Shared by the mermaid and
+/// display-math passes: both flatten their SVG to pixels — never inlining
+/// raw `<svg>`, which could carry `<script>` / `foreignObject` / `on*=`
+/// payloads — and embed the PNG as an `<img>`.  Natural sizing keeps the
+/// figure's own dimensions; `MAX_RASTER_*` in `image::svg` bounds them.
+fn svg_to_png_data_uri(svg: &str) -> Option<String> {
     let image = rasterize_svg(
-        &svg,
+        svg,
         SvgSizing {
             envelope: None,
             font_size: None,
@@ -363,6 +318,185 @@ fn render_mermaid_png_data_uri(source: &str) -> Option<String> {
     ))
 }
 
+// ── Display math ──────────────────────────────────────────────────────────
+
+/// Rewrite math events in the stream, mirroring the terminal's promotion
+/// rules (`markdown::parser::post_pass::promote_display_math_paragraphs`):
+///
+/// * A paragraph whose body is **only** display math (one or more
+///   `$$…$$`, plus whitespace and breaks) is a *figure* paragraph: the
+///   enclosing `<p>` is dropped (a block-level figure/code block can't nest
+///   in `<p>`) and each formula becomes its own block.  With figures on it
+///   rasterizes to a PNG `<figure class="math-formula">`; with figures off,
+///   or on a render failure, it becomes a fenced `math` code block
+///   (`push_display_math_source_block`) — the styled, padded box mermaid's
+///   non-inlined fallback gets, delimiters removed — never loose `$$…$$`
+///   text.
+/// * Everywhere else — inline `$…$`, display math mixed with other
+///   inlines, or math in a heading / list item — the math collapses to
+///   its literal `$…$` / `$$…$$` source, exactly as the terminal shows
+///   un-promoted math.
+///
+/// Enabling `Options::ENABLE_MATH` is what makes these events exist, so
+/// this pass must run whenever that option is set — otherwise pulldown's
+/// HTML writer would emit a bare `<span class="math">` wrapper (no KaTeX /
+/// MathJax ships with the export, so it would render as raw source anyway,
+/// only less predictably).
+///
+/// Rasterizing to PNG rather than inlining SVG is the same defence the
+/// mermaid pass relies on: no executable markup from RaTeX's output can
+/// survive into the exported file.
+fn replace_math(events: Vec<Event<'_>>, render_figures: bool) -> Vec<Event<'_>> {
+    let mut out: Vec<Event<'_>> = Vec::with_capacity(events.len());
+    let mut iter = events.into_iter();
+    while let Some(event) = iter.next() {
+        match event {
+            Event::Start(Tag::Paragraph) => {
+                // Buffer the paragraph body up to its close (paragraphs
+                // never nest in CommonMark, so the first End wins).
+                let mut body: Vec<Event<'_>> = Vec::new();
+                for inner in iter.by_ref() {
+                    if matches!(inner, Event::End(TagEnd::Paragraph)) {
+                        break;
+                    }
+                    body.push(inner);
+                }
+                if is_display_math_only(&body) {
+                    // A figure paragraph: drop the enclosing `<p>` (a
+                    // block-level `<figure>` / `<pre>` can't nest in `<p>`)
+                    // and emit one block per formula — a rasterized
+                    // `<figure>` when figures are on and the render
+                    // succeeds, otherwise a fenced `math` code block (the
+                    // export peer of the in-app figures-off `math` block,
+                    // and the parallel of mermaid's non-inlined code-block
+                    // fallback).  Whitespace text and breaks were only
+                    // separators between formulas — drop them with the `<p>`.
+                    for inner in body {
+                        if let Event::DisplayMath(source) = inner {
+                            if render_figures {
+                                push_display_math_figure(&mut out, &source);
+                            } else {
+                                push_display_math_source_block(&mut out, &source);
+                            }
+                        }
+                    }
+                } else {
+                    out.push(Event::Start(Tag::Paragraph));
+                    for inner in body {
+                        push_math_as_literal(&mut out, inner);
+                    }
+                    out.push(Event::End(TagEnd::Paragraph));
+                }
+            }
+            other => push_math_as_literal(&mut out, other),
+        }
+    }
+    out
+}
+
+/// True when `body` (a buffered paragraph's inner events) holds at least
+/// one display formula and nothing but display math, whitespace text, and
+/// line breaks — the same shape `collect_display_math_only` recognises in
+/// the terminal promotion pass.
+fn is_display_math_only(body: &[Event<'_>]) -> bool {
+    let mut saw_display = false;
+    for ev in body {
+        match ev {
+            Event::DisplayMath(_) => saw_display = true,
+            Event::Text(t) if t.trim().is_empty() => {}
+            Event::SoftBreak | Event::HardBreak => {}
+            _ => return false,
+        }
+    }
+    saw_display
+}
+
+/// Push `event`, converting any math to its literal source text
+/// (`$…$` / `$$…$$`) and passing everything else through untouched.
+fn push_math_as_literal<'a>(out: &mut Vec<Event<'a>>, event: Event<'a>) {
+    match event {
+        Event::InlineMath(source) => out.push(Event::Text(literal_math(&source, false))),
+        Event::DisplayMath(source) => out.push(Event::Text(literal_math(&source, true))),
+        other => out.push(other),
+    }
+}
+
+/// Emit one display formula as a `<figure class="math-formula">` PNG, or
+/// fall back to a fenced `math` code block ([`push_display_math_source_block`])
+/// on render failure — the same styled, padded box a non-inlined mermaid
+/// diagram gets, not loose `$$…$$` text.
+fn push_display_math_figure(out: &mut Vec<Event<'_>>, source: &str) {
+    match render_latex_png_data_uri(source) {
+        Some(data_uri) => {
+            let html = format!(
+                "<figure class=\"math-formula\">\
+                 <img alt=\"math formula\" src=\"{data_uri}\">\
+                 </figure>"
+            );
+            out.push(Event::Html(CowStr::Boxed(html.into_boxed_str())));
+        }
+        None => push_display_math_source_block(out, source),
+    }
+}
+
+/// Emit one display formula as a fenced `math` code block — the styled,
+/// padded box mermaid's non-inlined fallback produces (`<pre><code
+/// class="language-math">`, painted by the existing code-block rules), with
+/// the `$$` delimiters removed: pulldown already strips them from
+/// `Event::DisplayMath`, and the one surrounding newline on each side (the
+/// `$$` sitting on their own lines) is trimmed the way the in-app
+/// figures-off `math` block does.  Used whenever a display formula is *not*
+/// rasterized — figures off, or a render failure — so it reads as a
+/// formula rather than as source text stranded in a paragraph.
+///
+/// Emitted as real code-block events, not raw `Event::Html`, so pulldown's
+/// writer HTML-escapes the body: no LaTeX can inject markup into the
+/// exported file, the same guarantee `literal_math` gives.
+fn push_display_math_source_block(out: &mut Vec<Event<'_>>, source: &str) {
+    let trimmed = source.strip_prefix('\n').unwrap_or(source);
+    let body = trimmed.strip_suffix('\n').unwrap_or(trimmed);
+    out.push(Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(
+        CowStr::Borrowed("math"),
+    ))));
+    out.push(Event::Text(CowStr::Boxed(
+        body.to_string().into_boxed_str(),
+    )));
+    out.push(Event::End(TagEnd::CodeBlock));
+}
+
+/// The literal source form of a math span — `$source$` (inline) or
+/// `$$source$$` (display) — as an owned `CowStr`.  Emitted as an
+/// `Event::Text`, so pulldown's writer HTML-escapes it: the delimiters and
+/// LaTeX read back verbatim, exactly as the terminal shows un-rendered
+/// math.
+fn literal_math(source: &str, display: bool) -> CowStr<'static> {
+    let delim = if display { "$$" } else { "$" };
+    CowStr::Boxed(format!("{delim}{source}{delim}").into_boxed_str())
+}
+
+/// Reference cell height (px) the exporter renders display math at.  The
+/// in-app raster sizes off the *terminal's* real cell height; the exporter
+/// has none, so it passes this instead — larger than the 16 px terminal
+/// default so a formula reads at a comfortable display size in the browser
+/// (and stays crisp) rather than the cramped ~1-line PNG a 16 px cell gave.
+/// `diagram::render_latex_svg` scales the formula from it exactly as the
+/// TUI path does, so the export tracks the in-app look, only bigger.
+const HTML_EXPORT_MATH_CELL_PX: u16 = 24;
+
+/// Render display-math `source` to a PNG `data:` URI, or `None` on any
+/// failure (so the caller falls back to the literal source text).  Glyphs
+/// are drawn opaque black for a light document background; the SVG is
+/// rasterized to pixels, never inlined.
+fn render_latex_png_data_uri(source: &str) -> Option<String> {
+    let svg = diagram::render_latex_svg(
+        source,
+        [0, 0, 0, 255],
+        Some((HTML_EXPORT_MATH_CELL_PX, HTML_EXPORT_MATH_CELL_PX)),
+    )
+    .ok()?;
+    svg_to_png_data_uri(&svg)
+}
+
 // ── Image inlining ────────────────────────────────────────────────────────
 
 fn rewrite_images_to_data_uris(events: &mut [Event<'_>], source_dir: &Path) {
@@ -375,10 +509,8 @@ fn rewrite_images_to_data_uris(events: &mut [Event<'_>], source_dir: &Path) {
     }
 }
 
-/// Return a `data:` URI for `url` if it resolves to a readable local
-/// image file.  `None` signals "leave as-is" — covers remote URLs
-/// (`http(s)://`), URIs already in `data:` form, and any path we cannot
-/// read or classify.
+/// A `data:` URI for `url` if it resolves to a readable local image.  `None` means "leave as-is":
+/// remote URLs, existing `data:` URIs, and anything unreadable or unclassifiable.
 fn inline_image_data_uri(url: &str, source_dir: &Path) -> Option<String> {
     if is_remote_url(url) {
         return None;
@@ -401,18 +533,14 @@ fn is_remote_url(url: &str) -> bool {
         || lower.starts_with("file://")
 }
 
-/// Resolve a relative image `url` against `source_dir`, returning the path
-/// **only if it stays within `source_dir`**.  A self-contained HTML export
-/// is an artifact the victim typically shares, so an out-of-tree path
-/// (absolute, `../` traversal, or a symlink escape) would let a hostile
-/// document exfiltrate arbitrary on-disk files by riding them base64-
-/// encoded into the shared output.  Absolute paths and explicit `..`
-/// components are rejected up front; the post-`canonicalize` containment
-/// check additionally defeats symlinks that point outside the tree.
+/// Resolve a relative image `url` against `source_dir`, **only if it stays within it**.  A
+/// self-contained export is an artifact the victim shares, so an out-of-tree path would let a
+/// hostile document exfiltrate arbitrary files base64-encoded into that output.  Absolute paths
+/// and `..` components are rejected up front; the post-`canonicalize` containment check defeats
+/// symlink escapes.
 ///
-/// An out-of-tree reference returns `None` → the caller leaves the
-/// original (non-inlined) reference in place, so the export simply doesn't
-/// embed it rather than leaking it.
+/// `None` leaves the original reference in place — the export doesn't embed it rather than leaking
+/// it.
 fn resolve_relative(url: &str, source_dir: &Path) -> Option<PathBuf> {
     let p = Path::new(url);
     if p.is_absolute() {
@@ -444,8 +572,8 @@ fn mime_from_extension(path: &Path) -> Option<&'static str> {
 
 // ── HTML escaping ─────────────────────────────────────────────────────────
 
-/// Escape the five XML metacharacters.  Used only for the `<title>`
-/// element; the document body is escaped by `pulldown_cmark::html`.
+/// Escape the five XML metacharacters.  Only for `<title>`; the body is escaped by
+/// `pulldown_cmark::html`.
 fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -481,10 +609,7 @@ mod tests {
         assert!(html.contains("<p>World</p>"));
     }
 
-    /// Frontmatter is data about the document, not part of its body:
-    /// pulldown-cmark's writer suppresses a metadata block entirely.  The
-    /// options have to be enabled here too, or the export would reproduce
-    /// the rule-plus-setext-H2 misparse the renderer no longer has.
+    /// Without the extension the export reproduces the rule-plus-setext-H2 misparse.
     #[test]
     fn frontmatter_is_omitted_from_the_export() {
         let md = "---\ntitle: Foo\ndate: 2026-01-01\n---\n\n# Heading\n";
@@ -494,10 +619,8 @@ mod tests {
         assert!(!html.contains("<h2>"), "got: {html}");
     }
 
-    /// The export must not drop a section a mid-document `---` separator
-    /// happens to bracket.  pulldown-cmark's writer emits *nothing* for a
-    /// metadata block, so an unanchored extension here loses content the
-    /// user wrote — silently, and only in the exported file.
+    /// The writer emits *nothing* for a metadata block, so an unanchored extension would drop a
+    /// section a mid-document `---` pair brackets — silently, and only in the export.
     #[test]
     fn a_mid_document_rule_pair_is_not_dropped_from_the_export() {
         let md = "Intro.\n\n---\n## Section 2\n\nText.\n\n---\n## Section 3\n";
@@ -507,8 +630,7 @@ mod tests {
         assert!(html.contains("Section 3"), "got: {html}");
     }
 
-    /// The export's gate must be the same one the renderer uses, or the
-    /// two disagree about whether a block is frontmatter at all.
+    /// The export's gate must be the renderer's, or the two disagree about what frontmatter is.
     #[test]
     fn a_toml_opening_file_does_not_drop_a_later_dash_pair() {
         let md = "+++\na = 1\n+++\n\n---\nSection\n---\n\nEnd.\n";
@@ -576,9 +698,7 @@ mod tests {
 
     #[test]
     fn footnotes_render_with_bracket_convention() {
-        // The reference markup is the `<sup class="footnote-reference">…`
-        // that the bundled CSS targets to add `[ ]` brackets, and the
-        // bracket pseudo-element rules ship in the builtin stylesheet.
+        // The bundled CSS adds the `[ ]` brackets by targeting this exact markup.
         let opts = HtmlExportOptions {
             stylesheet: Stylesheet::Builtin,
             ..HtmlExportOptions::default()
@@ -646,14 +766,13 @@ mod tests {
             inline_images: true,
             source_dir: Some(dir.path().to_path_buf()),
             title: None,
-            render_diagrams: false,
+            render_figures: false,
         };
         let html = render_html(md, &opts).unwrap();
         assert!(
             html.contains("src=\"data:image/png;base64,"),
             "expected base64 data URI, got:\n{html}"
         );
-        // The original relative reference must be gone.
         assert!(!html.contains("src=\"pixel.png\""));
     }
 
@@ -665,7 +784,7 @@ mod tests {
             inline_images: true,
             source_dir: Some(PathBuf::from("/tmp")),
             title: None,
-            render_diagrams: false,
+            render_figures: false,
         };
         let html = render_html(md, &opts).unwrap();
         assert!(html.contains("src=\"https://example.com/cat.png\""));
@@ -709,7 +828,7 @@ mod tests {
         assert!(html.contains("href=\"mailto:x@y.z\""));
         assert!(html.contains("href=\"./page.md\""));
         assert!(html.contains("href=\"#anchor\""));
-        // A colon after a path segment is not a scheme → left intact.
+        // A colon after a path segment is not a scheme.
         assert!(html.contains("href=\"foo/bar:baz\""));
     }
 
@@ -734,14 +853,12 @@ mod tests {
 
     #[test]
     fn mermaid_export_never_emits_raw_svg_or_script() {
-        // Whether the live renderer is available or not, a hostile node
-        // label must never produce inline SVG or executable markup: a
-        // successful render is rasterized to a PNG data URI; a failed one
-        // falls back to an HTML-escaped code block.
+        // Holds whether or not the live renderer is available: a success rasterizes to PNG, a
+        // failure falls back to an escaped code block.
         let md = "```mermaid\nflowchart TD\n  A[\"<script>alert(1)</script>\"] --> B\n```";
         let opts = HtmlExportOptions {
             stylesheet: Stylesheet::Inline(String::new()),
-            render_diagrams: true,
+            render_figures: true,
             ..HtmlExportOptions::default()
         };
         let html = render_html(md, &opts).unwrap();
@@ -754,6 +871,148 @@ mod tests {
             !html.contains("<script>"),
             "no executable <script> may reach the export:\n{html}"
         );
+    }
+
+    // ── Display math ───────────────────────────────────────────────────
+
+    /// A `$$...$$` paragraph exports as a rasterized `math-formula` figure
+    /// (PNG data URI) — the same treatment mermaid gets — when figures are
+    /// on.  The KaTeX faces are bundled into the shared fontdb, so this
+    /// renders in CI without system fonts.
+    #[test]
+    fn display_math_exports_as_a_png_figure() {
+        let md = "$$\nx^2 + y^2 = z^2\n$$\n";
+        let opts = HtmlExportOptions {
+            stylesheet: Stylesheet::Inline(String::new()),
+            render_figures: true,
+            ..HtmlExportOptions::default()
+        };
+        let html = render_html(md, &opts).unwrap();
+        assert!(
+            html.contains("<figure class=\"math-formula\">"),
+            "expected a math-formula figure:\n{html}"
+        );
+        assert!(
+            html.contains("src=\"data:image/png;base64,"),
+            "formula must be a rasterized PNG:\n{html}"
+        );
+        // Rasterized to pixels, never inlined as SVG / math markup.
+        assert!(!html.contains("<svg"), "no raw SVG:\n{html}");
+        assert!(
+            !html.contains("class=\"math math-"),
+            "pulldown's math span must not survive:\n{html}"
+        );
+    }
+
+    /// The exported formula is rasterized at `HTML_EXPORT_MATH_CELL_PX`,
+    /// not the bare 16 px terminal-cell fallback, so a display equation
+    /// reads at a comfortable size in the browser instead of a cramped
+    /// ~1-line PNG.  Guards the export-sizing fix by decoding the figure
+    /// and asserting its pixel height clears what a 16 px cell produced.
+    #[test]
+    fn exported_display_math_is_rendered_large_enough_to_read() {
+        use image::GenericImageView;
+        let md = "$$\nx^2 + y^2 = z^2\n$$\n";
+        let opts = HtmlExportOptions {
+            stylesheet: Stylesheet::Inline(String::new()),
+            render_figures: true,
+            ..HtmlExportOptions::default()
+        };
+        let html = render_html(md, &opts).unwrap();
+        let marker = "data:image/png;base64,";
+        let start = html.find(marker).expect("png data uri present") + marker.len();
+        let end = start + html[start..].find('"').expect("data uri is quoted");
+        let bytes = BASE64
+            .decode(&html.as_bytes()[start..end])
+            .expect("valid base64 payload");
+        let (w, h) = image::load_from_memory(&bytes)
+            .expect("valid png")
+            .dimensions();
+        // A single-line display formula at the 24 px reference cell
+        // (`HTML_EXPORT_MATH_CELL_PX`) rendered tens of pixels tall —
+        // comfortably past the ~18 px a 16 px-cell fallback gave, and
+        // nowhere near runaway.
+        assert!(
+            (28..=160).contains(&h),
+            "exported formula height {h}px outside expected range (w={w})"
+        );
+    }
+
+    /// With figures disabled, a display-math paragraph renders as a
+    /// fenced `math` code block — the same styled, padded box mermaid's
+    /// non-inlined fallback gets — with the `$$` delimiters removed, never
+    /// loose `$$...$$` text in a paragraph and never a bare math span.
+    #[test]
+    fn display_math_off_renders_as_a_math_code_block() {
+        let md = "$$\na + b\n$$\n";
+        let opts = HtmlExportOptions {
+            stylesheet: Stylesheet::Inline(String::new()),
+            render_figures: false,
+            ..HtmlExportOptions::default()
+        };
+        let html = render_html(md, &opts).unwrap();
+        // Same box as a non-inlined mermaid diagram: a `<pre><code
+        // class="language-math">` block, painted by the existing code-block
+        // CSS — not a `<figure>`, not a math span, not literal `$$`.
+        assert!(
+            html.contains("<pre><code class=\"language-math\">"),
+            "expected a math code block:\n{html}"
+        );
+        assert!(html.contains("a + b"), "formula body kept:\n{html}");
+        assert!(!html.contains("$$"), "delimiters must be stripped:\n{html}");
+        assert!(!html.contains("<figure"), "no figure when off:\n{html}");
+        assert!(
+            !html.contains("class=\"math math-"),
+            "no math span:\n{html}"
+        );
+    }
+
+    /// A display formula that can't be rasterized (here: over the
+    /// `MAX_LATEX_SOURCE_BYTES` cap, so `render_latex_svg` refuses it)
+    /// falls back to the same `math` code block, not loose `$$...$$` text —
+    /// figures on, but the render fails.
+    #[test]
+    fn oversized_display_math_falls_back_to_a_code_block() {
+        let huge = "1+".repeat(64 * 1024); // well past MAX_LATEX_SOURCE_BYTES
+        let md = format!("$$\n{huge}1\n$$\n");
+        let opts = HtmlExportOptions {
+            stylesheet: Stylesheet::Inline(String::new()),
+            render_figures: true,
+            ..HtmlExportOptions::default()
+        };
+        let html = render_html(&md, &opts).unwrap();
+        assert!(
+            html.contains("<pre><code class=\"language-math\">"),
+            "render failure must fall back to a math code block, not a figure or literal text"
+        );
+        assert!(
+            !html.contains("data:image/png"),
+            "no PNG when the render failed:\n{}",
+            &html[..html.len().min(400)]
+        );
+    }
+
+    /// Inline `$...$` math always stays literal source (delimiters kept),
+    /// matching the terminal preview — regardless of the figures toggle.
+    #[test]
+    fn inline_math_stays_literal_source() {
+        let md = "Solve $a^2 + b^2$ please.\n";
+        for render_figures in [true, false] {
+            let opts = HtmlExportOptions {
+                stylesheet: Stylesheet::Inline(String::new()),
+                render_figures,
+                ..HtmlExportOptions::default()
+            };
+            let html = render_html(md, &opts).unwrap();
+            assert!(
+                html.contains("$a^2 + b^2$"),
+                "inline math must read back as literal source (figures={render_figures}):\n{html}"
+            );
+            assert!(
+                !html.contains("class=\"math math-"),
+                "no math span (figures={render_figures}):\n{html}"
+            );
+        }
     }
 
     // ── Vuln 4: image inlining stays within the source tree ────────────
@@ -781,7 +1040,7 @@ mod tests {
             stylesheet: Stylesheet::Inline(String::new()),
             inline_images: true,
             source_dir: Some(source.path().to_path_buf()),
-            render_diagrams: false,
+            render_figures: false,
             ..HtmlExportOptions::default()
         };
         let html = render_html(&md, &opts).unwrap();
@@ -804,7 +1063,7 @@ mod tests {
             stylesheet: Stylesheet::Inline(String::new()),
             inline_images: true,
             source_dir: Some(source.clone()),
-            render_diagrams: false,
+            render_figures: false,
             ..HtmlExportOptions::default()
         };
         let html = render_html(md, &opts).unwrap();

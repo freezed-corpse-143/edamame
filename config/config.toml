@@ -1,248 +1,151 @@
 # edamame configuration
 #
-# Uncommented lines are values that deviate from the compiled-in defaults, or
-# settings we expect users to set explicitly (capability warnings, remote-image
-# policy). Anything else appears commented-out as a reference — uncomment and
-# edit to override.
+# Full reference: docs/configuration.md (or press Ctrl-P → "Docs: Configuration" in edamame).
+#
+# Commented-out lines show the compiled-in default — uncomment and edit to override.
+# The handful of keys left uncommented below are the ones most people set: the theme,
+# the appearance mode, and the image / figure consent switches.  Settings changed from
+# inside edamame are written back here, preserving your comments, order, and spacing.
 
-# Name of the active theme. Built-in themes (see BUILTIN_THEMES in
-# src/config/theme.rs) are resolved by name; any other name is loaded
-# from themes/<theme>.toml. To author a custom theme, drop a TOML file
-# in themes/ and set `theme` to its stem.
+# Active theme — a built-in name or the stem of a themes/<name>.toml file.  See docs/themes.md.
 theme = "Edamame"
 
-# Appearance mode — filters the theme picker so only themes matching this mode
-# are shown, and decides which counterpart theme is previewed when the mode is
-# toggled.  Must be "dark" or "light".  Default: "dark".  Toggle interactively
-# via the "Dark mode" slider in the theme picker (open it from the command
-# palette, Ctrl-P → "Switch theme"); there is no default chord for the picker
-# and no Appearance row in the settings overlay.
+# Appearance mode for the theme picker: "dark" or "light".
 appearance = "dark"
 
 # ── Editor ────────────────────────────────────────────────────────────────────
 [editor]
-# Wrap long lines at the terminal width. When false, long lines extend past the
-# visible area without wrapping. Default: true.
+
+# Wrap long lines at the terminal width.
 # line_wrap = true
 
-# Wrap lines inside fenced/indented code blocks that exceed the terminal width.
-# Kept separate from `line_wrap` because wrapped code is often harder to read
-# than clipped code. Default: false.
+# Wrap long lines inside code blocks (separate — wrapped code is often harder to read).
 # code_block_wrap = false
 
-# Render multiple consecutive blank lines in the source as multiple blank lines
-# in the output. Standard Markdown collapses them to one; this preserves the
-# author's spacing. Default: true.
+# Render consecutive blank lines verbatim instead of collapsing them.
 # preserve_blank_lines = true
 
-# Move the cursor by *visual* lines with Up/Down, so it keeps its horizontal
-# screen column across a wrapped line. When false, Up/Down move by logical
-# (newline-terminated) buffer lines. Exposed as the settings-overlay row
-# "Use visual line navigation". Default: true.
+# Reflow soft-wrapped prose into one paragraph, re-wrapped to the viewport.
+# reflow = true
+
+# Up/Down move by visual (wrapped) rows, keeping the screen column.
 # visual_line_nav = true
 
-# Show the first-run welcome modal at startup. The modal's "Show on next
-# launch" toggle writes this value when you save. While the welcome is still
-# pending it also suppresses the images / remote-image / diagrams / capabilities
-# prompts so you are never double-prompted. Default: true.
-# show_welcome = true
-
-# Check GitHub for a newer release at startup, at most once every 24 hours.
-# The check is silent: it says nothing when you are up to date, and shows a
-# modal only the first time a genuinely newer version appears. Turning this
-# off disables only the automatic check — "Check for updates" on the About
-# page and in the command palette always checks on request. Exposed as the
-# settings-overlay row "Check for updates" and on the welcome modal.
-# See docs/security.md for what the request does and does not send.
-# Default: true.
-# check_for_updates = true
-
-# Bookkeeping for the update check, written by edamame rather than by hand:
-# when the last automatic check ran (Unix epoch seconds, 0 = never) and which
-# release tag you have already been shown a notice for. Delete them to be
-# reminded again about the current release.
-# last_update_check = 0
-# update_notified_for = ""
-
-# The version that last ran. After an upgrade, edamame shows the release
-# notes for the new version once, read from the changelog built into the
-# binary — no network, and unrelated to the update check above. Written by
-# edamame rather than by hand. The "Release notes" button on the About page
-# shows them at any time without touching this.
-# last_version_seen = ""
-
-# Fingerprints of terminals that have already shown the capabilities notice.
-# Dismissing the notice (or completing the welcome modal) appends the current
-# terminal's fingerprint here so it won't fire again. Launching in a new,
-# previously-unseen terminal re-fires the notice once. Clear this list to see
-# the capabilities notice on the next launch.
-# seen_terminal_fingerprints = []
-
-# Show line numbers in a left gutter in all modes. Default: false.
+# Show line numbers in a left gutter.
 # show_line_numbers = false
 
-# Lines advanced per mouse-wheel tick. Default 1 (fine control); 2 or 3 gives
-# a faster, coarser scroll. This setting also applies to touchpad scroll speed,
-# for which 1 might feel better. Keyboard scrolling always steps by one line and
-# is unaffected by this setting.
+# Lines advanced per mouse-wheel / trackpad tick.
 # mouse_scroll_lines = 1
 
-# Duration (ms) that a transient hint-line notification lingers before
-# auto-expiring. Default: 1500. Error messages ignore this and stay until
-# dismissed with Esc.
-# transient_ms = 1500
+# Cap the content width and center it; the status / hint rows always span full width.
+# max_width_enabled = true
 
-# Cap the editor content to a fixed column width and centre it horizontally
-# inside the terminal. The bottom status / hint region always spans the full
-# terminal width. Has no effect when the terminal is narrower than the cap.
-# Default: false (full terminal width is used).
-# max_width_enabled = false
-
-# Maximum content width in columns when `max_width_enabled` is true.
-# Floored at 20 to keep layout sane. Default: 100.
+# Content width cap in columns (floored at 20).
 # max_width_cols = 100
 
-# Silently save the buffer to disk after `autosave_idle_ms` of typing
-# inactivity. Only buffers with an associated file path autosave; an
-# unnamed buffer (e.g. `edamame` with no filename) is never written.
-# A successful autosave flashes "Autosaved" on the hint line.
-# Default: false.
-# autosave_enabled = false
-
-# Idle window (ms) the user must stop editing for before the pending
-# dirty buffer is autosaved. Every keystroke resets the timer, so a
-# typing burst produces at most one autosave at the end of the burst.
-# Must be strictly between 1000 and 600000 (10 min); out-of-range
-# values are ignored at load time (with a warning) and the default is
-# used instead. This setting is only configurable via this file —
-# the settings overlay exposes only the on/off toggle. Default: 5000.
-# autosave_idle_ms = 5000
-
-# Render H1 headings as 4-row "big text" using Quadrant block characters
-# (▘▝▖▗▀▄▌▐█), via the `tui-big-text` widget. Falls back to the regular
-# one-line styled rendering when the title would exceed the viewport width
-# or contains non-ASCII characters. Default: false.
+# Render H1 headings as 4-row big text (ASCII titles only; falls back otherwise).
 # big_h1 = false
 
-# Syntax highlight fenced code blocks, using the language named in the
-# opening fence (```rust). The language is never guessed: a fence with no
-# language, or one naming a grammar edamame does not ship, renders as plain
-# code. Token colors come from the active theme's `syntax_*` fields, so a
-# custom theme can restyle them. Default: true.
+# Syntax-highlight fenced code blocks by the language in the fence (never guessed).
 # syntax_highlighting = true
 
-# Blink the editor cursor. When false the cursor is drawn solid and never
-# hidden. The settings overlay exposes this on/off toggle. Default: true.
+# Blink the cursor.
 # cursor_blink = true
 
-# Cursor blink half-period in milliseconds — the cursor toggles between
-# visible and hidden every `cursor_blink_ms`. Only consulted when
-# `cursor_blink` is true. This cadence is file-only (the overlay exposes
-# only the on/off toggle). Default: 530.
+# Cursor blink half-period in milliseconds (only when cursor_blink is true).
 # cursor_blink_ms = 530
 
-# Review external changes in diff mode. When true (default), a file
-# modified on disk while this buffer is clean opens diff-review mode so
-# you see each change hunk by hunk before it replaces what's on screen.
-# When false, a clean buffer is silently reloaded from disk instead. A
-# buffer with unsaved edits always prompts the conflict modal regardless
-# (whose [Merge] button still enters diff review on demand). Exposed as
-# the "Diff when file changes" toggle in the settings overlay. Default: true.
+# How long a transient hint-line message lingers, in milliseconds.
+# transient_ms = 1500
+
+# Autosave after a spell of typing inactivity (never for an unnamed buffer).
+# autosave_enabled = false
+
+# Autosave idle window in milliseconds; must be between 1000 and 600000.
+# autosave_idle_ms = 5000
+
+# Review external changes in diff mode when the buffer is clean (else reload silently).
 # diff_on_change = true
 
-# Show the explainer modal when entering diff review. The modal's
-# "Don't show this again" checkbox flips this to false; set it back to
-# true here to re-enable the intro. File-only (not in the settings
-# overlay). Default: true.
+# Show the explainer modal when entering diff review.
 # show_diff_intro = true
 
+# Show the first-run welcome modal at startup.
+# show_welcome = true
+
+# Check GitHub for a newer release at startup, silent unless one exists.  See docs/security.md.
+# check_for_updates = true
+
 # ── Modal ─────────────────────────────────────────────────────────────────────
-# Which modal handler processes key events. "default" is the non-modal
-# chord/shortcut keymap; "vim" enables Vim-style modal editing and motions
-# (only a subset of Vim is supported — see the docs). This can also be
-# toggled from the first-run welcome modal.
 # [modal]
+
+# Editing handler: "default" (chord shortcuts) or "vim" (modal editing — see docs/vim-mode.md).
 # handler = "default"
 
 # ── Table ─────────────────────────────────────────────────────────────────────
-[table]
-# Show row / column buttons on tables when the terminal supports mouse
-# reporting: `⠿` reorder grips, `⇔` resize glyph, and `✕` row/column
-# delete glyphs.  Default: true.
-show_buttons = true
-# Stripe alternating data rows with `theme.table_row_even` / `table_row_odd`.
-row_striping = true
-# Show a confirmation modal the first time a column-border drag would inject
-# a `<!-- tui-columns: [...] -->` comment into the Markdown source.  The
-# modal's "Continue and don't ask again" button flips this to false.
-warn_on_width_injection = true
+# [table]
+
+# Show row / column mouse handles on tables (auto-disabled without mouse support).
+# show_buttons = true
+
+# Stripe alternating data rows.
+# row_striping = true
+
+# Warn before a column resize writes a tui-columns HTML comment into the source.
+# warn_on_width_injection = true
 
 # ── Images ────────────────────────────────────────────────────────────────────
 [images]
-# Master switch for inline image rendering: "ask" | "always" | "never".
+
+# Inline image rendering: "ask" | "always" | "never".
 enabled = "ask"
-# Ceilings in terminal cells. Images are scaled to fit within
-# max_width × max_height while preserving aspect ratio. Defaults: 100 × 24.
-# max_width = 100
-# max_height = 24
-# Policy for `http(s)://` image URLs: "ask" | "always" | "never".
+
+# Policy for remote http(s) image URLs: "ask" | "always" | "never".
 remote_policy = "ask"
-# Directory where pasted screenshots are saved. Defaults to a global
-# per-user directory under the XDG data dir (~/.local/share/edamame/images
+# Directory where pasted screenshots are saved. Empty (the default) means a
+# global per-user directory under the XDG data dir (~/.local/share/edamame/images
 # on Linux/macOS, %APPDATA%\edamame\images on Windows). A relative value
 # resolves against the open document; absolute is used verbatim. Overridden
 # by the EDAMAME_IMAGES_DIR environment variable when set. Only screenshots
 # land here: a copied image *file* is referenced where it lies.
 # save_dir = ""
 
-# ── Diagrams ──────────────────────────────────────────────────────────────────
-[diagrams]
-# Master switch for inline diagram rendering (e.g. ```mermaid):
-# "ask" | "always" | "never".  Kept separate from `[images].enabled` so a
-# user can opt in to one without the other.
+# Size ceilings in terminal cells; images scale to fit while keeping aspect ratio.
+# max_width = 100
+# max_height = 24
+
+# ── Figures ───────────────────────────────────────────────────────────────────
+[figures]
+
+# Inline rendering of mermaid diagrams and $$...$$ math: "ask" | "always" | "never".
 enabled = "ask"
 
-# ── Export ────────────────────────────────────────────────────────────────────
-# Run an export from the command palette (Ctrl-P → "Export…"). Pick the
-# output format — HTML, or anything you configure under [[export.custom]]
-# below — from the Format list at the bottom of the modal. These are the
-# defaults that modal opens with; choosing different options in it writes
-# them back here.
-# [export.html]
-# stylesheet     = "builtin"    # "builtin" (the bundled default), or a path to
-#                               # a .css file. Drop custom stylesheets in the
-#                               # `export/` folder beside this file and they
-#                               # show up in the export modal's stylesheet
-#                               # picker. A `default.css.example` reference is
-#                               # written there on first run — copy it to
-#                               # `<name>.css` and edit it as a starting point.
-# inline_images  = false        # when true, local images are base64-embedded
-# diagrams       = true         # render ```mermaid blocks as inline SVG
-#                               # (false → leave as <pre><code class="language-mermaid">)
+# Keep a math formula rendered and edit its source just below it, live (math blocks only).
+# math_preview = true
 
-# Custom export targets. Each block adds one format to the export modal's
-# Format list. edamame renders the document to HTML first — using the
-# [export.html] options above, so the stylesheet and the two inline toggles
-# shape the result — then runs your command over it. Output lands beside the
-# document: `notes/guide.md` with extension = "pdf" writes `notes/guide.pdf`.
-#
-# Two placeholders are substituted anywhere in `command`:
-#   {html}  the rendered HTML (a temp file, deleted afterwards)
-#   {out}   the file to write
-# A command that writes to stdout instead of {out} also works — edamame
-# captures it. Nothing goes through a shell, so `command` is an argv list,
-# not a string; use ["sh", "-c", "..."] if you want shell syntax.
-#
-# Repeat the block for as many targets as you like.
+# ── Export ────────────────────────────────────────────────────────────────────
+# Defaults the export modal (Ctrl-P → "Export…") opens with; your picks are written back.
+# [export.html]
+
+# Stylesheet: "builtin", or a .css file dropped in the export/ folder beside this file.
+# stylesheet = "builtin"
+
+# Base64-embed local images so the exported HTML is self-contained.
+# inline_images = false
+
+# Render mermaid diagrams and $$...$$ math to embedded PNG (false leaves them as source).
+# figures = true
+
+# Custom export targets each add a format to that modal.  edamame renders to HTML first,
+# then runs your command; {html} is the rendered file, {out} the output.  Repeat the block
+# per target.
 # [[export.custom]]
 # name      = "PDF (weasyprint)"
 # command   = ["weasyprint", "{html}", "{out}"]
 # extension = "pdf"
 
 # ── Dev ───────────────────────────────────────────────────────────────────────
-# Developer tooling. When `logging` is true, structured `tracing` logs are
-# written to the XDG data directory (e.g. ~/.local/share/edamame/); otherwise
-# the tracing subscriber is never initialized and all `tracing::*` calls are
-# no-ops. Default: false — keeps the TUI silent in normal use.
 # [dev]
+
+# Write tracing logs to the XDG data dir (useful when reporting a bug).
 # logging = false

@@ -1,24 +1,14 @@
 //! First-run welcome modal.
 //!
-//! Built on the `scroll_container` chrome primitives like
-//! [`crate::ui::theme_picker`] rather than the simpler `ModalView`,
-//! because the body contains interactive tri-state pill rows and a
-//! click-through theme button that aren't expressible as a flat
-//! body+button-row layout.
+//! Built on the `scroll_container` chrome primitives rather than `ModalView`: the body has
+//! interactive tri-state pill rows and a click-through theme button, which a flat
+//! body+button-row layout can't express.
 //!
-//! The widget is UI-only.  The adapter
-//! `src/app/modal/welcome.rs` wires the responses back into `App`:
-//! Save persists everything; the Theme button pushes the theme picker
-//! onto the modal stack so it stacks ON TOP of the welcome and pops
-//! back to it on close.
+//! UI-only — `src/app/modal/welcome.rs` wires the responses back into `App`.
 //!
-//! Layout is computed at render time from the available terminal area:
-//! the "Getting started" paragraph and the degraded-capabilities hint
-//! both wrap at the modal's body width, and the body is rendered into
-//! a scratch buffer of the natural height before a `scroll`-offset
-//! window is blitted into the visible body area.  This lets the modal
-//! gracefully scroll on small terminals instead of clipping or
-//! collapsing rows.
+//! Layout is computed at render time: the body is rendered into a scratch buffer of its natural
+//! height, then a `scroll`-offset window is blitted into the visible area, so a small terminal
+//! scrolls instead of clipping.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -29,7 +19,7 @@ use ratatui::{
     widgets::{Block, Paragraph, StatefulWidget, Widget, Wrap},
 };
 
-use crate::config::{DiagramsEnabled, ImagesEnabled, RemoteImagePolicy, Theme};
+use crate::config::{FiguresEnabled, ImagesEnabled, RemoteImagePolicy, Theme};
 use crate::terminal::Capabilities;
 use crate::ui::cap_summary::{cap_row_height, render_cap_row as shared_render_cap_row, CapSummary};
 use crate::ui::controls::{self, Control, ControlEvent, ControlInput, ControlValue};
@@ -65,13 +55,9 @@ const FOCUS_ORDER: [WelcomeFocus; 8] = [
 ];
 
 impl WelcomeFocus {
-    /// Position of this variant within [`FOCUS_ORDER`] — the single
-    /// source of truth shared by Tab navigation and the `focus_offsets`
-    /// slot each render pass writes to.  Using this instead of literal
-    /// indices means inserting a new focusable row only requires editing
-    /// `FOCUS_ORDER`; the offset assignments can never drift out of sync.
-    /// Panics if a variant is missing from `FOCUS_ORDER`, which
-    /// `every_focus_variant_is_ordered` guards against at test time.
+    /// Position within [`FOCUS_ORDER`], shared by Tab navigation and the `focus_offsets` slot
+    /// each render writes — so the two can't drift when a row is added.  Panics on a variant
+    /// missing from `FOCUS_ORDER`, which `every_focus_variant_is_ordered` guards at test time.
     fn order_index(self) -> usize {
         FOCUS_ORDER
             .iter()
@@ -84,85 +70,56 @@ impl WelcomeFocus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WelcomeResponse {
     Continue,
-    /// User clicked / activated the Theme button.  Caller should open
-    /// the theme picker on top of this modal.
+    /// Open the theme picker on top of this modal.
     OpenThemePicker,
-    /// User pressed Save.  Caller should persist the choices the state
-    /// exposes and dismiss the modal.
+    /// Persist the choices the state exposes and dismiss.
     Save,
-    /// User pressed `Esc` / clicked the `esc` affordance on a
-    /// [`WelcomeState::dismissable`] instance.  Caller should close
-    /// **without persisting anything** — see the field's docs.
+    /// `Esc` on a [`WelcomeState::dismissable`] instance: close **without persisting anything**.
     Cancel,
 }
 
-/// Live state of the welcome modal — the in-flight tri-state choices
-/// plus focus / hit-rect bookkeeping.  The active theme name is read
-/// straight off `config.theme` at render time; the picker mutates that
-/// directly so we never need to mirror it here.
+/// Live state of the welcome modal: in-flight tri-state choices plus focus / hit-rect
+/// bookkeeping.  The theme name is read off `config.theme` at render time, never mirrored here.
 pub struct WelcomeState {
     pub focused: WelcomeFocus,
     pub images: ImagesEnabled,
     pub remote: RemoteImagePolicy,
-    pub diagrams: DiagramsEnabled,
-    /// "Use Vim motions" toggle.  Default `false` — when checked, Save
-    /// flips `config.modal.handler` to `"vim"` and activates modal
-    /// editing for the running session.
+    pub diagrams: FiguresEnabled,
+    /// "Use Vim motions" toggle; Save flips `config.modal.handler` to `"vim"` and activates
+    /// modal editing for the running session.
     pub use_vim: bool,
-    /// "Check for updates" toggle.  Mirrors
-    /// `config.editor.check_for_updates`, and a first run can decline
-    /// the automatic startup check before it has ever run: the check is
-    /// spawned from `App::spawn_startup_update_check`, which parks
-    /// while this modal is on the stack and re-reads the setting only
-    /// after it closes — so a decline here means no request is made at
-    /// all, not one already sent.  The toggle therefore shows the
-    /// *config* value; there is nothing about this session's check for
-    /// it to reflect yet.
+    /// "Check for updates" toggle, mirroring `config.editor.check_for_updates`.  The startup
+    /// check parks while this modal is on the stack and re-reads the setting after it closes, so
+    /// a decline here prevents the request rather than following one already sent.
     pub check_for_updates: bool,
-    /// "Don't show this again" toggle.  Default `true` per spec — Save
-    /// writes `show_welcome = false` (the modal won't reappear on next
-    /// launch) unless the user opts back in by unchecking this box.
+    /// "Don't show this again" toggle, default on: Save writes `show_welcome = false` unless the
+    /// user unchecks it.
     pub dont_show_again: bool,
-    /// Whether `Esc` (and the `esc` title-bar affordance) closes without
-    /// saving.  Default `false`: on an actual first run the spec
-    /// replaces Cancel with the explicit "Show on next launch" toggle,
-    /// so Save is the only resolution.
+    /// Whether `Esc` closes without saving.  `false` on a first run, where the "Show on next
+    /// launch" toggle replaces Cancel and Save is the only resolution.
     ///
-    /// Set via [`Self::with_dismissable`] on every *on-demand* opening
-    /// (`Action::OpenWelcome`, the capabilities notice's "Adjust
-    /// settings" button), where a no-op exit must exist: below truecolor
-    /// this modal force-sets images and diagrams to `Never` and Save
-    /// *persists* those forced values, so an inescapable instance would
-    /// overwrite whatever the user chose on their capable terminal —
-    /// one `config.toml` is typically shared between both.
+    /// Set via [`Self::with_dismissable`] for every *on-demand* opening, which needs a no-op
+    /// exit: below truecolor this modal forces images and diagrams to `Never` and Save
+    /// *persists* that, so an inescapable instance would overwrite the choices made on a capable
+    /// terminal sharing the same `config.toml`.
     ///
-    /// Read by exactly two sites, both off this one field: the `Esc`
-    /// arm of [`Self::handle_key`] and `show_close_hint` in `render`
-    /// (which is also what populates [`Self::esc_button_rect`], so the
-    /// click path can't dismiss an instance that renders no affordance).
+    /// Read only by the `Esc` arm of [`Self::handle_key`] and by `show_close_hint` in `render`
+    /// (which also populates [`Self::esc_button_rect`], so the click path can't dismiss an
+    /// instance that renders no affordance).
     pub dismissable: bool,
-    /// True when the terminal reports an image protocol **and** 24-bit
-    /// color — image/remote/diagram rows are interactive only when this
-    /// is true.  Halfblocks (and even a native protocol) technically
-    /// render on an indexed-color terminal, but every pixel is quantized
-    /// to the 256-color cube, which looks broken rather than degraded, so
-    /// we don't offer the choice at all there.  Captured at construction
-    /// so the modal's behaviour doesn't drift when the underlying
-    /// `Capabilities` are queried from a callback that doesn't have
-    /// access to them.
+    /// Terminal has an image protocol **and** 24-bit color — the gate on the image / remote /
+    /// diagram rows.  Images do render on an indexed-color terminal, but every pixel quantizes
+    /// into the 256-color cube and looks broken rather than degraded, so the choice isn't
+    /// offered.  Captured at construction, since later callbacks have no `Capabilities`.
     pub image_capable: bool,
-    /// True when the terminal advertises 24-bit color.  Every built-in
-    /// theme is authored in RGB, so below truecolor the theme button is
-    /// disabled alongside the image rows and the explanatory note is
-    /// shown.
+    /// Terminal advertises 24-bit color.  Every built-in theme is authored in RGB, so below
+    /// truecolor the theme button is disabled alongside the image rows.
     pub full_color: bool,
-    /// Cached "remote was X before cascade" so flipping Images out of
-    /// Never restores the user's prior remote choice.
+    /// Remote's value before the cascade, so flipping Images out of `Never` restores it.
     pre_cascade_remote: Option<RemoteImagePolicy>,
 
-    /// Vertical scroll bookkeeping.  When the natural body height
-    /// exceeds the available body height, this drives the window of
-    /// content that gets blitted from the scratch buffer.
+    /// Vertical scroll bookkeeping: the window blitted from the scratch buffer when the natural
+    /// body height exceeds the available height.
     pub scroll_state: ScrollContainerState,
 
     // ── Hit-test rects, captured each render for click dispatch ──
@@ -176,12 +133,8 @@ pub struct WelcomeState {
     pub show_again_rect: Option<Rect>,
     pub save_button_rect: Option<Rect>,
 
-    /// Body-relative y of each focusable row, captured each render so
-    /// focus moves can scroll the focused element back into view.
-    /// Indexed by position in `FOCUS_ORDER` — array length is tied to
-    /// `FOCUS_ORDER.len()`, and both the render writes and the Tab reads
-    /// resolve their slot through `WelcomeFocus::order_index`, so the two
-    /// can't drift.
+    /// Body-relative y of each focusable row, captured each render so a focus move can scroll it
+    /// back into view.  Indexed by `WelcomeFocus::order_index` on both the write and read sides.
     focus_offsets: [u16; FOCUS_ORDER.len()],
 
     // ── Capability summary, captured at construction ──
@@ -189,29 +142,24 @@ pub struct WelcomeState {
 }
 
 impl WelcomeState {
-    /// Construct fresh state from detected `caps` and the current
-    /// `config` tri-state values.
+    /// Fresh state from detected `caps` and the current `config` tri-state values.
     pub fn new(
         caps: &Capabilities,
         images: ImagesEnabled,
         remote: RemoteImagePolicy,
-        diagrams: DiagramsEnabled,
+        diagrams: FiguresEnabled,
         use_vim: bool,
         check_for_updates: bool,
     ) -> Self {
         let full_color = caps.full_color();
-        // Below 24-bit color every decoded pixel collapses into the
-        // 256-color cube, which reads as broken rather than degraded, so
-        // images and diagrams are forced off rather than merely greyed
-        // out — `WelcomeModal::save_outcome` persists these two.  Remote
-        // is deliberately NOT cascaded to Never with them: it is a
-        // network-fetch preference, not a rendering one, so it keeps the
-        // user's existing value (`Ask` by default) and travels intact to
-        // a future truecolor terminal.
+        // Below truecolor, images and diagrams are forced off rather than greyed out (see
+        // `image_capable`), and `save_outcome` persists that.  Remote is deliberately NOT
+        // cascaded with them: it is a network-fetch preference, not a rendering one, so it
+        // travels intact to a future truecolor terminal.
         let (images, diagrams) = if full_color {
             (images, diagrams)
         } else {
-            (ImagesEnabled::Never, DiagramsEnabled::Never)
+            (ImagesEnabled::Never, FiguresEnabled::Never)
         };
         let mut state = Self {
             focused: WelcomeFocus::Theme,
@@ -238,32 +186,27 @@ impl WelcomeState {
             focus_offsets: [0; FOCUS_ORDER.len()],
             cap_summary: CapSummary::from_caps(caps),
         };
-        // Theme is the first row, but it's disabled below truecolor — step
-        // forward so the modal never opens with focus parked on a row the
-        // user can't act on.
+        // Theme is first but disabled below truecolor: never open focused on a dead row.
         if state.row_disabled(state.focused) {
             state.step_focus(1);
         }
         state
     }
 
-    /// Allow `Esc` to close this instance without saving.  Builder
-    /// rather than a sixth `new` parameter so the two adjacent `bool`s
-    /// can't be transposed silently at a call site.  See
-    /// [`Self::dismissable`] for when it applies.
+    /// Allow `Esc` to close without saving (see [`Self::dismissable`]).  A builder rather than a
+    /// sixth `new` parameter, so adjacent `bool`s can't be transposed silently.
     pub fn with_dismissable(mut self, dismissable: bool) -> Self {
         self.dismissable = dismissable;
         self
     }
 
-    /// True iff the cascade rule has forced remote to Never because
-    /// images is Never.  Rendered greyed-out and skipped by Tab focus.
+    /// True iff the cascade forced remote to Never because images is Never; the row is then
+    /// greyed out and skipped by Tab.
     fn remote_locked_by_images(&self) -> bool {
         matches!(self.images, ImagesEnabled::Never)
     }
 
-    /// True iff a row is non-interactive — either capability-locked
-    /// or cascade-locked.  `RemoteImages` carries both gates.
+    /// True iff a row is non-interactive, capability- or cascade-locked.
     fn row_disabled(&self, row: WelcomeFocus) -> bool {
         match row {
             WelcomeFocus::Theme => !self.full_color,
@@ -273,12 +216,8 @@ impl WelcomeState {
         }
     }
 
-    /// Step focus by `delta` (-1 for Shift-Tab, +1 for Tab).  Skips
-    /// disabled rows so the user never lands on a non-interactive
-    /// pill row.  Scrolls the newly focused row into view using the
-    /// body-relative y captured by the previous render.  Backed by the
-    /// shared [`next_focusable_wrapping`] so welcome and export share one
-    /// wrapping focus ring.
+    /// Step focus by `delta`, skipping disabled rows and scrolling the new row into view via the
+    /// offsets the previous render captured.  Uses the shared [`next_focusable_wrapping`].
     fn step_focus(&mut self, delta: i32) {
         let cur = FOCUS_ORDER
             .iter()
@@ -292,13 +231,9 @@ impl WelcomeState {
         }
     }
 
-    /// Apply a [`ControlInput`] to the focused option row through the shared
-    /// transition layer ([`Control::apply`]), writing the result back.  No-op
-    /// if focus isn't on an option row.  The tri-state pills (images / remote
-    /// / diagrams) cycle through [`controls::ASK_ALWAYS_NEVER`]; the on/off
-    /// toggles (vim motions / show-again) are direction-bound (Left=off /
-    /// Right=on, Activate flips).  The images path goes through `set_images`
-    /// so the remote cascade still fires.
+    /// Apply a [`ControlInput`] to the focused option row via [`Control::apply`], writing the
+    /// result back; a no-op off an option row.  The images path goes through
+    /// [`Self::set_images`] so the remote cascade still fires.
     fn apply_input(&mut self, input: ControlInput) {
         let pill = Control::Pill(controls::ASK_ALWAYS_NEVER);
         match self.focused {
@@ -363,8 +298,7 @@ impl WelcomeState {
     }
 
     pub fn handle_key(&mut self, key: &KeyEvent) -> WelcomeResponse {
-        // PgUp/PgDn/Home/End scroll the body without moving focus.
-        // Arrow keys remain bound to focus / tri-state cycling below.
+        // Paging keys scroll the body without moving focus; arrows stay bound to focus below.
         if self.scroll_state.handle_paging_key(key) {
             return WelcomeResponse::Continue;
         }
@@ -377,12 +311,8 @@ impl WelcomeState {
                 self.step_focus(-1);
                 WelcomeResponse::Continue
             }
-            // Activate (Enter / Space) on the Theme / Save rows fires its own
-            // response; on a control row it falls through to the shared
-            // `control_input_for` mapping below (where it becomes Activate).
-            // The Theme row is disabled below truecolor; focus can't land
-            // there via Tab, but a stale `focused` can't open the picker
-            // either — the gate lives on the response, not on navigation.
+            // Theme is disabled below truecolor: the gate lives here, on the response, so a
+            // stale `focused` can't open the picker either.
             KeyCode::Enter | KeyCode::Char(' ') if self.focused == WelcomeFocus::Theme => {
                 if self.row_disabled(WelcomeFocus::Theme) {
                     WelcomeResponse::Continue
@@ -393,19 +323,10 @@ impl WelcomeState {
             KeyCode::Enter | KeyCode::Char(' ') if self.focused == WelcomeFocus::Save => {
                 WelcomeResponse::Save
             }
-            // On a first run there is no Esc dismissal — the spec
-            // replaces Cancel with the explicit "Show on next launch"
-            // toggle, so Esc is consumed but does nothing and the modal
-            // can't be closed without pressing Save (which respects that
-            // toggle).  An on-demand opening is `dismissable` and exits
-            // without persisting; see the field's docs for why that
-            // escape hatch has to exist below truecolor.
+            // A first run consumes Esc and does nothing: Save is the only resolution.  See
+            // `dismissable` for why an on-demand opening needs the escape hatch.
             KeyCode::Esc if self.dismissable => WelcomeResponse::Cancel,
             KeyCode::Esc => WelcomeResponse::Continue,
-            // Left / Right (any control row) and Activate (Enter / Space on a
-            // control row) route through the single key → ControlInput map →
-            // `apply_input`.  Keys the control doesn't take map to None and
-            // no-op.
             _ => {
                 if let Some(input) = controls::control_input_for(key.code) {
                     self.apply_input(input);
@@ -415,18 +336,15 @@ impl WelcomeState {
         }
     }
 
-    /// Forward a mouse wheel delta into the scroll state.  Mirrors the
-    /// pattern used by `SettingsOverlay` / `KeybindsOverlay`.
+    /// Forward a mouse wheel delta into the scroll state.
     pub fn handle_wheel(&mut self, delta: i32) {
         self.scroll_state.scroll_by(delta);
     }
 
-    /// Hit-test `(col, row)` against the cached rects from the last
-    /// render.  Returns the matching response.
+    /// Hit-test `(col, row)` against the rects cached by the last render.
     pub fn handle_click(&mut self, col: u16, row: u16) -> WelcomeResponse {
-        // `esc_button_rect` is only populated when `dismissable` drives
-        // `show_close_hint`, so there is no affordance to click on a
-        // first-run instance and no second gate is needed here.
+        // `esc_button_rect` is populated only when `dismissable` shows the affordance, so a
+        // first-run instance needs no second gate here.
         if rect_contains(self.esc_button_rect, col, row) {
             return WelcomeResponse::Cancel;
         }
@@ -453,9 +371,7 @@ impl WelcomeState {
             self.apply_input(ControlInput::Activate);
             return WelcomeResponse::Continue;
         }
-        // A cycle pill shows only the current value, so a click advances
-        // it by one (same as Space / Right), rather than selecting a
-        // specific option.  `apply_input` applies the images cascade.
+        // A cycle pill shows only the current value, so a click advances it by one.
         if self.image_capable {
             if rect_contains(self.images_rect, col, row) {
                 self.focused = WelcomeFocus::Images;
@@ -498,31 +414,23 @@ const CONTROL_COL: u16 = 22;
 const QUICK_START_TEXT: &str = "edamame is a Markdown editor for your terminal, featuring:\n\
 • 3 modes — PREVIEW for viewing; EDIT renders everything but \
 the line the cursor is on; RAW is unformatted \n\
-• Mouse, image, and Mermaid diagram support, depending on your terminal's capabilities\n\
+• Mouse, image, KaTeX Math, and Mermaid diagram support, depending on your terminal's capabilities\n\
 • GitHub Flavored Markdown, including tables, task lists, and more, plus highlights\n\
 • Diff mode — review external file changes hunk by hunk\n\
 • Command palette for access to commands and settings (Ctrl-P)\n\
 • Vim mode — optional Vim-style editing (see docs for what's supported)";
-/// Hint shown below the capability summary when any capability is
-/// degraded.  Wrapped at body inner width at render time.
+/// Hint shown below the capability summary when any capability is degraded.
 const DEGRADED_HINT: &str = "✗ — Consider upgrading to a modern terminal, \
 such as kitty, wezterm, or ghostty, for a better experience.";
-/// Hint shown below the capability summary when the terminal is below
-/// 24-bit color.  `WelcomeState::new` forces images and diagrams to
-/// `Never` and `WelcomeModal::save_outcome` persists them, so without
-/// this line the modal would write two settings the user never chose and
-/// never mention it.  Deliberately says "24-bit color" rather than naming
-/// a depth: `Ansi256`, `Ansi16`, and `NoColor` all take the same forcing
-/// branch.  Theme switching is described as unavailable, not reassigned —
-/// the theme button is disabled here, but the active theme is only ever
-/// chosen at first-run seeding (`config::init::seed_config_toml`).
-const NO_TRUECOLOR_HINT: &str = "✗ — Images and diagrams have been turned off \
+/// Hint shown when the terminal is below 24-bit color.  `WelcomeState::new` forces images and
+/// figures to `Never` and Save persists that, so without this line the modal would silently
+/// write two settings the user never chose.  Says "24-bit color" rather than naming a depth:
+/// `Ansi256`, `Ansi16`, and `NoColor` all take the same branch.
+const NO_TRUECOLOR_HINT: &str = "✗ — Images and figures have been turned off \
 and theme switching is unavailable due to no 24-bit color support.";
 
-/// Number of wrapped rows a string would occupy at `width` columns
-/// under `Paragraph::wrap(Wrap { trim: false })`.  Uses ratatui's own
-/// line counter (gated by `unstable-rendered-line-info`) so the
-/// pre-render sizing matches the actual `WordWrapper` output.
+/// Rows a string occupies at `width` columns under `Paragraph::wrap(Wrap { trim: false })`.
+/// Uses ratatui's own line counter so the pre-render sizing matches the real `WordWrapper`.
 fn wrapped_para_rows(text: &str, width: u16) -> u16 {
     if width == 0 {
         // Worst-case: each \n becomes its own row.
@@ -540,18 +448,14 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let degraded = !state.cap_summary.all_ok();
 
-        // Body width is determined by the modal's outer width and its
-        // horizontal padding — both derived from `area` and the fixed
-        // CONTENT_WIDTH.  We need it BEFORE computing natural body
-        // height because the paragraph and hint wrap at this width.
+        // Needed before the natural body height: the paragraph and hint wrap at this width.
         let modal_width = CONTENT_WIDTH.saturating_add(2 * MAX_PAD_H).min(area.width);
         let pad_h = compute_pad_h(modal_width, CONTENT_WIDTH, MAX_PAD_H);
         let body_width = modal_width.saturating_sub(2 * pad_h);
 
         let para_inner_w = body_width.saturating_sub(2);
         let para_rows = wrapped_para_rows(QUICK_START_TEXT, para_inner_w);
-        // Declared in render order (forced-off note, then upgrade hint) so
-        // this block, the height trace below, and the painters agree.
+        // Declared in render order, so this block, the height trace, and the painters agree.
         let no_truecolor_rows = if state.full_color {
             0
         } else {
@@ -578,10 +482,8 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
         //  1                 "Don't show this again" toggle row
         //  1                 spacer
         //  1                 Save button row
-        // Measured once, here, and reused by the painter below: a row
-        // whose value wraps occupies more than one line, and the trace
-        // and the loop must agree or every section under the summary
-        // slides out of place.
+        // Measured once and reused by the painter below: a wrapping row occupies more than one
+        // line, and the trace and the loop must agree or every later section slides.
         let cap_row_heights: Vec<u16> = state
             .cap_summary
             .rows
@@ -633,10 +535,8 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
         state.scroll_state.observe(natural_height, body.height);
         let scroll = state.scroll_state.scroll;
 
-        // Render the natural-sized body into a scratch buffer whose
-        // origin is (0, 0).  Subsequent rect bookkeeping is in
-        // body-relative coords (matching the scratch); we translate to
-        // absolute terminal coords once at the end.
+        // The scratch buffer's origin is (0, 0), so rect bookkeeping below is body-relative and
+        // translated to absolute terminal coords once at the end.
         let scratch_rect = Rect {
             x: 0,
             y: 0,
@@ -675,8 +575,7 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
             self.theme,
         );
         y += 1;
-        // Fill the band with modal_bg so unprinted cells inside the
-        // wrapped paragraph inherit the modal surface color.
+        // Fill first, so unprinted cells inside the wrapped paragraph get the modal surface.
         for row in 0..para_rows {
             Paragraph::new("").style(self.theme.modal_bg).render(
                 Rect {
@@ -724,11 +623,8 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
             y += height;
         }
 
-        // The forced-off note comes first: it states what edamame already
-        // did to this session, which is the news.  The upgrade hint below
-        // is the remedy, so it reads as the follow-up rather than burying
-        // the consequence under general advice.  Same warning voice as the
-        // ✗ rows both summarize.
+        // The forced-off note comes first — what edamame already did — with the upgrade hint
+        // below it as the remedy.
         if no_truecolor_rows > 0 {
             for row in 0..no_truecolor_rows {
                 Paragraph::new("").style(self.theme.modal_bg).render(
@@ -770,9 +666,7 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
             }
             Paragraph::new(DEGRADED_HINT)
                 .wrap(Wrap { trim: false })
-                // Warning-colored, matching the ✗ rows it summarizes —
-                // it's the consequence of a degraded capability, not an
-                // aside, so it reads in the same voice as the summary.
+                // Warning-colored, in the same voice as the ✗ rows it summarizes.
                 .style(warn_style)
                 .render(
                     Rect {
@@ -786,8 +680,6 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
             y += hint_rows;
         }
 
-        // Spacer between capability summary (or its wrapped hint) and
-        // the theme section.
         Paragraph::new("").style(self.theme.modal_bg).render(
             Rect {
                 x: body_x,
@@ -800,12 +692,8 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
         y += 1;
 
         // ── Theme (standard label + button row) ──────────────────────
-        // The current theme name lives *inside* the button: the bracketed
-        // affordance distinguishes it without needing an accent color, and
-        // the ▸ arrow signals that activating it opens the theme picker.
         let theme_disabled = state.row_disabled(WelcomeFocus::Theme);
         let theme_focused = state.focused == WelcomeFocus::Theme && !theme_disabled;
-        // Uniform row fill so the label column inherits modal_bg.
         Paragraph::new("").style(self.theme.modal_bg).render(
             Rect {
                 x: body_x,
@@ -815,7 +703,6 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
             },
             &mut scratch,
         );
-        // Label column — same focus treatment as the option rows below.
         let label_col_w = CONTROL_COL.min(body_w) as usize;
         Paragraph::new(Line::from(Span::styled(
             format!("{:<label_col_w$}", "Choose theme"),
@@ -831,9 +718,8 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
             },
             &mut scratch,
         );
-        // Button carries the current theme name + the "opens a modal" arrow.
-        // A disabled button still renders (so the active theme stays
-        // visible) but reports no hit rect — clicks read as misses.
+        // A disabled button still renders, so the active theme stays visible, but reports no hit
+        // rect — clicks read as misses.
         let theme_button_label = format!("{} ▸", self.theme_name);
         let theme_button_rect = crate::ui::button_row::render_button_at(
             Rect {
@@ -860,7 +746,7 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
             &mut scratch,
             scratch_rect,
             y,
-            "Show diagrams",
+            "Show figures",
             controls::pill_spans(
                 controls::ASK_ALWAYS_NEVER,
                 pill_index(&DIAGRAMS_ORDER, state.diagrams),
@@ -879,7 +765,7 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
             body_x,
             y,
             body_w,
-            "Render mermaid code blocks as inline diagrams.",
+            "Render mermaid diagrams and $$…$$ math inline.",
             muted_style,
             self.theme,
         );
@@ -1046,12 +932,9 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
         state.focus_offsets[WelcomeFocus::Save.order_index()] = y;
 
         // ── Blit visible window of scratch into the body ────────────
-        // Retarget `scratch`'s area so its (scroll..scroll+visible_h)
-        // window aligns with the visible body rect, then merge into
-        // `buf`.  `Buffer::merge` clips by absolute coords, but it also
-        // *unions* the two areas — so we have to align the scratch top
-        // with `body.y` (not `body.y - scroll`) and drop the rows above
-        // `scroll` by trimming both `area.y` and `area.height`.
+        // `Buffer::merge` clips by absolute coords but also *unions* the two areas, so the
+        // scratch top must align with `body.y` (not `body.y - scroll`) and the rows above
+        // `scroll` be trimmed off instead.
         let visible_h = body.height.min(natural_height.saturating_sub(scroll));
         let visible_window = Rect {
             x: body.x,
@@ -1065,10 +948,7 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
         scratch.area = visible_window;
         buf.merge(&scratch);
 
-        // Translate every captured rect from body-relative scratch
-        // coords to absolute terminal coords, clipping to the visible
-        // body window.  Rects entirely outside the visible window
-        // become `None` — clicks in those regions read as misses.
+        // Rects outside the visible window become `None`, so clicks there read as misses.
         state.theme_button_rect = translate_rect(state.theme_button_rect, body, scroll);
         state.save_button_rect = translate_rect(state.save_button_rect, body, scroll);
         state.show_again_rect = translate_rect(state.show_again_rect, body, scroll);
@@ -1078,7 +958,6 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
         state.remote_rect = translate_rect(state.remote_rect, body, scroll);
         state.diagrams_rect = translate_rect(state.diagrams_rect, body, scroll);
 
-        // Scrollbar in the right padding column, only when overflowing.
         if state.scroll_state.max_scroll() > 0 {
             let bar_area = Rect {
                 x: layout.scrollbar_col,
@@ -1096,9 +975,8 @@ impl<'a> StatefulWidget for WelcomeView<'a> {
     }
 }
 
-/// Translate a body-relative rect (origin at body's top-left) into
-/// absolute terminal coords, clipped to the visible body window.
-/// Returns `None` when the rect lies entirely outside the window.
+/// Translate a body-relative rect into absolute terminal coords, clipped to the visible body
+/// window; `None` when it lies entirely outside.
 fn translate_rect(rect: Option<Rect>, body: Rect, scroll: u16) -> Option<Rect> {
     let r = rect?;
     let src_y0 = r.y;
@@ -1116,11 +994,8 @@ fn translate_rect(rect: Option<Rect>, body: Rect, scroll: u16) -> Option<Rect> {
     })
 }
 
-// One ordered table per tri-state enum, mirroring `controls::ASK_ALWAYS_NEVER`'s
-// label order.  Each table is the *single source* for both directions of its
-// enum's pill mapping — `pill_index` (value → `ControlValue::Choice` index) and
-// `pill_value` (index → value) read the same slice, so a reordering can't drift
-// the two halves apart.
+// One ordered table per tri-state enum, mirroring `controls::ASK_ALWAYS_NEVER`'s label order.
+// `pill_index` and `pill_value` both read it, so a reordering can't drift the two directions.
 const IMAGES_ORDER: [ImagesEnabled; 3] = [
     ImagesEnabled::Ask,
     ImagesEnabled::Always,
@@ -1131,32 +1006,26 @@ const REMOTE_ORDER: [RemoteImagePolicy; 3] = [
     RemoteImagePolicy::Always,
     RemoteImagePolicy::Never,
 ];
-const DIAGRAMS_ORDER: [DiagramsEnabled; 3] = [
-    DiagramsEnabled::Ask,
-    DiagramsEnabled::Always,
-    DiagramsEnabled::Never,
+const DIAGRAMS_ORDER: [FiguresEnabled; 3] = [
+    FiguresEnabled::Ask,
+    FiguresEnabled::Always,
+    FiguresEnabled::Never,
 ];
 
-/// Index of `value` within its pill `order` (the `ControlValue::Choice` index
-/// fed into [`Control::apply`]).  Falls back to 0 for a value absent from the
-/// table — unreachable for the tri-state enums, which list every variant.
+/// Index of `value` within its pill `order`, for [`Control::apply`].  Falls back to 0, which is
+/// unreachable for the tri-state enums since every variant is listed.
 fn pill_index<T: PartialEq>(order: &[T], value: T) -> usize {
     order.iter().position(|v| *v == value).unwrap_or(0)
 }
 
-/// Inverse of [`pill_index`]: the value at `i` in `order`, clamped to the last
-/// entry for any out-of-range index (the pill only ever yields `0..len`).
+/// Inverse of [`pill_index`], clamped to the last entry for an out-of-range index.
 fn pill_value<T: Copy>(order: &[T], i: usize) -> T {
     order[i.min(order.len().saturating_sub(1))]
 }
 
-/// Render a label + control (pill or toggle) row into the welcome modal's
-/// scratch buffer, returning the control's body-relative hit rect (or
-/// `None` when the row is disabled or the body is too narrow to fit the
-/// control).  The label uses the same focus / disabled styling as the
-/// surrounding rows; the caller supplies the already-built control
-/// `spans` (via [`controls::pill_spans`] / [`controls::toggle_spans`]) and
-/// their rendered `width`.
+/// Render a label + control row into the scratch buffer, returning the control's body-relative
+/// hit rect — `None` when the row is disabled or the body is too narrow.  The caller supplies the
+/// already-built control `spans` and their rendered `width`.
 #[allow(clippy::too_many_arguments)]
 fn render_control_row(
     buf: &mut Buffer,
@@ -1169,7 +1038,6 @@ fn render_control_row(
     disabled: bool,
     theme: &Theme,
 ) -> Option<Rect> {
-    // Row fill — uniform modal_bg across the whole row width.
     let row_rect = Rect {
         x: body.x,
         y,
@@ -1179,11 +1047,8 @@ fn render_control_row(
     Paragraph::new("")
         .style(theme.modal_bg)
         .render(row_rect, buf);
-    // The label column is one unit with the control: pad the label across
-    // the whole column (CONTROL_COL cells) so a focused row's fill spans the
-    // column → widget, then append the caller's control spans — the shared
-    // [`controls::control_row_spans`] composition, exactly like the settings
-    // and export modals.  The modal only reports focus / disabled.
+    // The label column is one unit with the control: padding it to CONTROL_COL makes a focused
+    // row's fill span label and widget alike, as in the settings and export modals.
     let label_col_w = CONTROL_COL.min(body.width) as usize;
     let row_spans =
         controls::control_row_spans(label, label_col_w, spans, focused, disabled, theme);
@@ -1294,8 +1159,8 @@ mod tests {
         }
     }
 
-    /// Apple Terminal and friends: a native image protocol is advertised,
-    /// but the terminal only has the 256-color cube to draw it with.
+    /// Apple Terminal and friends: an image protocol is advertised, but only the 256-color cube
+    /// is available to draw it with.
     fn caps_256_color() -> Capabilities {
         Capabilities {
             color_depth: ColorDepth::Ansi256,
@@ -1308,7 +1173,7 @@ mod tests {
             caps,
             ImagesEnabled::Ask,
             RemoteImagePolicy::Ask,
-            DiagramsEnabled::Ask,
+            FiguresEnabled::Ask,
             false,
             true,
         )
@@ -1323,8 +1188,6 @@ mod tests {
 
     #[test]
     fn esc_is_inert_on_a_first_run_instance() {
-        // Save is the only resolution; the "Show on next launch" toggle
-        // stands in for Cancel.
         let caps = caps_full();
         let mut s = make_state(&caps);
         assert!(!s.dismissable);
@@ -1333,9 +1196,8 @@ mod tests {
 
     #[test]
     fn esc_cancels_an_on_demand_instance() {
-        // Without this, reopening the modal on a 256-color terminal
-        // would be a one-way door: images / diagrams are forced to
-        // `Never` and Save persists them over the user's real choice.
+        // Without this, reopening on a 256-color terminal is a one-way door: images and
+        // diagrams are forced to `Never` and Save persists that over the user's real choice.
         let caps = caps_256_color();
         let mut s = make_state(&caps).with_dismissable(true);
         assert_eq!(s.images, ImagesEnabled::Never, "forced below truecolor");
@@ -1344,9 +1206,8 @@ mod tests {
 
     #[test]
     fn a_first_run_instance_renders_no_esc_affordance_to_click() {
-        // `handle_click` gates the cancel path on `esc_button_rect`
-        // alone, so that rect must stay `None` when not dismissable —
-        // otherwise a click could close a modal `Esc` cannot.
+        // `handle_click` gates cancel on `esc_button_rect` alone, so the rect must stay `None`
+        // when not dismissable — otherwise a click closes a modal `Esc` cannot.
         let caps = caps_full();
         let mut s = make_state(&caps);
         render_rows(&mut s);
@@ -1367,8 +1228,6 @@ mod tests {
             KeyCode::Tab,
             crossterm::event::KeyModifiers::NONE,
         ));
-        // Image rows are disabled (no protocol) — skip to the always-on
-        // vim-motions toggle.
         assert_eq!(s.focused, WelcomeFocus::VimMotions);
     }
 
@@ -1377,7 +1236,6 @@ mod tests {
         let caps = caps_full();
         let mut s = make_state(&caps);
         s.focused = WelcomeFocus::Images;
-        // Ask → Always → Never via two Right presses.
         s.handle_key(&KeyEvent::new(
             KeyCode::Right,
             crossterm::event::KeyModifiers::NONE,
@@ -1464,20 +1322,16 @@ mod tests {
 
     #[test]
     fn toggle_arrows_are_direction_bound() {
-        // Phase 2 unified toggle arrows to direction-bound everywhere: Left
-        // sets off, Right sets on (Space/Enter still flip).  Previously
-        // welcome flipped on either arrow.
+        // Left sets off, Right sets on, everywhere; only Space/Enter flip.
         let caps = caps_full();
         let mut s = make_state(&caps);
         s.focused = WelcomeFocus::VimMotions;
         assert!(!s.use_vim);
-        // Left on an already-off toggle is a no-op (not a flip-on).
         s.handle_key(&KeyEvent::new(
             KeyCode::Left,
             crossterm::event::KeyModifiers::NONE,
         ));
         assert!(!s.use_vim, "Left means off, even when already off");
-        // Right turns it on; a second Right is a no-op.
         s.handle_key(&KeyEvent::new(
             KeyCode::Right,
             crossterm::event::KeyModifiers::NONE,
@@ -1488,7 +1342,6 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         ));
         assert!(s.use_vim, "Right when already on is a no-op");
-        // Left turns it back off.
         s.handle_key(&KeyEvent::new(
             KeyCode::Left,
             crossterm::event::KeyModifiers::NONE,
@@ -1498,8 +1351,7 @@ mod tests {
 
     #[test]
     fn below_truecolor_disables_theme_and_image_rows() {
-        // A 256-color terminal quantizes both the RGB themes and every
-        // decoded image, so the theme button and all three image/diagram
+        // A 256-color terminal quantizes both the RGB themes and every decoded image, so these
         // rows are inert even though an image protocol was detected.
         let caps = caps_256_color();
         let s = make_state(&caps);
@@ -1516,8 +1368,6 @@ mod tests {
         ] {
             assert!(s.row_disabled(row), "{row:?} must be disabled");
         }
-        // Focus opens past the disabled Theme row, and the vim / show-again
-        // / save rows stay live.
         assert_eq!(s.focused, WelcomeFocus::VimMotions);
         for row in [
             WelcomeFocus::VimMotions,
@@ -1530,13 +1380,11 @@ mod tests {
 
     #[test]
     fn below_truecolor_forces_images_and_diagrams_off_but_not_remote() {
-        // Disabling the rows isn't enough: left at `Ask`, the app would
-        // still prompt at startup and then render quantized halfblocks.
-        // Remote is a fetch preference, not a rendering one, so it keeps
-        // the incoming value even though its row is inert.
+        // Disabling the rows isn't enough: left at `Ask` the app would still prompt at startup
+        // and render quantized halfblocks.  Remote is a fetch preference, so it keeps its value.
         let s = make_state(&caps_256_color());
         assert_eq!(s.images, ImagesEnabled::Never);
-        assert_eq!(s.diagrams, DiagramsEnabled::Never);
+        assert_eq!(s.diagrams, FiguresEnabled::Never);
         assert_eq!(s.remote, RemoteImagePolicy::Ask);
     }
 
@@ -1544,7 +1392,7 @@ mod tests {
     fn truecolor_leaves_the_incoming_tristate_values_alone() {
         let s = make_state(&caps_full());
         assert_eq!(s.images, ImagesEnabled::Ask);
-        assert_eq!(s.diagrams, DiagramsEnabled::Ask);
+        assert_eq!(s.diagrams, FiguresEnabled::Ask);
         assert_eq!(s.remote, RemoteImagePolicy::Ask);
     }
 
@@ -1569,8 +1417,7 @@ mod tests {
         assert_eq!(s.focused, WelcomeFocus::Theme);
     }
 
-    /// Area used by [`render_rows`] — tall enough that nothing scrolls,
-    /// so every row and hit rect is published.
+    /// Tall enough that nothing scrolls, so every row and hit rect is published.
     const RENDER_AREA: Rect = Rect {
         x: 0,
         y: 0,
@@ -1578,8 +1425,7 @@ mod tests {
         height: 60,
     };
 
-    /// Render the modal into a buffer tall enough that nothing scrolls,
-    /// and return the rows as plain strings.
+    /// Render into a non-scrolling buffer and return the rows as plain strings.
     fn render_rows(state: &mut WelcomeState) -> Vec<String> {
         let theme: &'static Theme = Box::leak(Box::new(Theme::default()));
         let area = RENDER_AREA;
@@ -1600,13 +1446,9 @@ mod tests {
 
     #[test]
     fn below_truecolor_renders_no_interactive_theme_or_image_rects() {
-        // Sanity check that a click *can* open the picker, so the
-        // sweep below isn't vacuously passing.  Its coordinates aren't
-        // reused for the 256-color render: the degraded hint only wraps
-        // into one of the two, so the theme row sits at a different y in
-        // each and a fixed coordinate would test nothing.  The sweep
-        // covers every cell instead, which is what "the disabled button
-        // is unclickable" actually means.
+        // The live render is a sanity check that the sweep below isn't vacuously passing.  Its
+        // coordinates can't be reused: the degraded hint wraps in only one of the two, so the
+        // theme row sits at a different y in each — hence sweeping every cell.
         let mut live = make_state(&caps_full());
         render_rows(&mut live);
         let button = live
@@ -1627,11 +1469,8 @@ mod tests {
         assert!(s.images_rect.is_none());
         assert!(s.remote_rect.is_none());
         assert!(s.diagrams_rect.is_none());
-        // The always-on rows still hit-test.
         assert!(s.vim_rect.is_some());
         assert!(s.save_button_rect.is_some());
-        // No cell anywhere in the modal opens the theme picker — not the
-        // cells the button is painted on, not anything else.
         for row in 0..RENDER_AREA.height {
             for col in 0..RENDER_AREA.width {
                 assert_ne!(
@@ -1645,16 +1484,11 @@ mod tests {
 
     #[test]
     fn below_truecolor_explains_itself_exactly_once() {
-        // Two distinct sentences, each rendered once: the upgrade hint
-        // (what to do about a degraded terminal) and the forced-off note
-        // (what edamame already did about it).  Counting rather than
-        // `contains` is what makes this catch a *duplicate* explanation,
-        // which is the regression worth guarding — the modal has three
-        // places a capability note could plausibly be added.
+        // Counting rather than `contains`, because the regression worth guarding is a
+        // *duplicated* explanation: three places in the modal could plausibly host one.
         let mut s = make_state(&caps_256_color());
         let rows = render_rows(&mut s);
-        // Join on newline, not space: a phrase split across a wrap
-        // boundary should fail this rather than be stitched back together.
+        // Newline, not space: a phrase split across a wrap must fail rather than be stitched.
         let text = rows.join("\n");
         assert_eq!(
             text.matches("Consider upgrading").count(),
@@ -1686,9 +1520,8 @@ mod tests {
 
     #[test]
     fn every_focus_variant_is_ordered() {
-        // `order_index` panics if a variant is absent from `FOCUS_ORDER`,
-        // so resolving each one is the guard that keeps the render writes
-        // and Tab reads addressing the same `focus_offsets` slots.
+        // `order_index` panics on a variant absent from `FOCUS_ORDER`, so resolving each one
+        // guards that render writes and Tab reads address the same `focus_offsets` slots.
         for (i, f) in FOCUS_ORDER.iter().enumerate() {
             assert_eq!(f.order_index(), i, "{f:?} resolves to its FOCUS_ORDER slot");
         }
@@ -1699,13 +1532,12 @@ mod tests {
         let caps = caps_full();
         let mut s = make_state(&caps);
         s.focused = WelcomeFocus::Images;
-        // Ask → Always
         s.handle_key(&KeyEvent::new(
             KeyCode::Char(' '),
             crossterm::event::KeyModifiers::NONE,
         ));
         assert!(matches!(s.images, ImagesEnabled::Always));
-        // Always → Never (also cascades remote → Never)
+        // Always → Never, which also cascades remote → Never.
         s.handle_key(&KeyEvent::new(
             KeyCode::Char(' '),
             crossterm::event::KeyModifiers::NONE,
@@ -1741,8 +1573,7 @@ mod tests {
     fn wheel_scrolls_body() {
         let caps = caps_full();
         let mut s = make_state(&caps);
-        // Simulate a prior render observing a body shorter than the
-        // natural content height so max_scroll() > 0.
+        // A prior render observing a short body, so max_scroll() > 0.
         s.scroll_state.observe(40, 20);
         s.handle_wheel(3);
         assert_eq!(s.scroll_state.scroll, 3);

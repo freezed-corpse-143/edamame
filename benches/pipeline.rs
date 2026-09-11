@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
 use std::hint::black_box;
 
 use edamame::config::Theme;
@@ -28,8 +28,11 @@ use edamame::markdown::{parse_offsets, parse_raw_with_ranges, RenderCache, Rende
 // ── Corpus generators ──────────────────────────────────────────────────────
 //
 // Each generator appends a fixed repeating unit until the document reaches
-// the target source-line count.  Deterministic; no images or diagrams (those
-// paths involve async decode workers the pipeline benches don't exercise).
+// the target source-line count.  Deterministic; no images, mermaid diagrams,
+// or rendered math (those paths involve async decode workers the pipeline
+// benches don't exercise).  The `math` corpus does contain `$$...$$` blocks,
+// but they measure only the synchronous parse + promotion work — the RaTeX
+// raster is produced later by the decode worker, off this path.
 
 fn fill(target_lines: usize, mut unit: impl FnMut(usize, &mut String)) -> String {
     let mut s = String::new();
@@ -89,6 +92,40 @@ fn code(target: usize) -> String {
     })
 }
 
+fn math(target: usize) -> String {
+    fill(target, |i, s| {
+        // Prose with inline `$...$`, then two stacked `$$...$$` display blocks.
+        // The stacked pair (no blank line between them) is one pulldown paragraph
+        // that post_pass splits per formula by scanning for `$$` delimiters —
+        // the O(document) promotion path this corpus exists to exercise.
+        s.push_str(&format!(
+            "Row {i}: the sum for $n = {i}$ and inline $ax^2 + bx + c = 0$ nearby.\n\n"
+        ));
+        s.push_str(
+            "$$\n\\sum_{k=1}^{n} k = \\frac{n(n+1)}{2}\n$$\n\
+             $$\nx = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}\n$$\n\n",
+        );
+    })
+}
+
+fn nested(target: usize) -> String {
+    fill(target, |i, s| {
+        // A list item wrapping a fenced `rust` block, and a blockquote wrapping a
+        // table — the two shapes where an expensive block hides inside a cheap
+        // container.  The render cache must keep caching the *outer* block (#35 §2
+        // `is_cache_worthy` walks into it); a gate that skipped lists/blockquotes
+        // by kind would re-highlight and re-measure this nested content on every
+        // keystroke.  The gap between this corpus's cold and memoized numbers is
+        // the guard: it collapses if the nested content stops being cached.
+        s.push_str(&format!(
+            "- step {i} with **bold** text\n\n  ```rust\n  fn step_{i}(x: usize) -> usize {{ x + {i} }}\n  ```\n\n"
+        ));
+        s.push_str(&format!(
+            "> | Field | Value |\n> | --- | --- |\n> | id | {i} |\n> | ok | yes |\n\n"
+        ));
+    })
+}
+
 fn mixed(target: usize) -> String {
     let mut s = String::from("# Document Title\n\n");
     let mut i = 0;
@@ -126,6 +163,8 @@ const MIXES: &[Corpus] = &[
     ("lists", lists),
     ("tables", tables),
     ("code", code),
+    ("math", math),
+    ("nested", nested),
     ("mixed", mixed),
 ];
 
@@ -136,11 +175,12 @@ const STAGE_PIVOT_SIZE: usize = 20_000;
 
 /// Mirrors the arguments `EditorState::refresh_parsed` passes: blank-line
 /// preservation on, realistic image ceiling, striping + big-H1 +
-/// syntax highlighting on (the costlier paths), width 100, diagrams
-/// promoted, no live overrides.
+/// syntax highlighting on (the costlier paths), width 100, diagrams and
+/// display math promoted, paragraph reflow on (the shipped default), no
+/// live overrides.
 fn build_doc(source: &str, theme: &Theme) -> ParsedDoc {
     ParsedDoc::build_with_overrides(
-        source, theme, true, 20, None, None, true, 100, true, true, true, None,
+        source, theme, true, 20, None, None, true, 100, true, true, true, true, None,
     )
 }
 
@@ -156,6 +196,7 @@ fn build_doc_cached(source: &str, theme: &Theme, cache: &mut RenderCache) -> Par
         None,
         true,
         100,
+        true,
         true,
         true,
         true,
@@ -283,7 +324,8 @@ fn bench_render_only(c: &mut Criterion) {
                 .with_image_max_height(20)
                 .with_row_striping(true)
                 .with_big_h1(true)
-                .with_syntax_highlighting(true);
+                .with_syntax_highlighting(true)
+                .with_reflow_paragraphs(true);
             b.iter(|| renderer.render_with_counts(black_box(blocks)));
         });
     }
@@ -294,6 +336,13 @@ fn bench_visual_cache(c: &mut Criterion) {
     warm_grammars();
     let theme = Theme::default();
     let mut g = c.benchmark_group("visual_cache_build");
+    // A single rebuild at 100k lines (~0.25 s) is far larger than the group's
+    // 2 s measurement window, so the default linear sampling can only fit one
+    // iteration per sample and then misreports the mean wildly (criterion warns
+    // "enable flat sampling").  Flat sampling runs a fixed iteration count per
+    // sample and reports slow routines correctly; give it room for the 100k row.
+    g.sampling_mode(SamplingMode::Flat);
+    g.measurement_time(Duration::from_secs(5));
     for &size in SIZES {
         let source = mixed(size);
         let doc = build_doc(&source, &theme);

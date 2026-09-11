@@ -2,14 +2,10 @@
 //! i\` a\``), and bracket pairs (`i( a( i[ a[ i{ a{`, plus the closing
 //! variants and the `b`/`B` aliases).
 //!
-//! `vim_feed` (input layer) maps the `i`/`a` prefix + the object char to a
-//! [`TextObject`]; [`resolve_text_object_range`] (editor layer) turns that
-//! into a char range against the buffer.  Every offset is a rope **char**
-//! offset, the same space as the rest of `vim_ops`.  All in-scope text
-//! objects are charwise, so the range is returned bare (no linewise flag).
-//! `None` means the object could not be resolved (cursor not inside a pair,
-//! no quote on the line, empty buffer) — the caller then does nothing.  See
-//! `docs/vim-implementation-plan.md` §2.4.
+//! `vim_feed` maps the `i`/`a` prefix + object char to a [`TextObject`];
+//! [`resolve_text_object_range`] turns that into a rope **char** range.  All in-scope
+//! objects are charwise, so the range is returned bare.  `None` means unresolvable (cursor
+//! not inside a pair, no quote on the line, empty buffer) and the caller does nothing.
 
 use std::ops::Range;
 
@@ -19,13 +15,12 @@ use crate::editor::vim_ops::motion::{class, line_end_offset, Class};
 /// A resolved text object, carrying the inner (`i`) / around (`a`) flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextObject {
-    /// `iw aw iW aW` — the word (or whitespace run) under the cursor;
-    /// `big` collapses punctuation into the word class (`W` semantics).
+    /// `iw aw iW aW`; `big` collapses punctuation into the word class (`W` semantics).
     Word { inner: bool, big: bool },
     /// `i" a" i' a' i\` a\`` — the quoted span on the cursor's line.
     Quote { inner: bool, quote: char },
-    /// `i( a( i[ a[ i{ a{` (and `)`/`]`/`}` / `b`/`B`) — the balanced
-    /// bracket pair surrounding (or under) the cursor.
+    /// `i( a( i[ a[ i{ a{` (and `)`/`]`/`}` / `b`/`B`) — the balanced pair around the
+    /// cursor.
     Pair {
         inner: bool,
         open: char,
@@ -33,10 +28,8 @@ pub enum TextObject {
     },
 }
 
-/// Resolve `obj` to the char range it covers, or `None` when it cannot be
-/// found.  An *inner* object can legitimately be empty (`di(` on `()`):
-/// `start == end`, which the operator layer treats as a no-op delete / an
-/// in-place Insert for change.
+/// Resolve `obj` to the char range it covers.  An *inner* object can legitimately be empty
+/// (`di(` on `()`), which the operator layer treats as a no-op delete / in-place Insert.
 pub fn resolve_text_object_range(
     obj: TextObject,
     cursor: usize,
@@ -55,12 +48,9 @@ fn ch(buf: &Buffer, i: usize) -> char {
 
 // ── Word objects ────────────────────────────────────────────────────────────
 
-/// `iw`/`aw`/`iW`/`aW`.  The inner object is the run of one character class
-/// (word / punctuation / whitespace) under the cursor.  The around object
-/// adds the trailing whitespace (or, when there is none, the leading
-/// whitespace) for a word run, or the following word for a whitespace run —
-/// vim's rules.  A newline is always a hard boundary: a word object never
-/// spans lines.
+/// `iw`/`aw`/`iW`/`aW`: the run of one character class under the cursor; the around form
+/// adds trailing (else leading) whitespace, or for a whitespace run the following word —
+/// vim's rules.  A newline is a hard boundary.
 fn word_object(buf: &Buffer, cursor: usize, inner: bool, big: bool) -> Option<Range<usize>> {
     let len = buf.len_chars();
     if len == 0 {
@@ -93,8 +83,6 @@ fn word_object(buf: &Buffer, cursor: usize, inner: bool, big: bool) -> Option<Ra
     }
 
     if cls != Class::Blank {
-        // Around a word: extend over trailing whitespace; if there is none,
-        // extend over leading whitespace instead (vim's `aw`).
         let mut e = end;
         while e < len && ch(buf, e) != '\n' && ch(buf, e).is_whitespace() {
             e += 1;
@@ -108,7 +96,6 @@ fn word_object(buf: &Buffer, cursor: usize, inner: bool, big: bool) -> Option<Ra
         }
         Some(s..end)
     } else {
-        // Around whitespace: extend over the following word.
         let mut e = end;
         while e < len && ch(buf, e) != '\n' && class(ch(buf, e), big) != Class::Blank {
             e += 1;
@@ -119,12 +106,9 @@ fn word_object(buf: &Buffer, cursor: usize, inner: bool, big: bool) -> Option<Ra
 
 // ── Quote objects ────────────────────────────────────────────────────────────
 
-/// `i"`/`a"` (and `'` / `` ` ``).  Quotes on the cursor's line pair up
-/// left-to-right; the chosen pair is the first whose closing quote is at or
-/// after the cursor (so a cursor between two strings selects the next one).
-/// The inner object is the span between the quotes; the around object adds
-/// the quotes plus trailing whitespace (or leading whitespace when there is
-/// none).  Bounded to the cursor's line.
+/// `i"`/`a"` (and `'` / `` ` ``).  Quotes on the cursor's line pair up left-to-right; the
+/// chosen pair is the first whose closing quote is at or after the cursor, so a cursor
+/// between two strings selects the next one.  Bounded to the cursor's line.
 fn quote_object(buf: &Buffer, cursor: usize, inner: bool, q: char) -> Option<Range<usize>> {
     let line = buf.char_to_line(cursor);
     let lstart = buf.line_to_char(line);
@@ -160,10 +144,8 @@ fn quote_object(buf: &Buffer, cursor: usize, inner: bool, q: char) -> Option<Ran
 
 // ── Bracket-pair objects ──────────────────────────────────────────────────────
 
-/// `i(`/`a(` (and `[]` / `{}`).  Finds the balanced bracket pair the cursor
-/// sits inside (or on); the inner object is the span between the brackets,
-/// the around object includes them.  Spans multiple lines.  Returns `None`
-/// when the cursor is not within a matched pair.
+/// `i(`/`a(` (and `[]` / `{}`): the balanced pair the cursor sits inside or on.  Spans
+/// multiple lines; `None` when the cursor is not within a matched pair.
 fn pair_object(
     buf: &Buffer,
     cursor: usize,
@@ -185,9 +167,8 @@ fn pair_object(
     }
 }
 
-/// Scan left (and the cursor itself) for the `open` bracket enclosing the
-/// cursor, respecting nesting.  A cursor sitting *on* an `open` is its own
-/// answer; a cursor on a `close` resolves to that close's matching open.
+/// Scan left (cursor included) for the enclosing `open`, respecting nesting.  A cursor on
+/// an `open` is its own answer; one on a `close` resolves to that close's matching open.
 fn find_enclosing_open(buf: &Buffer, cursor: usize, open: char, close: char) -> Option<usize> {
     if ch(buf, cursor) == open {
         return Some(cursor);
@@ -245,37 +226,30 @@ mod tests {
 
     #[test]
     fn inner_word_is_the_run_under_the_cursor() {
-        // "foo bar": iw from any char of "foo" → 0..3.
         assert_eq!(word(0, true, false, "foo bar"), Some(0..3));
         assert_eq!(word(2, true, false, "foo bar"), Some(0..3));
-        // From a char of "bar" → 4..7.
         assert_eq!(word(5, true, false, "foo bar"), Some(4..7));
     }
 
     #[test]
     fn inner_word_splits_punctuation() {
-        // "foo.bar": iw on 'f' → "foo" (0..3); on '.' → "." (3..4).
         assert_eq!(word(0, true, false, "foo.bar"), Some(0..3));
         assert_eq!(word(3, true, false, "foo.bar"), Some(3..4));
-        // iW collapses the whole "foo.bar".
         assert_eq!(word(0, true, true, "foo.bar"), Some(0..7));
     }
 
     #[test]
     fn around_word_takes_trailing_whitespace() {
-        // "foo bar": aw on "foo" → "foo " (0..4).
         assert_eq!(word(1, false, false, "foo bar"), Some(0..4));
     }
 
     #[test]
     fn around_word_falls_back_to_leading_whitespace() {
-        // "foo bar": aw on "bar" (no trailing ws) → " bar" (3..7).
         assert_eq!(word(5, false, false, "foo bar"), Some(3..7));
     }
 
     #[test]
     fn around_whitespace_takes_following_word() {
-        // "foo   bar": aw on a space (offset 4) → "   bar" (3..9).
         assert_eq!(word(4, false, false, "foo   bar"), Some(3..9));
     }
 
@@ -283,7 +257,6 @@ mod tests {
     fn word_object_does_not_cross_newlines() {
         let t = "foo\nbar";
         assert_eq!(word(0, true, false, t), Some(0..3));
-        // aw at end of line has no trailing space → no leading space → "foo".
         assert_eq!(word(0, false, false, t), Some(0..3));
     }
 
@@ -293,17 +266,15 @@ mod tests {
 
     #[test]
     fn inner_and_around_quote() {
-        // 'say "hi" now' — quotes at 4 and 7.
         let t = "say \"hi\" now";
-        assert_eq!(quote(5, true, '"', t), Some(5..7)); // inner "hi"
-        assert_eq!(quote(5, false, '"', t), Some(4..9)); // around: quotes + trailing space
-                                                         // Cursor before the opening quote still selects the pair.
+        assert_eq!(quote(5, true, '"', t), Some(5..7));
+        assert_eq!(quote(5, false, '"', t), Some(4..9));
+        // Cursor before the opening quote still selects the pair.
         assert_eq!(quote(0, true, '"', t), Some(5..7));
     }
 
     #[test]
     fn around_quote_falls_back_to_leading_whitespace() {
-        // No trailing whitespace after the close → include the leading space.
         let t = "a \"x\"";
         assert_eq!(quote(3, false, '"', t), Some(1..5));
     }
@@ -320,7 +291,6 @@ mod tests {
 
     #[test]
     fn inner_and_around_parens() {
-        // "(abc)": inner 1..4, around 0..5, from anywhere inside or on a bracket.
         let t = "(abc)";
         assert_eq!(pair(2, true, '(', ')', t), Some(1..4));
         assert_eq!(pair(2, false, '(', ')', t), Some(0..5));
@@ -330,11 +300,9 @@ mod tests {
 
     #[test]
     fn nested_parens_pick_the_innermost() {
-        // "(a(b)c)": from 'b' (3) the inner pair is 2..4 → inner 3..4.
         let t = "(a(b)c)";
         assert_eq!(pair(3, true, '(', ')', t), Some(3..4));
         assert_eq!(pair(3, false, '(', ')', t), Some(2..5));
-        // From 'a' (1) the enclosing pair is the outer one.
         assert_eq!(pair(1, false, '(', ')', t), Some(0..7));
     }
 
@@ -346,7 +314,6 @@ mod tests {
 
     #[test]
     fn empty_inner_pair_is_an_empty_range() {
-        // "()" inner → 1..1 (empty, but found).
         assert_eq!(pair(0, true, '(', ')', "()"), Some(1..1));
         assert_eq!(pair(0, false, '(', ')', "()"), Some(0..2));
     }
@@ -354,14 +321,12 @@ mod tests {
     #[test]
     fn cursor_outside_any_pair_is_none() {
         assert_eq!(pair(0, true, '(', ')', "abc"), None);
-        // After a closed pair, not inside it.
         assert_eq!(pair(3, true, '(', ')', "()x"), None);
     }
 
     #[test]
     fn pair_spans_lines() {
         let t = "(\nab\n)";
-        // '(' at 0, ')' at 5; inner 1..5, around 0..6.
         assert_eq!(pair(2, true, '(', ')', t), Some(1..5));
         assert_eq!(pair(2, false, '(', ')', t), Some(0..6));
     }

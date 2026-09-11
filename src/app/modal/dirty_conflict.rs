@@ -1,18 +1,9 @@
-//! Four-button reconciliation modal shown when a file changes on
-//! disk while the in-memory buffer is dirty.
+//! Four-button reconciliation modal shown when a file changes on disk while the in-memory
+//! buffer is dirty: `[Merge]` (diff review), `[Save a copy]`, `[Discard & reload]` (both push a
+//! sibling modal), `[Keep buffer]` (explicit no-op close).
 //!
-//! Buttons (left → right):
-//!
-//! | Button | Action |
-//! |---|---|
-//! | `[Merge]` | Enter diff mode to review the on-disk change hunk by hunk. |
-//! | `[Save a copy]` | Push the [`DirtyConflictSaveCopyModal`] sibling for path entry; on confirm save the current buffer to the chosen path, then reload the on-disk contents into the editor's buffer.  Carries `<stem>.local.<ext>` as the suggested filename. |
-//! | `[Discard & reload]` | Push the [`super::dirty_conflict_discard_confirm::DirtyConflictDiscardConfirmModal`] for a destructive-confirm step; on confirm drop the in-memory buffer and load the on-disk contents. |
-//! | `[Keep buffer]` | Close the modal; do nothing.  Buffer remains dirty.  Equivalent to the legacy "Cancel" — explicit so the user understands the consequence. |
-//!
-//! Carries the on-disk `contents: String` that the watcher worker
-//! has already read so downstream callbacks (`Discard & reload`,
-//! `Save a copy`) don't need to re-read disk.
+//! Carries the on-disk `contents: String` the watcher worker already read, so the downstream
+//! callbacks never re-read disk.
 
 use std::any::Any;
 use std::path::{Path, PathBuf};
@@ -33,12 +24,9 @@ pub struct DirtyConflictModal {
     body: Vec<Line<'static>>,
     buttons: Vec<ModalButton>,
     chrome: ModalChrome,
-    /// On-disk contents already read by the watcher worker.  Held
-    /// here so the button callbacks can reload without re-reading
-    /// (and racing the next watcher event).  `pub(crate)` so the
-    /// `file_changed.rs` test module can inspect what the modal
-    /// carries; mutated through [`Self::set_on_disk_contents`] in
-    /// production code.
+    /// On-disk contents already read by the watcher worker, so the button callbacks can reload
+    /// without re-reading (and racing the next watcher event).  Mutated through
+    /// [`Self::set_on_disk_contents`].
     pub(crate) on_disk_contents: String,
 }
 
@@ -63,23 +51,16 @@ impl DirtyConflictModal {
         }
     }
 
-    /// Replace the carried on-disk contents with the bytes from a
-    /// freshly-arrived external write.  Called from
-    /// `App::handle_file_changed` when a new change lands while a
-    /// child reconciliation modal is open (and the parent is therefore
-    /// still on the stack underneath it).  Without this, a cancel from
-    /// the child would return the user to a `DirtyConflictModal`
-    /// carrying stale bytes.
+    /// Refresh the carried bytes when a new external write lands while a child reconciliation
+    /// modal is open.  Without this, cancelling out of the child would return the user to a
+    /// modal carrying stale bytes.
     pub fn set_on_disk_contents(&mut self, contents: String) {
         self.on_disk_contents = contents;
     }
 }
 
-/// Build the suggested copy filename: `<stem>.local.<ext>`.  When
-/// the source path has no extension, the suffix lands at the end:
-/// `<stem>.local`.  When `original` is `None`, falls back to a
-/// generic `copy.md`.  Returned as an absolute path string for the
-/// path-entry modal, matching the convention used by
+/// Suggested copy filename: `<stem>.local.<ext>`, or `<stem>.local` with no extension, or
+/// `copy.md` when `original` is `None`.  Returned absolute, matching
 /// [`crate::ui::default_save_as_path`].
 pub(crate) fn local_copy_path(original: Option<&Path>) -> String {
     let Some(p) = original else {
@@ -106,32 +87,23 @@ pub(crate) fn local_copy_path(original: Option<&Path>) -> String {
 }
 
 impl DirtyConflictModal {
-    /// Map a resolved response to an outcome.  Shared by the key and
-    /// click paths so a mouse click on a button behaves exactly like
-    /// pressing it.
+    /// Map a resolved response to an outcome.  Shared by the key and click paths.
     fn resolve(&mut self, response: ModalResponse) -> ModalOutcome {
         match response {
             ModalResponse::Continue => ModalOutcome::Continue,
-            // The modal is non-dismissable (no `Cancelled` path
-            // reaches here), but handle it defensively as a no-op
-            // close to keep the match exhaustive.
+            // Non-dismissable, so this is unreachable; a no-op keeps the match exhaustive.
             ModalResponse::Cancelled => ModalOutcome::Continue,
             ModalResponse::ButtonPressed(0) => {
-                // [Merge] — enter inline diff review with the
-                // already-read on-disk bytes the modal is carrying.
-                // Close this modal first so the diff view (and any
-                // intro modal stacked on top) renders cleanly.
+                // [Merge] — close first so the diff view (and any intro modal atop it) renders
+                // cleanly.
                 let on_disk = self.on_disk_contents.clone();
                 ModalOutcome::CloseAnd(Box::new(move |app| {
                     app.enter_diff_mode(on_disk);
                 }))
             }
             ModalResponse::ButtonPressed(1) => {
-                // [Save a copy] — push the path-entry sibling atop
-                // ourselves so the user can edit the destination
-                // before confirming.  We stay on the stack so a
-                // cancel from the save-copy modal returns the user
-                // here, intact.
+                // [Save a copy] — stay on the stack under the path-entry sibling so a cancel
+                // there returns the user here, intact.
                 let on_disk = self.on_disk_contents.clone();
                 ModalOutcome::ContinueAnd(Box::new(move |app| {
                     let default = local_copy_path(app.editor.buffer.path());
@@ -140,9 +112,7 @@ impl DirtyConflictModal {
                 }))
             }
             ModalResponse::ButtonPressed(2) => {
-                // [Discard & reload] — destructive.  Gate behind a
-                // second confirmation modal that carries the
-                // on-disk contents along.
+                // [Discard & reload] — destructive; gated behind a second confirmation.
                 let on_disk = self.on_disk_contents.clone();
                 ModalOutcome::ContinueAnd(Box::new(move |app| {
                     app.modal_stack
@@ -150,7 +120,7 @@ impl DirtyConflictModal {
                 }))
             }
             ModalResponse::ButtonPressed(3) => {
-                // [Keep buffer] — explicit no-op.  Close.
+                // [Keep buffer] — explicit no-op.
                 ModalOutcome::Close
             }
             ModalResponse::ButtonPressed(_) => ModalOutcome::Close,
@@ -211,10 +181,8 @@ impl Modal for DirtyConflictModal {
 mod tests {
     use super::*;
 
-    // A real directory rather than a `/tmp/…` literal: a `/`-rooted path
-    // has no drive letter, so on Windows it is *not* absolute and would
-    // get the cwd prepended — the test would then fail on a platform
-    // where the behaviour it asserts is correct.
+    // A real tempdir rather than a `/tmp/…` literal: a `/`-rooted path has no drive letter, so
+    // on Windows it is not absolute and would get the cwd prepended.
     #[test]
     fn local_copy_path_appends_dot_local_with_extension() {
         let dir = tempfile::tempdir().unwrap();
@@ -263,7 +231,7 @@ mod tests {
     #[test]
     fn keep_buffer_button_closes_modal_without_change() {
         let (mut app, _tmp) = open_with_disk_contents("external");
-        // Tab three times to reach button index 3 ([Keep buffer]).
+        // Tab to button 3 ([Keep buffer]).
         for _ in 0..3 {
             app.dispatch_modal_key(key(KeyCode::Tab), 24, 80);
         }
@@ -279,8 +247,7 @@ mod tests {
     #[test]
     fn discard_reload_opens_confirmation_modal() {
         let (mut app, _tmp) = open_with_disk_contents("external");
-        // Default focus is button 0 ([Merge]); Tab twice to land
-        // on [Discard & reload].
+        // Default focus is button 0 ([Merge]); Tab twice to reach [Discard & reload].
         app.dispatch_modal_key(key(KeyCode::Tab), 24, 80);
         app.dispatch_modal_key(key(KeyCode::Tab), 24, 80);
         app.dispatch_modal_key(key(KeyCode::Enter), 24, 80);
@@ -289,8 +256,6 @@ mod tests {
                 .contains::<DirtyConflictDiscardConfirmModal>(),
             "discard requires confirmation modal",
         );
-        // Underlying DirtyConflictModal is preserved while
-        // confirmation is open.
         assert!(app.modal_stack.contains::<DirtyConflictModal>());
     }
 
@@ -309,7 +274,6 @@ mod tests {
     #[test]
     fn merge_button_enters_diff_mode_and_closes_modal() {
         let (mut app, _tmp) = open_with_disk_contents("external");
-        // Default focus is button 0 ([Merge]).
         app.dispatch_modal_key(key(KeyCode::Enter), 24, 80);
         assert!(
             !app.modal_stack.contains::<DirtyConflictModal>(),

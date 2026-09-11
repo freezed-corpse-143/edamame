@@ -1,13 +1,7 @@
-//! Diff-mode subsystem.  Exposes:
-//!
-//! - [`engine`] — pure line + word diff over two strings; returns
-//!   [`hunk::Hunk`] sequences with stable ids.
-//! - [`state::DiffState`] — owned by `EditorState::diff` while
-//!   `Mode::Diff` is active; carries the hunk list, per-hunk
-//!   decisions, focused id, and the working new-side buffer.
-//! - [`hunk`] — `Hunk`, `HunkKind`, `Decision`, `InlineSpan`, etc.
-//! - [`layout`] — the flat stacked visual-line model + a cached
-//!   per-width row-count table the renderer and scroll math share.
+//! Diff-mode subsystem: [`engine`] (pure line + word diff), [`hunk`] (data types),
+//! [`state::DiffState`] (session state owned by `EditorState::diff` while `Mode::Diff` is
+//! active), and [`layout`] (the stacked visual-line model shared by renderer and scroll math).
+//! See `docs/dev/diff-review.md`.
 
 pub mod engine;
 pub mod hunk;

@@ -1,45 +1,24 @@
-//! Reusable per-(width) visual-row prefix-sum cache.
-//!
-//! Both rendered-mode (`ParsedDoc`) and raw-mode (`EditorState`) need to
-//! answer the same set of questions per scroll event:
-//!
-//! - How many visual rows does line `i` occupy at width `w`?
-//! - How many visual rows do lines `[0..i)` occupy?
-//! - Which line contains visual row `r`, and which sub-row within it?
-//! - What's the document's total visual row count?
-//!
-//! Without a cache each answer is O(N) in the line count and re-runs the
-//! wrap algorithm per line.  A long document plus a fast trackpad swipe
-//! produces ~2·N wrap calls per queued scroll event, which can saturate a
-//! CPU core and produce visible lag (the events back up faster than they
-//! drain).
-//!
-//! The cache stores per-line counts plus a prefix sum, making all four
-//! queries O(1) (or O(log N) for `find_visual_row` via binary search).
-//! It is invalidated by a width change; callers needing additional
-//! invalidation keys (e.g. raw mode tracking buffer mutations) wrap the
-//! cache in their own staleness check.
+//! Per-width visual-row prefix-sum cache shared by rendered mode (`ParsedDoc`) and raw mode
+//! (`EditorState`). Without it every scroll event re-wraps every line (O(N)), which a fast
+//! trackpad swipe turns into visible lag. Invalidated by a width change; callers with extra
+//! staleness keys (e.g. buffer version) wrap it in their own check.
 
-/// Per-(line_count, width) prefix-sum table over a sequence of lines so
-/// scroll arithmetic and visual-row → line lookups are O(1) / O(log N).
+/// Per-line wrapped row counts plus their prefix sum, so scroll arithmetic is O(1) and
+/// visual-row → line lookup is O(log N).
 #[derive(Debug, Clone)]
 pub(crate) struct VisualRowCache {
-    /// Viewport width this cache was built for.  A mismatch with the
-    /// caller's width forces a refill.
+    /// Viewport width this cache was built for.
     pub(crate) width: usize,
-    /// `visual_rows_per_line[i]` = wrapped row count of line `i` at `width`,
-    /// always at least 1.
+    /// Wrapped row count of each line at `width`, always at least 1.
     pub(crate) visual_rows_per_line: Vec<usize>,
-    /// `visual_row_prefix_sum[i]` = sum of `visual_rows_per_line[0..i]`.
-    /// Length is `visual_rows_per_line.len() + 1`; `[0] == 0`,
-    /// `[len()]` is the total visual row count.
+    /// `[i]` = sum of `visual_rows_per_line[0..i]`; one entry longer than the line count, so
+    /// the last entry is the total.
     pub(crate) visual_row_prefix_sum: Vec<usize>,
 }
 
 impl VisualRowCache {
-    /// Build a cache by invoking `rows_for(idx)` for each `idx` in
-    /// `0..line_count`.  The returned row count is clamped to at least 1
-    /// to match the renderer's behaviour for empty / blank lines.
+    /// Build by calling `rows_for(idx)` for each line; counts are clamped to at least 1 to match
+    /// the renderer's treatment of blank lines.
     pub(crate) fn build<F>(line_count: usize, width: usize, mut rows_for: F) -> Self
     where
         F: FnMut(usize) -> usize,
@@ -61,19 +40,16 @@ impl VisualRowCache {
         }
     }
 
-    /// Width this cache was built for.
     pub(crate) fn width(&self) -> usize {
         self.width
     }
 
-    /// Visual rows occupied by line `idx`.  Returns 1 for out-of-range
-    /// indices (matches the `.max(1)` clamp used by callers historically).
+    /// Visual rows occupied by line `idx`; 1 for out-of-range indices.
     pub(crate) fn for_line(&self, idx: usize) -> usize {
         self.visual_rows_per_line.get(idx).copied().unwrap_or(1)
     }
 
-    /// Sum of visual rows occupied by lines `[0..idx)`.  Saturates at the
-    /// total when `idx > line_count`.
+    /// Visual rows occupied by lines `[0..idx)`; saturates at the total.
     pub(crate) fn before(&self, idx: usize) -> usize {
         let clamped = idx.min(self.visual_rows_per_line.len());
         self.visual_row_prefix_sum
@@ -82,8 +58,7 @@ impl VisualRowCache {
             .unwrap_or(0)
     }
 
-    /// Sum of visual rows occupied by lines `[first..=last]`.  Returns 0
-    /// for an empty cache or a reversed range.
+    /// Visual rows occupied by lines `[first..=last]`; 0 for an empty cache or reversed range.
     #[allow(dead_code)]
     pub(crate) fn between(&self, first: usize, last: usize) -> usize {
         if first > last || self.visual_rows_per_line.is_empty() {
@@ -98,24 +73,16 @@ impl VisualRowCache {
         self.before(self.visual_rows_per_line.len())
     }
 
-    /// Return `(line_idx, sub_row)` for a document-level visual row.
-    ///
-    /// `sub_row` is the wrapped row within `line_idx`.  If `visual_row` is
-    /// past the end of the document, returns `(line_count, 0)` so callers
-    /// can stop rendering without special-case arithmetic.  O(log N) via
-    /// binary search on the prefix sum.
+    /// `(line_idx, sub_row)` for a document-level visual row; `(line_count, 0)` past the end so
+    /// callers can stop rendering without special-case arithmetic.
     pub(crate) fn find_visual_row(&self, visual_row: usize) -> (usize, usize) {
         let total = self.total();
         if visual_row >= total {
             return (self.visual_rows_per_line.len(), 0);
         }
-        // `prefix[i] <= visual_row < prefix[i+1]` — find the smallest `i`
-        // where `prefix[i+1] > visual_row` via `partition_point`.
+        // Smallest `i` with `prefix[i+1] > visual_row`; the prefix array has one extra entry.
         let target = visual_row + 1;
         let upper = self.visual_row_prefix_sum.partition_point(|&p| p < target);
-        // `upper` is the index in the prefix array where `prefix >= target`.
-        // The line index is `upper - 1` because prefix has one more entry
-        // than there are lines.
         let line = upper.saturating_sub(1);
         let start = self.visual_row_prefix_sum[line];
         (line, visual_row - start)
@@ -136,7 +103,6 @@ mod tests {
 
     #[test]
     fn prefix_sum_matches_per_line_counts() {
-        // 5 lines with row counts [1, 2, 1, 3, 1] → prefix [0,1,3,4,7,8].
         let counts = [1usize, 2, 1, 3, 1];
         let cache = VisualRowCache::build(counts.len(), 80, |i| counts[i]);
         assert_eq!(cache.total(), 8);
@@ -150,7 +116,6 @@ mod tests {
 
     #[test]
     fn find_visual_row_lands_on_correct_line_and_subrow() {
-        // Row counts [2, 1, 3] → prefix [0, 2, 3, 6].
         let counts = [2usize, 1, 3];
         let cache = VisualRowCache::build(counts.len(), 80, |i| counts[i]);
         assert_eq!(cache.find_visual_row(0), (0, 0));
@@ -159,7 +124,6 @@ mod tests {
         assert_eq!(cache.find_visual_row(3), (2, 0));
         assert_eq!(cache.find_visual_row(4), (2, 1));
         assert_eq!(cache.find_visual_row(5), (2, 2));
-        // Past EOF.
         assert_eq!(cache.find_visual_row(6), (3, 0));
         assert_eq!(cache.find_visual_row(100), (3, 0));
     }

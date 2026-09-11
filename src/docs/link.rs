@@ -1,28 +1,15 @@
-//! Resolve a relative link written inside an embedded documentation
-//! page.
+//! Resolve a relative link written inside an embedded documentation page. Pure and
+//! I/O-free; the `#fragment` was already split off by `LinkTarget::parse`.
 //!
-//! Pure and I/O-free, like [`crate::editor::link::LinkTarget::parse`],
-//! and unit-tested against string literals for the same reason.  The
-//! `#fragment` has already been split off by `LinkTarget::parse` by the
-//! time this sees a path, so it is carried through rather than parsed
-//! again.
-//!
-//! **Why this exists at all.**  A doc page is pathless, so
-//! `LinkTarget::parse` has no `base_dir` and hands back a bare relative
-//! `PathBuf` — which the ordinary local-file path would resolve against
-//! the process's working directory, opening whatever `security.md`
-//! happens to sit next to the user's shell.  Interception therefore has
-//! to happen somewhere; it happens in `App::follow_link`, gated on a
-//! doc page actually being open, rather than inside `LinkTarget::parse`,
-//! which has no business knowing about documentation and must keep
-//! answering the same way for an ordinary user document that links to a
-//! file of its own named `security.md`.
+//! Needed because a doc page is pathless: the ordinary local-file path would resolve
+//! `security.md` against the process cwd. Interception lives in `App::follow_link`, gated
+//! on a doc page being open, so `LinkTarget::parse` keeps answering the same way for a user
+//! document that links to its own `security.md`.
 
 use std::path::Path;
 
 use super::registry::DocId;
 
-/// Where the repository lives, for links that leave the embedded set.
 const REPO_BLOB_BASE: &str = "https://github.com/mijowi/edamame/blob/main";
 
 /// What a relative link inside a doc page turns out to name.
@@ -30,17 +17,12 @@ const REPO_BLOB_BASE: &str = "https://github.com/mijowi/edamame/blob/main";
 pub enum DocLinkResolution {
     /// Another embedded page, with any fragment carried through.
     Doc(DocId, Option<String>),
-    /// A file that ships in the repository but not in the binary —
-    /// the contributor pages under `docs/dev/` and the root
-    /// `SECURITY.md`.  Handed to the system browser as a GitHub URL.
+    /// A repository file not in the binary (`docs/dev/`, root `SECURITY.md`), as a GitHub URL.
     External(String),
 }
 
-/// Classify `path` as written inside an embedded page.
-///
-/// An exact file-name match is another embedded page; anything else is
-/// a repository file we do not carry, mapped onto its GitHub URL so the
-/// link still goes somewhere truthful instead of failing silently.
+/// An exact file-name match is another embedded page; anything else maps onto its GitHub
+/// URL so the link still goes somewhere truthful.
 pub fn resolve_doc_reference(path: &Path, fragment: Option<String>) -> DocLinkResolution {
     if let Some(id) = path.to_str().and_then(DocId::from_slug) {
         return DocLinkResolution::Doc(id, fragment);
@@ -53,18 +35,12 @@ pub fn resolve_doc_reference(path: &Path, fragment: Option<String>) -> DocLinkRe
     DocLinkResolution::External(url)
 }
 
-/// Re-root a link that leaves the embedded set onto a repository path.
-///
-/// Links inside the docs are written relative to `docs/`, so `..`
-/// climbs to the repository root (`../SECURITY.md` → `SECURITY.md`) and
-/// anything else stays beneath it (`dev/theming.md` →
-/// `docs/dev/theming.md`).  Resolved textually rather than with
-/// `Path::canonicalize`, which would consult a filesystem that has
-/// nothing to do with these paths.
+/// Re-root a link relative to `docs/` onto a repository path (`../SECURITY.md` →
+/// `SECURITY.md`, `dev/theming.md` → `docs/dev/theming.md`), textually — `canonicalize`
+/// would consult an unrelated filesystem.
 fn repo_relative_path(path: &Path) -> String {
     let raw = path.to_string_lossy().replace('\\', "/");
     let mut parts: Vec<&str> = Vec::new();
-    // Every doc lives in `docs/`, so that is the starting directory.
     parts.push("docs");
     for segment in raw.split('/') {
         match segment {
@@ -97,7 +73,6 @@ mod tests {
 
     #[test]
     fn a_fragment_is_carried_through_to_the_page() {
-        // This exact link is in the shipped docs today.
         assert_eq!(
             resolve("keybindings.md", Some("terminal-compatibility")),
             DocLinkResolution::Doc(
@@ -117,8 +92,6 @@ mod tests {
 
     #[test]
     fn a_parent_reference_climbs_out_of_the_docs_directory() {
-        // `../SECURITY.md` is written from `docs/`, so it names the
-        // repository root — not `docs/../SECURITY.md`.
         assert_eq!(
             resolve("../SECURITY.md", None),
             DocLinkResolution::External(format!("{REPO_BLOB_BASE}/SECURITY.md"))
@@ -137,9 +110,6 @@ mod tests {
 
     #[test]
     fn an_unknown_file_name_does_not_masquerade_as_a_page() {
-        // Falling through to GitHub is right: we know the docs
-        // directory, so the guess is at least truthful about where it
-        // looked.
         assert_eq!(
             resolve("nonexistent.md", None),
             DocLinkResolution::External(format!("{REPO_BLOB_BASE}/docs/nonexistent.md"))
@@ -148,10 +118,7 @@ mod tests {
 
     #[test]
     fn every_cross_link_in_the_shipped_docs_resolves_somewhere_sane() {
-        // A regression guard against a doc being renamed out from
-        // under a sibling's link: every `](*.md)` target in the
-        // embedded set must either name an embedded page or be one of
-        // the two known out-of-set destinations.
+        // Guards against a doc being renamed out from under a sibling's link.
         for page in super::super::registry::ALL_DOCS {
             for target in md_link_targets(page.source) {
                 let (path, _) = match target.split_once('#') {
@@ -173,9 +140,7 @@ mod tests {
         }
     }
 
-    /// Every `](target)` in `src` whose target looks like a local
-    /// Markdown path — enough for the guard above, deliberately not a
-    /// Markdown parser.
+    /// Every `](target)` that looks like a local Markdown path; deliberately not a parser.
     fn md_link_targets(src: &str) -> Vec<String> {
         let mut out = Vec::new();
         let bytes: Vec<char> = src.chars().collect();

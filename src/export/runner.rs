@@ -3,50 +3,29 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-/// Result reported by any background export job.  Kept simple (owned
-/// `String` for errors) so it crosses the `Send` boundary without having
-/// to deal with `anyhow::Error`'s `!Sync` story.
+/// Result of a background export job; an owned `String` error so it is trivially `Send`.
 pub type ExportOutcome = Result<PathBuf, String>;
 
 /// Reasons [`preflight`] may refuse to start an export.
 #[derive(Debug, Error)]
 pub enum PreflightError {
-    /// The output path already exists and the caller did not request an
-    /// overwrite.  The caller is expected to surface a confirmation
-    /// prompt and re-invoke with `overwrite = true` on approval.
+    /// The caller should confirm with the user and re-invoke with `overwrite = true`.
     #[error("output file already exists: {0}")]
     TargetExists(PathBuf),
-    /// The source has no associated path, so we cannot derive a default
-    /// target filename next to it.  Only relevant when the caller relied
-    /// on [`target_for_source`] — explicit targets never hit this path.
-    /// Constructed only by callers that derive a target from a pathless
-    /// source — library surface the binary doesn't reach (it guards on a
-    /// saved `file_path` before exporting).
+    /// Library surface only: the binary guards on a saved `file_path` before exporting.
     #[allow(dead_code)]
     #[error("source document has no path; cannot derive an export target")]
     NoSourcePath,
 }
 
-/// Compute the default export target next to a source markdown file.
-///
-/// `source` is the `.md` path; `extension` is supplied without a leading
-/// dot (`"html"`, `"pdf"`, …).  A source path of `notes/guide.md` with
-/// `"html"` yields `notes/guide.html`.
-///
-/// `source.with_extension(...)` preserves the parent directory and
-/// replaces the final extension, matching the "output next to
-/// the source" behaviour.
+/// Default export target next to the source: `notes/guide.md` + `"html"` (no leading dot)
+/// yields `notes/guide.html`.
 pub fn target_for_source(source: &Path, extension: &str) -> PathBuf {
     source.with_extension(extension)
 }
 
-/// Decide whether an export may proceed to `target`.
-///
-/// Returns `Ok(())` when the file does not exist *or* `overwrite` is
-/// true.  The file-system check is advisory — a concurrent writer can
-/// still lose the race, but the exporter's atomic temp-file-and-rename
-/// write means the worst case is "the user's confirmation modal was
-/// based on slightly stale state".
+/// Decide whether an export may proceed to `target`. The existence check is advisory (a
+/// concurrent writer can race it), but the atomic write below bounds the damage.
 pub fn preflight(target: &Path, overwrite: bool) -> Result<(), PreflightError> {
     if target.exists() && !overwrite {
         Err(PreflightError::TargetExists(target.to_path_buf()))
@@ -55,18 +34,9 @@ pub fn preflight(target: &Path, overwrite: bool) -> Result<(), PreflightError> {
     }
 }
 
-/// Write `bytes` to `path` atomically: a temp file is created in the
-/// target directory and renamed over `path` only after the write
-/// succeeds.  A partial or interrupted write therefore never leaves a
-/// truncated export file at the target path.
-///
-/// The temp file is created with a random, `O_EXCL` name via
-/// `NamedTempFile` rather than a predictable `.{name}.edamame-export.tmp`
-/// sibling: a predictable name in a directory the user can't fully trust
-/// could be pre-planted as a symlink and redirect the write elsewhere.
-/// `persist` is a same-directory rename, so atomicity is preserved.
-///
-/// Used by every export backend, so failure modes are uniform.
+/// Write `bytes` to `path` via a same-directory temp file and rename, so an interrupted
+/// write never leaves a truncated export. The temp name is random and `O_EXCL`
+/// (`NamedTempFile`), not a predictable sibling a symlink could be pre-planted under.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;

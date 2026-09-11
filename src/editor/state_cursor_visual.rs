@@ -1,39 +1,21 @@
-//! Visual-line cursor navigation.
-//!
-//! Visual-line moves use the same word-aware wrap algorithm as
-//! `ui::line_render::render_line` so the cursor lands at the screen column
-//! the user actually sees.  The free helpers in this file translate between
-//! a logical-line raw column and a screen-cell column for a wrapped line.
+//! Visual-line cursor navigation, using the same word-aware wrap as
+//! `ui::line_render::render_line` so the cursor lands at the screen column the user sees.
 
 use crate::editor::state::line_text_trimmed;
 use crate::editor::{EditorState, Mode};
 
 impl EditorState {
-    /// Move the cursor one line up/down, skipping the structural rows that
-    /// are not real editing targets — but **only in a rendered view**.  In
-    /// `Mode::Rendered`/`Preview` a GFM table's alignment row (`|---|`) and
-    /// hidden (zero-rendered-line) HTML-comment blocks are skipped, because
-    /// they're artefacts the user can't sensibly land on.  In `Mode::Raw`
-    /// every line is genuine, editable source, so nothing is skipped.  This
-    /// rendered-vs-raw rule is shared by the default handler (`MoveUp`/
-    /// `MoveDown`) and vim `j`/`k`.
-    ///
-    /// `visual` selects per-visual-row stepping (wrapped lines — the
-    /// `gj`/`gk` feel) over logical-line stepping: the default handler
-    /// passes `visual_line_nav`; vim `j`/`k` pass `false` (logical), since
-    /// `gj`/`gk` are the visual variants.
+    /// Move the cursor one line up/down.  In rendered views a table's alignment row and
+    /// hidden (zero-rendered-line) HTML-comment blocks are skipped; in `Mode::Raw` every
+    /// line is editable source, so nothing is.  Shared by the default handler and vim
+    /// `j`/`k`.  `visual` selects per-visual-row stepping (the `gj`/`gk` feel).
     pub fn move_cursor_line(&mut self, down: bool, visual: bool, viewport_width: usize) {
         self.step_cursor_line(down, visual, viewport_width);
 
-        // Raw view: the alignment row and comment bytes are real lines the
-        // user may want to edit, so they're valid targets — skip nothing.
         if self.mode == Mode::Raw {
             return;
         }
 
-        // Skip a landed-on alignment row, then walk past any run of hidden
-        // (zero-rendered-line) comment blocks.  The loop is bounded by
-        // offset-stalls at the buffer edge so it can't spin.
         if crate::editor::table_edit_ops::cursor_on_alignment_row(self) {
             self.step_cursor_line(down, visual, viewport_width);
         }
@@ -48,8 +30,7 @@ impl EditorState {
         }
     }
 
-    /// One raw step for [`Self::move_cursor_line`]: per-visual-row when
-    /// `visual` is set and a width is known, else per-logical-line.
+    /// One step for [`Self::move_cursor_line`].
     fn step_cursor_line(&mut self, down: bool, visual: bool, viewport_width: usize) {
         match (down, visual && viewport_width > 0) {
             (true, true) => self.move_down_visual(viewport_width),
@@ -59,35 +40,25 @@ impl EditorState {
         }
     }
 
-    /// Attempt table-cell **horizontal** navigation, skipping the
-    /// auto-managed border chrome (`|`, padding, the alignment row) so a
-    /// motion lands cell-to-cell rather than on characters the editor owns.
-    /// Reuses the default handler's [`table_edit_ops::table_move_horizontal`](crate::editor::table_edit_ops::table_move_horizontal) logic, so vim
-    /// `h`/`l` and the arrow keys behave identically inside a table.
-    ///
-    /// Returns `true` when the cursor was moved or deliberately clamped at a
-    /// table edge; `false` when the caller should fall back to a plain
-    /// grapheme step.  Always `false` in `Mode::Raw`, where the borders are
-    /// real, hand-editable source and every character is a valid target.
+    /// Table-cell horizontal navigation that skips the border chrome, via
+    /// [`table_edit_ops::table_move_horizontal`](crate::editor::table_edit_ops::table_move_horizontal)
+    /// so vim `h`/`l` and the arrow keys agree.  Returns `true` when the cursor moved or was
+    /// clamped at a table edge; `false` (fall back to a grapheme step) otherwise, and always
+    /// in `Mode::Raw` where the borders are editable source.
     pub fn try_table_move_horizontal(&mut self, forward: bool) -> bool {
         if self.mode == Mode::Raw {
             return false;
         }
         let moved = crate::editor::table_edit_ops::table_move_horizontal(self, forward);
         if moved {
-            // `table_move_horizontal` sets the offset directly; refresh the
-            // preferred column so a following logical `j`/`k` lands sensibly.
             self.cursor.preferred_col = self.cursor.cell_col(&self.buffer);
         }
         moved
     }
 
-    /// Attempt table-cell **vertical** navigation (the `j`/`k` companion to
-    /// [`Self::try_table_move_horizontal`]): move to the cell directly
-    /// above/below, preserving the column and skipping the alignment row.
-    /// Reuses the default handler's [`try_move_cell_vertical`](crate::editor::table_edit_ops::try_move_cell_vertical), which also
-    /// refreshes the cursor block and viewport on success.  Same `Raw`-mode
-    /// and fall-back contract as the horizontal variant.
+    /// Vertical companion to [`Self::try_table_move_horizontal`], via
+    /// [`try_move_cell_vertical`](crate::editor::table_edit_ops::try_move_cell_vertical);
+    /// same `Raw`-mode and fall-back contract.
     pub fn try_table_move_vertical(
         &mut self,
         down: bool,
@@ -105,14 +76,8 @@ impl EditorState {
         )
     }
 
-    /// Move the cursor up by one **visual** line, accounting for word-wrap at
-    /// `col_width`.
-    ///
-    /// Uses the same word-aware wrap algorithm as `line_render::render_line`
-    /// so navigation lands on the same visual column the user sees on screen.
-    /// If the cursor is on the first visual sub-line of its logical line, it
-    /// moves to the LAST visual sub-line of the previous logical line,
-    /// preserving `cursor.preferred_col` as the target visual column.
+    /// Move the cursor up one visual row (wrapped at `col_width`), crossing into the last
+    /// row of the previous logical line and keeping `preferred_col` as the target column.
     pub fn move_up_visual(&mut self, col_width: usize) {
         if col_width == 0 {
             self.cursor.move_up(&self.buffer);
@@ -151,8 +116,7 @@ impl EditorState {
         }
     }
 
-    /// Move the cursor down by one **visual** line, accounting for word-wrap at
-    /// `col_width`. See `move_up_visual` for details.
+    /// Down counterpart of [`Self::move_up_visual`].
     pub fn move_down_visual(&mut self, col_width: usize) {
         if col_width == 0 {
             self.cursor.move_down(&self.buffer);
@@ -183,8 +147,6 @@ impl EditorState {
                 let next_rows = wrap_rows_for_text(&next_text, col_width, next_indent);
                 let target = next_rows[0];
                 let is_last = next_rows.len() == 1;
-                // First row of the next logical line uses no hanging indent;
-                // continuation rows of the same line do.
                 let raw_col = raw_col_for_visual_cells(&next_text, target, target_cell, is_last, 0);
                 let next_start = self.buffer.line_to_char(next_line);
                 self.cursor.offset = next_start + raw_col;
@@ -194,10 +156,8 @@ impl EditorState {
         }
     }
 
-    /// Cell column of the cursor measured from the **screen-row** left
-    /// edge, including any hanging-indent padding when the cursor sits on
-    /// a wrapped continuation row.  Used to seed `preferred_col` so
-    /// vertical navigation lands at the same screen X on the target row.
+    /// Cell column of the cursor from the screen-row's left edge (hanging indent included),
+    /// used to seed `preferred_col`.
     pub fn current_visual_col(&self, col_width: usize) -> usize {
         if col_width == 0 {
             return self.cursor.cell_col(&self.buffer);
@@ -213,14 +173,9 @@ impl EditorState {
     }
 }
 
-/// Hanging indent to wrap `text` with, for the given view `mode`.
-///
-/// Rendered / Preview reveal the cursor's line as raw source *inside* the
-/// rendered document, and `line_render` hang-indents that revealed line so it
-/// stays aligned with the list around it — so navigation must see the same
-/// indent or the cursor lands in a different column than it appears.
-/// `Mode::Raw` paints flat (`line_render::render_raw_line_with_cursor`), and
-/// so wraps flat here too; see that function for why Raw takes no indent.
+/// Hanging indent to wrap `text` with: the same one `line_render` paints the revealed line
+/// with in Rendered/Preview, so the cursor lands where it appears; Raw paints flat
+/// (`line_render::render_raw_line_with_cursor`) and so wraps flat.
 fn hanging_indent_for_mode(text: &str, mode: Mode) -> usize {
     if mode == Mode::Raw {
         0
@@ -229,10 +184,7 @@ fn hanging_indent_for_mode(text: &str, mode: Mode) -> usize {
     }
 }
 
-/// Wrap `text` at `col_width` cells with a hanging `indent` on continuation
-/// rows.  Returns `(start, end, next_start)` tuples (char indices) — the
-/// same shape `visual_rows_of_chars` returns, just bridged from `&str`
-/// since `EditorState` works in raw text.
+/// `visual_rows_of_chars` bridged from `&str`: `(start, end, next_start)` char-index rows.
 fn wrap_rows_for_text(text: &str, col_width: usize, indent: usize) -> Vec<(usize, usize, usize)> {
     let chars: Vec<(char, ratatui::style::Style)> = text
         .chars()
@@ -241,23 +193,11 @@ fn wrap_rows_for_text(text: &str, col_width: usize, indent: usize) -> Vec<(usize
     crate::ui::line_render::visual_rows_of_chars(&chars, col_width, indent)
 }
 
-/// Cell-aware inverse of the wrap layout: given the text of a logical line,
-/// one of its visual rows `(start, end, next_start)` (char indices), the
-/// desired screen cell column `target_cell`, whether this row is the last
-/// in its line, and the row's hanging-indent width in cells, return the
-/// absolute char column on the logical line where the cursor should land.
-///
-/// Wide chars (CJK, emoji) are handled via the snap-past rule: a target
-/// cell that lands inside a wide glyph places the cursor *after* the glyph
-/// rather than splitting it.  For non-last rows, the cursor is clamped by
-/// `line_render::last_col_in_row` — which measures against the row's `end`,
-/// never its `next_start` — so it stays visually on this row.  (Clamping to
-/// `next_start - 1` would land it on a space the break absorbed, a char that
-/// owns no cell and paints at the *next* row's column 0; see that helper.)
-/// When
-/// `indent > 0` (a continuation row of a wrapped list item), the indent
-/// area is a forbidden zone — clicks inside it snap forward to the row's
-/// first content char.
+/// Inverse of the wrap layout: the absolute char column on the logical line where a cursor
+/// aiming at screen cell `target_cell` lands on visual row `row`.  A cell inside a wide
+/// glyph snaps past it; a target in the hanging-indent area snaps to the row's first content
+/// char; non-last rows clamp via `line_render::last_col_in_row` (measured against `end`,
+/// never `next_start`, which would land on a break-absorbed space that paints on the next row).
 fn raw_col_for_visual_cells(
     text: &str,
     row: (usize, usize, usize),
@@ -273,12 +213,8 @@ fn raw_col_for_visual_cells(
     absolute.min(max_char_in_row)
 }
 
-/// Screen cell column of char position `char_col` within its visual row
-/// `row`, for a logical line whose raw text is `text`.  `indent` is the
-/// hanging-indent in cells for this row (0 for first rows; the line's
-/// detected indent for continuation rows).  Used by `current_visual_col`
-/// to seed `preferred_col` after a horizontal move so subsequent vertical
-/// nav preserves the cursor's screen X.
+/// Screen cell column of char `char_col` within visual row `row` of `text`, `indent` being
+/// the row's hanging indent in cells (0 on first rows).
 fn cell_col_within_row(
     text: &str,
     row: (usize, usize, usize),

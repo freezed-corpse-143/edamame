@@ -1,8 +1,4 @@
 //! Cursor-block tracking and the jitter-suppression reveal timer.
-//!
-//! Methods extracted from `EditorState`'s big `impl` block.  Lives on the
-//! same struct via Rust's ability to have multiple `impl` blocks across
-//! files in the same crate.
 
 use std::time::Instant;
 
@@ -10,25 +6,17 @@ use crate::editor::state::ImageReveal;
 use crate::editor::{EditorState, Mode, RAW_REVEAL_DELAY};
 
 impl EditorState {
-    /// Call after any cursor movement in Rendered mode. Tracks which block the
-    /// cursor is in and which buffer line it is on. `RenderedView` uses
-    /// `cursor_block_entered_at` to delay revealing the raw cursor-block view.
-    /// The timer resets whenever the cursor moves to a **different buffer line**
-    /// (not just a different block), so that the delay is consistent regardless
-    /// of whether the block is a single-line paragraph or a fifty-line table.
+    /// Call after any cursor movement in Rendered mode: refreshes the cursor block, its
+    /// buffer line range, and the raw-reveal timer.  The timer resets on every change of
+    /// **buffer line** (not block), so a fifty-line table reveals row by row with the same
+    /// delay as a one-line paragraph.
     pub fn update_cursor_block(&mut self) {
         let cursor_byte = self.buffer.rope().char_to_byte(self.cursor.offset);
         let previous_block_idx = self.cursor_block_idx;
-        // Always keep cursor_block_idx up-to-date (used by rendered_view for
-        // extracting the raw source of the current block).
         self.cursor_block_idx = self.parsed.source_map.block_for_byte(cursor_byte);
 
-        // Cache the cursor block's buffer line range.  Used by rendered_view
-        // to extract the raw block source during a typing burst without
-        // consulting the (then-stale) source_map.  In-line edits keep line
-        // indices stable — no newlines added or removed — so this range
-        // stays correct until the cursor moves or a cross-line edit fires
-        // refresh_parsed.
+        // Lets rendered_view extract the raw block source during a typing burst without
+        // consulting the stale source_map; in-line edits never move line indices.
         self.cursor_block_line_range = self.cursor_block_idx.and_then(|idx| {
             let byte_range = self.parsed.source_map.original_range_for_block(idx)?;
             let rope = self.buffer.rope();
@@ -36,68 +24,75 @@ impl EditorState {
             let start_byte = byte_range.start.min(total_bytes);
             let end_byte = byte_range.end.min(total_bytes);
             let start_char = rope.byte_to_char(start_byte);
-            // Use `end_byte.saturating_sub(1)` so a range that ends on a `\n`
-            // doesn't claim the next line.
+            // `end_byte - 1` so a range ending on `\n` doesn't claim the next line.
             let end_char = rope.byte_to_char(end_byte.saturating_sub(1).max(start_byte));
             let start_line = rope.char_to_line(start_char);
             let end_line = rope.char_to_line(end_char).max(start_line);
             Some(start_line..end_line + 1)
         });
 
-        // Reset the reveal timer only when the cursor moves to a different
-        // logical buffer line — this makes scrolling through a large table feel
-        // uniform: each row gets the same delay, not the whole table at once.
-        //
-        // Exception: a mermaid diagram block reveals as a single unit (every
-        // rendered row swaps to raw source), so re-arming the timer on every
-        // intra-block line move would flash the image placeholder back in
-        // between line moves.  Keep the existing reveal time once the cursor
-        // is inside a mermaid block until it leaves.
+        // Crossing into a different block drops the "revealed as one unit" latch: the new block
+        // must earn its own reveal (a dwell, or the immediate reflow-from-below case below).
+        if previous_block_idx != self.cursor_block_idx {
+            self.cursor_reveal_latched = false;
+        }
+
         let (current_line, _) = self.cursor.line_col(&self.buffer);
         if Some(current_line) != self.cursor_line_idx {
-            let staying_in_mermaid = previous_block_idx == self.cursor_block_idx
-                && self
-                    .cursor_block_idx
-                    .is_some_and(|idx| self.parsed.is_mermaid_block(idx));
             self.cursor_line_idx = Some(current_line);
-            if !staying_in_mermaid {
+            // Re-arm the delay on every buffer-line change — the same beat every block gets — so
+            // scrolling *through* a block never dwells long enough to reveal it.  (A diagram
+            // (mermaid / `$$` math) and a reflowed paragraph then stay revealed once a dwell
+            // latches them, via `cursor_reveal_latched`, so re-arming here doesn't flash them
+            // collapsed mid-block.)
+            //
+            // The one exception is *entering* a reflowed paragraph on a line other than its first
+            // — an upward move or a click.  Its raw form is taller than its rendered form, so
+            // during the delay the collapsed single flow row can't show the cursor on its true
+            // line: it would sit on that top row and then drop when the block expands.  Reveal
+            // such an entry at once (and latch it) so the cursor lands on the right line
+            // immediately.  A top-line entry (a downward move) keeps the delay — its line *is* the
+            // flow row, so nothing jumps and fast downward scrolling stays smooth.
+            let entering_block = previous_block_idx != self.cursor_block_idx;
+            let on_first_line = self
+                .cursor_block_line_range
+                .as_ref()
+                .is_some_and(|r| current_line == r.start);
+            if entering_block && !on_first_line && self.parsed.is_reflowed_paragraph_at(cursor_byte)
+            {
+                self.cursor_block_entered_at = None;
+                self.cursor_reveal_latched = true;
+            } else {
                 self.cursor_block_entered_at = Some(Instant::now());
             }
         }
         self.cursor_blink.reset();
     }
 
-    /// Whether the cursor should be painted this frame.  Combines the
-    /// blink state with the current mode — Preview never shows a cursor.
+    /// Whether the cursor should be painted this frame.
     pub fn cursor_visible(&self) -> bool {
         self.terminal_focused
             && self.mode != Mode::Preview
             && (self.modal_open || self.cursor_blink.is_visible())
     }
 
-    /// Returns true when the raw view for the cursor block should be shown.
-    /// False during the `RAW_REVEAL_DELAY` window after the cursor entered a
-    /// new block (so rapidly-traversed blocks stay rendered), and false
-    /// while a mouse drag is in progress (so the user's visible click
-    /// anchor doesn't shift under the drag).
+    /// Whether the cursor block should show raw source.  False during the `RAW_REVEAL_DELAY`
+    /// window, during a mouse drag (the click anchor must not shift), and while a search or
+    /// `:s` preview is active (blocks must not flip to raw under the highlights).  A latched
+    /// one-unit block (diagram — mermaid or `$$` math — or reflowed paragraph) stays revealed past
+    /// a delay re-arm — see [`Self::cursor_reveal_latched`].
     pub fn cursor_block_revealed(&self) -> bool {
         if self.drag_in_progress {
             return false;
         }
-        // An active search flow keeps the document fully rendered:
-        // tabbing through matches must not flip blocks between rendered
-        // and raw under the highlights.  This holds even for a
-        // non-capturing navigate flow, where editing is allowed — the
-        // highlights stay stable until the user dismisses the search.
         if self.search.is_some() {
             return false;
         }
-        // Likewise during a live `:s` preview: the preview parks the
-        // cursor on the first affected line while the user types, and
-        // the reveal delay would elapse mid-typing, flipping that block
-        // to raw source under the preview highlights.
         if self.substitute_preview.is_some() {
             return false;
+        }
+        if self.cursor_reveal_latched {
+            return true;
         }
         match self.cursor_block_entered_at {
             None => true,
@@ -105,26 +100,38 @@ impl EditorState {
         }
     }
 
-    /// Bring [`EditorState::image_reveal`] in line with where the cursor
-    /// is right now, re-parsing when it changed.  Returns `true` when the
-    /// document was re-laid-out, so the caller can force a redraw.
-    ///
-    /// Called once per frame from `App::prepare_viewport` because the
-    /// reveal is time-driven (the `RAW_REVEAL_DELAY` window elapses without
-    /// any event of its own), so there is no single action site that could
-    /// own the transition.  It is a no-op on every frame where the target
-    /// hasn't moved — the re-parse only fires as the cursor enters or
-    /// leaves an image block.
+    /// Latch the reveal of a "reveal as one unit" block — a diagram (mermaid or `$$` math) or a
+    /// reflowed paragraph — once it has been revealed by a dwell, so it stays revealed while the
+    /// cursor remains inside even as line moves re-arm the delay.  Called once per frame from
+    /// `App::prepare_viewport`.  Other blocks (tables, code) are left to the per-line delay, so
+    /// they keep revealing row by row and hide again under a moving cursor.
+    pub fn latch_cursor_reveal(&mut self) {
+        if self.cursor_reveal_latched || self.mode != Mode::Rendered {
+            return;
+        }
+        let is_one_unit = self.cursor_block_idx.is_some_and(|idx| {
+            self.parsed.is_diagram_reveal_block(idx) || {
+                let cursor_byte = self.buffer.rope().char_to_byte(self.cursor.offset);
+                self.parsed.is_reflowed_paragraph_at(cursor_byte)
+            }
+        });
+        if is_one_unit && self.cursor_block_revealed() {
+            self.cursor_reveal_latched = true;
+        }
+    }
+
+    /// Bring [`EditorState::image_reveal`] in line with the cursor, re-parsing when it
+    /// changed; returns `true` when it did.  Called every event-loop pass from
+    /// `App::prepare_viewport` because the reveal is time-driven and has no action site of
+    /// its own, so the no-op path must not allocate.
     pub fn sync_image_reveal(&mut self) -> bool {
-        // The target borrows out of `parsed`, so nothing is allocated on
-        // the overwhelmingly common no-op path — this runs on every pass of
-        // the event loop (every keystroke and every idle tick), not just on
-        // the frames that draw.  Only a real transition pays for the
-        // `String`.
         let target = self.image_reveal_target();
         let unchanged = match (target, self.image_reveal.as_ref()) {
-            (Some((ordinal, url, rows)), Some(cur)) => {
-                ordinal == cur.ordinal && url == cur.url.as_str() && rows == cur.rows
+            (Some((ordinal, url, rows, preview_rows)), Some(cur)) => {
+                ordinal == cur.ordinal
+                    && url == cur.url.as_str()
+                    && rows == cur.rows
+                    && preview_rows == cur.preview_rows
             }
             (None, None) => true,
             _ => false,
@@ -132,61 +139,41 @@ impl EditorState {
         if unchanged {
             return false;
         }
-        self.image_reveal = target.map(|(ordinal, url, rows)| ImageReveal {
+        self.image_reveal = target.map(|(ordinal, url, rows, preview_rows)| ImageReveal {
             ordinal,
             url: url.to_owned(),
             rows,
+            preview_rows,
         });
-        // Only the block's *rendered* row count changed — the source is
-        // untouched, so every byte range (and with it the cached cursor
-        // block and its line range) survives the re-parse unchanged.
+        // Source is untouched, so every byte range survives the re-parse.
         self.refresh_parsed();
         true
     }
 
-    /// The reservation the image reveal wants for the current cursor
-    /// position: `(image-block ordinal, image URL, one row per raw source
-    /// line)`, or `None` when the cursor isn't resting inside a revealed
-    /// image block.  The ordinal is the block's index into
-    /// `ParsedDoc::image_blocks`, which is the index space the renderer's
-    /// row override counts in — see [`ImageReveal`] for why the URL alone
-    /// is not enough to name a block.
-    ///
-    /// The URL is borrowed out of `self.parsed` rather than cloned: the
-    /// caller runs this per event-loop pass purely to compare against the
-    /// stashed reservation, and owns the result only when they differ.
-    fn image_reveal_target(&self) -> Option<(usize, &str, usize)> {
-        // Preview is browse-only and Raw already shows the source, so the
-        // reveal — and its reflow — belongs to Rendered mode alone.
+    /// The reservation the reveal wants for the cursor position: `(ordinal into
+    /// `ParsedDoc::image_blocks`, URL, raw-source rows, preview-band rows)`, or `None` outside a
+    /// revealed image block.  See [`ImageReveal`] for why the URL alone can't name a block.
+    /// The URL is borrowed, not cloned, because this runs every event-loop pass.
+    fn image_reveal_target(&self) -> Option<(usize, &str, usize, usize)> {
         if self.mode != Mode::Rendered {
             return None;
         }
-        // Mid-typing the parse is stale, and with it the block's URL (a
-        // diagram's hashes its source; an ordinary image's *is* source
-        // text).  An in-line edit can't change the block's line count, so
-        // hold the current reservation rather than recomputing one against
-        // a URL that no longer exists.
+        // Mid-typing the parse (and a diagram's source-hashed URL) is stale; an in-line edit
+        // can't change the line count, so hold the current reservation.
         if self.parsed_dirty {
             return self
                 .image_reveal
                 .as_ref()
-                .map(|r| (r.ordinal, r.url.as_str(), r.rows));
+                .map(|r| (r.ordinal, r.url.as_str(), r.rows, r.preview_rows));
         }
         if !self.cursor_block_revealed() {
             return None;
         }
         let cursor_byte = self.buffer.rope().char_to_byte(self.cursor.offset);
         let block_idx = self.parsed.source_map.block_for_byte(cursor_byte)?;
-        // Every `Block::ImageBlock` qualifies, diagram or not: the row
-        // reservation tracks the rendered image in both cases, and the raw
-        // source it hides is a mermaid fence in one and a single
-        // `![alt](url)` line in the other.
         if !self.parsed.is_image_block(block_idx) {
             return None;
         }
-        // `position` rather than `find`: the index *is* the ordinal the
-        // renderer's row override counts to, so the same walk answers both
-        // halves of the block's identity.
         let ordinal = self
             .parsed
             .image_blocks
@@ -194,19 +181,186 @@ impl EditorState {
             .position(|info| info.block_idx == block_idx)?;
         let url = self.parsed.image_blocks[ordinal].url.as_str();
         let range = self.parsed.source_map.original_range_for_block(block_idx)?;
-        // Read the document out of `ParsedDoc`, not the live `Buffer`: the
-        // range is a *parse-time* byte range, and this runs on every frame
-        // the cursor rests in an image block — `Buffer::contents()` would
-        // allocate the whole document as a `String` each time.
+        // Parse-time range, so read the parse-time source (also avoids `Buffer::contents()`
+        // allocating the whole document every frame).
         let contents = self.parsed.source();
         let source = contents.get(range.start..range.end.min(contents.len()))?;
-        // Counts the lines `RenderedView` reveals through — minus a
-        // trailing blank the extended block range absorbed, which owns a
-        // rendered row of its own as a virtual block.  Derived from the
-        // same split the painter uses, so the reserved rows and the raw
-        // lines painted onto them can't disagree, and without allocating
-        // the `Vec` of slices just to read its length.
-        let rows = crate::ui::rendered_view::revealed_source_line_count(source);
-        Some((ordinal, url, rows))
+        // Same split the painter uses, so reserved rows and painted lines can't disagree.
+        let raw_rows = crate::ui::rendered_view::revealed_source_line_count(source);
+        // A `$$...$$` block with preview on reserves a top band for the decoded formula (keeping
+        // its pre-reveal position) while the source paints below.  Same row count the renderer's
+        // override gives the image outside the reveal, so it doesn't resize when the reveal opens;
+        // zero for mermaid / plain images / preview off.
+        let preview_rows = if self.math_preview && self.parsed.is_latex_block(block_idx) {
+            let max_w = self.image_max_width.min(u16::MAX as usize) as u16;
+            let max_h = self.image_max_height.min(u16::MAX as usize) as u16;
+            // `aspect_rows`, not `reserved_rows`: the former answers `None` for a *failed* decode
+            // as well as a pending one, so an invalid formula falls through to the same "keep the
+            // last resolved band" branch as an in-flight one.  `reserved_rows` would instead
+            // collapse the band to one row (`Some(1)`) the instant an intermediate keystroke fails
+            // to parse, then spring it back when the formula is valid again — the janky mid-typing
+            // reflow this branch exists to prevent.
+            self.images
+                .aspect_rows(url, max_w, max_h, self.image_font_size)
+                .unwrap_or_else(|| {
+                    // URL unknown (still decoding, a failed/invalid render, or a keystroke's
+                    // throwaway hash the debounce is holding): keep this block's last resolved band
+                    // so it doesn't jump to the placeholder while typing, falling back to the
+                    // placeholder only with no prior.
+                    self.image_reveal
+                        .as_ref()
+                        .filter(|r| r.ordinal == ordinal && r.preview_rows > 0)
+                        .map_or(self.image_max_height, |r| r.preview_rows)
+                })
+        } else {
+            0
+        };
+        Some((ordinal, url, raw_rows, preview_rows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::Theme;
+    use crate::document::Buffer;
+    use crate::editor::{EditorState, Mode};
+
+    fn theme() -> &'static Theme {
+        Box::leak(Box::new(Theme::default()))
+    }
+
+    /// Once a reflowed paragraph is revealed (latched by a dwell), moving between its source lines
+    /// keeps it revealed even though each move re-arms the delay — so it never flashes collapsed
+    /// mid-block.  The latch, not a suppressed timer, is what holds it.
+    #[test]
+    fn moving_within_a_revealed_reflowed_paragraph_keeps_it_revealed() {
+        let mut st = EditorState::new(Buffer::from_str("one\ntwo\nthree\n\nafter\n"), theme());
+        st.mode = Mode::Rendered;
+        st.set_viewport_width(80);
+        st.sync_reflow_for_mode();
+        // Cursor rests on the paragraph's first source line; dwell reveals it, and the per-frame
+        // latch step then pins it revealed.
+        st.cursor.offset = 0;
+        st.update_cursor_block();
+        st.cursor_block_entered_at = None;
+        st.latch_cursor_reveal();
+        assert!(st.cursor_reveal_latched, "a dwell must latch the reveal");
+
+        // Move down to the second source line: the delay re-arms, but the latch holds the reveal.
+        let byte = st.buffer.contents().find("two").unwrap();
+        st.cursor.offset = st.buffer.rope().byte_to_char(byte);
+        st.update_cursor_block();
+        assert!(
+            st.cursor_block_entered_at.is_some(),
+            "an intra-block line move re-arms the delay, like every other block",
+        );
+        assert!(
+            st.cursor_block_revealed(),
+            "the latch must hold the paragraph revealed across the move",
+        );
+    }
+
+    /// Scrolling *through* a reflowed paragraph (a hold-down that re-arms the delay every line)
+    /// must not reveal it — the delay never elapses, exactly as for any other block.  This is the
+    /// regression the old "don't re-arm within a one-unit block" shortcut caused: the timer, set
+    /// once on entry, elapsed a few lines in and de-rendered the block mid-scroll.
+    #[test]
+    fn scrolling_through_a_reflowed_paragraph_does_not_reveal_it() {
+        let mut st = EditorState::new(
+            Buffer::from_str("intro\n\none\ntwo\nthree\nfour\nfive\n\nafter\n"),
+            theme(),
+        );
+        st.mode = Mode::Rendered;
+        st.set_viewport_width(80);
+        st.sync_reflow_for_mode();
+        // Enter from above (first line), the way a downward scroll does.
+        let first = st.buffer.contents().find("one").unwrap();
+        st.cursor.offset = st.buffer.rope().byte_to_char(first);
+        st.update_cursor_block();
+        for word in ["two", "three", "four", "five"] {
+            let byte = st.buffer.contents().find(word).unwrap();
+            st.cursor.offset = st.buffer.rope().byte_to_char(byte);
+            st.update_cursor_block(); // re-arms the delay with a fresh instant every line
+            st.latch_cursor_reveal();
+            assert!(
+                !st.cursor_block_revealed(),
+                "the block must stay rendered while scrolling through it (at {word})",
+            );
+        }
+    }
+
+    /// Entering a reflowed paragraph on a line other than its first (an upward move or a click)
+    /// reveals it immediately, so the cursor lands on its true line at once rather than sitting on
+    /// the collapsed flow's top row for `RAW_REVEAL_DELAY` and then dropping.
+    #[test]
+    fn entering_a_reflowed_paragraph_from_below_reveals_immediately() {
+        let mut st = EditorState::new(
+            Buffer::from_str("intro\n\none\ntwo\nthree\n\nafter\n"),
+            theme(),
+        );
+        st.mode = Mode::Rendered;
+        st.set_viewport_width(80);
+        st.sync_reflow_for_mode();
+        // Rest below the paragraph, revealed there, then move up onto its last source line.
+        let after = st.buffer.contents().find("after").unwrap();
+        st.cursor.offset = st.buffer.rope().byte_to_char(after);
+        st.update_cursor_block();
+        st.cursor_block_entered_at = None;
+
+        let last = st.buffer.contents().find("three").unwrap();
+        st.cursor.offset = st.buffer.rope().byte_to_char(last);
+        st.update_cursor_block();
+        assert!(
+            st.cursor_block_entered_at.is_none(),
+            "entering a reflowed paragraph on a non-first line must skip the reveal delay",
+        );
+        assert!(st.cursor_block_revealed());
+    }
+
+    /// The downward counterpart: entering a reflowed paragraph on its first line keeps the reveal
+    /// delay (its line is the flow row, so nothing jumps, and fast downward scrolling stays smooth).
+    #[test]
+    fn entering_a_reflowed_paragraph_from_above_keeps_the_delay() {
+        let mut st = EditorState::new(
+            Buffer::from_str("intro\n\none\ntwo\nthree\n\nafter\n"),
+            theme(),
+        );
+        st.mode = Mode::Rendered;
+        st.set_viewport_width(80);
+        st.sync_reflow_for_mode();
+        let intro = st.buffer.contents().find("intro").unwrap();
+        st.cursor.offset = st.buffer.rope().byte_to_char(intro);
+        st.update_cursor_block();
+        st.cursor_block_entered_at = None;
+
+        let first = st.buffer.contents().find("one").unwrap();
+        st.cursor.offset = st.buffer.rope().byte_to_char(first);
+        st.update_cursor_block();
+        assert!(
+            st.cursor_block_entered_at.is_some(),
+            "entering on the first line must keep the reveal delay",
+        );
+    }
+
+    /// The counterpart: crossing into a *different* block does re-arm the timer, so the new
+    /// block honors the reveal delay (jitter suppression on entry is preserved).
+    #[test]
+    fn crossing_into_another_block_rearms_the_reveal_timer() {
+        let mut st = EditorState::new(Buffer::from_str("one\ntwo\nthree\n\nafter\n"), theme());
+        st.mode = Mode::Rendered;
+        st.set_viewport_width(80);
+        st.sync_reflow_for_mode();
+        st.cursor.offset = 0;
+        st.update_cursor_block();
+        st.cursor_block_entered_at = None;
+
+        // Into the `after` paragraph, a different block.
+        let byte = st.buffer.contents().find("after").unwrap();
+        st.cursor.offset = st.buffer.rope().byte_to_char(byte);
+        st.update_cursor_block();
+        assert!(
+            st.cursor_block_entered_at.is_some(),
+            "crossing into a new block must re-arm the reveal delay",
+        );
     }
 }

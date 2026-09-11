@@ -8,32 +8,20 @@ use super::readers::{INDEXED_FALLBACK_THEME, TRUECOLOR_FALLBACK_THEME};
 
 /// The annotated reference `config.toml` compiled into the binary.
 ///
-/// Seeded on first run by [`ensure_default_files_in`], and used again as
-/// the merge base by [`Config::save`](super::config::Config::save)'s
-/// private `save_merge` helper whenever the user's
-/// file is missing at save time — otherwise a save that raced a deleted
-/// `config.toml` would emit a bare serialization and strip every comment
-/// permanently (each later save then faithfully merges into the
-/// de-annotated file).
+/// Seeded on first run by [`ensure_default_files_in`], and reused as the merge base by
+/// [`Config::save`](super::config::Config::save) when the user's file is missing at save time —
+/// otherwise a save racing a deleted `config.toml` would strip every comment permanently.
 pub(super) const REFERENCE_CONFIG_TOML: &str = include_str!("../../config/config.toml");
 
-/// Testable core of [`super::config::Config::ensure_default_files`]:
-/// given the config directory (which may be a tempdir in tests), create
-/// it plus the `themes/` subdirectory and write the shipped default
-/// files if absent.  Never overwrites existing files.
+/// Testable core of [`super::config::Config::ensure_default_files`]: create the config
+/// directory and its `themes/` and `export/` subdirectories, then write the shipped defaults
+/// if absent.  Never overwrites an existing file.
 ///
-/// Built-in themes (see [`super::theme::BUILTIN_THEMES`]) are compiled
-/// into the binary and resolved before any disk read, so this function
-/// does NOT write `themes/<builtin>.toml` files.  The `themes/`
-/// directory is still created so an empty folder exists for users (or
-/// future export actions) to drop custom theme files into.
+/// Built-in themes are compiled in and resolved before any disk read, so no
+/// `themes/<builtin>.toml` is written; the empty directory exists for custom themes.
 ///
-/// `truecolor` selects the seeded `theme` value: the reference config
-/// ships [`TRUECOLOR_FALLBACK_THEME`], but on an indexed-color terminal
-/// that palette quantizes badly, so a first run there is seeded with
-/// [`INDEXED_FALLBACK_THEME`] instead — the same capability-appropriate
-/// pair [`super::readers::read_theme_named`] falls back to.  Only the
-/// first write is affected; an existing `config.toml` is never touched.
+/// `truecolor` selects the seeded `theme`: indexed-color terminals quantize
+/// [`TRUECOLOR_FALLBACK_THEME`] badly, so they are seeded with [`INDEXED_FALLBACK_THEME`].
 pub(super) fn ensure_default_files_in(dir: &Path, truecolor: bool) {
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, dir = %dir.display(), "failed to create config dir");
@@ -45,15 +33,9 @@ pub(super) fn ensure_default_files_in(dir: &Path, truecolor: bool) {
         return;
     }
 
-    // The export stylesheet folder mirrors `themes/`: an (initially empty)
-    // place for users to drop custom `.css` files, each of which becomes a
-    // pick in the Export HTML modal.  The single built-in default is the
-    // frozen compiled-in stylesheet (`export::html::BUILTIN_STYLESHEET`),
-    // so we deliberately do NOT write a selectable `default.css` here — that
-    // would surface a second, identical "default" in the picker.  Instead we
-    // seed a `.example` reference (excluded from the picker by
-    // `list_export_stylesheets`'s `.css` filter): a fork-able starting point
-    // the user copies to `<name>.css` and edits.
+    // A selectable `default.css` is deliberately NOT written: the built-in default is the
+    // compiled-in stylesheet, so a copy here would surface a duplicate in the Export HTML
+    // picker.  The `.example` seed is excluded by `list_export_stylesheets`'s `.css` filter.
     let export_dir = dir.join("export");
     if let Err(e) = std::fs::create_dir_all(&export_dir) {
         tracing::warn!(error = %e, dir = %export_dir.display(), "failed to create export dir");
@@ -71,11 +53,9 @@ pub(super) fn ensure_default_files_in(dir: &Path, truecolor: bool) {
     );
 }
 
-/// The `config.toml` body to seed on first run.  Truecolor terminals get
-/// the reference file verbatim; everything else gets it with the single
-/// `theme = "<truecolor default>"` assignment rewritten to the
-/// indexed-color built-in.  All comments and the rest of the file are
-/// untouched, so the seeded file still reads as the annotated reference.
+/// The `config.toml` body to seed on first run: the reference file verbatim, except that a
+/// non-truecolor terminal gets its single `theme = "…"` assignment rewritten.  Everything else,
+/// comments included, is untouched.
 fn seed_config_toml(truecolor: bool) -> String {
     if truecolor {
         return REFERENCE_CONFIG_TOML.to_owned();
@@ -98,7 +78,106 @@ fn write_if_absent(path: &Path, contents: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::config::Config;
+
+    /// Machine-managed bookkeeping that [`Config::save`] writes on its own.  Deliberately absent
+    /// from the shipped template — a fresh config should not carry state the user never sets — so
+    /// [`reference_config_documents_every_default_setting`] both skips these in its coverage sweep
+    /// and asserts they never appear as reference lines.
+    const BOOKKEEPING_KEYS: &[&str] = &[
+        "editor.seen_terminal_fingerprints",
+        "editor.last_update_check",
+        "editor.update_notified_for",
+        "editor.last_version_seen",
+    ];
+
+    /// Drop a trailing ` # comment` from a value, leaving quoted `#`s alone.
+    fn strip_inline_comment(value: &str) -> &str {
+        let mut in_string = false;
+        for (i, c) in value.char_indices() {
+            match c {
+                '"' => in_string = !in_string,
+                '#' if !in_string => return &value[..i],
+                _ => {}
+            }
+        }
+        value
+    }
+
+    /// Collect `section.key -> value` for every scalar assignment in a TOML-ish string, tracking
+    /// the current `[section]` header.  A leading `# ` (a commented-out reference line) and any
+    /// trailing inline comment are ignored, so the annotated template and a bare
+    /// `toml::to_string_pretty` serialization parse through the same lens.  First write per key
+    /// wins.  Non-identifier keys (prose lines that happen to contain `=`) are skipped.
+    fn scalar_assignments(src: &str) -> HashMap<String, String> {
+        let mut section = String::new();
+        let mut out = HashMap::new();
+        for raw in src.lines() {
+            let line = raw.trim_start();
+            let line = line.strip_prefix('#').map_or(line, str::trim_start);
+            if let Some(rest) = line.strip_prefix('[') {
+                if let Some(name) = rest.split(']').next() {
+                    section = name.trim().to_string();
+                }
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                continue;
+            }
+            let value = strip_inline_comment(value.trim()).trim().to_string();
+            let full = if section.is_empty() {
+                key.to_string()
+            } else {
+                format!("{section}.{key}")
+            };
+            out.entry(full).or_insert(value);
+        }
+        out
+    }
+
+    /// The shipped `config.toml` must list every configurable setting exactly once, at its
+    /// compiled-in default — so adding a `Config` field without documenting it, or letting a
+    /// default drift from the comment beside it, is a test failure rather than a silent gap.
+    /// Machine-written bookkeeping is the sole, asserted, exception.
+    #[test]
+    fn reference_config_documents_every_default_setting() {
+        let serialized = toml::to_string_pretty(&Config::default()).expect("serialize default");
+        let defaults = scalar_assignments(&serialized);
+        let reference = scalar_assignments(REFERENCE_CONFIG_TOML);
+
+        for (key, default_value) in &defaults {
+            // Empty arrays (`export.custom = []`) have no scalar reference line; the custom-export
+            // block is shown as a commented `[[export.custom]]` example instead.
+            if default_value == "[]" || BOOKKEEPING_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            match reference.get(key) {
+                Some(reference_value) => assert_eq!(
+                    reference_value, default_value,
+                    "config.toml lists `{key} = {reference_value}` but the default is \
+                     `{default_value}` — update the reference line",
+                ),
+                None => panic!(
+                    "config.toml has no line for `{key}` (default `{default_value}`) — document \
+                     it, or add it to BOOKKEEPING_KEYS if edamame writes it automatically",
+                ),
+            }
+        }
+
+        for key in BOOKKEEPING_KEYS {
+            assert!(
+                !reference.contains_key(*key),
+                "`{key}` is machine-written bookkeeping and must not ship in config.toml",
+            );
+        }
+    }
 
     #[test]
     fn seed_keeps_reference_verbatim_on_truecolor() {
@@ -107,9 +186,8 @@ mod tests {
 
     #[test]
     fn seed_swaps_theme_for_indexed_terminals() {
-        // Guards both the rewrite and the assumption it rests on: the
-        // reference config must keep spelling the truecolor default as a
-        // plain `theme = "…"` assignment, or the swap would silently no-op.
+        // The reference config must keep spelling the default as a plain `theme = "…"`
+        // assignment, or the swap would silently no-op.
         assert!(REFERENCE_CONFIG_TOML.contains(&format!("theme = \"{TRUECOLOR_FALLBACK_THEME}\"")));
         let seeded = seed_config_toml(false);
         assert!(seeded.contains(&format!("theme = \"{INDEXED_FALLBACK_THEME}\"")));

@@ -1,12 +1,5 @@
-//! Markdown syntax cheat-sheet popover.  No footer buttons — dismissed
-//! via Escape or the `esc` close hint.  The simplest of the modal
-//! implementations and the reference example for trait-based migration.
-//!
-//! The body is rebuilt each frame rather than cached, because it is a
-//! function of the width: the code-block and block-quote rows are
-//! background washes sized to the body, and a wash built for a wider
-//! terminal wraps onto a second, ragged row.  Everything else is
-//! content and wraps normally.
+//! Markdown syntax cheat-sheet popover; the simplest modal and the reference example.
+//! The body is rebuilt each frame because its background washes are sized to the width.
 
 use std::any::Any;
 
@@ -103,7 +96,5 @@ mod tests {
         let mut app = make_app();
         app.open_markdown_cheat_sheet();
         assert!(app.modal_stack.contains::<CheatSheetModal>());
-        // Body-content regression assertions live alongside
-        // `markdown_cheat_sheet_body` in `crate::ui::markdown_cheat_sheet`.
     }
 }

@@ -1,23 +1,13 @@
-//! Path-entry modal for "Save As" — write the buffer to a chosen path
-//! and *adopt* it as the buffer's home.  Reuses the shared
-//! [`SaveCopyState`] + [`SaveCopyView`] widget, but its post-save effect
-//! re-points the buffer, the App's `file_path`, and the filesystem
-//! watcher at the new location via [`App::save_buffer_as`].  When the
-//! typed path would clobber a *different* existing file it hands off to
-//! [`super::OverwriteConfirmModal`] (a vim `:w <path>` instead writes a
-//! detached copy and leaves the buffer's path untouched).
+//! Path-entry modal for "Save As" — write the buffer to a chosen path and *adopt* it as
+//! the buffer's home.  Reuses the shared [`SaveCopyState`] + [`SaveCopyView`] widget, but
+//! its post-save effect re-points the buffer, the App's `file_path`, and the watcher via
+//! [`App::save_buffer_as`] (a vim `:w <path>` instead writes a detached copy).  Clobbering
+//! a *different* existing file hands off to [`super::OverwriteConfirmModal`].
 //!
-//! Reached from several places:
-//! - [`Action::SaveAs`](crate::config::Action::SaveAs) (command palette),
-//! - a `Save` (`Ctrl-S` / vim `:w`) on a path-less buffer, which has no
-//!   destination yet, and
-//! - the file-deleted `[Save as…]` button, where the original file is gone
-//!   so the buffer must move to a new home.
-//!
-//! An optional `after_save` continuation runs once the write succeeds —
-//! used by the "save then quit" (`:wq`, quit-confirm) and "save then
-//! navigate" (dirty-guard) flows so a path-less buffer can complete the
-//! deferred action after the user supplies a path.
+//! Reached from [`Action::SaveAs`](crate::config::Action::SaveAs), a `Save` on a path-less
+//! buffer, and the file-deleted `[Save as…]` button.  The optional `after_save`
+//! continuation lets the "save then quit" / "save then navigate" flows finish once the
+//! user supplies a path.
 
 use std::any::Any;
 use std::path::Path;
@@ -36,18 +26,14 @@ pub type AfterSave = Box<dyn FnOnce(&mut App)>;
 pub struct SaveAsModal {
     state: SaveCopyState,
     after_save: Option<AfterSave>,
-    /// True when this modal is the file-deletion recovery flow (opened
-    /// from [`super::FileDeletedModal`]'s `[Save as…]`).  The watcher
-    /// dedup in `file_changed.rs` suppresses external events only for
-    /// *this* variant — a voluntary save-as on a live file must not hide
-    /// an external change that arrives while the prompt is open.
+    /// True for the file-deletion recovery flow.  The watcher dedup in `file_changed.rs`
+    /// suppresses external events only for *this* variant — a voluntary save-as must not
+    /// hide an external change arriving while the prompt is open.
     from_deletion: bool,
 }
 
 impl SaveAsModal {
-    /// Open as the file-deletion recovery flow, seeded with the deleted
-    /// path.  Distinguished from a voluntary save-as so the watcher dedup
-    /// can treat an open prompt as an in-progress deletion flow.
+    /// Open as the file-deletion recovery flow, seeded with the deleted path.
     pub fn for_deleted_file(default_path: String) -> Self {
         Self {
             state: SaveCopyState::new(default_path),
@@ -56,10 +42,8 @@ impl SaveAsModal {
         }
     }
 
-    /// Seed the path field with the buffer's current path resolved to an
-    /// absolute path (so the destination directory is visible and the user
-    /// can retarget it), or `<cwd>/untitled.md` for an unnamed buffer, and
-    /// optionally attach a continuation to run after a successful save.
+    /// Seed the path field with the buffer's path made absolute, or `<cwd>/untitled.md`
+    /// for an unnamed buffer, optionally attaching a post-save continuation.
     pub fn for_buffer_path(buffer_path: Option<&Path>, after_save: Option<AfterSave>) -> Self {
         Self {
             state: SaveCopyState::new(default_save_as_path(buffer_path)),
@@ -68,8 +52,7 @@ impl SaveAsModal {
         }
     }
 
-    /// Whether this is the file-deletion recovery flow (see
-    /// [`Self::for_deleted_file`]).
+    /// Whether this is the file-deletion recovery flow.
     pub fn is_deletion_recovery(&self) -> bool {
         self.from_deletion
     }
@@ -94,17 +77,11 @@ impl Modal for SaveAsModal {
     ) -> ModalOutcome {
         match self.state.handle_key(&key) {
             SaveCopyResponse::Continue => ModalOutcome::Continue,
-            // Cancel abandons the save-as; any deferred continuation
-            // (quit / navigate) is dropped, leaving the user where they
-            // were so a mis-press is recoverable.
+            // Cancel drops any deferred continuation, so a mis-press is recoverable.
             SaveCopyResponse::Cancelled => ModalOutcome::Close,
             SaveCopyResponse::Save(path_str) => {
                 let path = Path::new(&path_str).to_owned();
                 // Writing over a *different* existing file: confirm first.
-                // Hand the destination and any deferred continuation to the
-                // confirm modal and close this prompt.  Declining there
-                // returns the user to the editor (like Cancel) — they
-                // re-open Save As to pick another name.
                 if app.editor.buffer.would_overwrite(&path) {
                     let after = self.after_save.take();
                     return ModalOutcome::CloseAnd(Box::new(move |app| {
@@ -124,8 +101,7 @@ impl Modal for SaveAsModal {
                         }))
                     }
                     Err(e) => {
-                        // Stay open so the user can correct the path;
-                        // surface the error inline.
+                        // Stay open so the user can correct the path.
                         self.state.last_error = Some(format!("{e}"));
                         ModalOutcome::Continue
                     }
@@ -180,7 +156,6 @@ mod tests {
             std::fs::read_to_string(&target).expect("file written"),
             "moved contents",
         );
-        // The buffer and App now live at the new path, dirty cleared.
         assert_eq!(app.file_path.as_deref(), Some(target.as_path()));
         assert_eq!(app.editor.buffer.path(), Some(target.as_path()));
         assert!(!app.editor.dirty);
@@ -197,8 +172,7 @@ mod tests {
         app.editor.refresh_parsed();
         app.editor.dirty = true;
 
-        // Seed the field with the target path (an absolute temp path that
-        // doesn't yet exist, so no overwrite confirm) and accept it.
+        // The target doesn't exist yet, so no overwrite confirm.
         app.modal_stack.push(Box::new(SaveAsModal::for_buffer_path(
             Some(&target),
             Some(Box::new(|app| app.should_quit = true)),

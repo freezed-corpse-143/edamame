@@ -1,17 +1,10 @@
-//! Idle-debounce autosave.
+//! Idle-debounce autosave: every dirtying edit resets a window of
+//! `config.editor.autosave_idle_ms`; when it expires the buffer is written silently and
+//! an `Autosaved` flash is shown.  Pathless buffers are skipped without UI; save failures
+//! escalate to a sticky `NoticeModal` via [`App::notify`].
 //!
-//! Every dirtying edit resets a debounce window; once the user stops
-//! typing for `config.editor.autosave_idle_ms`, the dirty buffer is
-//! written to disk (no dialog, no confirmation) and an `Autosaved`
-//! transient is flashed on the hint line.  Buffers without an
-//! associated path skip without any UI — the user named no file, so
-//! there's nowhere to save.  Save failures escalate to a sticky
-//! `NoticeModal` via [`App::notify`] so the user can't miss them.
-//!
-//! The run loop drives this from [`App::tick_timers`] (once per
-//! iteration) and consults [`App::autosave_deadline`] in
-//! [`App::next_deadline`] so the channel `recv_timeout` wakes exactly
-//! when the debounce window expires — no polling.
+//! Driven from [`App::tick_timers`]; [`App::autosave_deadline`] feeds [`App::next_deadline`]
+//! so the loop wakes exactly when the window expires rather than polling.
 
 use std::time::{Duration, Instant};
 
@@ -21,27 +14,18 @@ use super::flash::MessageKind;
 use super::App;
 
 impl App {
-    /// Per-iteration autosave step.  Detects edits via
-    /// [`Buffer::version`](crate::document::Buffer::version), so a
-    /// typing burst restarts the debounce window on every keystroke
-    /// rather than firing mid-burst.  No return value: both the
-    /// success path ([`App::flash`]) and the failure path
-    /// ([`App::notify`]) already set `needs_draw`, so the caller in
-    /// `tick_timers` doesn't need to.
+    /// Per-iteration autosave step.  Edits are detected via
+    /// [`Buffer::version`](crate::document::Buffer::version), so every keystroke restarts
+    /// the window.  Both outcomes already set `needs_draw`.
     pub(super) fn tick_autosave(&mut self) {
-        // Diff mode is review-in-progress; saving mid-review would
-        // clobber the on-disk file the user is reconciling against.
-        // Drop any armed timer so it doesn't fire the instant the
-        // user exits diff mode, and skip arming new ones.
+        // Saving mid-review would clobber the file being reconciled against; also drop the
+        // armed timer so it can't fire the instant diff mode exits.
         if self.editor.mode == crate::editor::Mode::Diff {
             self.autosave_pending_since = None;
             return;
         }
-        // A live `:s` preview has transiently rewritten the buffer (raw
-        // buffer edits bump `version` without touching `dirty`); on an
-        // already-dirty buffer the debounce would arm and autosave the
-        // preview text to disk.  Skip entirely — once the preview reverts
-        // or commits, the next tick sees a version change and re-arms.
+        // A live `:s` preview rewrites the buffer through raw edits (version bumps, `dirty`
+        // untouched); on an already-dirty buffer the preview text would reach disk.
         if self.editor.substitute_preview.is_some() {
             self.autosave_pending_since = None;
             return;
@@ -49,9 +33,7 @@ impl App {
         let enabled = self.config.editor.autosave_enabled;
         let version = self.editor.buffer.version();
 
-        // Detect edits: any version change is an edit.  Reset the
-        // debounce window even when autosave is disabled so re-enabling
-        // it later doesn't fire instantly off a stale timestamp.
+        // Track the version even when disabled so re-enabling doesn't fire off a stale stamp.
         if version != self.autosave_last_seen_version {
             self.autosave_last_seen_version = version;
             if enabled && self.editor.dirty && self.editor.buffer.path().is_some() {
@@ -59,22 +41,16 @@ impl App {
             }
         }
 
-        // Clean buffer (e.g. manual Save) — clear any pending timer.
         if !self.editor.dirty {
             self.autosave_pending_since = None;
             return;
         }
 
-        // No pending timer (autosave disabled, unnamed buffer, or
-        // freshly-cleared) — nothing to do this tick.
         let Some(since) = self.autosave_pending_since else {
             return;
         };
 
-        // Autosave was toggled off after the timer was armed: drop the
-        // pending save without writing.  Re-enabling later will re-arm
-        // on the next edit.  Symmetric with `autosave_deadline`, which
-        // already returns `None` when disabled.
+        // Toggled off after arming: drop without writing (mirrors `autosave_deadline`).
         if !enabled {
             self.autosave_pending_since = None;
             return;
@@ -85,19 +61,13 @@ impl App {
             return;
         }
 
-        // Window elapsed: persist through the unified save helper so
-        // any future side effect (e.g. the watcher's own-write hash
-        // stamp introduced in a later checkpoint) applies to autosave
-        // automatically.
         match self.save_buffer() {
             Ok(()) => {
                 self.autosave_pending_since = None;
                 self.flash("Autosaved", MessageKind::Success);
             }
             Err(e) => {
-                // Back off so we don't hammer a failing write every tick.
-                // The user's edits stay in the in-memory buffer; the
-                // next edit re-arms the timer for another attempt.
+                // Back off rather than retry every tick; the next edit re-arms.
                 self.autosave_pending_since = None;
                 tracing::warn!(error = %e, "autosave failed");
                 self.notify(format!("Autosave failed: {e}"), ModalKind::Error);
@@ -105,9 +75,7 @@ impl App {
         }
     }
 
-    /// The instant at which the run loop must wake to fire the pending
-    /// autosave, if any.  Contributes to [`App::next_deadline`] so the
-    /// `recv_timeout` blocks exactly long enough — no idle CPU.
+    /// When the run loop must wake to fire the pending autosave, if any.
     pub(super) fn autosave_deadline(&self) -> Option<Instant> {
         if self.editor.mode == crate::editor::Mode::Diff || self.editor.substitute_preview.is_some()
         {
@@ -131,10 +99,7 @@ mod tests {
     use crate::document::Buffer;
     use crate::editor::edit_ops;
 
-    /// Enable autosave (off by default) and force the debounce window to
-    /// a known short value so tests can advance past it with `sleep`.
-    /// Returns the configured duration so callers can `sleep` for it + a
-    /// small jitter.
+    /// Enable autosave with a short window; returns it so callers can `sleep` past it.
     fn shrink_window(app: &mut App) -> Duration {
         app.config.editor.autosave_enabled = true;
         app.config.editor.autosave_idle_ms = 25;
@@ -142,8 +107,6 @@ mod tests {
     }
 
     fn dirty_edit(app: &mut App) {
-        // Bump the version directly via a buffer edit so the test
-        // doesn't depend on the action dispatch path.
         let len = app.editor.buffer.len_chars();
         app.editor.buffer.insert_char(len, 'x');
         app.editor.dirty = true;
@@ -158,8 +121,6 @@ mod tests {
 
     #[test]
     fn dirtying_an_unnamed_buffer_does_not_arm_the_timer() {
-        // `make_app` builds an app with no path; autosave must silently
-        // skip until a path is associated.
         let mut app = make_app();
         assert!(app.editor.buffer.path().is_none());
         dirty_edit(&mut app);
@@ -173,8 +134,6 @@ mod tests {
     #[test]
     fn dirtying_a_named_buffer_arms_the_timer() {
         let mut app = make_app();
-        // Swap in a buffer associated with a temp path so autosave is
-        // eligible.  Use `tempfile` to keep the test hermetic.
         let tmp = tempfile::NamedTempFile::new().expect("temp file");
         app.editor.buffer = Buffer::for_new_file(tmp.path());
         app.config.editor.autosave_enabled = true;
@@ -219,8 +178,6 @@ mod tests {
         dirty_edit(&mut app);
         app.tick_autosave();
         let first = app.autosave_pending_since.expect("armed");
-        // Sleep less than the window, then dirty again — the timer must
-        // restart, not fire.
         std::thread::sleep(window / 3);
         dirty_edit(&mut app);
         app.tick_autosave();
@@ -252,10 +209,7 @@ mod tests {
 
     #[test]
     fn disabling_autosave_after_arming_cancels_pending_save() {
-        // Regression: previously `tick_autosave` only consulted the
-        // `enabled` flag on the arm branch.  If the user disabled
-        // autosave after the timer was already armed, any tick after
-        // the window elapsed would still call `save_file()`.
+        // Regression: the `enabled` flag was once consulted only on the arm branch.
         let mut app = make_app();
         let tmp = tempfile::NamedTempFile::new().expect("temp file");
         app.editor.buffer = Buffer::for_new_file(tmp.path());
@@ -278,18 +232,12 @@ mod tests {
 
     #[test]
     fn real_edit_dispatch_arms_the_autosave_timer() {
-        // The other tests poke `buffer.insert_char` + `editor.dirty`
-        // directly to keep the autosave logic in isolation.  This one
-        // exercises the *real* edit path (`edit_ops::apply` with an
-        // `InsertChar` action) to verify that `dirty` and
-        // `Buffer::version()` move in lockstep — otherwise autosave
-        // would silently fail to arm in production.
+        // Unlike the others, this drives the real edit path to pin that `dirty` and
+        // `Buffer::version()` move in lockstep.
         let mut app = make_app();
         let tmp = tempfile::NamedTempFile::new().expect("temp file");
         app.editor.buffer = Buffer::for_new_file(tmp.path());
         app.config.editor.autosave_enabled = true;
-        // Move out of Preview so InsertChar actually types instead of
-        // just switching modes.
         app.editor.mode = crate::editor::Mode::Rendered;
         let version_before = app.editor.buffer.version();
         edit_ops::apply(&mut app.editor, Action::InsertChar('a'), 24, 80);
@@ -311,8 +259,6 @@ mod tests {
 
     #[test]
     fn diff_mode_clears_pending_autosave_and_skips() {
-        // Diff mode is review-in-progress: an armed timer must be
-        // disarmed and no save must fire while reviewing.
         let mut app = make_app();
         let tmp = tempfile::NamedTempFile::new().expect("temp file");
         app.editor.buffer = Buffer::for_new_file(tmp.path());
@@ -320,7 +266,6 @@ mod tests {
         dirty_edit(&mut app);
         app.tick_autosave();
         assert!(app.autosave_pending_since.is_some(), "armed");
-        // Flip into diff mode and let the window elapse.
         app.editor.mode = crate::editor::Mode::Diff;
         std::thread::sleep(window + Duration::from_millis(20));
         app.tick_autosave();
@@ -340,11 +285,6 @@ mod tests {
 
     #[test]
     fn live_substitute_preview_suspends_autosave() {
-        // A `:s` preview transiently rewrites the buffer through raw
-        // `Buffer` edits (version bumps, `dirty` untouched); on an
-        // already-dirty buffer an armed timer must be disarmed and no
-        // save may fire while the preview is active — otherwise preview
-        // text would reach the disk.
         let mut app = make_app();
         let tmp = tempfile::NamedTempFile::new().expect("temp file");
         let path = tmp.path().to_owned();
@@ -381,9 +321,6 @@ mod tests {
 
     #[test]
     fn deadline_is_none_when_disabled_even_if_armed() {
-        // Pathological state: timer was armed when autosave was on,
-        // then the user toggled the setting off.  The deadline must
-        // not contribute to next_deadline anymore.
         let mut app = make_app();
         app.autosave_pending_since = Some(Instant::now());
         app.config.editor.autosave_enabled = false;

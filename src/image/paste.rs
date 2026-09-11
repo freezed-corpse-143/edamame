@@ -20,12 +20,14 @@
 //!   only when nothing better is present.
 //!
 //! The save directory comes from `EDAMAME_IMAGES_DIR` when set, then
-//! `ImagesConfig::save_dir`, resolved relative to the open document.
+//! `ImagesConfig::save_dir` — empty meaning the platform directory beside
+//! edamame's logs — resolved relative to the open document.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::clipboard::{Bitmap, ClipboardData};
+use crate::config::Config;
 
 /// Environment variable that overrides the configured image save directory.
 pub const IMAGES_DIR_ENV: &str = "EDAMAME_IMAGES_DIR";
@@ -183,11 +185,17 @@ fn encode_png(bitmap: &Bitmap) -> Result<Vec<u8>, String> {
 
 /// Resolve a save-directory string to a concrete directory.
 ///
+/// An empty `dir` — the shipped default — means [`images_dir_default`].
 /// Absolute paths pass through; relative paths (a leading `./` is
 /// dropped) resolve against the open document's parent.  An unsaved
 /// buffer has no parent, so relative resolution fails.
 pub fn resolve_save_dir(dir: &str, doc_path: Option<&Path>) -> Result<PathBuf, String> {
-    let dir = dir.strip_prefix("./").unwrap_or(dir);
+    let configured = if dir.trim().is_empty() {
+        images_dir_default()
+    } else {
+        dir.to_owned()
+    };
+    let dir = configured.strip_prefix("./").unwrap_or(configured.as_str());
     let dir = Path::new(dir);
     if dir.is_absolute() {
         return Ok(dir.to_path_buf());
@@ -197,6 +205,15 @@ pub fn resolve_save_dir(dir: &str, doc_path: Option<&Path>) -> Result<PathBuf, S
             .to_owned()
     })?;
     Ok(parent.join(dir))
+}
+
+/// The platform image directory: `<data dir>/edamame/images`, matching
+/// where edamame writes its logs.  Falls back to `./images` when no data
+/// directory is available.
+fn images_dir_default() -> String {
+    Config::log_dir()
+        .map(|dir| dir.join("images").to_string_lossy().into_owned())
+        .unwrap_or_else(|| "./images".to_owned())
 }
 
 /// A non-colliding `image-<millis>.png` path inside `dir`.
@@ -273,6 +290,18 @@ mod tests {
         assert_eq!(rel, Path::new("docs").join("images"));
 
         assert!(resolve_save_dir("./images", None).is_err());
+    }
+
+    #[test]
+    fn empty_save_dir_means_the_platform_directory() {
+        // The shipped default leaves `save_dir` unset; it means the platform directory
+        // (beside edamame's logs), never a path relative to the open document.
+        let doc = Path::new("docs").join("guide.md");
+        assert_eq!(
+            resolve_save_dir("", Some(&doc)).unwrap(),
+            resolve_save_dir("", None).unwrap()
+        );
+        assert!(resolve_save_dir("", None).unwrap().ends_with("images"));
     }
 
     #[test]

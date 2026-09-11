@@ -1,24 +1,16 @@
 //! `--doctor`: the diagnostic report a user pastes into a GitHub issue.
 //!
-//! Two sections — the system and terminal facts that identify *where*
-//! edamame is running, then the capability rows that say what that
-//! terminal can do.  The capability half is not re-derived here: it comes
-//! from [`CapSummary::from_caps`], the same builder the in-app
-//! capabilities notice and welcome modal render, so the CLI and the TUI
-//! can never disagree about what was detected.
+//! System/terminal facts, then capability rows.  The capability half comes from
+//! [`CapSummary::from_caps`] — the same builder the TUI renders — so the two can't disagree.
 //!
-//! **The probe needs a real terminal.**  `Capabilities::detect` writes
-//! escape sequences and reads the replies off the tty, so under
-//! `edamame --doctor > report.txt` it would both pollute the file and
-//! report "no image support" for a terminal that has it.  [`run`]
-//! therefore checks `IsTerminal` first and falls back to
-//! [`Capabilities::env_only`], marking the two probe-derived rows
+//! **The probe needs a real terminal.**  `Capabilities::detect` writes escape sequences and reads
+//! the replies off the tty, so under `edamame --doctor > report.txt` it would pollute the file and
+//! report "no image support" for a terminal that has it.  [`run`] checks `IsTerminal` first and
+//! falls back to [`Capabilities::env_only`], marking the two probe-derived rows
 //! [`Status::Unknown`] rather than guessing.
 //!
-//! System facts are read from files, never a subprocess: `--doctor` is a
-//! diagnostic path, and spawning processes is a hardened area of this
-//! codebase (`docs/security.md`).  Anything that can't be resolved
-//! degrades to a coarser answer, never to an error.
+//! System facts are read from files, never a subprocess (`docs/security.md`); anything
+//! unresolvable degrades to a coarser answer, never an error.
 
 use std::env;
 use std::io::IsTerminal;
@@ -32,28 +24,19 @@ use crate::ui::cap_summary::{CapRow, CapSummary};
 /// Value printed for any fact the environment doesn't carry.
 const UNKNOWN: &str = "unknown";
 
-/// Probe the terminal (when there is one), then print the report to
-/// stdout.
-///
-/// The report goes to stdout so it can be redirected or piped; the
-/// not-a-terminal notice goes with it rather than to stderr, because it
-/// is part of what the reader of the report needs to know.
+/// Probe the terminal (when there is one) and print the report to stdout.  The not-a-terminal
+/// notice goes to stdout too — it is part of what a reader of the report needs to know.
 pub fn run() -> Result<()> {
     let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
 
     let caps = if interactive {
-        // Same ordering constraint as `main`: the probe must run after
-        // the alternate screen is up.  Nothing is drawn — we enter,
-        // probe, and leave — so the report lands on the user's normal
-        // screen with their scrollback intact.
+        // Same ordering constraint as `main`: the probe must run after the alternate screen is
+        // up.  Nothing is drawn, so the report lands on the normal screen with scrollback intact.
         let TerminalSetup {
             terminal,
             keyboard_enhancement,
         } = terminal::setup()?;
-        // The `Terminal` is unused: `--doctor` never draws a frame.
-        // Dropping it here rather than holding it across the probe keeps
-        // the borrow-free shape obvious.
-        drop(terminal);
+        drop(terminal); // `--doctor` never draws a frame.
 
         let orig_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -61,10 +44,8 @@ pub fn run() -> Result<()> {
             orig_hook(info);
         }));
 
-        // The hook stays installed for the rest of the (very short)
-        // process: `take_hook` would swap in the *default* hook rather
-        // than the original, and a panic while printing the report
-        // should still leave the terminal usable.
+        // The hook stays installed for the rest of the process: `take_hook` would swap in the
+        // *default* hook, and a panic while printing should still leave the terminal usable.
         let caps = Capabilities::detect(keyboard_enhancement);
         terminal::restore()?;
         caps
@@ -76,13 +57,9 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// How confident the report is about one capability row.
-///
-/// [`CapRow`] carries a two-state `ok` flag, which is the right model for
-/// the TUI (where every row was genuinely probed).  The CLI has a third
-/// case the TUI can't reach — output redirected away from a terminal —
-/// and reporting that as a ✗ would send users chasing a missing feature
-/// their terminal actually has.
+/// How confident the report is about one capability row.  [`CapRow`]'s two-state `ok` flag is
+/// enough for the TUI, but the CLI has a third case it can't reach — output redirected away from a
+/// terminal — and reporting that as a failure sends users chasing a feature they already have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     Ok,
@@ -91,8 +68,7 @@ enum Status {
 }
 
 impl Status {
-    /// Leading marker, padded to a fixed width so the label column lines
-    /// up across rows.
+    /// Leading marker, padded so the label column lines up across rows.
     fn marker(self) -> &'static str {
         match self {
             Self::Ok => "ok  ",
@@ -102,23 +78,13 @@ impl Status {
     }
 }
 
-/// Value substituted for the two rows that need a live probe when there
-/// isn't one.
-///
-/// Deliberately doesn't name a stream: [`run`] requires stdout *and*
-/// stdin to be terminals (it writes escape sequences to one and reads
-/// the replies from the other), so blaming stdout was wrong for the
-/// `echo | edamame --doctor` case — where stdout plainly *is* a
-/// terminal, and the user has no way to work out that redirected stdin
-/// is what stopped the probe.
+/// Substituted for the two probe-derived rows when there was no probe.  Deliberately names no
+/// stream: [`run`] requires stdout *and* stdin to be terminals, so blaming stdout misleads in the
+/// `echo | edamame --doctor` case.
 const NOT_PROBED: &str = "unknown — needs an interactive terminal";
 
-/// Build the full report text, including the trailing newline.
-///
-/// `probed` is false when [`run`] skipped the escape-sequence probe;
-/// the Images and Keyboard rows are the only two that depend on it
-/// (color, mouse, and unicode are env-derived either way), so they —
-/// and only they — are downgraded to [`Status::Unknown`].
+/// Build the full report text, including the trailing newline.  When `probed` is false the Images
+/// and Keyboard rows — the only two that need the probe — drop to [`Status::Unknown`].
 pub fn report(caps: &Capabilities, probed: bool) -> String {
     let mut out = format!("edamame {VERSION}\n\nSystem\n");
     for (label, value) in system_facts() {
@@ -139,9 +105,8 @@ pub fn report(caps: &Capabilities, probed: bool) -> String {
     out
 }
 
-/// Resolve one capability row's status.  `Images` and `Keyboard` are the
-/// probe-derived pair; every other row is env-derived and keeps its
-/// detected verdict whether or not the probe ran.
+/// `Images` and `Keyboard` are the probe-derived pair; every other row is env-derived and keeps
+/// its verdict whether or not the probe ran.
 fn row_status(row: &CapRow, probed: bool) -> Status {
     match row.label {
         "Images" | "Keyboard" if !probed => Status::Unknown,
@@ -154,13 +119,9 @@ fn row_status(row: &CapRow, probed: bool) -> Status {
 
 /// The `System` section as ordered `(label, value)` pairs.
 ///
-/// Every fact here describes the *machine*, never the person using it:
-/// the report exists to be pasted into a public issue tracker, and
-/// someone doing that has no reason to scan it for their own identity
-/// first.  The config directory is deliberately absent for that reason —
-/// it is a username in the common case, and all it carries diagnostically
-/// is "this path is or isn't the default", which is worth asking about by
-/// hand on the rare issue where it matters.
+/// Every fact must describe the *machine*, never the person: the report is pasted into a public
+/// issue tracker.  The config directory is deliberately absent — it is usually a username, and
+/// carries little diagnostically.
 fn system_facts() -> Vec<(&'static str, String)> {
     vec![
         ("OS:", format!("{} ({})", os_version(), env::consts::ARCH)),
@@ -186,12 +147,8 @@ fn env_or_unknown(key: &str) -> String {
         .unwrap_or_else(|| UNKNOWN.to_owned())
 }
 
-/// A human-readable OS name and version.
-///
-/// Read from the platform's own metadata file rather than by spawning
-/// `sw_vers` / `lsb_release`, and falling back to the compile-time
-/// `env::consts::OS` when that file is missing or shaped unexpectedly.
-/// Windows has no equivalent file, so it reports the bare OS name.
+/// A human-readable OS name and version, read from the platform's metadata file rather than by
+/// spawning `sw_vers` / `lsb_release`.  Falls back to `env::consts::OS` (always, on Windows).
 fn os_version() -> String {
     #[cfg(target_os = "macos")]
     {
@@ -213,9 +170,8 @@ fn os_version() -> String {
     env::consts::OS.to_owned()
 }
 
-/// Extract a `KEY=value` entry from an `/etc/os-release` body, stripping
-/// the optional surrounding quotes.  Comments and unrelated keys are
-/// skipped; a key that appears with an empty value reads as absent.
+/// Extract a `KEY=value` entry from an `/etc/os-release` body, stripping optional quotes.  An
+/// empty value reads as absent.
 #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
 fn parse_os_release(text: &str, key: &str) -> Option<String> {
     text.lines()
@@ -225,12 +181,8 @@ fn parse_os_release(text: &str, key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Pull `<key>NAME</key><string>VALUE</string>` out of an XML plist.
-///
-/// A deliberate string scan rather than an XML dependency: this file's
-/// shape has been stable for the entire life of macOS, the value is a
-/// plain string, and a miss degrades to the bare OS name.  Same posture
-/// as `app::update_check::parse_tag_name`.
+/// Pull `<key>NAME</key><string>VALUE</string>` out of an XML plist.  A deliberate string scan
+/// rather than an XML dependency: the shape is stable and a miss degrades to the bare OS name.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_plist_value(text: &str, key: &str) -> Option<String> {
     let rest = &text[text.find(&format!("<key>{key}</key>"))?..];
@@ -239,17 +191,12 @@ fn parse_plist_value(text: &str, key: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-/// The terminal emulator's name and version, from the environment.
+/// The terminal emulator's name and version, from the environment.  `$LC_TERMINAL` is iTerm2's
+/// own marker, which — unlike `$TERM_PROGRAM` — survives ssh.  kitty, alacritty, and foot set none
+/// of these and read as unknown.
 ///
-/// `$TERM_PROGRAM` / `$TERM_PROGRAM_VERSION` are set by iTerm2, Apple
-/// Terminal, WezTerm, Ghostty, and VS Code; `$LC_TERMINAL` is iTerm2's
-/// own marker, which — unlike `$TERM_PROGRAM` — survives ssh.  kitty,
-/// alacritty, and foot set none of them and read as unknown; the `TERM`
-/// row below usually names them anyway.
-///
-/// Note this is exactly the pair `Capabilities::fingerprint` leaves out
-/// on purpose (a version bump must not re-trigger the new-terminal
-/// notice).  Here the version is the point.
+/// This is exactly the pair `Capabilities::fingerprint` omits so a version bump can't re-trigger
+/// the new-terminal notice; here the version is the point.
 fn terminal_program() -> String {
     let name = env::var("TERM_PROGRAM")
         .ok()
@@ -270,9 +217,8 @@ fn terminal_program() -> String {
     }
 }
 
-/// The active locale and which variable supplied it — the same
-/// precedence `capabilities::detect_unicode_full` walks, so a user
-/// puzzled by a ✗ Unicode row can see exactly which variable decided it.
+/// The active locale and which variable supplied it, walking the same precedence as
+/// `capabilities::detect_unicode_full` so a puzzling Unicode row can be traced to its variable.
 fn locale() -> String {
     for var in ["LC_ALL", "LC_CTYPE", "LANG"] {
         if let Ok(v) = env::var(var) {
@@ -300,9 +246,8 @@ mod tests {
         }
     }
 
-    /// Every test that calls [`report`] takes the crate-wide env lock:
-    /// the System section reads `TERM_PROGRAM`, `XDG_CONFIG_HOME` and
-    /// friends, which env-mutating tests elsewhere in the binary write.
+    /// Every test calling [`report`] takes the crate-wide env lock — the System section reads
+    /// environment variables that other tests in this binary write.
     #[test]
     fn report_opens_with_the_version_and_carries_both_sections() {
         let _lock = crate::test_env::env_lock();
@@ -316,8 +261,7 @@ mod tests {
         assert!(text.ends_with('\n'));
     }
 
-    /// The capability half must be the summary builder's text verbatim —
-    /// if the CLI restated it, the two surfaces would drift.
+    /// The capability half must be the summary builder's text verbatim, or the two surfaces drift.
     #[test]
     fn capability_values_come_from_the_shared_summary() {
         let _lock = crate::test_env::env_lock();
@@ -333,12 +277,8 @@ mod tests {
         }
     }
 
-    /// Just the `Terminal capabilities` rows.
-    ///
-    /// Assertions about status markers must not see the `System`
-    /// section: its values come from the live environment, not from the
-    /// fixture, so a `?` in a `TERM_PROGRAM_VERSION`, a `PRETTY_NAME`,
-    /// or a `LANG` would fail a test that is about the marker column.
+    /// Just the `Terminal capabilities` rows: marker assertions must not see the `System`
+    /// section, whose live-environment values can themselves contain a `?`.
     fn capability_section(text: &str) -> String {
         let (_, caps) = text
             .split_once("\nTerminal capabilities\n")
@@ -349,7 +289,6 @@ mod tests {
     #[test]
     fn every_row_is_marked_ok_or_warn_when_probed() {
         let _lock = crate::test_env::env_lock();
-        // Truecolor + Kitty + mouse + kbd + UTF-8 is the all-green case.
         let text = report(
             &caps(ColorDepth::TrueColor, Some(ImageProtocol::KittyGraphics)),
             true,
@@ -370,9 +309,7 @@ mod tests {
         );
     }
 
-    /// Without a live terminal the two probe-derived rows must read as
-    /// unknown, not as failures — a redirected report otherwise tells the
-    /// user their terminal lacks images it actually supports.
+    /// Without a live terminal the probe-derived rows must read unknown, not failed.
     #[test]
     fn unprobed_rows_are_unknown_not_failures() {
         let _lock = crate::test_env::env_lock();
@@ -404,7 +341,6 @@ mod tests {
         );
         assert_eq!(parse_os_release(text, "ID").as_deref(), Some("ubuntu"));
         assert_eq!(parse_os_release(text, "VERSION_ID"), None);
-        // An empty value is as good as absent — the caller falls back.
         assert_eq!(parse_os_release("PRETTY_NAME=\"\"\n", "PRETTY_NAME"), None);
     }
 
@@ -426,20 +362,14 @@ mod tests {
             Some("macOS")
         );
         assert_eq!(parse_plist_value(text, "ProductBuildVersion"), None);
-        // A malformed body degrades to None rather than panicking on a slice.
+        // A malformed body must degrade to None, not panic on a slice.
         assert_eq!(
             parse_plist_value("<key>ProductVersion</key>", "ProductVersion"),
             None
         );
     }
 
-    /// Every system fact must resolve to *something* — the section is
-    /// what identifies the reporter's machine, so a silently empty value
-    /// is worse than "unknown".
-    ///
-    /// Takes the crate-wide env lock: this reads `TERM_PROGRAM`,
-    /// `XDG_CONFIG_HOME` and friends, which env-mutating tests in
-    /// `terminal::capabilities` and `config::config` write concurrently.
+    /// Every system fact must resolve to *something*: a blank value is worse than "unknown".
     #[test]
     fn no_system_fact_is_ever_blank() {
         let _lock = crate::test_env::env_lock();
@@ -448,16 +378,13 @@ mod tests {
         }
     }
 
-    /// The report is written to be pasted into a public issue tracker,
-    /// so it describes the machine and never the person.  The config
-    /// directory was the one row that did — `/Users/<name>/…` — and it
-    /// is deliberately gone; a row that reintroduces a home-relative
-    /// path fails here.
+    /// The report is pasted into a public issue tracker, so no fact may carry a home-relative
+    /// path.  The config-directory row was removed for exactly this reason.
     #[test]
     fn no_system_fact_leaks_the_home_directory() {
         let Some(home) = dirs::home_dir() else { return };
         let home = home.display().to_string();
-        // A degenerate `/` home would match everything; nothing to test.
+        // A degenerate `/` home would match everything.
         if home.len() < 2 {
             return;
         }

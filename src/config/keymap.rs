@@ -9,9 +9,7 @@ use thiserror::Error;
 
 // ─── Action ──────────────────────────────────────────────────────────────────
 
-/// Every command the editor can execute. The full enum is defined upfront so
-/// keybindings are stable across phases; unimplemented variants are simply
-/// no-ops until their phase is implemented.
+/// Every command the editor can execute.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Action {
     // ── Navigation / scrolling ─────────────────────────────────────
@@ -46,23 +44,17 @@ pub enum Action {
     Copy,
     Paste,
     // ── Formatting ─────────────────────────────────────────────────
-    /// Wrap the selection in `**…**` (or unwrap it if it is exactly
-    /// bold already).  No-op without a non-empty, single-line selection.
+    // Each wraps the selection in its markers, or unwraps it if it is exactly that already.
+    // All are no-ops without a non-empty, single-line selection.
+    /// `**…**`
     BoldSelection,
-    /// Wrap the selection in `*…*` (or unwrap it if it is exactly italic
-    /// already).  No-op without a non-empty, single-line selection.
+    /// `*…*`
     ItalicizeSelection,
-    /// Wrap the selection in `` ` `` backticks (or unwrap it if it is
-    /// exactly an inline code span already).  No-op without a
-    /// non-empty, single-line selection.
+    /// `` `…` ``
     InlineCodeSelection,
-    /// Wrap the selection in `~~…~~` (or unwrap it if it is exactly
-    /// struck-through already).  No-op without a non-empty,
-    /// single-line selection.
+    /// `~~…~~`
     StrikethroughSelection,
-    /// Wrap the selection in `==…==` (or unwrap it if it is exactly
-    /// highlighted already).  No-op without a non-empty, single-line
-    /// selection.
+    /// `==…==`
     HighlightSelection,
     // ── Selection ──────────────────────────────────────────────────
     SelectLeft,
@@ -75,11 +67,9 @@ pub enum Action {
     Redo,
     // ── File operations ────────────────────────────────────────────
     Save,
-    /// Write the buffer to a chosen path and adopt it as the buffer's
-    /// home — subsequent `Save`s target the new path.  Opens a path-entry
-    /// modal seeded with the current path (or a default for an unnamed
-    /// buffer).  The vim `:w <path>` command writes a detached copy
-    /// instead, leaving the buffer's path unchanged.
+    /// Write the buffer to a chosen path and adopt it as the buffer's home, so subsequent
+    /// `Save`s target it.  The vim `:w <path>` command instead writes a detached copy, leaving
+    /// the buffer's path unchanged.
     SaveAs,
     Open,
     // ── Mode transitions ───────────────────────────────────────────
@@ -91,9 +81,8 @@ pub enum Action {
     // ── List editing ───────────────────────────────────────────────
     ToggleCheckbox,
     // ── Table editing ──────────────────────────────────────────────
-    // Cell navigation. Tab/Shift+Tab/Enter outside a table retain their
-    // normal behaviour; edit_ops redirects them when the cursor is inside
-    // a table.
+    // Cell navigation.  Tab/Shift+Tab/Enter keep their normal behavior outside a table;
+    // edit_ops redirects them when the cursor is inside one.
     TableNextCell,
     TablePrevCell,
     TableNextRow,
@@ -111,83 +100,57 @@ pub enum Action {
     // Row/column deletion.
     TableDeleteRow,
     TableDeleteColumn,
-    // Shift+Enter inside a cell inserts a literal `<br>` (GFM supports this
-    // as the canonical way to get multi-line cells).  Outside a table it
-    // falls through to `Newline`.
+    // Shift+Enter inside a cell inserts a literal `<br>` (GFM's way to get multi-line cells);
+    // outside a table it falls through to `Newline`.
     TableInsertBreak,
     // ── Link navigation ────────────────────────────────────────────
-    /// Follow the link at the cursor's rope offset (if any).  In
-    /// Preview mode users reach links via mouse click; in Rendered /
-    /// Raw mode this action is the keyboard equivalent.  Handled by
-    /// the `App`, not `edit_ops`, so the dispatch happens against UI
-    /// state (nav stack, in-flight worker threads).
+    /// Follow the link at the cursor's rope offset.  Handled by the `App`, not `edit_ops`,
+    /// because the dispatch needs UI state (nav stack, in-flight worker threads).
     FollowLinkUnderCursor,
-    /// Pop the navigation history: move the current (path, scroll,
-    /// cursor, mode) onto the forward stack and restore the most
-    /// recent back-entry.  App-level.
+    /// Pop the navigation history: push the current (path, scroll, cursor, mode) onto the
+    /// forward stack and restore the most recent back-entry.
     NavigateBack,
-    /// Mirror of [`Action::NavigateBack`] operating on the forward
-    /// stack.
+    /// Mirror of [`Action::NavigateBack`] on the forward stack.
     NavigateForward,
-    /// Open the fuzzy-searchable command palette (Ctrl-P).  Lists
-    /// every bound action and routes the chosen one through the
-    /// normal `edit_ops::apply` path.
+    /// Open the fuzzy-searchable command palette; the chosen action goes through the normal
+    /// `edit_ops::apply` path.
     ShowCommandPalette,
-    /// Show the static Markdown syntax cheat sheet (CommonMark + GFM
-    /// tables / task lists / strikethrough / footnotes).
+    /// Show the static Markdown syntax cheat sheet.
     ShowMarkdownCheatSheet,
-    /// Open a page of the manual shipped inside the binary
-    /// (`crate::docs`) as a read-only document.
+    /// Open a page of the built-in manual (`crate::docs`) read-only.
     ///
-    /// Payload-bearing, and therefore palette-only: like
-    /// [`Action::InsertChar`] it is excluded from `action_variants!`,
-    /// so `FromStr` cannot reconstruct it and it can never be named in
-    /// `keybindings.toml`.  That is the right shape here rather than a
-    /// limitation — there is no keystroke-sized way to say *which*
-    /// page, and the palette lists each one by name.
+    /// Payload-bearing, hence excluded from `action_variants!` and unnameable in
+    /// `keybindings.toml` — there is no keystroke-sized way to say *which* page, so the palette
+    /// lists each one by name.
     OpenDoc(crate::docs::DocId),
     /// Open the settings overlay — edits `[editor] / [modal] / [table]
     /// / [images] / [export]` keys in `config.toml` in place.
     OpenSettings,
-    /// Reopen the welcome modal: the capability-aware settings surface
-    /// (theme / images / diagrams / vim), rebuilt from the *live*
-    /// terminal capabilities.  Unlike the first-run path this ignores
-    /// `editor.show_welcome`, so it is the way back in after the
-    /// terminal's capabilities change.
+    /// Reopen the welcome modal, rebuilt from the *live* terminal capabilities.  Ignores
+    /// `editor.show_welcome`, so it is the way back in after capabilities change.
     OpenWelcome,
     /// Open the keybinds overlay — edits `keybindings.toml` with
     /// conflict detection.
     OpenKeybinds,
-    /// Open the fuzzy-searchable theme picker.  Selecting a theme
-    /// writes `config.theme` to disk and reapplies the palette live.
+    /// Open the theme picker; a selection writes `config.theme` and reapplies the palette live.
     SwitchTheme,
-    /// Open the export-theme modal: choose an existing theme to copy,
-    /// pick a new name, write the resulting `<name>.toml` into the
-    /// user's `themes/` directory, and apply it as the active theme.
+    /// Open the export-theme modal: copy an existing theme to a new `<name>.toml` in the
+    /// user's `themes/` directory and make it active.
     CreateCustomTheme,
-    /// Reveal the active config directory in the OS file manager / open
-    /// it via `open::that`.
+    /// Reveal the active config directory in the OS file manager.
     OpenConfigFolder,
-    /// Open the export modal.  Its Format list offers HTML plus every
-    /// configured `[[export.custom]]` converter, so this one action reaches
-    /// every target; the palette shows it as `Export…`.
+    /// Open the export modal.  Its Format list offers HTML plus every configured
+    /// `[[export.custom]]` converter, so this one action reaches every target.
     ExportHtml,
-    /// Save the current buffer and open it in `$VISUAL` / `$EDITOR`
-    /// (falling back to the OS handler).  Reuses the same suspend /
-    /// resume flow the settings overlay uses for `config.toml`.  The
-    /// buffer is reloaded from disk after the editor exits so any
-    /// external edits are picked up.
+    /// Save the buffer and open it in `$VISUAL` / `$EDITOR` (or the OS handler), reloading
+    /// from disk when the editor exits.
     OpenInExternalEditor,
-    /// Toggle `config.table.show_buttons` and persist it to
-    /// `config.toml`, mirroring the settings-overlay row.  Gated on
-    /// mouse capability — the handles are inert without mouse reporting.
+    /// Toggle `config.table.show_buttons`.  Gated on mouse capability — the handles are inert
+    /// without mouse reporting.
     ToggleTableButtons,
     // ── Setting toggles (palette) ──────────────────────────────────
-    // Persisted boolean settings surfaced in the command palette so a
-    // user who prefers the search-for-a-thing flow can flip them
-    // without opening the settings overlay.  Each flips the same
-    // `config` field its overlay row writes, persists `config.toml`,
-    // and pushes the change through the shared `apply_live_update`.
+    // Each flips the same `config` field its settings-overlay row writes, persists
+    // `config.toml`, and pushes the change through the shared `apply_live_update`.
     /// Toggle `config.editor.big_h1` (big block-character H1 titles).
     ToggleBigH1,
     /// Toggle `config.editor.show_line_numbers` (gutter line numbers).
@@ -196,30 +159,21 @@ pub enum Action {
     ToggleBlinkCursor,
     /// Toggle `config.editor.autosave_enabled` (idle autosave).
     ToggleAutosave,
-    /// Toggle `config.editor.visual_line_nav` (visual vs. logical
-    /// Up/Down movement).
+    /// Toggle `config.editor.visual_line_nav` (visual vs. logical Up/Down movement).
     ToggleVisualLineNav,
-    /// Toggle Vim modal editing by swapping `config.modal.handler`
-    /// between `vim` and `default`; rebuilds the live `VimState`.
+    /// Toggle Vim modal editing (`config.modal.handler`); rebuilds the live `VimState`.
     ToggleVimMode,
     /// Toggle `config.editor.max_width_enabled` (content-width limit).
     ToggleLimitWidth,
-    /// Toggle `config.editor.diff_on_change` (review external changes
-    /// hunk-by-hunk vs. silent reload).
+    /// Toggle `config.editor.diff_on_change` (hunk-by-hunk review vs. silent reload).
     ToggleDiffOnChange,
-    /// Open the rows/columns modal that inserts a fresh
-    /// GFM pipe table at the cursor.  Requires the cursor to be on
-    /// a blank line; the App-level handler flashes an error
-    /// when that pre-flight fails.
+    /// Open the rows/columns modal that inserts a fresh GFM pipe table.  Requires the cursor
+    /// on a blank line; the App-level handler flashes when that pre-flight fails.
     InsertTable,
-    /// Insert an inline image snippet (`![alt text](file path or URL)`)
-    /// at the cursor, or wrap the selection as the alt text.  Denied in
-    /// blocks whose content is literal (code, HTML, an existing image);
-    /// the App-level handler flashes a warning when that pre-flight
-    /// fails.
+    /// Insert an inline image snippet at the cursor, or wrap the selection as the alt text.
+    /// Denied in literal-content blocks (code, HTML, an existing image).
     InsertImage,
-    /// Insert an inline link snippet (`[link text](file path or URL)`)
-    /// at the cursor, or wrap the selection as the link text.  Same
+    /// Insert an inline link snippet, or wrap the selection as the link text.  Same
     /// literal-block pre-flight as [`Action::InsertImage`].
     InsertLink,
     /// Paste an image from the OS clipboard: a screenshot is saved to
@@ -229,63 +183,45 @@ pub enum Action {
     /// Insert an auto-numbered `[^N]` footnote reference at the cursor
     /// (the next integer past the highest existing numeric footnote).
     /// The user writes the matching definition wherever they want.
+    /// Insert an auto-numbered `[^N]` footnote reference (next integer past the highest
+    /// existing numeric footnote); the user writes the definition.
     InsertFootnote,
-    /// Delete the footnote at the cursor — all of its references plus the
-    /// definition — and renumber the remaining numeric footnotes.
+    /// Delete the footnote at the cursor — every reference plus the definition — and renumber
+    /// the rest.
     DeleteFootnote,
-    /// Re-sequence every numeric footnote into order of first reference
-    /// (GFM); named labels are left untouched.
+    /// Re-sequence numeric footnotes into order of first reference; named labels untouched.
     RenumberFootnotes,
-    /// Renumber the ordered list under the cursor so its source numbering
-    /// matches what is rendered (sequential from the first item's number,
-    /// nesting-aware, spanning loose-list blank gaps), as one undoable edit.
-    /// Flashes when the cursor is not in an ordered list or it is already
-    /// sequential.
+    /// Renumber the ordered list under the cursor so its source numbering matches what is
+    /// rendered (nesting-aware, spanning loose-list blank gaps), as one undoable edit.
     FixListNumbering,
-    /// Show the About edamame popover: bean art, rotating acronym
-    /// tagline, the installed version, author credit, and buttons for
-    /// the project homepage and an update check.  Opening it performs
-    /// no network request — see [`Action::CheckForUpdates`].
+    /// Show the About popover.  Opening it performs no network request — see
+    /// [`Action::CheckForUpdates`].
     ShowAbout,
-    /// Check GitHub for a newer release right now, and report either
-    /// "up to date" or the new version with its release notes.
-    /// Bypasses the daily throttle that governs the automatic startup
-    /// check (`editor.check_for_updates`): that gate bounds unattended
-    /// chatter, and this is an explicit request.
+    /// Check GitHub for a newer release now.  Bypasses the daily throttle on the automatic
+    /// startup check: that gate bounds unattended chatter, and this is an explicit request.
     CheckForUpdates,
-    /// Open the fuzzy-searchable heading list ("Go to section").  Lets
-    /// the user jump the viewport to any heading in the document; the
-    /// pick is live-previewed (debounced) so holding ↓ doesn't thrash
-    /// the scroll, Esc reverts to the original position, Enter
-    /// confirms and places the cursor at the end of the heading line.
+    /// Open the fuzzy-searchable heading list ("Go to section").  The pick is live-previewed
+    /// (debounced, so holding ↓ doesn't thrash the scroll); Esc reverts, Enter confirms.
     GoToSection,
 
     // ── Search and replace ─────────────────────────────────────────
-    /// Open the search-and-replace modal (search term + optional
-    /// replacement).  Confirming with a non-empty search term starts
-    /// the search flow.  Pressed during an active flow, it re-opens
-    /// the modal pre-filled with the current terms.
+    /// Open the search-and-replace modal.  Pressed during an active flow it re-opens the modal
+    /// pre-filled with the current terms.
     OpenSearch,
-    /// Advance focus to the next match, wrapping at the end of the
-    /// document.  Hard-bound to `Tab` while the flow is active.
+    /// Advance focus to the next match, wrapping.  Hard-bound to `Tab` during the flow.
     SearchNext,
-    /// Retreat focus to the previous match, wrapping at the start.
-    /// Hard-bound to `Shift+Tab` while the flow is active.
+    /// Retreat focus to the previous match, wrapping.  Hard-bound to `Shift+Tab`.
     SearchPrev,
-    /// Replace the focused match with the replacement text, then
-    /// auto-advance to the next match after a short reveal delay.
-    /// No-op in a navigate-only flow (empty replace field).
+    /// Replace the focused match, then auto-advance after a short reveal delay.  No-op in a
+    /// navigate-only flow (empty replace field).
     SearchReplace,
-    /// Replace every match in one shot — a single undo step — then
-    /// exit the flow.  No-op in a navigate-only flow.
+    /// Replace every match as one undo step, then exit the flow.
     SearchReplaceAll,
-    /// Exit the search flow, leaving the cursor and viewport on the
-    /// current match (search is a motion — no scroll-back to origin).
+    /// Exit the search flow, leaving the cursor on the current match (search is a motion).
     SearchExit,
 
     // ── Diff review ────────────────────────────────────────────────
-    /// Advance focus to the next hunk in document order.  No decision
-    /// implied — pressing this leaves the current hunk as `Pending`.
+    /// Advance focus to the next hunk, leaving the current one `Pending`.
     DiffNext,
     /// Retreat focus to the previous hunk in document order.
     DiffPrev,
@@ -297,22 +233,16 @@ pub enum Action {
     DiffAcceptAll,
     /// Bulk-reject every still-`Pending` hunk in one shot.
     DiffRejectAll,
-    /// Reset the focused hunk's decision back to `Pending`
-    /// ("undecide").  No-op when the hunk is already `Pending`.  Bound
-    /// to `Backspace` in Review sub-mode.
+    /// Reset the focused hunk's decision to `Pending`.  Bound to `Backspace` in Review.
     DiffResetHunk,
-    /// Request to exit diff mode.  Gated on full resolution: a no-op
-    /// while any hunk is still pending, and otherwise opens the
+    /// Request to exit diff mode.  A no-op while any hunk is pending; otherwise opens the
     /// apply-confirm modal before the merged result is written.
     DiffExit,
 }
 
-/// Classification used by the run loop to coalesce a burst of
-/// autorepeat keystrokes into a single buffer edit + history entry.
-/// Only the three highest-frequency hot-path edits are coalescable:
-/// they share an `EditDelta` shape (one offset, one removed-range,
-/// one inserted-range) so a run of them collapses cleanly.  Any
-/// action that returns `None` from [`Action::coalesce_kind`] ends the run.
+/// Classification used by the run loop to coalesce a burst of autorepeat keystrokes into one
+/// buffer edit + history entry.  Only these three are coalescable: they share an `EditDelta`
+/// shape (one offset, one removed range, one inserted range) so a run collapses cleanly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoalesceKind {
     Insert,
@@ -321,11 +251,8 @@ pub enum CoalesceKind {
 }
 
 impl Action {
-    /// Classify this action for keystroke coalescing.  `None` means
-    /// the action cannot be merged with its neighbours (cursor moves,
-    /// mode switches, table/list special handling, etc.).  Run-
-    /// membership is `Some(kind1) == Some(kind2)` — equal `Some`
-    /// kinds extend the current run; everything else breaks it.
+    /// Classify this action for keystroke coalescing.  Equal `Some` kinds extend the current
+    /// run; `None` and any mismatch break it.
     pub fn coalesce_kind(&self) -> Option<CoalesceKind> {
         match self {
             Action::InsertChar(_) => Some(CoalesceKind::Insert),
@@ -336,29 +263,17 @@ impl Action {
     }
 }
 
-/// Drive `Display for Action` and `FromStr for Action` from a single
-/// list of unit variant names.  Every payload-bearing variant has to
-/// be named explicitly outside the macro: those go into the `Display`
-/// `match` only (FromStr can't reconstruct them without their
-/// payload).
+/// Drive `Display` and `FromStr` for [`Action`] from one list of unit variant names.
+/// Payload-bearing variants are named explicitly in the `Display` match only — `FromStr` can't
+/// reconstruct them without their payload.
 macro_rules! action_variants {
     ($( $variant:ident ),* $(,)?) => {
         /// Every unit variant of [`Action`], in declaration order.
         ///
-        /// Derived from the same list that drives `Display` / `FromStr`
-        /// — whose `Display` match is exhaustive, so a new unit variant
-        /// cannot compile without joining it.  That is what lets a
-        /// caller sweep the whole action surface without maintaining a
-        /// second list beside this one.
-        ///
-        /// The two payload-bearing variants (`InsertChar`, `OpenDoc`)
-        /// are absent: they need a value to construct.  A sweep that
-        /// cares about them names them itself.
-        ///
-        /// Test-only, and gated rather than merely `pub(crate)`: its
-        /// sole purpose is letting the `ActionCaps` gate sweeps in
-        /// `app::actions` enumerate the whole surface, so in a release
-        /// build it would be a dead 80-entry array.
+        /// The exhaustive `Display` match means a new unit variant cannot compile without
+        /// joining this list, so a caller can sweep the whole action surface without keeping a
+        /// second list.  `InsertChar` and `OpenDoc` are absent — they need a value to
+        /// construct.  `#[cfg(test)]` because its only use is the `app::actions` gate sweeps.
         #[cfg(test)]
         pub(crate) const EVERY_UNIT_ACTION: &[Action] = &[ $( Action::$variant, )* ];
 
@@ -439,8 +354,7 @@ pub enum KeyMapError {
     ConflictingBinding { key: String, action: String },
 }
 
-/// Parse a single token as a `KeyModifiers` flag, or return `None` if it
-/// is not a modifier name.
+/// Parse a token as a `KeyModifiers` flag, or `None` if it is not a modifier name.
 fn parse_modifier(part: &str) -> Option<KeyModifiers> {
     match part {
         "ctrl" => Some(KeyModifiers::CONTROL),
@@ -450,8 +364,7 @@ fn parse_modifier(part: &str) -> Option<KeyModifiers> {
     }
 }
 
-/// Parse a `key_part` token (everything after the modifiers) into a
-/// `KeyCode`, or return `None` if the token is not a recognized key.
+/// Parse the token after the modifiers into a `KeyCode`, or `None` if unrecognized.
 fn parse_key_code(key_part: &str) -> Option<KeyCode> {
     let code = match key_part {
         "up" => KeyCode::Up,
@@ -528,9 +441,8 @@ pub fn parse_key(s: &str) -> Result<KeyEvent, KeyMapError> {
     Ok(KeyEvent::new(code, modifiers))
 }
 
-/// Glyph-style label for a non-character `KeyCode` (compact form used in
-/// the bottom-region hint line).  Returns `None` for `KeyCode::Char` —
-/// callers handle character keys directly.
+/// Glyph-style label for a non-character `KeyCode` (compact form for the hint line).  `None`
+/// for `KeyCode::Char` — callers handle character keys themselves.
 fn keycode_glyph(code: KeyCode) -> Option<&'static str> {
     Some(match code {
         KeyCode::Up => "↑",
@@ -538,9 +450,7 @@ fn keycode_glyph(code: KeyCode) -> Option<&'static str> {
         KeyCode::Left => "←",
         KeyCode::Right => "→",
         KeyCode::Enter => "↵",
-        // BackTab is the terminal's representation of Shift+Tab — collapse
-        // to the canonical `⇧⇥` glyph so it reads the same regardless of
-        // which form the source `KeyEvent` used.
+        // BackTab is a terminal's Shift+Tab; collapse to one glyph so both forms read alike.
         KeyCode::Tab | KeyCode::BackTab => "⇥",
         KeyCode::Backspace => "⌫",
         KeyCode::Delete => "Del",
@@ -554,8 +464,7 @@ fn keycode_glyph(code: KeyCode) -> Option<&'static str> {
     })
 }
 
-/// Word-style label for a non-character `KeyCode` (long form used in the
-/// keybinds overlay and cheat sheet).
+/// Word-style label for a non-character `KeyCode` (long form for the overlay and cheat sheet).
 fn keycode_word(code: KeyCode) -> Option<&'static str> {
     Some(match code {
         KeyCode::Up => "Up",
@@ -577,9 +486,7 @@ fn keycode_word(code: KeyCode) -> Option<&'static str> {
     })
 }
 
-/// Render the key-code portion of a chord using `lookup` for the named
-/// (non-Char) keys.  `KeyCode::Char` always renders as its uppercase form
-/// for ASCII letters or as itself otherwise, with `' '` shown as `Space`.
+/// Render the key-code portion of a chord, using `lookup` for the named (non-Char) keys.
 fn format_keycode(code: KeyCode, lookup: fn(KeyCode) -> Option<&'static str>) -> String {
     if let Some(s) = lookup(code) {
         return s.to_owned();
@@ -593,15 +500,9 @@ fn format_keycode(code: KeyCode, lookup: fn(KeyCode) -> Option<&'static str>) ->
     }
 }
 
-/// Render `ev` as a compact glyph-based chord string suitable for the
-/// bottom-region hint line, where horizontal space is at a premium.
-/// Modifiers collapse to single characters (`^` / `⌥` / `⇧`) and
-/// non-printable keys use Unicode glyphs (`↑` / `↓` / `←` / `→` / `↵`
-/// / `⇥` / `⌫`).  Mirrors [`format_key`] for everything else.
-///
-/// This is the inverse of how the hint line *used* to hardcode chord
-/// glyphs — by going through this formatter, the displayed chord
-/// always tracks whatever the live `KeyMap` has bound for the action.
+/// Render `ev` as a compact glyph chord for the hint line, where space is at a premium:
+/// modifiers collapse to `^` / `⌥` / `⇧` and non-printable keys use Unicode glyphs.  Going
+/// through this formatter keeps the displayed chord tracking the live `KeyMap`.
 pub fn format_key_compact(ev: &KeyEvent) -> String {
     let mut out = String::new();
     if ev.modifiers.contains(KeyModifiers::CONTROL) {
@@ -618,18 +519,13 @@ pub fn format_key_compact(ev: &KeyEvent) -> String {
     out
 }
 
-/// Render `ev` in the lowercase `+`-separated form accepted by
-/// [`parse_key`].  Use this when the result needs to round-trip back
-/// through `parse_key` (e.g. the keybinds overlay writes the captured
-/// chord to `keybindings.toml`).  Going via `format_key` + `replace('-',
-/// '+')` instead would mangle keys whose own glyph is `-` or `+`.
+/// Render `ev` in the lowercase `+`-separated form [`parse_key`] accepts — use this whenever
+/// the result must round-trip, as when the keybinds overlay writes to `keybindings.toml`.
+/// `format_key` + `replace('-', '+')` would mangle keys whose own glyph is `-` or `+`.
 ///
-/// Returns `None` for `KeyCode` variants that have no parseable
-/// spelling — e.g. `KeyCode::Modifier(_)` (bare modifier presses,
-/// emitted only with keyboard-enhancement flags), `Null`, the
-/// lock/print/pause cluster, `Media(_)`, `KeypadBegin`.  Callers
-/// should surface these as "unsupported key" rather than silently
-/// writing an un-parseable string to disk.
+/// `None` for `KeyCode` variants with no parseable spelling (`Modifier(_)`, `Null`, the
+/// lock/print/pause cluster, `Media(_)`, `KeypadBegin`); callers should surface those as
+/// "unsupported key" rather than write an un-parseable string to disk.
 pub fn format_key_parseable(ev: &KeyEvent) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if ev.modifiers.contains(KeyModifiers::CONTROL) {
@@ -638,9 +534,8 @@ pub fn format_key_parseable(ev: &KeyEvent) -> Option<String> {
     if ev.modifiers.contains(KeyModifiers::ALT) {
         parts.push("alt".into());
     }
-    // BackTab implies Shift even when the SHIFT modifier isn't set —
-    // mirror the canonicalisation `action_for` does on lookup so the
-    // serialized form is the canonical `shift+tab`.
+    // BackTab implies Shift even without the modifier set; mirror `action_for`'s
+    // canonicalization so the serialized form is `shift+tab`.
     if ev.modifiers.contains(KeyModifiers::SHIFT) || ev.code == KeyCode::BackTab {
         parts.push("shift".into());
     }
@@ -668,11 +563,8 @@ pub fn format_key_parseable(ev: &KeyEvent) -> Option<String> {
     Some(parts.join("+"))
 }
 
-/// Render `ev` as a human-readable key string roughly matching what
-/// [`parse_key`] accepts.  Used by the cheat-sheet popover to
-/// display bindings; the inverse of `parse_key` is good enough here
-/// even if it's not strictly round-tripping (e.g. we emit `Ctrl-C`
-/// rather than `ctrl+c` for readability).
+/// Render `ev` for display (`Ctrl-C`).  Deliberately not round-tripping — use
+/// [`format_key_parseable`] when the result must parse back.
 pub fn format_key(ev: &KeyEvent) -> String {
     let mut parts: Vec<String> = Vec::new();
     if ev.modifiers.contains(KeyModifiers::CONTROL) {
@@ -690,18 +582,14 @@ pub fn format_key(ev: &KeyEvent) -> String {
 
 // ─── KeyBindingOverrides ──────────────────────────────────────────────────────
 
-/// The `[keybindings]` section of config.toml. Maps action name strings to key
-/// strings. Unknown action names are an error at startup.
+/// The `[keybindings]` section of config.toml: action name → key string.  An unknown action
+/// name is an error at startup.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct KeyBindingOverrides(pub HashMap<String, String>);
 
 impl KeyBindingOverrides {
-    /// Persist the overrides to `path` as TOML.  Used by the
-    /// keybinds overlay so a rebind takes effect immediately and
-    /// survives the next startup.  Returns the underlying I/O / TOML
-    /// error verbatim — callers typically log + flash on failure
-    /// rather than treating it as fatal.
+    /// Persist the overrides to `path` as TOML.  Failure is not fatal — callers log and flash.
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
         use anyhow::Context;
         if let Some(parent) = path.parent() {
@@ -719,33 +607,18 @@ impl KeyBindingOverrides {
 
 // ─── KeyMap ───────────────────────────────────────────────────────────────────
 
-/// Map the readline word-motion escapes `ESC b` / `ESC f` — which
-/// crossterm decodes as `Alt+b` / `Alt+f` — onto `Alt+Left` /
-/// `Alt+Right`, or `None` for any other event.
+/// Alias the readline word-motion escapes `ESC b` / `ESC f` — which crossterm decodes as
+/// `Alt+b` / `Alt+f` — onto `Alt+Left` / `Alt+Right`.
 ///
-/// Every mainstream macOS terminal emits those two escapes for
-/// Option+←/→ rather than the modified-arrow CSI the chord would
-/// otherwise produce: it is Apple Terminal's and iTerm2's default key
-/// mapping, and Ghostty ships `keybind = alt+arrow_left=esc:b` (and
-/// `…right=esc:f`) as a compiled-in default.  Without this alias the
-/// column-reorder and navigation-history chords (`Alt-←` / `Alt-→`,
-/// which the App redirects to `NavigateBack` / `NavigateForward`
-/// outside a table) are silently inert on macOS — the event carries
-/// `ALT`, so it matches no binding *and* is not printable enough to
-/// become an `InsertChar`.  See issue #29.
+/// Every mainstream macOS terminal emits those escapes for Option+←/→ instead of a
+/// modified-arrow CSI, so without this the `Alt-←` / `Alt-→` chords are silently inert there:
+/// the event carries `ALT`, so it matches no binding and is not printable enough to become an
+/// `InsertChar` (issue #29).
 ///
-/// This is deliberately not gated on `cfg(target_os = "macos")`: the
-/// escape originates in the terminal emulator, not the host, so an
-/// edamame running on Linux over SSH from a Mac needs it too.  It is a
-/// *fallback*, consulted only after the primary lookup, so a user who
-/// binds `alt+b` to something of their own keeps it — at the cost of
-/// Option+← on macOS, which is the correct trade for an explicit
-/// binding.
-///
-/// Only the bare `ALT` chord aliases.  `Alt-Shift-←`/`→` are left
-/// alone because no terminal rewrites them: they still arrive as real
-/// modified arrows, and mapping `Alt-Shift-B` onto
-/// `TableInsertColumnLeft` would be a chord nobody asked for.
+/// Not gated on `cfg(target_os = "macos")` — the escape comes from the terminal emulator, so a
+/// Linux edamame reached over SSH from a Mac needs it too.  Consulted only *after* the primary
+/// lookup, so an explicit `alt+b` binding wins.  Only the bare `ALT` chord aliases; no terminal
+/// rewrites `Alt-Shift-←`/`→`.
 fn alt_word_motion_alias(event: &KeyEvent) -> Option<KeyEvent> {
     if event.modifiers != KeyModifiers::ALT {
         return None;
@@ -758,18 +631,15 @@ fn alt_word_motion_alias(event: &KeyEvent) -> Option<KeyEvent> {
     Some(KeyEvent::new(code, KeyModifiers::ALT))
 }
 
-/// Maps `KeyEvent`s to `Action`s. Built from compiled-in defaults, then
-/// overridden by the user's `[keybindings]` config.
+/// Maps `KeyEvent`s to `Action`s: compiled-in defaults, then the user's `[keybindings]`.
 #[derive(Debug, Clone)]
 pub struct KeyMap {
-    /// Primary map: key event → action.
     bindings: HashMap<KeyEvent, Action>,
 }
 
 impl KeyMap {
-    /// Build a `KeyMap` with compiled-in defaults, then apply any overrides
-    /// from config. Returns an error if any override contains an unknown action
-    /// name or an unparseable key string.
+    /// Compiled-in defaults plus the config overrides.  Errors on an unknown action name or an
+    /// unparseable key string.
     pub fn build(overrides: &KeyBindingOverrides) -> Result<Self, KeyMapError> {
         let mut map = Self::default_bindings();
 
@@ -782,13 +652,8 @@ impl KeyMap {
         Ok(map)
     }
 
-    /// Return the first key (in insertion order, which HashMap does not
-    /// guarantee but is fine for an approximate lookup) bound to
-    /// `action`, formatted as a human-readable string.  Used by the
-    /// cheat-sheet popover to surface the current binding for
-    /// each known action.  When multiple keys are bound, only one is
-    /// returned — callers that need every binding should iterate
-    /// `bindings()` themselves.
+    /// One key bound to `action`, formatted for display.  Which one is unspecified when
+    /// several are bound — iterate `bindings()` for the full set.
     pub fn first_key_for(&self, action: &Action) -> Option<String> {
         self.bindings
             .iter()
@@ -796,9 +661,8 @@ impl KeyMap {
             .map(|(k, _)| format_key(k))
     }
 
-    /// Like [`KeyMap::first_key_for`] but returns the raw `KeyEvent` so
-    /// callers can apply their own formatter (e.g. the bottom-region
-    /// hint line uses `format_key_compact` instead of `format_key`).
+    /// [`KeyMap::first_key_for`] returning the raw `KeyEvent`, for callers with their own
+    /// formatter.
     pub fn first_key_event_for(&self, action: &Action) -> Option<KeyEvent> {
         self.bindings
             .iter()
@@ -806,15 +670,9 @@ impl KeyMap {
             .map(|(k, _)| *k)
     }
 
-    /// Rebind `action` to `new_key` (parsed from `parse_key`-style
-    /// syntax).  If `new_key` is already bound to a *different*
-    /// action, returns `Err` and leaves the keymap unchanged — that's
-    /// the conflict-detection contract from the keybinds
-    /// overlay.  On success, the overrides table is updated to keep
-    /// the on-disk shape in sync with the in-memory keymap.
-    ///
-    /// Existing bindings of the same `action` are removed so the
-    /// caller doesn't have to track stale mappings.
+    /// Rebind `action` to `new_key`.  A key already bound to a *different* action is an `Err`
+    /// leaving the keymap unchanged — the keybinds overlay's conflict-detection contract.  On
+    /// success `overrides` is updated too, and any prior key for `action` is dropped.
     pub fn rebind(
         &mut self,
         action: &Action,
@@ -829,11 +687,10 @@ impl KeyMap {
                     action: existing.to_string(),
                 });
             }
-            // Same action already bound to the same key — no-op.
+            // Already bound to this same key.
             return Ok(());
         }
-        // Drop any prior key bound to this action so we don't end up
-        // with two chords for the same action sticking around.
+        // Drop any prior chord for this action rather than leaving two.
         self.bindings.retain(|_, a| a != action);
         self.bindings.insert(parsed, action.clone());
         overrides.0.insert(action.to_string(), new_key.to_owned());
@@ -842,26 +699,19 @@ impl KeyMap {
 
     /// Look up the action bound to a key event, if any.
     pub fn action_for(&self, event: &KeyEvent) -> Option<&Action> {
-        // Normalize: strip `state` and force `kind: Press` so the kitty
-        // keyboard protocol (which reports KEYPAD / CAPS_LOCK state flags)
-        // does not prevent HashMap lookup. `KeyEvent`'s PartialEq/Hash
-        // compare all four fields, and `parse_key` always produces events
-        // with `state: EMPTY, kind: Press`.
+        // Strip `state` and force `kind: Press`: `KeyEvent`'s Hash covers all four fields, and
+        // the kitty protocol's KEYPAD / CAPS_LOCK flags would otherwise defeat the lookup.
         let normalized = KeyEvent::new(event.code, event.modifiers);
         if let Some(action) = self.bindings.get(&normalized) {
             return Some(action);
         }
-        // Some terminals report Shift+Tab as `KeyCode::BackTab` (with or
-        // without the SHIFT modifier set).  Normalize it to the canonical
-        // `Tab + SHIFT` form produced by `parse_key("shift+tab")` so bindings
-        // match regardless of which representation the terminal emits.
+        // Some terminals report Shift+Tab as `BackTab`, with or without SHIFT set; normalize
+        // to the `Tab + SHIFT` form `parse_key("shift+tab")` produces.
         if event.code == KeyCode::BackTab {
             let fallback = KeyEvent::new(KeyCode::Tab, event.modifiers | KeyModifiers::SHIFT);
             return self.bindings.get(&fallback);
         }
-        // macOS terminals send the readline word-motion escapes for
-        // Option+←/→ instead of a modified-arrow CSI (see
-        // `alt_word_motion_alias`).
+        // See `alt_word_motion_alias`.
         if let Some(alias) = alt_word_motion_alias(&normalized) {
             return self.bindings.get(&alias);
         }
@@ -880,26 +730,24 @@ impl KeyMap {
             };
         }
 
-        // Quit — Ctrl-Q only. Ctrl-C is Copy (see below).
+        // Ctrl-Q only; Ctrl-C is Copy.
         bind!("ctrl+q", Action::Quit);
 
-        // Scrolling / cursor movement
-        // Arrow keys → cursor movement in all modes; MoveUp/Down act as
-        // ScrollUp/ScrollDown when in Preview mode (handled in app).
+        // Arrows move the cursor in all modes; the app turns MoveUp/Down into scrolling in
+        // Preview mode.
         bind!("up", Action::MoveUp);
         bind!("down", Action::MoveDown);
         bind!("left", Action::MoveLeft);
         bind!("right", Action::MoveRight);
         bind!("ctrl+left", Action::MoveWordLeft);
         bind!("ctrl+right", Action::MoveWordRight);
-        // Ctrl+A is SelectAll (typical GUI editor convention).  Unix shell
-        // users who want move-line-start can still use Home.
+        // Ctrl+A is SelectAll (GUI convention); Home still moves to line start.
         bind!("ctrl+a", Action::SelectAll);
         bind!("ctrl+e", Action::MoveLineEnd);
         bind!("ctrl+home", Action::MoveDocStart);
         bind!("ctrl+end", Action::MoveDocEnd);
 
-        // Explicit scrolling (works in all modes)
+        // Explicit scrolling
         bind!("page_up", Action::ScrollPageUp);
         bind!("page_down", Action::ScrollPageDown);
         bind!("home", Action::ScrollToTop);
@@ -917,9 +765,7 @@ impl KeyMap {
         // History
         bind!("ctrl+z", Action::Undo);
         bind!("ctrl+shift+z", Action::Redo);
-        // Ctrl-R is vim's Redo; bind it for everyone so vim Redo works via
-        // plain passthrough (no vim-specific claim) and non-vim users gain a
-        // second Redo chord.  See docs/vim-implementation-plan.md §2.7.
+        // Ctrl-R is vim's Redo; bound for everyone so vim Redo works by plain passthrough.
         bind!("ctrl+r", Action::Redo);
 
         // Clipboard
@@ -940,11 +786,9 @@ impl KeyMap {
 
         // File operations
         bind!("ctrl+s", Action::Save);
-        // `Action::Open` is deliberately unbound: it is still a stub (see
-        // `NOT_YET_IMPLEMENTED` in `app::actions`), so a default chord would
-        // only surface a "not implemented" notice.  Restore the `ctrl+o`
-        // binding — and the palette entry in `ui::command_palette::actions` —
-        // when real in-app file opening lands.
+        // `Action::Open` is deliberately unbound while it is a stub: a default chord would
+        // only surface "not implemented".  Restore `ctrl+o` (and the palette entry in
+        // `ui::command_palette::actions`) when real in-app file opening lands.
 
         // Mode transitions
         bind!("escape", Action::ExitToPreview);
@@ -959,11 +803,8 @@ impl KeyMap {
         // List
         bind!("ctrl+space", Action::ToggleCheckbox);
 
-        // Table editing — org-mode-style Alt+Arrow scheme.
-        // Arrow direction = operation direction; Shift promotes "reorder" to
-        // "insert" on that side. Cell navigation (Tab / Shift+Tab / Enter) is
-        // handled via context dispatch in edit_ops when the cursor is inside
-        // a table — they remain bound to InsertTab / Newline by default.
+        // Table editing — org-mode-style Alt+Arrow: arrow direction is the operation
+        // direction, Shift promotes "reorder" to "insert" on that side.
         bind!("alt+up", Action::TableMoveRowUp);
         bind!("alt+down", Action::TableMoveRowDown);
         bind!("alt+left", Action::TableMoveColumnLeft);
@@ -974,57 +815,33 @@ impl KeyMap {
         bind!("alt+shift+right", Action::TableInsertColumnRight);
         bind!("alt+backspace", Action::TableDeleteRow);
         bind!("alt+shift+backspace", Action::TableDeleteColumn);
-        // Shift+Tab moves to the previous cell when the cursor is inside a
-        // table; it is a no-op elsewhere.  Tab / Enter remain bound to
-        // InsertTab / Newline so that context dispatch in edit_ops can decide
-        // whether to insert text or move between cells.
+        // Tab / Enter stay bound to InsertTab / Newline; edit_ops dispatches on context to
+        // decide between inserting text and moving between cells.
         bind!("shift+tab", Action::TablePrevCell);
-        // Shift+Enter inserts a literal `<br>` when the cursor is inside a
-        // table cell; outside a table it has no binding and the default
-        // Shift+Enter behaviour (same as Enter) applies.
+        // Only inside a table cell; elsewhere Shift+Enter falls back to Enter.
         bind!("shift+enter", Action::TableInsertBreak);
 
-        // Link navigation.  Alt+Left / Alt+Right are NOT bound to
-        // NavigateBack/NavigateForward here: those keys remain bound to
-        // TableMoveColumnLeft / TableMoveColumnRight so tables keep their
-        // column-reorder semantics, and the `App` dispatches them to
-        // NavigateBack/Forward only when the cursor is outside any table.
-        // Users can still rebind NavigateBack/Forward to any key via the
-        // keybindings config.
+        // Alt+Left / Alt+Right stay bound to the table column-reorder actions; the `App`
+        // redirects them to NavigateBack / NavigateForward when the cursor is outside a table.
         bind!("ctrl+enter", Action::FollowLinkUnderCursor);
 
-        // Command palette.  Ctrl-P is the primary chord
-        // (also surfaced on the bottom-region hint line as `^P Menu`).
-        // The other palette actions (`ShowMarkdownCheatSheet`,
-        // `ShowAbout`, `OpenSettings`, `OpenKeybinds`,
-        // `OpenConfigFolder`, `ExportHtml`) are intentionally unbound:
-        // they are reached only via the palette, so the user can
-        // search-and-execute without memorising a chord per overlay.
+        // The other overlay actions (cheat sheet, About, settings, keybinds, config folder,
+        // export) are intentionally unbound — the palette reaches them all.
         bind!("ctrl+p", Action::ShowCommandPalette);
 
-        // "Go to section" — pop open a fuzzy-searchable heading list
-        // and jump the viewport to the chosen heading.  Ctrl-G is
-        // otherwise unbound by terminals (ASCII BEL is generated by
-        // the application, never consumed as input).
+        // Ctrl-G is unclaimed by terminals: ASCII BEL is generated, never consumed as input.
         bind!("ctrl+g", Action::GoToSection);
 
-        // Search and replace.  Ctrl-F is unclaimed by terminals and
-        // unbound elsewhere in edamame, so the conventional "find"
-        // chord opens the search modal directly.  The in-flow keys
-        // (Tab / Shift-Tab / r / a / Esc) are hard-bound in
+        // The in-flow keys (Tab / Shift-Tab / r / a / Esc) are hard-bound in
         // `search::search_keys`, not here.
         bind!("ctrl+f", Action::OpenSearch);
 
-        // Graduation chord for the Insert Table command.
-        // Tables can't be authored from Rendered mode without this
-        // flow, so a discoverable keybind sits next to the palette
-        // entry.
+        // Tables can't be authored from Rendered mode without this flow, so it gets a
+        // discoverable chord alongside its palette entry.
         bind!("ctrl+shift+t", Action::InsertTable);
 
-        // `InsertLink` / `InsertImage` and the code / strikethrough /
-        // highlight selection wraps ship unbound: they're reachable
-        // from the command palette, and a user who wants a chord can
-        // bind one in keybindings.toml.
+        // `InsertLink` / `InsertImage` and the code / strikethrough / highlight wraps ship
+        // unbound: palette-reachable, and rebindable in keybindings.toml.
 
         Self { bindings: b }
     }
@@ -1034,18 +851,10 @@ impl KeyMap {
 mod tests {
     use super::*;
 
-    /// The full default binding table, pinned.
-    ///
-    /// `docs/keybindings.md` is written by hand from this table, and a
-    /// user reading a chord that no longer fires is a worse bug than most
-    /// code defects — it is unfalsifiable from inside the app.  So any
-    /// change here has to be accepted as a snapshot, and **that review is
-    /// the reminder to update `docs/keybindings.md`** (plus the
-    /// `config/keybindings.toml` reference file if the action appears
-    /// there).
-    ///
-    /// Rendered as `chord = Action` sorted by chord so the diff is
-    /// readable and independent of `HashMap` iteration order.
+    /// The full default binding table, pinned.  `docs/keybindings.md` is written by hand from
+    /// it, so **accepting this snapshot is the reminder to update that page** (and
+    /// `config/keybindings.toml`).  Sorted by chord, so the diff is independent of `HashMap`
+    /// iteration order.
     #[test]
     fn default_bindings_are_pinned_for_the_docs() {
         let km = KeyMap::default_bindings();
@@ -1062,10 +871,8 @@ mod tests {
         insta::assert_snapshot!(rows.join("\n"));
     }
 
-    /// `Action::Open` is still a stub (`app::actions::NOT_YET_IMPLEMENTED`).
-    /// It must stay unbound so no user discovers a default chord that can
-    /// only flash "not implemented" — `docs/keybindings.md` tells readers
-    /// there is no in-app file open, and this is what keeps that true.
+    /// `Action::Open` is a stub, so it must stay unbound — `docs/keybindings.md` says there is
+    /// no in-app file open, and this keeps that true.
     #[test]
     fn open_stays_unbound_while_it_is_a_stub() {
         let km = KeyMap::default_bindings();
@@ -1115,8 +922,7 @@ mod tests {
 
     #[test]
     fn backtab_maps_to_shift_tab_binding() {
-        // Some terminals emit Shift+Tab as `KeyCode::BackTab` instead of the
-        // canonical `Tab + SHIFT` form.  `action_for` must match either way.
+        // Some terminals emit `BackTab` instead of `Tab + SHIFT`; both must match.
         let km = KeyMap::build(&KeyBindingOverrides::default()).unwrap();
         let backtab_no_mod = KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE);
         assert_eq!(km.action_for(&backtab_no_mod), Some(&Action::TablePrevCell));
@@ -1124,8 +930,7 @@ mod tests {
         assert_eq!(km.action_for(&backtab_shift), Some(&Action::TablePrevCell));
     }
 
-    /// macOS terminals send `ESC b` / `ESC f` for Option+←/→, which
-    /// crossterm decodes as `Alt+b` / `Alt+f`.  Both must reach whatever
+    /// macOS terminals send `ESC b` / `ESC f` for Option+←/→; both must reach whatever
     /// `alt+left` / `alt+right` are bound to (issue #29).
     #[test]
     fn alt_b_and_alt_f_reach_the_alt_arrow_bindings() {
@@ -1144,9 +949,7 @@ mod tests {
         assert_eq!(km.action_for(&alt_f), Some(&Action::TableMoveColumnRight));
     }
 
-    /// The alias follows the *live* binding rather than hard-coding the
-    /// default action, so a user who rebinds `alt+left` keeps Option+←
-    /// working on macOS.
+    /// The alias follows the *live* binding, so a user who rebinds `alt+left` keeps Option+←.
     #[test]
     fn alt_arrow_alias_follows_a_rebound_alt_left() {
         let mut overrides = KeyBindingOverrides::default();
@@ -1156,8 +959,7 @@ mod tests {
         assert_eq!(km.action_for(&alt_b), Some(&Action::NavigateBack));
     }
 
-    /// It is a fallback, not an override: an explicit `alt+b` binding
-    /// wins, and shifted / control-laden variants never alias.
+    /// A fallback, not an override: an explicit `alt+b` wins, and modified variants never alias.
     #[test]
     fn explicit_alt_b_binding_wins_over_the_arrow_alias() {
         let mut overrides = KeyBindingOverrides::default();
@@ -1176,8 +978,7 @@ mod tests {
 
     #[test]
     fn action_lookup_ignores_kitty_state_flags() {
-        // The kitty keyboard protocol attaches non-default `state` flags
-        // (e.g. KEYPAD) to events. `action_for` must look past those.
+        // The kitty protocol attaches `state` flags (e.g. KEYPAD); `action_for` looks past them.
         use crossterm::event::{KeyEventKind, KeyEventState};
         let km = KeyMap::build(&KeyBindingOverrides::default()).unwrap();
         let ctrl_q_with_state = KeyEvent {
@@ -1202,10 +1003,8 @@ mod tests {
 
     #[test]
     fn literal_plus_and_hyphen_round_trip() {
-        // The `+` separator collides with `+` as a key glyph; `-` is
-        // unambiguous but used to be mangled by the overlay's old
-        // dash-to-plus normalisation.  Both must round-trip cleanly
-        // through `parse_key` / `format_key_parseable`.
+        // The `+` separator collides with `+` as a key glyph, and `-` was once mangled by a
+        // dash-to-plus normalization; both must round-trip.
         for chord in ["+", "-", "ctrl++", "ctrl+-", "ctrl+shift++"] {
             let ev = parse_key(chord).unwrap_or_else(|_| panic!("parse {chord}"));
             let re = format_key_parseable(&ev).expect("supported key");

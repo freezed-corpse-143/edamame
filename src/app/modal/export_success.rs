@@ -1,10 +1,5 @@
-//! Post-export success modal.  Three buttons: OK (close), Open the
-//! exported `<name>.toml` in the user's `$VISUAL` / `$EDITOR`, or
-//! Open the surrounding config folder in the OS file manager.
-//!
-//! The theme has already been written and applied by
-//! [`super::export_theme::ExportThemeModal`] before this modal opens, so all three
-//! buttons are post-effect: dismissing is harmless.
+//! Post-export success modal: OK, open the exported theme in `$VISUAL` / `$EDITOR`, or open
+//! the config folder.  The theme is already written and applied, so dismissing is harmless.
 
 use std::any::Any;
 use std::path::PathBuf;
@@ -41,9 +36,7 @@ impl ExportSuccessModal {
         }
     }
 
-    /// Map a resolved response to an outcome.  Shared by the key and
-    /// click paths so a mouse click on a button behaves exactly like
-    /// pressing it.
+    /// Map a chrome response to an outcome; shared by the key and click paths.
     fn resolve(&mut self, response: ModalResponse) -> ModalOutcome {
         match response {
             ModalResponse::Continue => ModalOutcome::Continue,

@@ -15,25 +15,11 @@ impl<'t> Renderer<'t> {
         out: &mut Vec<Line<'static>>,
         indent_prefix: &str,
     ) {
-        // Two width metrics drive list layout:
-        //
-        //   marker_width: cells consumed by the marker prefix that the
-        //   renderer prints in front of the first line of each item.
-        //     • unordered:  `• `              → 2 cells
-        //     • ordered:    ` 1. ` / `10. `   → max_digits + 2 cells
-        //
-        //   nested_indent_width: cells of leading whitespace inserted in
-        //   front of each nested block (sub-list, continuation paragraph,
-        //   …) in this list's items.  Both ordered and unordered nest at
-        //   `max(4, marker_width)`.  Nesting in the source uses 4 spaces
-        //   (the conventional `tab_width` indent that satisfies
-        //   CommonMark's ≥3-cell rule for single-digit / bullet markers);
-        //   rendering at the same width keeps the de-rendered (raw-mode)
-        //   view from showing the nested marker shifted relative to its
-        //   rendered position.  For lists wide enough that the marker
-        //   outgrows 4 cells (multi-digit ordered markers), the indent
-        //   grows with it so those markers still align under their
-        //   parent's content column.
+        // `marker_width` is the prefix printed before each item's first line; `nested_indent_width`
+        // is the leading whitespace before each nested block.  The latter is `max(4, marker_width)`
+        // because source nesting uses 4 spaces, and rendering at the same width keeps the raw-mode
+        // view from showing the nested marker shifted; a marker wider than 4 grows the indent with
+        // it so those markers still align under their parent's content column.
         let first_num = start.unwrap_or(1);
         let last_num = first_num + items.len().saturating_sub(1) as u64;
         let digit_width = last_num.to_string().len().max(1);
@@ -43,22 +29,16 @@ impl<'t> Renderer<'t> {
 
         let mut counter = first_num;
         for item in items {
-            // Loose-list spacing: emit the blank source lines that precede
-            // this item's marker so the rendered list keeps its legibility
-            // gaps.  These blanks stay 1:1 with the source lines the reveal
-            // in `RenderedView` maps against (`block_text.split('\n')`), so
-            // the count comes straight from `annotate_list_blanks`.
+            // Loose-list spacing.  These blanks stay 1:1 with the source lines the reveal maps
+            // against, so the count comes straight from `annotate_list_blanks`.
             for _ in 0..item.blank_lines_before {
                 out.push(Line::raw(""));
             }
-            // Marker is the bullet / number prefix.  Tasks are decorated
-            // bullets — they render the same `• ` (or ordered marker)
-            // followed by the `[ ] ` checkbox span emitted just below.
-            // This lets task items and plain bullets coexist in one list.
+            // A task is a decorated bullet — the same marker plus the checkbox span below — so
+            // task items and plain bullets can coexist in one list.
             let (marker, marker_style) = if ordered {
-                // Right-align the number inside a `digit_width`-wide slot so
-                // multi-digit numbers (10+) don't push their item's text out
-                // of alignment with the single-digit items above.
+                // Right-aligned in a `digit_width` slot so 10+ doesn't push its text out of
+                // alignment with the single-digit items above.
                 let s = format!(
                     "{indent_prefix}{counter:>digit_width$}. ",
                     digit_width = digit_width
@@ -74,7 +54,6 @@ impl<'t> Renderer<'t> {
                 (format!("{indent_prefix}• "), bullet_style)
             };
 
-            // Task list prefix (checkbox).
             let task_prefix: Option<Span<'static>> = item.task.map(|checked| {
                 if checked {
                     Span::styled("[✓] ", self.theme.task_checked)
@@ -83,10 +62,8 @@ impl<'t> Renderer<'t> {
                 }
             });
 
-            // Checked-item text style.  `task_complete_text` is the
-            // theme's "muted text" style; `task_strikethrough` keeps
-            // the CROSSED_OUT modifier opt-in so themes can ship the
-            // muted color without the strikethrough.
+            // `task_strikethrough` keeps CROSSED_OUT opt-in, so a theme can mute completed text
+            // without striking it through.
             let checked_text_style = if item.task == Some(true) {
                 if self.theme.task_strikethrough {
                     self.theme
@@ -99,10 +76,7 @@ impl<'t> Renderer<'t> {
                 Style::default()
             };
 
-            // Empty list item: render the marker (and the task checkbox, if any)
-            // so the block produces ≥1 line.  Without the checkbox branch, an
-            // empty task item collapses to an invisible line because the "marker"
-            // for task items is just indentation.
+            // An empty item still emits its marker so the block produces at least one line.
             if item.blocks.is_empty() {
                 let mut spans = vec![Span::styled(marker.clone(), marker_style)];
                 if let Some(tp) = task_prefix.clone() {
@@ -112,10 +86,8 @@ impl<'t> Renderer<'t> {
                 continue;
             }
 
-            // Render each block in the item.
             for (i, block) in item.blocks.iter().enumerate() {
                 if i == 0 {
-                    // First block: prepend the marker (and task prefix if any).
                     match block {
                         Block::Paragraph { inlines } => {
                             let mut spans = vec![Span::styled(marker.clone(), marker_style)];
@@ -124,24 +96,21 @@ impl<'t> Renderer<'t> {
                             }
                             spans.extend(self.render_inlines(inlines, checked_text_style));
                             out.push(Line::from(spans));
-                            // No blank line after list items (tight-list style).
                         }
                         other => {
-                            // Non-paragraph first block: render the marker (and
-                            // task prefix, if any) alone, then the block below.
+                            // A non-paragraph first block gets the marker on a line of its own.
                             let mut spans = vec![Span::styled(marker.clone(), marker_style)];
                             if let Some(tp) = task_prefix.clone() {
                                 spans.push(tp);
                             }
                             out.push(Line::from(spans));
-                            self.render_block(other, out, &child_indent_prefix);
+                            self.render_block(other, out, &child_indent_prefix, false);
                         }
                     }
                 } else {
-                    // Subsequent blocks in the same item: render with the
-                    // child indent prefix so their text aligns with this
-                    // item's text column (hanging-indent layout).
-                    self.render_block(block, out, &child_indent_prefix);
+                    // Later blocks take the child indent, so their text aligns with this item's
+                    // text column.
+                    self.render_block(block, out, &child_indent_prefix, false);
                 }
             }
         }

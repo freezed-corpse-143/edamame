@@ -3,54 +3,28 @@ use ratatui::{buffer::Buffer, layout::Rect, style::Style, text::Line, widgets::S
 use super::line_render::{render_line_from_visual, visual_rows_of_chars};
 use crate::document::VisualSelection;
 
-/// State for the `PreviewView` widget — scroll offset, selection, and
-/// hit-test snapshots.  The rendered line list is NOT held here; it
-/// flows through the widget by borrow (`PreviewView::lines`) so a
-/// scroll or mouse event no longer pays for a full `parsed.lines.clone()`
-/// on every dispatch.  Mirrors the borrow style `RenderedView` already
-/// uses against `&EditorState`.
+/// State for the `PreviewView` widget.  The rendered lines are not held here: they are borrowed
+/// through `PreviewView::lines` so a scroll or mouse event never clones `parsed.lines`.
 #[derive(Debug, Default)]
 pub struct PreviewState {
-    /// Current scroll offset (top visible line index).
+    /// Top visible line index.
     pub scroll: usize,
-    /// Optional selection in rendered coordinates, used to paint the
-    /// selection background on top of the rendered cells.
+    /// Selection in rendered coordinates, painted over the rendered cells.
     pub selection: Option<VisualSelection>,
-    /// Background style to apply over selected cells.
     pub selection_style: Style,
-    /// Snapshots of every visible `Block::ImageBlock`, populated in
-    /// `EditorView::render` before the line-render pass so the image
-    /// overlay step can paint pixels into the cells reserved by each
-    /// placeholder.  Built against `EditorState::parsed.image_blocks`
-    /// directly — no preview-local copy needed.
+    /// Visible `Block::ImageBlock` snapshots, populated in `EditorView::render` before the
+    /// line-render pass so the image overlay can paint into each placeholder's cells.
     pub image_snapshots: Vec<super::ImageLayoutSnapshot>,
-    /// Cache key for `image_snapshots`: `(scroll, area, parsed_version)`.
-    /// When the tuple matches the current frame, the snapshot vector is
-    /// reused instead of rebuilt.
+    /// `(scroll, area, parsed_version)`; a match reuses `image_snapshots` instead of rebuilding.
     pub image_snapshots_key: Option<(usize, ratatui::layout::Rect, u64)>,
-    /// Link layout snapshots populated in `EditorView::render`
-    /// so preview-mode mouse clicks can hit-test against link spans.
+    /// Link snapshots for preview-mode click hit-testing, populated in `EditorView::render`.
     pub link_snapshots: Vec<super::LinkLayoutSnapshot>,
-    /// Cache key for `link_snapshots`: `(scroll, area, parsed_version)`.
-    /// Mirrors `image_snapshots_key` — skips the link geometry walk
-    /// when nothing that affects link layout has changed.
+    /// Same scheme as `image_snapshots_key`.
     pub link_snapshots_key: Option<(usize, ratatui::layout::Rect, u64)>,
 }
 
-/// A read-only, scrollable preview of rendered Markdown lines.
-///
-/// `lines` is borrowed from `EditorState::parsed.lines` so the widget
-/// renders without owning a copy.  Scroll, selection, and snapshot
-/// caches live on `PreviewState`.
-///
-/// Usage:
-/// ```ignore
-/// frame.render_stateful_widget(
-///     PreviewView { lines: &editor.parsed.lines, scroll: editor.scroll },
-///     area,
-///     &mut state,
-/// );
-/// ```
+/// A read-only, scrollable preview of rendered Markdown lines, borrowed from
+/// `EditorState::parsed.lines`.
 pub struct PreviewView<'a> {
     pub lines: &'a [Line<'static>],
     pub scroll: usize,
@@ -64,14 +38,10 @@ impl<'a> StatefulWidget for PreviewView<'a> {
             return;
         }
 
-        // Render each visible line ourselves (rather than using `Paragraph`)
-        // so that styled blocks like code blocks extend their background to
-        // the full viewport width — both on their last (wrapped) visual row
-        // and on short lines within a wider terminal.
+        // Lines are rendered by hand rather than via `Paragraph` so block backgrounds fill the
+        // full viewport width, including the last wrapped row.
         let sel_range = state.selection.map(|s| s.range());
-        // A cell-banded selection (started inside a table cell) limits the
-        // painted span on every line to the cell's column band instead of
-        // running to the line edges.
+        // A cell-banded selection (started inside a table cell) clips every line to that band.
         let band_cols = state.selection.and_then(|s| s.band).map(|b| b.cols);
         let sel_style = state.selection_style;
         let width = area.width as usize;
@@ -87,11 +57,6 @@ impl<'a> StatefulWidget for PreviewView<'a> {
                 break;
             }
 
-            // Selection overlay: if this rendered line falls inside the
-            // selection's line range, paint the theme's selection background
-            // over the covered columns.  Uses the same word-wrap algorithm
-            // as `render_line` to determine where visible content ends on
-            // each sub-row so trailing padding isn't highlighted.
             if let Some(((s_line, s_col), (e_line, e_col))) = sel_range {
                 if line_idx >= s_line && line_idx <= e_line {
                     let start_col = if line_idx == s_line {
@@ -133,10 +98,9 @@ fn line_at_visual_row(lines: &[Line<'static>], visual_row: usize, width: usize) 
     (lines.len(), 0)
 }
 
-/// Paint `sel_style` as a background over the rendered cells on the visual
-/// rows produced by wrapping `line` at `width`, clipped to `[start_col,
-/// end_col)` in char columns.  Mirrors `paint_selection_overlay` in
-/// `rendered_view` but for a single line's wrap layout.
+/// Paint `sel_style` over the wrapped rows of `line`, clipped to `[start_col, end_col)` in char
+/// columns.  Reuses the wrap algorithm so trailing padding is never highlighted; mirrors
+/// `paint_selection_overlay` in `rendered_view` for a single line.
 #[allow(clippy::too_many_arguments)]
 fn paint_preview_selection(
     line: &Line<'_>,
@@ -173,14 +137,12 @@ fn paint_preview_selection(
         if y >= area.y + area.height {
             break;
         }
-        // Intersect the selection's char range with this row's char span.
         let row_sel_start = start_col.max(row_start);
         let row_sel_end = end_col.min(row_end);
         if row_sel_start >= row_sel_end {
             continue;
         }
-        // Continuation rows are pre-padded with `indent` blank cells; the
-        // selection background must shift by the same amount.
+        // Continuation rows are pre-padded with `indent` blank cells.
         let row_indent = if row_off == 0 { 0 } else { indent };
         for i in row_sel_start..row_sel_end {
             let x_off = row_indent + (i - row_start);
@@ -206,12 +168,9 @@ mod tests {
         Box::leak(Box::new(Theme::default()))
     }
 
-    /// A wrapped code block line (with `code_block_wrap` enabled) should have
-    /// its background on every visual row — including the last, partial row.
     #[test]
     fn wrapped_code_block_bg_fills_last_row() {
         let theme = theme();
-        // 100-char code line, renderer's block_width is 80, so this wraps.
         let long = "a".repeat(100);
         let md = format!("```\n{}\n```\n", long);
         let lines = Renderer::new(theme)
@@ -236,8 +195,6 @@ mod tests {
 
         let tbuf = terminal.backend().buffer().clone();
         let expected_bg = theme.code_block_text.bg;
-        // The 'a's wrap over two visual rows. Locate the last row that contains
-        // any 'a' and verify every cell on that row has the code bg.
         let mut last_a_row: Option<u16> = None;
         for y in 0..6u16 {
             let row: String = (0..80)
@@ -262,16 +219,10 @@ mod tests {
         }
     }
 
-    /// A list item whose text wraps in the viewport must hang-indent: the
-    /// marker (`• `, `[ ] `, `1. `) sits alone on column 0 of the first
-    /// visual row, and every wrapped continuation row begins at the column
-    /// where the first row's text started — so the wrapped text is flush
-    /// with the first character after the marker.
+    /// Wrapped list continuation rows must align with the first row's text column.
     #[test]
     fn list_item_wrap_hangs_indent_after_marker() {
         let theme = theme();
-        // Bullet item with enough words to force wrap at width 12.  Marker
-        // takes 2 cells; text begins at column 2.
         let lines = Renderer::new(theme).render(&parse("- alpha bravo charlie delta\n"));
         let mut state = PreviewState::default();
 
@@ -299,12 +250,8 @@ mod tests {
                 })
                 .collect()
         };
-        // Row 0: marker hangs off at col 0; text starts at col 2.
         let r0 = row_text(0);
         assert!(r0.starts_with("• "), "row 0 = {r0:?}");
-        // Row 1+ are wrapped continuations.  At least one continuation row
-        // must exist, and its first two cells must be blanks (the hanging
-        // indent), with non-blank content starting at column 2.
         let r1 = row_text(1);
         assert_eq!(
             &r1[..2],
@@ -315,21 +262,15 @@ mod tests {
             r1.chars().nth(2).map(|c| c != ' ').unwrap_or(false),
             "continuation row must have text starting at indent column: {r1:?}"
         );
-        // Sanity: the wrap must actually have produced a continuation row
-        // (i.e. the first row didn't fit the entire body).
         assert!(
             r1.trim_end().chars().any(|c| c.is_alphabetic()),
             "expected wrapped body on row 1: {r1:?}"
         );
     }
 
-    /// Same hanging-indent rule applies to ordered, task, and nested lists —
-    /// the wrap continuation aligns with the first row's text column for any
-    /// recognized list marker.
     #[test]
     fn list_item_wrap_hangs_indent_for_task_and_ordered() {
         let theme = theme();
-        // Task item: marker is `• [ ] ` (bullet + checkbox) = 6 cells.
         let lines = Renderer::new(theme).render(&parse("- [ ] alpha bravo charlie delta\n"));
         let mut state = PreviewState::default();
         let backend = TestBackend::new(16, 4);
@@ -369,18 +310,13 @@ mod tests {
         );
     }
 
-    /// A code block line should have its background style applied to every
-    /// cell of the row, from the first content column through the last cell
-    /// of the viewport — even when the viewport is wider than the renderer's
-    /// default `block_width`.
     #[test]
     fn code_block_bg_extends_to_viewport_edge() {
         let theme = theme();
         let lines = Renderer::new(theme).render(&parse("```\nfoo\n```\n"));
         let mut state = PreviewState::default();
 
-        // Use a 100-wide terminal; the renderer's default block_width is 80,
-        // so the extra 20 cells must be filled by the preview widget.
+        // The renderer's default block_width is 80; the extra 20 cells must be filled here.
         let backend = TestBackend::new(100, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -397,8 +333,6 @@ mod tests {
             .unwrap();
 
         let tbuf = terminal.backend().buffer().clone();
-        // Find the code row (contains "foo") and check that every cell in it
-        // carries the code_block_text background style.
         let mut code_row: Option<u16> = None;
         for y in 0..3 {
             let row_text: String = (0..100)

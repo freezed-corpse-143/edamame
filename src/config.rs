@@ -1,6 +1,4 @@
-// Facade pattern: this file re-exports types from `src/config/config.rs`
-// so call sites can write `use crate::config::Config` instead of
-// `crate::config::config::Config`.  See CLAUDE.md "Module Facade Pattern".
+// Facade module — see CLAUDE.md "Module Facade Pattern".
 #[allow(clippy::module_inception)]
 pub mod config;
 pub mod init;
@@ -13,12 +11,11 @@ pub mod theme_file;
 pub mod themes;
 pub mod warnings;
 
-// `pub use` re-exports through the facade. Rustc reports `CustomExportEntry`
-// as "unused" because the inner `pub mod config` shadows the parent name in
-// dead-code analysis, but removing it breaks resolution in `src/export/`.
+// `CustomExportEntry` is reported "unused" because the inner `pub mod config` shadows the parent
+// name in dead-code analysis, but removing it breaks resolution in `src/export/`.
 #[allow(unused_imports)]
 pub use config::{
-    AppearanceMode, Config, ConfigWarning, CustomExportEntry, DiagramsEnabled, ImagesEnabled,
+    AppearanceMode, Config, ConfigWarning, CustomExportEntry, FiguresEnabled, ImagesEnabled,
     LoadedConfig, RemoteImagePolicy, WarningKind,
 };
 pub use keymap::{Action, CoalesceKind, KeyBindingOverrides, KeyMap, KeyMapError};

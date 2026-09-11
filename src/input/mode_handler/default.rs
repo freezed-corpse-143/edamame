@@ -6,14 +6,8 @@ use crate::editor::{EditorState, Mode};
 use super::diff_keys;
 use super::ModeHandler;
 
-/// The default (non-modal) keybinding handler.
-///
-/// Priority:
-/// 1. If the key is in the `KeyMap`, return the bound action.
-/// 2. If the key is a printable character (no non-Shift modifier), return
-///    `InsertChar` when in Rendered or Raw mode (or when transitioning from
-///    Preview — the editor state machine handles the mode switch).
-/// 3. Otherwise return `None`.
+/// The default (non-modal) keybinding handler: the `KeyMap` first, then a printable character as
+/// `InsertChar` (in any mode — `edit_ops` handles the Preview transition), then `None`.
 pub struct DefaultHandler<'k> {
     keymap: &'k KeyMap,
 }
@@ -26,26 +20,17 @@ impl<'k> DefaultHandler<'k> {
 
 impl<'k> ModeHandler for DefaultHandler<'k> {
     fn handle(&mut self, event: KeyEvent, state: &EditorState) -> Option<Action> {
-        // Diff Review sub-mode owns the keymap.  Bare keys (`y` /
-        // `n` / `Y` / `N` / `i` / Tab / Shift-Tab / Enter / Esc) are
-        // mapped to diff actions before the global keymap gets a
-        // look-in, because the global keymap binds Tab to
-        // `InsertTab` etc.  Review's bindings are hard-coded here;
-        // there is no Edit sub-mode yet.
+        // Diff Review's bare keys win over the global keymap, which would otherwise turn Tab
+        // into `InsertTab`.
         if state.mode == Mode::Diff {
             if let Some(action) = diff_review_handle(&event) {
                 return Some(action);
             }
         }
 
-        // The search flow owns its keys the same way: search keys map to
-        // search actions before the global keymap gets a look-in (which
-        // would otherwise turn Tab into `InsertTab` and Esc into
-        // `ExitToPreview`).  A *capturing* replace flow intercepts the full
-        // set (`Tab`/`Shift+Tab`/`r`/`a`/`Esc`); a non-capturing navigate
-        // flow intercepts only the navigation keys (`Tab`/`Shift+Tab`/`Esc`)
-        // so `r`/`a` and every printable key fall through to normal editing
-        // with the match highlights left in place.
+        // The search flow claims its keys the same way.  A *capturing* replace flow takes the
+        // full set; a navigate flow takes only `Tab`/`Shift+Tab`/`Esc`, so `r`/`a` and every
+        // printable key fall through to normal editing with the highlights left in place.
         if let Some(search) = state.search.as_ref() {
             if let Some(action) = crate::search::search_action_for(&event) {
                 let capturing = search.is_replace_flow();
@@ -60,13 +45,9 @@ impl<'k> ModeHandler for DefaultHandler<'k> {
             }
         }
 
-        // 1. Check the keymap first (explicit bindings take priority).
         if let Some(action) = self.keymap.action_for(&event) {
-            // Preview-mode guard: Ctrl-* chords must not cause an implicit
-            // transition into edit mode — users want to read and copy in
-            // Preview without `Ctrl+Z`, `Ctrl+D`, `Ctrl+Left`, etc.
-            // exiting it on them.  Drop any Ctrl-bound action that isn't on
-            // the Preview-safe allow-list.
+            // A Ctrl-* chord must not implicitly leave Preview — reading and copying there should
+            // not be interrupted by `Ctrl+Z` / `Ctrl+D` / `Ctrl+Left` dropping into edit mode.
             if state.mode == Mode::Preview
                 && event.modifiers.contains(KeyModifiers::CONTROL)
                 && !preview_safe_action(action)
@@ -76,23 +57,15 @@ impl<'k> ModeHandler for DefaultHandler<'k> {
             return Some(action.clone());
         }
 
-        // 2. Ctrl+Backspace fallbacks. Different terminals encode this chord
-        //    wildly differently; none of the encodings below is covered by the
-        //    `ctrl+backspace` binding (which matches `KeyCode::Backspace` with
-        //    exactly `CONTROL`).  We also match on `modifiers.contains(CONTROL)`
-        //    rather than strict equality so combinations like Ctrl+Shift+BS also
-        //    delete a word back.
+        // The `ctrl+backspace` binding matches only `Backspace` with exactly `CONTROL`; these are
+        // the other encodings terminals use (see [`is_ctrl_backspace`]).
         if is_ctrl_backspace(&event) {
-            // Same Preview guard — ctrl+backspace is destructive, no-op in
-            // Preview.
             if state.mode == Mode::Preview {
                 return None;
             }
             return Some(Action::DeleteWordBack);
         }
 
-        // 3. Printable character → InsertChar (in any mode; edit_ops handles
-        //    the preview → rendered transition).
         if let KeyCode::Char(ch) = event.code {
             let only_shift =
                 event.modifiers == KeyModifiers::NONE || event.modifiers == KeyModifiers::SHIFT;
@@ -105,10 +78,8 @@ impl<'k> ModeHandler for DefaultHandler<'k> {
     }
 }
 
-/// Actions that are allowed to run in Preview mode when triggered by a
-/// Ctrl-* key chord.  Everything else gets suppressed by the handler so
-/// Preview-mode users can safely read and copy without their clipboard /
-/// quit / selection chords accidentally dropping them into edit mode.
+/// Actions a Ctrl-* chord may run from Preview.  Everything else is suppressed so browsing is
+/// never interrupted by an accidental drop into edit mode.
 fn preview_safe_action(action: &Action) -> bool {
     matches!(
         action,
@@ -126,17 +97,11 @@ fn preview_safe_action(action: &Action) -> bool {
             | Action::ScrollPageDown
             | Action::ScrollToTop
             | Action::ScrollToBottom
-            // Overlay-opening actions are read-only:
-            // they pop a modal that absorbs subsequent input.
-            // Suppressing them in Preview would leave Ctrl-P unable
-            // to launch the command palette while the user is just
-            // browsing.
+            // Overlay openers pop a modal that absorbs later input, so they change nothing.
             | Action::ShowCommandPalette
             | Action::ShowMarkdownCheatSheet
-            // Opening the manual replaces the document rather than
-            // popping a modal, but it is read-only in the sense that
-            // matters here: it starts no edit and the dirty guard
-            // protects anything unsaved.
+            // The manual replaces the document rather than popping a modal, but starts no edit
+            // and the dirty guard protects anything unsaved.
             | Action::OpenDoc(_)
             | Action::ShowAbout
             | Action::CheckForUpdates
@@ -147,16 +112,10 @@ fn preview_safe_action(action: &Action) -> bool {
             | Action::CreateCustomTheme
             | Action::ExportHtml
             | Action::OpenConfigFolder
-            // Both are palette-only by default but a user may bind a
-            // chord — allow them to fire from Preview without first
-            // entering edit mode.  `OpenInExternalEditor` saves and
-            // suspends the TUI; `ToggleTableButtons` flips a config
-            // flag — neither needs the buffer to be in an editing mode.
+            // Palette-only by default but bindable; neither needs an editing mode.
             | Action::OpenInExternalEditor
             | Action::ToggleTableButtons
-            // The persisted setting toggles are likewise palette-only by
-            // default but bind-able; each is a buffer-read-only config
-            // flip, safe to fire while browsing in Preview.
+            // The persisted setting toggles are likewise config-only flips.
             | Action::ToggleBigH1
             | Action::ToggleLineNumbers
             | Action::ToggleBlinkCursor
@@ -165,43 +124,20 @@ fn preview_safe_action(action: &Action) -> bool {
             | Action::ToggleVimMode
             | Action::ToggleLimitWidth
             | Action::ToggleDiffOnChange
-            // `InsertTable` is allowed from Preview so
-            // the default Ctrl+Shift+T chord opens the rows/columns
-            // modal without requiring the user to enter edit mode
-            // first.  The modal itself absorbs subsequent input;
-            // pre-flight blank-line checks fire only when the user
-            // hits Insert.
+            // The remaining three open a modal that touches the buffer only on submit; the
+            // section picker's cursor motion is benign in Preview, where no cursor is drawn.
             | Action::InsertTable
-            // `SaveAs` opens a path-input modal — read-only with respect
-            // to the buffer until the user submits a path, so it's safe to
-            // launch from Preview.
             | Action::SaveAs
-            // `GoToSection` opens the heading-jump picker; the cursor
-            // motion that Enter applies is benign in Preview because
-            // the cursor isn't drawn there anyway.
             | Action::GoToSection
-            // `OpenSearch` opens the search/replace modal — read-only
-            // with respect to the buffer until the user confirms, so
-            // Ctrl+F works while just browsing in Preview.
             | Action::OpenSearch
     )
 }
 
-/// Map a bare key to the corresponding diff-Review action, mirroring
-/// the §9 default bind table.  Returns `None` for keys that aren't
-/// diff-specific — those fall through to the global keymap (which
-/// handles `Ctrl-Q` / `Ctrl-S` / overlay openers / scrolling
-/// uniformly across modes).
+/// Map a bare key to its diff-Review action; `None` falls through to the global keymap.
 ///
-/// Hard-coded rather than read from a separate KeyMap because the
-/// review bindings need to win over the global keymap's `Tab` →
-/// `InsertTab`.  This could become a proper layered keymap once an
-/// Edit sub-mode lands and rebinding review keys matters.
-///
-/// The mapping itself lives in `diff_keys::DIFF_REVIEW_BINDINGS` — the
-/// single source of truth shared with the hint bar, keybinds overlay,
-/// decision divider, and diff-intro modal — so behavior and the
-/// displayed glyphs can never drift.
+/// Hard-coded rather than a second `KeyMap` because these bindings must beat the global `Tab` →
+/// `InsertTab`.  The table itself is `diff_keys::DIFF_REVIEW_BINDINGS`, shared with the hint bar,
+/// keybinds overlay, decision divider and diff-intro modal so glyphs can't drift from behavior.
 fn diff_review_handle(event: &KeyEvent) -> Option<Action> {
     diff_keys::diff_action_for(event)
 }
@@ -224,9 +160,8 @@ pub(crate) fn is_ctrl_backspace(event: &KeyEvent) -> bool {
     }
 }
 
-/// Does this event represent Ctrl+Delete?  Unlike Ctrl+Backspace there is no
-/// ASCII control-code encoding, so every terminal reports it as the `Delete`
-/// key with the CONTROL modifier set.
+/// Does this event represent Ctrl+Delete?  Unlike Ctrl+Backspace it has no ASCII control-code
+/// encoding, so every terminal reports `Delete` + CONTROL.
 pub(crate) fn is_ctrl_delete(event: &KeyEvent) -> bool {
     matches!(event.code, KeyCode::Delete) && event.modifiers.contains(KeyModifiers::CONTROL)
 }
@@ -260,13 +195,8 @@ mod tests {
         s
     }
 
-    /// A read-only page has **no bespoke key table**: it resolves every
-    /// key through the ordinary keymap, exactly as an editable document
-    /// does.  There was briefly a vim-flavored scroll table here
-    /// (`j`/`k`, `Ctrl-D`/`Ctrl-U`, `Space`); it was removed, and this
-    /// is the guard that it does not creep back.  Scrolling a page is
-    /// the arrow keys, `PageUp`/`PageDown`, `Home`/`End` and the wheel,
-    /// which the keymap already owns.
+    /// A read-only page has **no bespoke key table**.  A vim-flavored scroll table (`j`/`k`,
+    /// `Ctrl-D`/`Ctrl-U`, `Space`) briefly lived here; this guards against its return.
     #[test]
     fn a_read_only_page_resolves_keys_through_the_ordinary_keymap() {
         let km = keymap();
@@ -292,9 +222,7 @@ mod tests {
         }
     }
 
-    /// Preview's "press any key to edit" is unchanged — `j` starts
-    /// editing an ordinary document, and is merely refused downstream
-    /// on a read-only one.
+    /// "Press any key to edit" is unchanged; read-only merely refuses downstream.
     #[test]
     fn an_ordinary_preview_still_edits_on_a_letter_key() {
         let km = keymap();
@@ -306,8 +234,7 @@ mod tests {
         );
     }
 
-    /// Falling through is what keeps every bound chord working: the
-    /// table only claims the handful of keys it lists.
+    /// Falling through is what keeps every bound chord working.
     #[test]
     fn unbound_keys_still_reach_the_keymap_on_a_read_only_page() {
         let km = keymap();
@@ -322,28 +249,20 @@ mod tests {
         );
     }
 
-    /// The handler knows nothing about `readonly` at all.
-    ///
-    /// It used to answer `None` for every unbound key on a read-only
-    /// page, because the App's gate flashed "read-only" once per
-    /// keystroke and a hand resting on the letter keys would strobe the
-    /// hint line.  Both halves of that are gone: a read-only document
-    /// rests in Preview, where `edit_ops::enter_edit_if_preview` refuses
-    /// the transition (and `apply_delta` the write) *silently*.  So the
-    /// synthesized action is produced and then goes nowhere, which is
-    /// one guard instead of two.
+    /// The handler knows nothing about `readonly`: a read-only document rests in Preview, where
+    /// `enter_edit_if_preview` refuses the transition silently, so the synthesized action is
+    /// produced and then goes nowhere.  One guard instead of two.
     #[test]
     fn a_read_only_page_no_longer_suppresses_the_keymap_bypassing_arms() {
         let km = keymap();
         let mut h = DefaultHandler::new(&km);
         let st = readonly_state(Mode::Preview);
-        // Arm 3: a printable key with no reading binding.
         assert_eq!(
             h.handle(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), &st),
             Some(Action::InsertChar('z'))
         );
-        // Arm 2: a `Ctrl-Backspace` encoding the keymap does not match.
-        // Dropped in Preview by the Preview guard, not by `readonly`.
+        // A `Ctrl-Backspace` encoding the keymap misses: dropped by the Preview guard, not by
+        // `readonly`.
         let ev = KeyEvent::new(
             KeyCode::Backspace,
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
@@ -357,8 +276,7 @@ mod tests {
 
     #[test]
     fn bound_chords_still_resolve_on_a_read_only_page() {
-        // Every bound chord still produces its action; the App's
-        // `readonly_safe_action` decides which of them may run.
+        // The App's `readonly_safe_action` decides which of them may actually run.
         let km = keymap();
         let mut h = DefaultHandler::new(&km);
         let st = readonly_state(Mode::Rendered);
@@ -403,7 +321,7 @@ mod tests {
     fn ctrl_char_not_insert() {
         let km = keymap();
         let mut handler = DefaultHandler::new(&km);
-        // Ctrl+A is bound to MoveLineStart, not InsertChar.
+        // Ctrl+A is bound to MoveLineStart.
         let event = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
         let action = handler.handle(event, &state(Mode::Rendered));
         assert_ne!(action, Some(Action::InsertChar('a')));
@@ -424,7 +342,6 @@ mod tests {
     fn preview_ctrl_c_and_ctrl_a_still_fire() {
         let km = keymap();
         let mut handler = DefaultHandler::new(&km);
-        // Clipboard and select-all are allowed in Preview.
         assert_eq!(
             handler.handle(
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -439,7 +356,6 @@ mod tests {
             ),
             Some(Action::SelectAll)
         );
-        // Quit must always be allowed.
         assert_eq!(
             handler.handle(
                 KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
@@ -453,8 +369,7 @@ mod tests {
     fn preview_suppresses_non_safelisted_ctrl_chords() {
         let km = keymap();
         let mut handler = DefaultHandler::new(&km);
-        // Ctrl+Z (Undo) and Ctrl+D (DeleteLine) would normally enter edit
-        // mode; in Preview they must drop out so the user stays in read mode.
+        // Undo / DeleteLine / Cut / Paste would all otherwise enter edit mode.
         for ch in ['z', 'd', 'x', 'v'] {
             let event = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
             assert_eq!(

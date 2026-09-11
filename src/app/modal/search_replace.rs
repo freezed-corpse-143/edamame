@@ -1,11 +1,6 @@
-//! Search-and-replace modal.  Adapter wrapping
-//! [`crate::ui::SearchModalState`].
-//!
-//! On confirm the modal closes and the App starts the search flow via
-//! [`crate::app::App::enter_search_flow`]; a query with zero matches
-//! never enters the flow (the App flashes and stays put).  Re-opening
-//! over an active flow is handled by `App::open_search_modal`, which
-//! pre-fills this modal with the flow's terms.
+//! Search-and-replace modal over [`crate::ui::SearchModalState`].  Confirm hands off to
+//! [`crate::app::App::enter_search_flow`], which refuses a zero-match query; re-opening over
+//! an active flow pre-fills the flow's terms (`App::open_search_modal`).
 
 use std::any::Any;
 
@@ -76,9 +71,6 @@ impl Modal for SearchReplaceModal {
 
 #[cfg(test)]
 mod tests {
-    //! Exercise the App-level search flow end to end: modal open via
-    //! the action, term entry, flow entry, and the zero-match guard.
-
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
@@ -146,8 +138,6 @@ mod tests {
         let mut app = app_with_buffer("alpha beta alpha\n", 0);
         app.enter_search_flow("alpha".to_owned(), Some("delta".to_owned()));
         assert!(app.editor.search.is_some());
-        // Ctrl+F mid-flow routes through the search gate and re-opens
-        // the modal with the current terms.
         app.dispatch_action(Action::OpenSearch, 24, 80);
         assert!(app.editor.search.is_none(), "flow torn down");
         let modal = app

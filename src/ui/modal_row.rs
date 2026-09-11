@@ -1,16 +1,6 @@
-//! Shared formatter for the focused-row pattern used across modal
-//! overlays (command palette, settings, keybinds).
-//!
-//! Every overlay shows rows of the form
-//!
-//! ```text
-//! › Label                      value
-//! ```
-//!
-//! with the focus marker (`"› "` vs `"  "`) on the left, the label
-//! styled by focus, and a value (or chord, or hint) styled by focus +
-//! editing.  This module owns the styling rules so they stay
-//! consistent.
+//! Shared formatter for the focused-row pattern used across modal overlays (command palette,
+//! settings, keybinds): a focus marker (`"› "` vs `"  "`), a label styled by focus, and a value
+//! styled by focus + editing.  Owning the styling rules here keeps the overlays consistent.
 
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
@@ -21,20 +11,16 @@ use crate::config::Theme;
 #[derive(Debug, Clone, Copy)]
 pub enum RowLayout {
     /// Pad the label to a fixed character width (settings, keybinds).
-    /// The value follows immediately after the padded label.
     FixedPad(usize),
-    /// Right-align the value against the given total line width
-    /// (command palette).  At least one space always separates the
-    /// label from the value.
+    /// Right-align the value against the given total line width (command palette).  At least one
+    /// space always separates label from value.
     RightAlign(u16),
 }
 
 /// Build a styled `Line` for one focusable modal row.
 ///
-/// `editing` only changes the value style — when true the value is
-/// drawn in `theme.modal_input_focused` regardless of focus, matching
-/// the in-place edit affordance used by the settings and keybinds
-/// overlays.  Pass `false` from the palette, which has no edit mode.
+/// `editing` only changes the value style, drawing it as an in-place edit affordance regardless of
+/// focus; pass `false` from the palette, which has no edit mode.
 pub fn format_modal_row(
     label: &str,
     value: &str,
@@ -81,17 +67,9 @@ pub fn format_modal_row(
     }
 }
 
-/// Truncate `text` so its display width fits within `max_cells`,
-/// appending `…` to signal the cut.  Counts grapheme display cells via
-/// `unicode-width` so wide characters (CJK, emoji) consume their full
-/// column budget.
-///
-/// Edge cases:
-/// - returns the input unchanged when it already fits
-/// - returns `""` when `max_cells == 0`
-/// - returns a single `…` when `max_cells == 1` (the ellipsis itself
-///   takes one cell), or as much input as fits when no room is left
-///   for an ellipsis
+/// Truncate `text` so its display width fits within `max_cells`, appending `…` to signal the cut.
+/// Measured in display cells, so wide characters (CJK, emoji) consume their full column budget.
+/// `max_cells == 0` gives `""`; `max_cells == 1` gives just the ellipsis.
 pub fn truncate_to_cells(text: &str, max_cells: usize) -> String {
     if max_cells == 0 {
         return String::new();
@@ -99,8 +77,7 @@ pub fn truncate_to_cells(text: &str, max_cells: usize) -> String {
     if UnicodeWidthStr::width(text) <= max_cells {
         return text.to_owned();
     }
-    // Reserve one cell for the ellipsis; fill the rest with as many
-    // input cells as we can.
+    // Reserve one cell for the ellipsis.
     let budget = max_cells - 1;
     let mut out = String::new();
     let mut used = 0usize;
@@ -156,8 +133,7 @@ mod tests {
 
     #[test]
     fn right_align_pads_to_width() {
-        // Original palette behaviour leaves one column of slack so the
-        // value never butts up against the modal frame.
+        // The palette leaves one column of slack so the value never butts up against the frame.
         let line = format_modal_row(
             "Save",
             "Ctrl+S",
@@ -199,14 +175,12 @@ mod tests {
 
     #[test]
     fn truncate_appends_ellipsis_when_too_long() {
-        // 6 cells of input, budget 5 → 4 cells of input + `…`.
         assert_eq!(truncate_to_cells("abcdef", 5), "abcd…");
     }
 
     #[test]
     fn truncate_respects_wide_characters() {
-        // "漢字" is 4 display cells.  Budget 3 → reserve 1 for `…`,
-        // remaining 2 cells holds exactly the first wide char.
+        // "漢字" is 4 display cells; budget 3 leaves 2 after the ellipsis — one wide char.
         assert_eq!(truncate_to_cells("漢字", 3), "漢…");
     }
 
@@ -217,8 +191,6 @@ mod tests {
 
     #[test]
     fn truncate_one_cell_budget_returns_just_ellipsis() {
-        // Budget = 1, content too wide: reserve 1 for `…`, can't fit
-        // any input char.
         assert_eq!(truncate_to_cells("abc", 1), "…");
     }
 }

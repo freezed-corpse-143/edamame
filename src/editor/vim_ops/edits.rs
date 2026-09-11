@@ -1,18 +1,9 @@
-//! Single-key edits driven from `vim_feed`.  CP3 implements `p`/`P`
-//! (paste the unnamed register); CP4 adds the remaining Normal primitives
-//! that mutate the buffer directly: `r{c}` (replace), `~` (toggle case),
-//! `J` (join lines), and `>>`/`<<` (indent / outdent).  `x`/`X`/`D`/`C`/`Y`
-//! are expressed via `execute_operator` in `vim_feed`, and `u`/`Ctrl-R`
-//! reuse the existing undo/redo path, so they don't appear here.  CP6 adds
-//! the Visual-mode range edits: `toggle_case_range` (`~`), `set_case_range`
-//! (`u`/`U` force-case), `replace_char_range` (`r{c}`), and
-//! `replace_range_with` (`p` paste-over).  See
-//! `docs/vim-implementation-plan.md` §2.4.
+//! Single-key edits driven from `vim_feed`: `p`/`P`, `r{c}`, `~`, `J`, `>>`/`<<`, and the
+//! Visual-mode range forms.  `x`/`X`/`D`/`C`/`Y` go through `execute_operator` instead.
 //!
-//! Every primitive issues a *single* [`EditDelta`] so the whole command is
-//! one undo unit (`3>>`, `3J`, `3rx`).  Paste and the CP4 edits take plain
-//! values (register contents, a char, a count) rather than any vim type, so
-//! this editor-layer module needs no `use crate::input`.
+//! Every primitive issues a *single* [`EditDelta`] so the whole command is one undo unit
+//! (`3>>`, `3J`, `3rx`).  All take plain values rather than vim types, so this
+//! editor-layer module needs no `use crate::input`.
 
 use crate::document::{next_grapheme_offset, EditDelta};
 use crate::editor::edit_ops::{apply_byte_delta, cursor_byte};
@@ -20,10 +11,8 @@ use crate::editor::list_edit;
 use crate::editor::vim_ops::motion::{first_non_blank, line_end_offset};
 use crate::editor::{EditorState, Mode};
 
-/// Paste the register `text` `count` times.  `after` selects `p` (after
-/// the cursor / below the line) vs. `P` (before the cursor / above the
-/// line); `linewise` selects the open-a-new-line behavior.  A no-op for
-/// an empty register.
+/// Paste the register `text` `count` times.  `after` selects `p` over `P`; `linewise`
+/// selects the open-a-new-line behavior.  A no-op for an empty register.
 pub fn paste(editor: &mut EditorState, text: &str, linewise: bool, count: u32, after: bool) {
     if text.is_empty() {
         return;
@@ -36,8 +25,8 @@ pub fn paste(editor: &mut EditorState, text: &str, linewise: bool, count: u32, a
     }
 }
 
-/// Charwise paste: insert after (`p`) or at (`P`) the cursor, leaving the
-/// cursor on the last inserted char (vim's convention).
+/// Insert after (`p`) or at (`P`) the cursor, leaving the cursor on the last inserted
+/// char (vim's convention).
 fn paste_charwise(editor: &mut EditorState, text: &str, after: bool) {
     let cursor = editor.cursor.offset;
     let line = editor.buffer.char_to_line(cursor);
@@ -53,8 +42,7 @@ fn paste_charwise(editor: &mut EditorState, text: &str, after: bool) {
         removed: String::new(),
         inserted: text.to_owned(),
     });
-    // `apply_delta` parks the cursor past the inserted text; vim leaves it
-    // on the final pasted char.
+    // `apply_delta` parks past the inserted text; vim leaves the cursor on its last char.
     editor.cursor.offset = (insert_at + inserted_chars)
         .saturating_sub(1)
         .max(insert_at)
@@ -63,25 +51,21 @@ fn paste_charwise(editor: &mut EditorState, text: &str, after: bool) {
     editor.update_cursor_block();
 }
 
-/// Linewise paste: open a fresh line below (`p`) or above (`P`) the
-/// cursor's line and drop the register's whole lines there, landing the
-/// cursor on the first non-blank of the first pasted line.
+/// Open a fresh line below (`p`) or above (`P`) and drop the register's whole lines
+/// there, landing on the first non-blank of the first pasted line.
 fn paste_linewise(editor: &mut EditorState, text: &str, after: bool) {
     let cursor = editor.cursor.offset;
     let line = editor.buffer.char_to_line(cursor);
     let line_count = editor.buffer.line_count();
     let len = editor.buffer.len_chars();
 
-    // `text` always ends in '\n' (linewise register).  Where it lands and
-    // whether a separator newline is needed depends on the insertion site.
+    // `text` always ends in '\n' (linewise register).
     let (insert_at, payload, first_line_offset) = if after {
         if line + 1 < line_count {
-            // Clean line boundary just below the cursor's line.
             let at = editor.buffer.line_to_char(line + 1);
             (at, text.to_owned(), at)
         } else {
-            // Cursor is on the document's last line (no trailing newline):
-            // prepend a separator and drop the register's own trailing one.
+            // Last line, so no trailing newline: move the separator to the front.
             let body = text.strip_suffix('\n').unwrap_or(text);
             (len, format!("\n{body}"), len + 1)
         }
@@ -105,17 +89,16 @@ fn paste_linewise(editor: &mut EditorState, text: &str, after: bool) {
 
 // ── Replace / toggle-case ───────────────────────────────────────────────────────
 
-/// `r{c}`: replace `count` characters at the cursor with `c`, in one delta.
-/// A no-op (vim beeps) when fewer than `count` characters remain on the line
-/// — `r` never replaces the trailing newline or spills onto the next line.
-/// The cursor lands on the last replaced character.
+/// `r{c}`: replace `count` characters at the cursor with `c`, in one delta, landing on
+/// the last one.  A no-op when fewer than `count` remain on the line — `r` never replaces
+/// the newline or spills onto the next line.
 pub fn replace_char(editor: &mut EditorState, c: char, count: u32) {
     let count = count.max(1) as usize;
     let cursor = editor.cursor.offset;
     let line = editor.buffer.char_to_line(cursor);
     let line_end = line_end_offset(&editor.buffer, line);
     if cursor + count > line_end {
-        return; // not enough room on the line
+        return;
     }
     let removed = editor.buffer.slice_to_string(cursor, cursor + count);
     let inserted: String = std::iter::repeat_n(c, count).collect();
@@ -129,9 +112,8 @@ pub fn replace_char(editor: &mut EditorState, c: char, count: u32) {
     editor.update_cursor_block();
 }
 
-/// `~`: toggle the case of `count` characters at the cursor (clamped to the
-/// line content), as one delta, then advance the cursor past them — vim's
-/// `~` behavior.  Non-cased characters pass through unchanged.
+/// `~`: toggle the case of `count` characters at the cursor (clamped to the line content)
+/// in one delta, then advance past them.  Non-cased characters pass through.
 pub fn toggle_case(editor: &mut EditorState, count: u32) {
     let count = count.max(1) as usize;
     let cursor = editor.cursor.offset;
@@ -139,7 +121,7 @@ pub fn toggle_case(editor: &mut EditorState, count: u32) {
     let line_end = line_end_offset(&editor.buffer, line);
     let n = count.min(line_end.saturating_sub(cursor));
     if n == 0 {
-        return; // at (or past) the line content end — nothing to toggle
+        return;
     }
     let removed = editor.buffer.slice_to_string(cursor, cursor + n);
     let inserted: String = removed.chars().map(toggle_case_char).collect();
@@ -153,11 +135,9 @@ pub fn toggle_case(editor: &mut EditorState, count: u32) {
     editor.update_cursor_block();
 }
 
-/// Toggle the case of every character in `[start, end)` as a single delta,
-/// leaving the cursor at `start`.  Used by Visual-mode `~`, where the range
-/// is the highlighted span (charwise) or the line-expanded range (VisualLine).
-/// Non-cased characters (including any newline inside the range) pass through
-/// unchanged; a range with nothing to toggle records no delta.
+/// Visual-mode `~` over `[start, end)`, as one delta leaving the cursor at `start`.
+/// Non-cased characters and newlines pass through; a range with nothing to toggle records
+/// no delta.
 pub fn toggle_case_range(editor: &mut EditorState, start: usize, end: usize) {
     let len = editor.buffer.len_chars();
     let start = start.min(len);
@@ -168,7 +148,7 @@ pub fn toggle_case_range(editor: &mut EditorState, start: usize, end: usize) {
     let removed = editor.buffer.slice_to_string(start, end);
     let inserted: String = removed.chars().map(toggle_case_char).collect();
     if inserted == removed {
-        return; // nothing cased in the range
+        return;
     }
     editor.apply_delta(EditDelta {
         offset: start,
@@ -180,11 +160,8 @@ pub fn toggle_case_range(editor: &mut EditorState, start: usize, end: usize) {
     editor.update_cursor_block();
 }
 
-/// Force the case of every character in `[start, end)` to lower
-/// (`upper == false`) or upper (`upper == true`) as a single delta, leaving
-/// the cursor at `start`.  Used by Visual-mode `u` / `U`.  Newlines and
-/// already-correct / non-cased characters pass through unchanged; a range
-/// with nothing to change records no delta.
+/// Visual-mode `u` / `U`: force `[start, end)` to lower or upper case as one delta,
+/// leaving the cursor at `start`.  Records no delta when nothing changes.
 pub fn set_case_range(editor: &mut EditorState, start: usize, end: usize, upper: bool) {
     let len = editor.buffer.len_chars();
     let start = start.min(len);
@@ -195,7 +172,7 @@ pub fn set_case_range(editor: &mut EditorState, start: usize, end: usize, upper:
     let removed = editor.buffer.slice_to_string(start, end);
     let inserted: String = removed.chars().map(|c| force_case_char(c, upper)).collect();
     if inserted == removed {
-        return; // nothing to recase in the range
+        return;
     }
     editor.apply_delta(EditDelta {
         offset: start,
@@ -207,10 +184,8 @@ pub fn set_case_range(editor: &mut EditorState, start: usize, end: usize, upper:
     editor.update_cursor_block();
 }
 
-/// Visual-mode `r{c}`: replace every character in `[start, end)` with `c` as a
-/// single delta, preserving any newlines inside the range (so a multi-line
-/// selection keeps its line breaks, matching vim).  The cursor lands at
-/// `start`.  An empty range records no delta.
+/// Visual-mode `r{c}` over `[start, end)`, as one delta landing at `start`.  Newlines
+/// inside the range survive, so a multi-line selection keeps its line breaks (vim).
 pub fn replace_char_range(editor: &mut EditorState, start: usize, end: usize, c: char) {
     let len = editor.buffer.len_chars();
     let start = start.min(len);
@@ -233,11 +208,9 @@ pub fn replace_char_range(editor: &mut EditorState, start: usize, end: usize, c:
     editor.update_cursor_block();
 }
 
-/// Visual-mode `p`: replace `[start, end)` with `text` as a single delta,
-/// landing the cursor on the last inserted char (vim's charwise-paste
-/// convention).  `text` is the register contents, already normalized by the
-/// caller (a trailing newline appended when a charwise register is dropped
-/// over whole lines).  A no-op when both the range and `text` are empty.
+/// Visual-mode `p`: replace `[start, end)` with `text` as one delta, landing on the last
+/// inserted char.  `text` is already normalized by the caller (a trailing newline appended
+/// when a charwise register is dropped over whole lines).
 pub fn replace_range_with(editor: &mut EditorState, start: usize, end: usize, text: &str) {
     let len = editor.buffer.len_chars();
     let start = start.min(len);
@@ -260,7 +233,7 @@ pub fn replace_range_with(editor: &mut EditorState, start: usize, end: usize, te
     editor.update_cursor_block();
 }
 
-/// Swap the case of a single character; leave non-cased characters as-is.
+/// Swap the case of one character; non-cased characters pass through.
 fn toggle_case_char(c: char) -> char {
     if c.is_uppercase() {
         c.to_lowercase().next().unwrap_or(c)
@@ -271,8 +244,7 @@ fn toggle_case_char(c: char) -> char {
     }
 }
 
-/// Force a single character to upper (`upper`) or lower case; leave non-cased
-/// characters as-is.
+/// Force one character to upper or lower case; non-cased characters pass through.
 fn force_case_char(c: char, upper: bool) -> char {
     if upper {
         c.to_uppercase().next().unwrap_or(c)
@@ -283,13 +255,10 @@ fn force_case_char(c: char, upper: bool) -> char {
 
 // ── Join ────────────────────────────────────────────────────────────────────────
 
-/// `J`: join the current line with the line(s) below it as a *single* delta
-/// (so `3J` is one undo).  A bare `J` (or `2J`) joins one line below; `3J`
-/// joins two, and so on.  Each join removes the intervening newline and the
-/// next line's leading whitespace and inserts a single separating space —
-/// unless the text before the join already ends in whitespace or the joined
-/// line is empty, in which case no space is added.  The cursor lands on the
-/// first join column (vim's convention).
+/// `J`: join the current line with the line(s) below as one delta.  `J` and `2J` join one
+/// line, `3J` two, and so on.  Each join drops the newline and the next line's leading
+/// whitespace and inserts one separating space — unless the preceding text already ends in
+/// whitespace or the joined line is empty.  The cursor lands on the first join column.
 pub fn join_lines(editor: &mut EditorState, count: u32) {
     let joins = count.max(2) as usize - 1; // 1J / 2J → 1 join; 3J → 2
     let buf = &editor.buffer;
@@ -315,7 +284,6 @@ pub fn join_lines(editor: &mut EditorState, count: u32) {
             break;
         }
         last_consumed = li;
-        // Strip the joined line's leading whitespace.
         let li_start = buf.line_to_char(li);
         let li_end = line_end_offset(buf, li);
         let mut content_start = li_start;
@@ -352,12 +320,10 @@ pub fn join_lines(editor: &mut EditorState, count: u32) {
 
 // ── Indent / outdent ────────────────────────────────────────────────────────────
 
-/// `>>` / `<<`: indent (`right`) or outdent buffer lines `first..=last` by one
-/// `indent_width` step, as a single delta.  Indent prepends `indent_width`
-/// spaces to every line that holds non-blank content (blank lines stay empty,
-/// matching vim); outdent strips up to `indent_width` leading spaces, or one
-/// leading tab, per line.  The cursor lands on the first non-blank of `first`.
-/// CP4 does the plain-indent case; list-aware indenting is wired in CP10 (§2.5).
+/// `>>` / `<<`: shift lines `first..=last` by one `indent_width` step, as one delta.
+/// Indent skips blank lines (vim); outdent strips up to `indent_width` spaces or one tab.
+/// The cursor lands on the first non-blank of `first`.  See [`indent_list_item`] for the
+/// list-aware path that takes precedence.
 pub fn indent_lines(
     editor: &mut EditorState,
     first: usize,
@@ -396,7 +362,7 @@ pub fn indent_lines(
         out.push_str(nl);
     }
     if out == region {
-        return; // nothing changed (e.g. outdent of already-flush lines)
+        return;
     }
     editor.apply_delta(EditDelta {
         offset: start,
@@ -408,24 +374,17 @@ pub fn indent_lines(
     editor.update_cursor_block();
 }
 
-// ── List-aware wiring (CP10) ──────────────────────────────────────────────────────
+// ── List-aware wiring ─────────────────────────────────────────────────────────────
 //
-// `o`/`O`, `dd`, and `>>`/`<<` reuse the byte-oriented `list_edit` primitives —
-// the same ones the non-vim editing path drives — so vim list editing and
-// arrow-key list editing produce identical structure.  Each goes through
-// `edit_ops::apply_byte_delta` (byte → char conversion + cursor placement), and
-// every primitive is a *single* `EditDelta` (`continue_item` and `indent_item`
-// renumber inline), keeping `o`/`>>` one undo unit.  All bail out in `Mode::Raw`,
-// where the markers are hand-editable source the engine must not rewrite.
+// `o`/`O`, `dd`, and `>>`/`<<` reuse the byte-oriented `list_edit` primitives the non-vim
+// editing path drives, so both produce identical structure.  Each stays a *single*
+// `EditDelta` and so one undo unit.  All bail out in `Mode::Raw`, where the markers are
+// hand-editable source the engine must not rewrite.
 
-/// `o` / `O` inside a Markdown list: continue the list with a fresh empty item
-/// instead of a bare newline, auto-renumbering an ordered list.  `below`
-/// (`o`) continues from the cursor's item; `O` continues from the *previous*
-/// item so the new marker lands above the current one.  Returns `true` when a
-/// list continuation was applied; `false` (cursor not in a list, in Raw mode,
-/// or `O` on the list's first item) lets the caller fall back to a plain
-/// newline open.  The cursor is left just past the new marker, ready for
-/// Insert.
+/// `o` / `O` inside a Markdown list: continue with a fresh empty item instead of a bare
+/// newline, auto-renumbering an ordered list.  `O` continues from the *previous* item so
+/// the new marker lands above the current one.  `false` (not in a list, Raw mode, or `O`
+/// on the first item) means the caller should fall back to a plain newline open.
 pub fn open_list_continue(editor: &mut EditorState, below: bool) -> bool {
     if editor.mode == Mode::Raw {
         return false;
@@ -438,9 +397,7 @@ pub fn open_list_continue(editor: &mut EditorState, below: bool) -> bool {
     let Some(item_idx) = list_edit::cursor_item_idx(&info, byte) else {
         return false;
     };
-    // The byte to continue from: the end of the current item's content line
-    // (`o`), or the previous item's (`O`).  `O` on the first item has no
-    // earlier item to split from, so it falls back to a plain open-above.
+    // `O` on the first item has no earlier item to split from.
     let at = if below {
         info.items[item_idx].line_end
     } else if item_idx > 0 {
@@ -455,26 +412,17 @@ pub fn open_list_continue(editor: &mut EditorState, below: bool) -> bool {
     true
 }
 
-/// After a linewise delete (`dd`, `dj`, `Vd`, …) renumber the ordered list
-/// surrounding the cursor so its sequence stays monotonic.  No-op for bullet
-/// lists, already-sequential lists, in Raw mode, or when the cursor is not in
-/// a list — so it is safe to call after *any* linewise operator (a yank or a
-/// `cc` leaves the numbers untouched and records no delta).
-///
-/// Delegates to [`edit_ops::list_renumber_at_cursor`](crate::editor::edit_ops::list_renumber_at_cursor), the shared post-edit
-/// recovery hook: a `dd` lands the cursor on the line below, and the
-/// parser-driven renumber walks every ordered run in the surrounding list
-/// block (loose-list gaps included), each restarting under its own parent.
+/// Renumber the ordered list around the cursor after a linewise delete.  A no-op for
+/// bullet lists, already-sequential lists, Raw mode, or a cursor outside a list, so it is
+/// safe after *any* linewise operator.  Delegates to
+/// [`edit_ops::list_renumber_at_cursor`](crate::editor::edit_ops::list_renumber_at_cursor).
 pub fn renumber_list_at_cursor(editor: &mut EditorState) {
     crate::editor::edit_ops::list_renumber_at_cursor(editor);
 }
 
-/// `>>` / `<<` inside a Markdown list: indent (`right`) or outdent the cursor's
-/// list item one level via the structure-aware `list_edit` primitives — which
-/// reset an indented ordered item to a fresh `1.` and renumber the surrounding
-/// run, matching the non-vim `Tab` / `Shift+Tab` behavior.  Returns `true` when
-/// handled; `false` (not in a list, in Raw mode, or an outdent with no indent
-/// to strip) lets the caller fall back to the plain space-based `indent_lines`.
+/// `>>` / `<<` inside a Markdown list: shift the cursor's item one nesting level via the
+/// structure-aware `list_edit` primitives, matching non-vim `Tab` / `Shift+Tab`.  `false`
+/// means the caller should fall back to the plain [`indent_lines`].
 pub fn indent_list_item(editor: &mut EditorState, right: bool) -> bool {
     if editor.mode == Mode::Raw {
         return false;
@@ -493,20 +441,15 @@ pub fn indent_list_item(editor: &mut EditorState, right: bool) -> bool {
         return false;
     };
     apply_byte_delta(editor, res.delta, res.cursor_byte);
-    // Moving the item between nesting levels can leave a stale marker number in
-    // the destination ordered list — an outdented item carries its old nested
-    // `1.` into the outer run, and an item indented onto an existing nested run
-    // joins it as a duplicate `1.`.  The rendered view always shows sequential
-    // numbers, so the raw source would otherwise disagree.  Renumber the list
-    // now at the cursor's new level, mirroring the global renumber pass the
-    // non-vim `Tab` / `Shift+Tab` path runs after every edit.  A no-op for
-    // bullet lists and already-sequential runs.
+    // Changing nesting level leaves a stale marker number in the destination run (an
+    // outdented item carries its old `1.` out; an indented one joins as a duplicate `1.`),
+    // and the rendered view always shows sequential numbers.
     renumber_list_at_cursor(editor);
     true
 }
 
-/// Drop up to `indent_width` leading spaces, or a single leading tab, from
-/// `content`.  Returns a sub-slice (all stripped chars are single-byte).
+/// Drop up to `indent_width` leading spaces, or one leading tab.  Returns a sub-slice
+/// (every stripped char is single-byte).
 fn strip_indent(content: &str, indent_width: usize) -> &str {
     let mut skip = 0;
     for (i, c) in content.char_indices() {

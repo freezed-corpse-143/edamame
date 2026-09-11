@@ -1,10 +1,5 @@
-//! Frame-rate / draw-throttle timing helpers extracted from `app.rs`
-//! in Step 2 of `refactor-app.md`.
-//!
-//! Owns the wall-clock instants the run loop consults to decide when
-//! to draw — `last_draw_at`, `last_scroll_at`, `resize_quiesce_at` —
-//! plus the related quiesce / throttle constants and the
-//! [`App::next_deadline`] aggregator.
+//! Draw-throttle timing: the quiesce / throttle constants and the [`App::next_deadline`]
+//! aggregator the run loop uses to decide when to wake and draw.
 
 use std::time::{Duration, Instant};
 
@@ -12,39 +7,25 @@ use crate::editor::RAW_REVEAL_DELAY;
 
 use super::App;
 
-/// After the scroll position stops changing for this long, images
-/// upgrade from the halfblocks partial render back to the native
-/// protocol.  Tuned so the upgrade feels "immediate" to a human but
-/// never fires during continuous scroll input (typical wheel tick gap
-/// is well under 50 ms).
+/// After scrolling stops for this long, images upgrade from halfblocks back to the native
+/// protocol.  Must exceed the typical wheel-tick gap (well under 50 ms).
 pub(super) const SCROLL_QUIESCE: Duration = Duration::from_millis(150);
 
-/// Minimum interval between successive `terminal.draw()` calls.  The
-/// event loop processes events as fast as they arrive, but draws are
-/// coalesced to at most one per this interval (~60 fps).  Under this
-/// threshold, events still mutate state; the accumulated changes show
-/// up on the next draw that actually fires.  Tuned so a wheel-tick
-/// burst produces a handful of draws instead of one per tick.
+/// Minimum interval between `terminal.draw()` calls (~60 fps); events still mutate state
+/// in between and show up on the next draw.
 pub(super) const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
-/// Grace window after a `Resize` event during which draws are
-/// suppressed.  Dragging a terminal window's edge fires a burst of
-/// Resize events — one per pixel.  Drawing on each one produces
-/// flickery partial-width output and pins CPU; instead we wait for
-/// the burst to settle and draw exactly once at the final size.
+/// Draws are suppressed for this long after a `Resize` so an edge drag (one event per
+/// pixel) settles into a single draw at the final size.
 pub(super) const RESIZE_QUIESCE: Duration = Duration::from_millis(80);
 
-/// Pure helper: true when `last_scroll_at` is `Some` and its elapsed
-/// time is shorter than `quiesce`.  Extracted so tests can exercise it
-/// without constructing a full `App`.
+/// Pure form of [`App::is_scrolling`], testable without an `App`.
 pub(super) fn is_scrolling_within(last_scroll_at: Option<Instant>, quiesce: Duration) -> bool {
     last_scroll_at.is_some_and(|t| t.elapsed() < quiesce)
 }
 
 impl App {
-    /// Record that the scroll position has just changed; used by the
-    /// image painter to decide whether to fall back to halfblocks
-    /// partial rendering on non-Kitty terminals.
+    /// Record a scroll; the image painter falls back to halfblocks while scrolling.
     pub(super) fn mark_scrolling(&mut self) {
         self.last_scroll_at = Some(Instant::now());
     }
@@ -54,26 +35,9 @@ impl App {
         is_scrolling_within(self.last_scroll_at, SCROLL_QUIESCE)
     }
 
-    /// Earliest wall-clock instant at which the event loop must wake
-    /// up to apply a time-driven state change, even if no external
-    /// event arrives.  Returns `None` when the loop can block
-    /// indefinitely on `rx.recv()` — the common idle case.
-    ///
-    /// Only deadlines still in the future contribute.  Once a deadline
-    /// has elapsed (and the post-elapse redraw has fired), it drops
-    /// out of the computation so we can go back to blocking on input.
-    ///
-    /// Deadlines tracked:
-    /// - `cursor_block_entered_at + RAW_REVEAL_DELAY` — wake to reveal
-    ///   the raw cursor-block view when the jitter-suppression window
-    ///   expires.
-    /// - `last_scroll_at + SCROLL_QUIESCE` — wake to upgrade images
-    ///   from halfblocks to the native graphics protocol once the
-    ///   user stops scrolling.
-    /// - `resize_quiesce_at` — wake to redraw once a terminal-resize
-    ///   drag has settled (carries its own absolute deadline rather
-    ///   than an offset, since it's set to `now + RESIZE_QUIESCE` on
-    ///   each event).
+    /// Earliest instant the event loop must wake to apply a time-driven change, or `None`
+    /// when it can block indefinitely on input.  Only deadlines still in the future
+    /// contribute, so an elapsed one drops out after its redraw fires.
     pub(super) fn next_deadline(&self, now: Instant) -> Option<Instant> {
         let mut earliest: Option<Instant> = None;
         let mut push = |candidate: Option<Instant>| {
@@ -88,29 +52,16 @@ impl App {
         );
         push(self.last_scroll_at.map(|t| t + SCROLL_QUIESCE));
         push(self.resize_quiesce_at);
-        // Wake in time to expire a transient hint-line
-        // message so the hint reverts to chords even if the user
-        // isn't typing.
         push(self.transient_deadline());
         push(self.editor.cursor_blink.next_toggle());
-        // Yank flash: wake to repaint (fade out) the post-yank highlight
-        // when its window elapses even if the user isn't typing.
         push(self.editor.yank_flash_deadline());
-        // Autosave: wake when the idle-debounce window expires so the
-        // save fires without the user having to press a key.
         push(self.autosave_deadline());
-        // Section picker: wake when the live-preview debounce expires
-        // so the viewport reposition happens even if the user has
-        // stopped pressing arrow keys.
+        // Figure render debounce: wake when the window expires so the deferred render
+        // dispatches after the user stops typing, even with no key event of its own.
+        push(self.diagram_render_hold_until);
         push(self.section_jump_deadline());
-        // Diff review: wake to auto-advance focus after the
-        // post-decision reveal window elapses.
         push(self.diff_advance_deadline());
-        // Search flow: wake to auto-advance focus after the
-        // post-replace reveal window elapses.
         push(self.search_advance_deadline());
-        // Animated modals (e.g. the About page's spinner / rotating
-        // tagline): wake when the next time-driven frame is due.
         push(self.modal_stack.next_deadline());
         earliest
     }
@@ -133,8 +84,6 @@ mod tests {
 
     #[test]
     fn is_scrolling_is_false_after_quiesce_elapsed() {
-        // `Instant` can't be forged into the past directly; instead use
-        // a tiny quiesce window and sleep past it.
         let now = Instant::now();
         std::thread::sleep(Duration::from_millis(20));
         assert!(!is_scrolling_within(Some(now), Duration::from_millis(5)));
@@ -142,8 +91,6 @@ mod tests {
 
     #[test]
     fn is_scrolling_is_true_within_a_short_window() {
-        // With a generous window, a just-marked timestamp is still
-        // "scrolling".
         let now = Instant::now();
         assert!(is_scrolling_within(
             Some(now),

@@ -1,10 +1,6 @@
-//! The network half: one detached worker, one GET, one event back.
-//!
-//! Same fire-and-send shape as the image decode workers — the main
-//! thread never blocks on this.  Everything the worker sends has
-//! already been parsed and bounded by [`super::parse`], so the result
-//! crossing the channel is a small, fixed-shape value rather than a
-//! response body.
+//! The network half: one detached worker, one GET, one event back.  The main thread never
+//! blocks on this, and what crosses the channel is already parsed and bounded by
+//! [`super::parse`] — a small fixed-shape value, not a response body.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -16,32 +12,25 @@ use crate::app::AppEvent;
 /// Project homepage, opened by the About modal's footer button.
 pub(crate) const GITHUB_URL: &str = "https://github.com/mijowi/edamame";
 
-/// The one endpoint this feature talks to.  A compile-time constant,
-/// never derived from the open document or from config — see
-/// `docs/security.md`.
+/// The one endpoint this feature talks to.  A compile-time constant, never derived from the
+/// open document or from config — see `docs/security.md`.
 const RELEASES_API_URL: &str = "https://api.github.com/repos/mijowi/edamame/releases/latest";
 
-/// Bound on connect / response / body phases so a slow or unreachable
-/// endpoint can't pin the worker thread for the whole session.
+/// Bounds connect / response / body phases so an unreachable endpoint can't pin the worker.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Explicit body cap, well under ureq's 10 MB default.  A release
-/// object is a few kilobytes; anything approaching this is not a
-/// response worth reading, and refusing early keeps a pathological or
-/// compromised reply from being materialized in the worker at all.
+/// Body cap, well under ureq's 10 MB default.  A release object is a few kilobytes; refusing
+/// early keeps a pathological reply from being materialized at all.
 const BODY_CAP_BYTES: u64 = 256 * 1024;
 
-/// Browser URL for a specific release, opened by the update modal's
-/// `[ View on GitHub ]` button.  Constructed from the tag rather than
-/// read out of the response's `html_url`: it is the same stable
-/// convention, and it keeps the parser to the two fields it needs.
+/// Browser URL for a specific release.  Built from the tag rather than the response's
+/// `html_url` so the parser stays limited to the two fields it needs.
 pub(crate) fn release_url(tag: &str) -> String {
     format!("{GITHUB_URL}/releases/tag/{tag}")
 }
 
 /// Spawn the release-check worker.  The result lands on `tx` as
-/// [`AppEvent::ReleaseCheckResult`]; a dropped receiver is ignored
-/// (the app is shutting down).
+/// [`AppEvent::ReleaseCheckResult`]; a dropped receiver is ignored (the app is shutting down).
 pub(crate) fn spawn_release_check(tx: mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
         let result = fetch_release(RELEASES_API_URL);

@@ -1,23 +1,8 @@
-//! Vim operator / resolution layer — the editor-side half of the
-//! two-layer split (mirrors `mouse_ops`).
+//! Vim operator / resolution layer — the editor-side half of the two-layer split
+//! (mirrors `mouse_ops`).
 //!
-//! `input::vim::vim_feed` decides *what* the user asked for; this module
-//! resolves offsets against the buffer and mutates `EditorState`.  CP2
-//! added `motion` (the core motions); CP3 added `operator` (the `d`/`c`/`y`
-//! application) and `edits` (`p`/`P` paste), plus the count-aware
-//! `resolve_motion_range` operator entry point.  CP4 extends `edits` with
-//! the remaining Normal primitives (`r{c}`, `~`, `J`, `>>`/`<<`).  CP6 adds
-//! `visual` (the shared VisualLine line-expansion helper used by the render
-//! path, the Visual operators, and the system clipboard copy/cut) plus the
-//! Visual range edits in `edits` (`u`/`U` force-case, `r{c}`, `p` paste-over).
-//! CP7 adds `text_object` (the `iw`/`aw`/quote/bracket-pair objects used by
-//! `d`/`c`/`y` and Visual).  CP8 added `search` (the `*`/`#` word scan).  CP9
-//! adds `ex` (the `:w`/`:q`/`:wq`/`:s`/`:%s` parser + the regex substitution —
-//! the only use of the `fancy-regex` crate).  CP10 extends `edits` with the
-//! markdown-aware list wiring (`open_list_continue` for `o`/`O`,
-//! `renumber_list_at_cursor` after `dd`, `indent_list_item` for `>>`/`<<`),
-//! which reuse the byte-oriented `list_edit` primitives.  See
-//! `docs/vim-implementation-plan.md` §2.1.
+//! `input::vim::vim_feed` decides *what* the user asked for; this module resolves offsets
+//! against the buffer and mutates `EditorState`.
 
 pub mod edits;
 pub mod ex;
@@ -45,10 +30,8 @@ pub use motion::{
 pub use operator::{execute_operator, OpResult, Operator};
 pub use preview::{clear_substitute_preview, update_substitute_preview, SubstitutePreview};
 pub use search::word_under_cursor_at;
-// Table scoping deliberately re-exports the *scoped* resolvers rather than
-// leaving `feed.rs` to clamp `resolve_motion`'s output itself: after CP11 the
-// input layer calls these instead of the bare `motion::resolve_*` pair, so a
-// new operator target cannot forget the cell clamp.  `rg 'resolve_motion'
+// The input layer must call these *scoped* resolvers, never the bare `motion::resolve_*`
+// pair, so a new operator target cannot forget the table cell clamp.  `rg 'resolve_motion'
 // src/input/vim/feed.rs` should stay empty.
 pub use table::{
     cell_scope, clear_table_cell, cursor_row_kind, delete_table_row, insert_table_rows,

@@ -1,12 +1,8 @@
-//! Settings overlay.  Adapter wrapping
-//! [`crate::ui::SettingsState`].
+//! Settings overlay — adapter wrapping [`crate::ui::SettingsState`].
 //!
-//! Field changes drive [`crate::app::App::save_config_with_flash`];
-//! the Theme row also drives [`crate::app::App::apply_active_theme`]
-//! so the color palette updates live.  The "Open config.toml in
-//! external editor" row sets a deferred flag that the run loop
-//! drains — the editor invocation needs `&mut Terminal` which only
-//! the run loop owns.
+//! Field changes drive [`crate::app::App::save_config_with_flash`].  The "Open config.toml in
+//! external editor" row sets a deferred flag the run loop drains, since the editor invocation needs
+//! the `&mut Terminal` only the run loop owns.
 
 use std::any::Any;
 
@@ -19,8 +15,9 @@ use crate::app::App;
 use crate::config::sections::VIM_HANDLER;
 use crate::config::Config;
 use crate::ui::settings_overlay::{
-    LABEL_BIG_H1, LABEL_BLINK_CURSOR, LABEL_SCROLL_SPEED, LABEL_SHOW_DIAGRAMS, LABEL_SHOW_IMAGES,
-    LABEL_SHOW_REMOTE_IMAGES, LABEL_SYNTAX_HIGHLIGHTING, LABEL_VIM_MODE, LABEL_VISUAL_LINE_NAV,
+    LABEL_BIG_H1, LABEL_BLINK_CURSOR, LABEL_MATH_PREVIEW, LABEL_REFLOW, LABEL_SCROLL_SPEED,
+    LABEL_SHOW_DIAGRAMS, LABEL_SHOW_IMAGES, LABEL_SHOW_REMOTE_IMAGES, LABEL_SYNTAX_HIGHLIGHTING,
+    LABEL_VIM_MODE, LABEL_VISUAL_LINE_NAV,
 };
 use crate::ui::{ModalKind, SettingsResponse, SettingsState, SettingsView};
 
@@ -36,18 +33,14 @@ impl SettingsOverlayModal {
     }
 }
 
-/// Map a settings-overlay [`SettingsResponse`] to a [`ModalOutcome`],
-/// running its App-side effects.  Shared by the key and click paths so a
-/// mouse click on a row behaves exactly like operating it from the
-/// keyboard.
+/// Map a [`SettingsResponse`] to a [`ModalOutcome`], running its App-side effects.  Shared by the
+/// key and click paths so a click on a row behaves exactly like operating it from the keyboard.
 fn resolve(app: &mut App, response: SettingsResponse) -> ModalOutcome {
     match response {
         SettingsResponse::Continue => ModalOutcome::Continue,
         SettingsResponse::Cancelled => ModalOutcome::Close,
         SettingsResponse::OpenInExternalEditor => {
-            // The actual editor invocation needs the live `Terminal`
-            // handle, owned by the run loop.  Record intent here and let
-            // the loop drain the flag at the end of this iteration.
+            // Record intent only; the run loop owns the `Terminal` handle the editor needs.
             ModalOutcome::CloseAnd(Box::new(|app| {
                 app.pending_open_config_in_editor = true;
                 app.needs_draw = true;
@@ -69,13 +62,12 @@ fn resolve(app: &mut App, response: SettingsResponse) -> ModalOutcome {
     }
 }
 
-/// Push a single settings-overlay change into App-owned cached
-/// state.  Called from the `FieldChanged` arm above; extracted so
-/// the live-update wiring can be unit-tested without going through
-/// the full overlay key dispatch.
+/// Push a single settings-overlay change into App-owned cached state.  Separate from [`resolve`]
+/// so the live-update wiring can be unit-tested without the full overlay key dispatch.
 pub(crate) fn apply_live_update(label: &str, app: &mut App) {
     match label {
         LABEL_BIG_H1 => app.editor.set_big_h1(app.config.editor.big_h1),
+        LABEL_REFLOW => app.editor.set_reflow(app.config.editor.reflow),
         LABEL_SYNTAX_HIGHLIGHTING => app
             .editor
             .set_syntax_highlighting(app.config.editor.syntax_highlighting),
@@ -90,16 +82,14 @@ pub(crate) fn apply_live_update(label: &str, app: &mut App) {
             app.editor.visual_line_nav = app.config.editor.visual_line_nav;
         }
         LABEL_VIM_MODE => {
-            // The row cycle flipped `config.modal.handler`; rebuild the
-            // live VimState (and resting mode) to match so vim editing
-            // turns on/off immediately without a restart.
+            // Rebuild the live VimState so vim editing turns on/off without a restart.
             app.set_vim_enabled(app.config.modal.handler == VIM_HANDLER);
         }
-        // The image and diagram rows emit `FieldChanged` only on a real
-        // value transition, so these handlers never run for a no-op cycle.
+        // These rows emit `FieldChanged` only on a real transition, never for a no-op cycle.
         LABEL_SHOW_IMAGES => app.apply_images_setting_change(),
         LABEL_SHOW_REMOTE_IMAGES => app.apply_remote_policy_change(),
         LABEL_SHOW_DIAGRAMS => app.apply_diagrams_setting_change(),
+        LABEL_MATH_PREVIEW => app.editor.set_math_preview(app.config.figures.math_preview),
         _ => {}
     }
 }
@@ -141,7 +131,6 @@ impl Modal for SettingsOverlayModal {
     }
 
     fn handle_click(&mut self, col: u16, row: u16, app: &mut App) -> ModalOutcome {
-        // An `esc` close-hint click dismisses, like every other modal.
         if super::types::esc_rect_hit(self.state.esc_button_rect, col, row) {
             return ModalOutcome::Close;
         }
@@ -160,25 +149,19 @@ impl Modal for SettingsOverlayModal {
 
 #[cfg(test)]
 mod tests {
-    //! Settings overlay App-level wiring.  The "Open config.toml in
-    //! default editor" row defers the actual editor invocation to the
-    //! run loop so it can drive the terminal suspend/resume.
-
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
     use crate::app::test_utils::{app_with_buffer, make_app};
     use crate::ui::settings_overlay::all_row_labels;
 
-    /// Labels whose underlying config field is also cached on `App`
-    /// (or a child) at startup and therefore needs an explicit push
-    /// after a settings-overlay edit to take effect without
-    /// restarting.  The rest of the rows are read live at render /
-    /// use time.  Kept in sync with the row table by
-    /// [`live_update_coverage_is_exhaustive`].
+    /// Labels whose config field is also cached on `App` and so needs an explicit push to take
+    /// effect without a restart.  Kept in sync by [`live_update_coverage_is_exhaustive`].
     const LIVE_UPDATE_LABELS: &[&str] = &[
         LABEL_BIG_H1,
+        LABEL_REFLOW,
         LABEL_BLINK_CURSOR,
+        LABEL_MATH_PREVIEW,
         LABEL_SCROLL_SPEED,
         LABEL_SHOW_DIAGRAMS,
         LABEL_SHOW_IMAGES,
@@ -188,11 +171,8 @@ mod tests {
         LABEL_VIM_MODE,
     ];
 
-    /// Labels that are read live (no App-side cache to push to) and
-    /// therefore intentionally have no arm in [`apply_live_update`].
-    /// Includes the two non-editable "open externally" rows and the
-    /// blank divider.  Kept next to [`LIVE_UPDATE_LABELS`] so the
-    /// pair must add up to every row in the overlay.
+    /// Labels read live, with no arm in [`apply_live_update`].  Together with
+    /// [`LIVE_UPDATE_LABELS`] this must account for every row in the overlay.
     const NON_LIVE_UPDATE_LABELS: &[&str] = &[
         crate::ui::settings_overlay::HEADER_NOTE,
         "",
@@ -210,12 +190,7 @@ mod tests {
 
     #[test]
     fn live_update_coverage_is_exhaustive() {
-        // Every row in the settings overlay must appear in exactly
-        // one of LIVE_UPDATE_LABELS or NON_LIVE_UPDATE_LABELS.
-        // Adding a new row to `build_rows` without classifying it
-        // here trips this test, forcing the author to decide whether
-        // the new field needs an `apply_live_update` arm or is read
-        // live at use time.
+        // A new row in `build_rows` trips this until it is classified as live-update or not.
         let actual = all_row_labels();
         let mut classified: Vec<&str> = LIVE_UPDATE_LABELS
             .iter()
@@ -230,7 +205,6 @@ mod tests {
             "settings overlay rows changed; update LIVE_UPDATE_LABELS \
              and/or NON_LIVE_UPDATE_LABELS in src/app/modal/settings.rs"
         );
-        // Guard against a label appearing in both lists.
         for label in LIVE_UPDATE_LABELS {
             assert!(
                 !NON_LIVE_UPDATE_LABELS.contains(label),
@@ -247,6 +221,16 @@ mod tests {
         apply_live_update(LABEL_BIG_H1, &mut app);
         assert_eq!(app.editor.big_h1, app.config.editor.big_h1);
         assert_ne!(app.editor.big_h1, original);
+    }
+
+    #[test]
+    fn live_update_pushes_math_preview_into_editor_cache() {
+        let mut app = make_app();
+        let original = app.editor.math_preview;
+        app.config.figures.math_preview = !original;
+        apply_live_update(LABEL_MATH_PREVIEW, &mut app);
+        assert_eq!(app.editor.math_preview, app.config.figures.math_preview);
+        assert_ne!(app.editor.math_preview, original);
     }
 
     #[test]
@@ -277,13 +261,10 @@ mod tests {
         // make_app starts with the default handler → no vim state.
         assert!(app.vim.is_none());
 
-        // Enable: the row cycle flips the handler, then the live update
-        // builds the VimState.
         app.config.modal.handler = "vim".into();
         apply_live_update(LABEL_VIM_MODE, &mut app);
         assert!(app.vim.is_some(), "vim mode on builds VimState");
 
-        // Disable: handler back to default, live update tears it down.
         app.config.modal.handler = "default".into();
         apply_live_update(LABEL_VIM_MODE, &mut app);
         assert!(app.vim.is_none(), "vim mode off clears VimState");
@@ -292,8 +273,7 @@ mod tests {
     #[test]
     fn live_update_images_ask_queues_prompt_and_resets_session_answer() {
         let mut app = app_with_buffer("![a](img.png)\n", 0);
-        // Simulate an earlier session-level decline, then a settings
-        // change to `Ask`.
+        // An earlier session-level decline, then a settings change to `Ask`.
         app.session_images_enabled = Some(false);
         app.editor.images_enabled = false;
         app.config.images.enabled = crate::config::ImagesEnabled::Ask;
@@ -313,7 +293,6 @@ mod tests {
         assert!(app
             .modal_stack
             .contains::<crate::app::modal::ImagesEnabledPromptModal>());
-        // Flip to Never: layout collapses and the queued prompt is gone.
         app.config.images.enabled = crate::config::ImagesEnabled::Never;
         apply_live_update(LABEL_SHOW_IMAGES, &mut app);
         assert!(!app.editor.images_enabled);
@@ -341,7 +320,7 @@ mod tests {
         let mut app = app_with_buffer("```mermaid\ngraph TD;\n```\n", 0);
         app.session_diagrams_enabled = Some(false);
         app.editor.diagrams_enabled = false;
-        app.config.diagrams.enabled = crate::config::DiagramsEnabled::Ask;
+        app.config.figures.enabled = crate::config::FiguresEnabled::Ask;
         apply_live_update(LABEL_SHOW_DIAGRAMS, &mut app);
         assert_eq!(app.session_diagrams_enabled, None);
         assert!(
@@ -350,23 +329,23 @@ mod tests {
         );
         assert!(app
             .modal_stack
-            .contains::<crate::app::modal::DiagramsEnabledPromptModal>());
+            .contains::<crate::app::modal::FiguresEnabledPromptModal>());
     }
 
     #[test]
     fn live_update_diagrams_never_collapses_layout_and_drops_prompt() {
         let mut app = app_with_buffer("```mermaid\ngraph TD;\n```\n", 0);
-        app.config.diagrams.enabled = crate::config::DiagramsEnabled::Ask;
+        app.config.figures.enabled = crate::config::FiguresEnabled::Ask;
         apply_live_update(LABEL_SHOW_DIAGRAMS, &mut app);
         assert!(app
             .modal_stack
-            .contains::<crate::app::modal::DiagramsEnabledPromptModal>());
-        app.config.diagrams.enabled = crate::config::DiagramsEnabled::Never;
+            .contains::<crate::app::modal::FiguresEnabledPromptModal>());
+        app.config.figures.enabled = crate::config::FiguresEnabled::Never;
         apply_live_update(LABEL_SHOW_DIAGRAMS, &mut app);
         assert!(!app.editor.diagrams_enabled);
         assert!(!app
             .modal_stack
-            .contains::<crate::app::modal::DiagramsEnabledPromptModal>());
+            .contains::<crate::app::modal::FiguresEnabledPromptModal>());
     }
 
     #[test]
@@ -374,13 +353,13 @@ mod tests {
         let mut app = app_with_buffer("```mermaid\ngraph TD;\n```\n", 0);
         app.session_diagrams_enabled = Some(false);
         app.editor.diagrams_enabled = false;
-        app.config.diagrams.enabled = crate::config::DiagramsEnabled::Always;
+        app.config.figures.enabled = crate::config::FiguresEnabled::Always;
         apply_live_update(LABEL_SHOW_DIAGRAMS, &mut app);
         assert!(app.editor.diagrams_enabled);
         assert_eq!(app.session_diagrams_enabled, None);
         assert!(!app
             .modal_stack
-            .contains::<crate::app::modal::DiagramsEnabledPromptModal>());
+            .contains::<crate::app::modal::FiguresEnabledPromptModal>());
     }
 
     #[test]
@@ -424,8 +403,7 @@ mod tests {
         let mut app = make_app();
         app.open_settings_overlay();
         assert!(app.modal_stack.contains::<SettingsOverlayModal>());
-        // Default focus is the first editable row; one Up skips the divider and lands
-        // on the editor row.
+        // Default focus is the first editable row; one Up skips the divider to the editor row.
         app.dispatch_modal_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 40, 80);
         app.dispatch_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 40, 80);
         assert!(app.pending_open_config_in_editor);
@@ -434,11 +412,8 @@ mod tests {
 
     #[test]
     fn settings_overlay_open_config_folder_closes_overlay() {
-        // The top-row "Open config folder" entry hands the path to the
-        // OS file manager via `spawn_open_worker` and closes the
-        // overlay.  No `pending_open_config_in_editor` flag is set —
-        // that path is editor-only.  Default focus is the first editable row; two Up
-        // presses (skipping the divider) reach the folder row.
+        // Two Up presses from the default focus (skipping the divider) reach the folder row.
+        // It opens the OS file manager, so no `pending_open_config_in_editor` flag is set.
         let mut app = make_app();
         app.open_settings_overlay();
         app.dispatch_modal_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 40, 80);

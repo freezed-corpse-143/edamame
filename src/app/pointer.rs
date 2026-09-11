@@ -1,20 +1,16 @@
-//! OSC 22 pointer-shape feedback extracted from `app.rs` in Step 2 of
-//! `refactor-app.md`.
+//! OSC 22 pointer-shape feedback.
 
 use crate::terminal::{set_pointer_shape, PointerShape};
 
 use super::App;
 
 impl App {
-    /// Emit an OSC 22 escape to change the terminal pointer shape, but only
-    /// if the requested shape differs from the last one we asked for.
+    /// Emit an OSC 22 pointer-shape escape, only when the shape actually changes.
     pub(super) fn update_pointer_shape(&mut self, shape: PointerShape) {
         if self.last_pointer_shape == shape {
             return;
         }
-        // `set_pointer_shape` writes the escape straight to stdout,
-        // which libtest does not capture — unit tests driving mouse
-        // events would spray OSC 22 bytes into the test output.
+        // Writes straight to stdout, which libtest doesn't capture.
         if !cfg!(test) {
             set_pointer_shape(shape);
         }

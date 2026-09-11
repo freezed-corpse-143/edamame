@@ -1,31 +1,21 @@
 //! Body content for the update-check modal.
 //!
-//! Pure content builder in the [`super::about`] mold: the modal adapter
-//! (`crate::app::modal::update`) owns the status and the spinner
-//! timing and calls [`body_lines`] each frame with plain values, so
-//! this module stays free of any `app`-layer dependency and is testable
-//! as a function of its inputs.  [`UpdateReport`] is deliberately the
-//! `ui` layer's own vocabulary rather than a re-used
-//! `app::update_check::ReleaseStatus` — nothing under `src/ui/` imports
-//! `crate::app`, and this is not the module to start.
+//! A pure content builder: the modal adapter owns the status and spinner timing and calls
+//! [`body_lines`] each frame with plain values, so nothing here depends on the `app` layer.
+//! [`UpdateReport`] is the `ui` layer's own vocabulary for that reason.
 //!
-//! Release notes arrive here already truncated, control-stripped and
-//! capped (`app::update_check::parse::sanitize_notes`), and are then
-//! given *structural* styling only — see [`note_lines`]: a heading is
-//! bolded, a list marker becomes a bullet, and nothing else about a
-//! line is interpreted.  They are **never** re-parsed as Markdown:
-//! this is text fetched from the network, and a parser would let a
-//! release body choose emphasis, links, images, and layout inside an
-//! app modal.  `**bold**` and `[text](url)` therefore stay literal,
-//! which is correct — it is what the release page says.
+//! Release notes arrive already truncated, control-stripped and capped by
+//! `app::update_check::parse::sanitize_notes`, and get *structural* styling only — see
+//! [`note_lines`].  They are **never** re-parsed as Markdown: this is network text, and a
+//! parser would let a release body choose emphasis, links, images, and layout inside an app
+//! modal.  `**bold**` and `[text](url)` stay literal, which is what the release page says.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::config::Theme;
 
-/// Braille spinner frames, advanced by the modal while a check is in
-/// flight.
+/// Braille spinner frames, advanced by the modal while a check is in flight.
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// What the modal is reporting right now.
@@ -36,34 +26,27 @@ pub enum UpdateReport<'a> {
     UpToDate { tag: &'a str },
     /// A newer release exists, with whatever notes it carried.
     Available { tag: &'a str, notes: &'a [String] },
-    /// A release was found but the two versions could not be ordered
-    /// (a pre-release or build suffix, or a tag not shaped like a
-    /// version).  Both numbers are shown and the verdict says so —
-    /// claiming "up to date" over two rows that disagree is the state
-    /// this variant exists to prevent.
+    /// A release was found but the versions could not be ordered (a pre-release suffix, or a
+    /// tag not shaped like a version).  Both numbers are shown and the verdict says so, rather
+    /// than claiming "up to date" over two rows that disagree.
     Inconclusive { tag: &'a str },
     /// The check could not be completed.
     Failed,
 }
 
-/// Left column of the two version rows, wide enough for the longer
-/// label plus a separating space, so the values line up under each
-/// other.
+/// Left column of the two version rows: the longer label plus a separating space, so the
+/// values line up.
 const VERSION_LABEL_WIDTH: usize = "Installed version: ".len();
 
-/// Label on the post-upgrade notice's version row.  It names the
-/// program rather than saying "installed", because the row is rendered
-/// only for [`PostUpgradeOccasion::OnDemand`], where nothing was just
-/// installed.
+/// Label on the post-upgrade notice's version row.  Names the program rather than saying
+/// "installed", since it renders only for [`PostUpgradeOccasion::OnDemand`].
 const VERSION_LABEL: &str = "edamame version:";
 
-/// Build the modal body.  `installed` is the bare Cargo version
-/// (`0.1.0`); the `v` prefix is added here so it reads like a tag.
+/// Build the modal body.  `installed` is the bare Cargo version; the `v` prefix is added here
+/// so it reads like a tag.
 ///
-/// Both conclusive states share the same shape — a one-line verdict,
-/// then the two version rows — so the numbers are read off a table
-/// rather than out of a sentence, and moving between the two states
-/// doesn't rearrange the page.
+/// Both conclusive states share one shape — a verdict line, then the two version rows — so the
+/// numbers are read off a table and moving between states doesn't rearrange the page.
 pub fn body_lines(theme: &Theme, report: UpdateReport<'_>, installed: &str) -> Vec<Line<'static>> {
     match report {
         UpdateReport::Checking { spinner_frame } => {
@@ -117,10 +100,7 @@ pub fn body_lines(theme: &Theme, report: UpdateReport<'_>, installed: &str) -> V
                 Line::raw(""),
             ];
             out.extend(version_rows(theme, installed, tag));
-            // A release cut without a matching CHANGELOG.md heading has
-            // no notes.  Emit nothing rather than an empty "What's new"
-            // heading over blank space — the version alone is still the
-            // news.
+            // No notes: emit nothing rather than a "What's new" heading over blank space.
             if !notes.is_empty() {
                 out.push(Line::raw(""));
                 out.extend(note_lines(notes));
@@ -130,56 +110,37 @@ pub fn body_lines(theme: &Theme, report: UpdateReport<'_>, installed: &str) -> V
     }
 }
 
-/// What the post-upgrade notice is reporting — the modal that fires
-/// once after edamame has been updated, and the About page's
+/// What the post-upgrade notice reports — the one-time post-update modal and the About page's
 /// `[ Release notes ]` button.
 ///
-/// A second enum rather than a variant on [`UpdateReport`] because the
-/// two answer different questions: that one reports a *check* against
-/// GitHub and always has two version numbers to compare, while this
-/// one reports on the build already running and has exactly one.  They
-/// share this module — and so `note_lines` and `version_row`, which
-/// stay private — because what they put on screen must not drift.
+/// A second enum rather than a variant on [`UpdateReport`]: that one reports a *check* against
+/// GitHub with two versions to compare, this one reports on the running build and has one.
+/// They share this module so what they put on screen can't drift.
 pub enum PostUpgradeReport<'a> {
-    /// The changelog carried a section for the installed version.
-    /// `notes` may still be empty, for a section with no content.
+    /// The changelog carried a section for this version; `notes` may still be empty.
     Found { notes: &'a [String] },
-    /// No `## [<version>]` section for this build.  Only the on-demand
-    /// path renders this: the startup notice stays silent instead, on
-    /// the grounds that the user already knows they upgraded and the
-    /// version number alone is not news.
+    /// No `## [<version>]` section for this build.  Only the on-demand path renders it; the
+    /// startup notice stays silent, since the user already knows they upgraded.
     NotFound,
 }
 
-/// Which entry point is asking, which is the only thing that differs
-/// between the two bodies.
+/// Which entry point is asking — the only difference between the two bodies.
 ///
-/// One body serves both, but the opening line cannot: the startup
-/// notice fires *because* the build changed and should say so, while
-/// the About page's `[ Release notes ]` button is a question the user
-/// asked about the build already running, where "Updated to …" would
-/// announce an event that never happened.  Each therefore states the
-/// one fact it can know, and neither carries the other's — a headline
-/// naming the occasion, or a version row that merely repeats it.
+/// One body serves both, but the opening line cannot: the startup notice fires *because* the
+/// build changed and says so, while the About page's button asks about the build already
+/// running, where "Updated to …" would announce an event that never happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostUpgradeOccasion {
-    /// The one-time startup notice: this build is newer than the one
-    /// that last ran.
+    /// The one-time startup notice: this build is newer than the one that last ran.
     Upgrade,
     /// The About page's `[ Release notes ]` button.
     OnDemand,
 }
 
-/// Build the post-upgrade body.  `installed` is the bare Cargo version.
-///
-/// The opening line is the [`PostUpgradeOccasion`]'s: a verdict for the
-/// upgrade notice, a labelled version row for the on-demand opening.
-/// The upgrade path gets no version row because the headline already
-/// names the number, and the on-demand path gets no headline because
-/// there is no occasion to name — the row is the same shape
-/// [`body_lines`] uses, so the number is read off a labelled line
-/// rather than out of the middle of a sentence.  One row, not the two
-/// there, because there is nothing to compare against.
+/// Build the post-upgrade body.  The opening line is the [`PostUpgradeOccasion`]'s: a verdict
+/// for the upgrade notice, a labeled version row for the on-demand opening.  Neither carries
+/// the other's — the headline already names the number, and there is no occasion to name on
+/// demand.  One row, not [`body_lines`]'s two, since there is nothing to compare against.
 pub fn post_upgrade_body_lines(
     theme: &Theme,
     occasion: PostUpgradeOccasion,
@@ -190,9 +151,7 @@ pub fn post_upgrade_body_lines(
         PostUpgradeOccasion::Upgrade => {
             Line::from(Span::styled(format!("Updated to v{installed}."), theme.h1))
         }
-        // One space after the label, not the update check's shared
-        // column: this row stands alone, so there is nothing to align
-        // it with.
+        // One space, not the update check's shared column: this row stands alone.
         PostUpgradeOccasion::OnDemand => version_row(
             theme,
             VERSION_LABEL,
@@ -208,8 +167,7 @@ pub fn post_upgrade_body_lines(
                 theme.modal_description,
             )));
         }
-        // Same reasoning as the `Available` arm: a section that is
-        // present but empty gets no blank-space heading of its own.
+        // As in the `Available` arm: a present-but-empty section gets no heading.
         PostUpgradeReport::Found { notes } if !notes.is_empty() => {
             out.push(Line::raw(""));
             out.extend(note_lines(notes));
@@ -222,35 +180,25 @@ pub fn post_upgrade_body_lines(
 /// Glyph substituted for a list marker (`-`, `*`, `+`).
 const BULLET: &str = "•";
 
-/// Render the release notes with *structural* styling only: an ATX
-/// heading loses its `#` run and is bolded, a list marker becomes a
-/// [`BULLET`], and the blank line Keep a Changelog puts under every
-/// heading is dropped.  Everything else is emitted verbatim.
+/// Render the release notes with *structural* styling only: an ATX heading loses its `#` run
+/// and is bolded, a list marker becomes a [`BULLET`], and Keep a Changelog's blank line under
+/// every heading is dropped.  Everything else is verbatim.
 ///
-/// This is deliberately not Markdown rendering, and the distinction is
-/// the whole safety argument.  The notes are remote text; parsing them
-/// would let a release body choose emphasis, links, images, and layout
-/// inside an app modal.  Here the *line* is classified locally, over
-/// text `parse::sanitize_notes` has already bounded, and the outcome is
-/// a choice between three fixed local styles.  A release body can make
-/// a line a heading; it cannot make it anything this function doesn't
-/// already know how to draw.  Don't grow this into an inline parser —
-/// `**bold**` and `[text](url)` stay literal on purpose.
+/// Deliberately not Markdown rendering, and that distinction is the whole safety argument: each
+/// *line* is classified locally, over text `parse::sanitize_notes` has already bounded, into one
+/// of three fixed local styles.  A release body can make a line a heading; it cannot make it
+/// anything this function doesn't already know how to draw.  Don't grow this into an inline
+/// parser — `**bold**` and `[text](url)` stay literal on purpose.
 ///
-/// A wrapped line's continuation starts at column 0: `ModalView` owns
-/// the wrapping (`Paragraph` with `Wrap { trim: false }`), so there is
-/// no hanging indent to be had without pre-wrapping the body, which
-/// double-wraps at narrow widths — see the modal-sizing rule in
-/// `AGENTS.md`.
+/// A wrapped line's continuation starts at column 0: `ModalView` owns the wrapping, so a
+/// hanging indent would require pre-wrapping the body, which double-wraps at narrow widths.
 fn note_lines(notes: &[String]) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::with_capacity(notes.len());
     let mut after_heading = false;
     for raw in notes {
         if let Some(text) = heading_text(raw) {
-            // A blank before a heading separates the sections and is
-            // kept; the one *after* it is Keep a Changelog's shape
-            // rather than anything the reader needs, and rows are the
-            // scarce resource in a modal.
+            // The blank *before* a heading separates sections and is kept; the one after it is
+            // Keep a Changelog's shape, and rows are scarce in a modal.
             out.push(Line::from(Span::styled(
                 text.to_owned(),
                 Style::new().add_modifier(Modifier::BOLD),
@@ -274,9 +222,8 @@ fn note_lines(notes: &[String]) -> Vec<Line<'static>> {
     out
 }
 
-/// The text of an ATX heading (`## Added` → `Added`), or `None` for any
-/// other line.  CommonMark wants one to six `#` followed by a space;
-/// the closing-`#` form is not worth recognizing in a changelog.
+/// The text of an ATX heading (`## Added` → `Added`), or `None`.  The closing-`#` form is not
+/// worth recognizing in a changelog.
 fn heading_text(line: &str) -> Option<&str> {
     let hashes = line.len() - line.trim_start_matches('#').len();
     (1..=6)
@@ -287,8 +234,7 @@ fn heading_text(line: &str) -> Option<&str> {
         .filter(|text| !text.is_empty())
 }
 
-/// A list item with its marker swapped for [`BULLET`], indentation
-/// preserved so nesting still reads; any other line unchanged.
+/// A list item with its marker swapped for [`BULLET`], indentation preserved.
 fn bulleted(line: &str) -> String {
     let indent = line.len() - line.trim_start().len();
     let rest = &line[indent..];
@@ -302,8 +248,7 @@ fn bulleted(line: &str) -> String {
     }
 }
 
-/// The installed / latest pair, in that order — what the user has
-/// first, then what is out there, so the comparison reads downward.
+/// The installed / latest pair, in that order, so the comparison reads downward.
 fn version_rows(theme: &Theme, installed: &str, latest: &str) -> [Line<'static>; 2] {
     [
         version_row(
@@ -321,16 +266,12 @@ fn version_rows(theme: &Theme, installed: &str, latest: &str) -> [Line<'static>;
     ]
 }
 
-/// One label/value row.  The label is padded out to `width` rather than
-/// styled into a separate aligned block, because the modal body is
-/// left-aligned text: padding is all the alignment there is.
+/// One label/value row, the label padded to `width` — the modal body is left-aligned text, so
+/// padding is all the alignment there is.
 ///
-/// `width` is a parameter because the two callers align against
-/// different things.  The update check's pair share
-/// [`VERSION_LABEL_WIDTH`] so their values sit in one column; the
-/// post-upgrade notice's lone row has nothing to line up with, and
-/// padding it to that same column would leave a gap the reader has to
-/// cross for no reason.
+/// `width` is a parameter because the callers align against different things: the update
+/// check's pair share [`VERSION_LABEL_WIDTH`], while the post-upgrade notice's lone row has
+/// nothing to line up with.
 fn version_row(theme: &Theme, label: &str, value: String, width: usize) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{label:<width$}"), theme.text_muted()),
@@ -388,7 +329,7 @@ mod tests {
             UpdateReport::UpToDate { tag: "v0.1.0" },
             "0.1.0",
         ));
-        // The verdict is a sentence on its own; the numbers are rows.
+        // The verdict is a sentence; the numbers are rows.
         assert!(body.starts_with("edamame is up to date."), "{body}");
         assert!(body.contains("Installed version: v0.1.0"), "{body}");
         assert!(body.contains("Latest release:    v0.1.0"), "{body}");
@@ -396,8 +337,7 @@ mod tests {
 
     #[test]
     fn the_two_version_rows_align_their_values() {
-        // The labels differ in length, so the shorter one is padded —
-        // a left-aligned body has no other way to make a column.
+        // The shorter label is padded; a left-aligned body has no other way to make a column.
         let body = text(&body_lines(
             theme(),
             UpdateReport::UpToDate { tag: "v0.2.0" },
@@ -409,8 +349,7 @@ mod tests {
                 .map(|l| l[VERSION_LABEL_WIDTH..].to_owned())
                 .expect("row present")
         };
-        // Both values start at exactly the label column, so the shorter
-        // label must have been padded out to it.
+        // Both values start at the label column, so the shorter label was padded to it.
         assert_eq!(value("Installed version:"), "v0.1.0");
         assert_eq!(value("Latest release:"), "v0.2.0");
     }
@@ -423,7 +362,7 @@ mod tests {
             "0.1.0",
         ));
         assert!(body.starts_with("Couldn't compare versions."));
-        // Both numbers are still shown — that is the whole point.
+        // Both numbers are still shown.
         assert!(body.contains("Installed version:"), "{body}");
         assert!(body.contains("v0.1.0"), "{body}");
         assert!(body.contains("v0.2.0-rc1"), "{body}");
@@ -456,8 +395,7 @@ mod tests {
         assert!(body.starts_with("Update available."), "{body}");
         assert!(body.contains("Installed version: v0.1.0"), "{body}");
         assert!(body.contains("Latest release:    v0.2.0"), "{body}");
-        // Structural styling only: the heading loses its `#` run and
-        // the marker becomes a bullet…
+        // Structural styling only…
         assert!(body.contains("\nAdded"), "{body}");
         // …but nothing *inside* a line is interpreted.
         assert!(body.contains("• **bold** stays literal"), "{body}");
@@ -484,9 +422,7 @@ mod tests {
 
     #[test]
     fn the_blank_under_a_heading_goes_but_the_one_above_it_stays() {
-        // Keep a Changelog's shape: `### Added`, blank, items, blank,
-        // `### Changed`.  Rows are scarce in a modal, and the blank
-        // under a heading separates nothing.
+        // Keep a Changelog's shape; the blank under a heading separates nothing.
         let notes =
             ["### Added", "", "- one", "", "### Changed", "", "- two", ""].map(str::to_owned);
         assert_eq!(text(&note_lines(&notes)), "Added\n• one\n\nChanged\n• two");
@@ -537,12 +473,10 @@ mod tests {
         );
         let rendered = text(&body);
         assert!(rendered.starts_with("Updated to v0.1.2."));
-        // The headline already names the version, so the labelled row
-        // would only repeat it.
+        // The headline already names the version, so the labeled row would repeat it.
         assert!(!rendered.contains(VERSION_LABEL));
         assert!(!rendered.contains("Installed version:"));
-        // Structural styling, shared with the release-check path: the
-        // heading loses its `#` run and the marker becomes a bullet.
+        // Structural styling, shared with the release-check path.
         assert!(rendered.contains("Added"));
         assert!(!rendered.contains("### Added"));
         assert!(rendered.contains("\u{2022} a thing"));
@@ -550,9 +484,7 @@ mod tests {
 
     #[test]
     fn the_on_demand_opening_names_the_build_without_claiming_an_upgrade() {
-        // Reached from the About page, where nothing was just
-        // installed — so the version arrives as a labelled row and
-        // there is no verdict line above it.
+        // From the About page, where nothing was just installed: a labeled row, no verdict.
         let notes = vec!["- a thing".to_owned()];
         let body = post_upgrade_body_lines(
             theme(),
@@ -568,9 +500,7 @@ mod tests {
 
     #[test]
     fn a_post_upgrade_report_shows_no_second_version_row() {
-        // There is nothing to compare against, so "Latest release:"
-        // would be a row with no value to put in it — and either
-        // occasion opens on exactly one line.
+        // Nothing to compare against, so "Latest release:" would have no value to show.
         for occasion in [PostUpgradeOccasion::Upgrade, PostUpgradeOccasion::OnDemand] {
             let body = post_upgrade_body_lines(
                 theme(),
@@ -589,9 +519,8 @@ mod tests {
 
     #[test]
     fn a_missing_section_says_so_without_claiming_an_update() {
-        // The About page's on-demand opening is the only path that
-        // reaches this: it must answer, but it must not announce an
-        // upgrade that may not have happened.
+        // Only the on-demand path reaches this: it must answer without announcing an upgrade
+        // that may not have happened.
         let body = post_upgrade_body_lines(
             theme(),
             PostUpgradeOccasion::OnDemand,

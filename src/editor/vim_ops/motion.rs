@@ -1,26 +1,18 @@
 //! Vim motion resolution — pure char-offset arithmetic over the rope.
 //!
-//! `vim_feed` maps a key to a [`Motion`]; [`resolve_motion`] turns that
-//! into a target char offset against the buffer.  Every offset here is a
-//! rope **char** offset (the same space as `Cursor::offset` and
-//! `Selection`) — vim introduces no byte offsets.  See
-//! `docs/vim-implementation-plan.md` §2.4.
-//!
-//! CP2 ships the core motions (`w e b W E B 0 ^ $ gg G`).  CP3 adds the
-//! count-aware [`resolve_motion_range`] operator entry point (plus the
-//! `h`/`l` charwise targets `Left`/`Right`).  CP5 adds the character-find
-//! (`f F t T`, replayed by `; ,`), paragraph (`{ }`), and matching-pair
-//! (`%`) motions.  Search (`n N`) lands in a later checkpoint.
+//! `vim_feed` maps a key to a [`Motion`]; [`resolve_motion`] turns that into a
+//! target char offset, and [`resolve_motion_range`] into the span an operator
+//! acts on.  Every offset here is a rope **char** offset (the same space as
+//! `Cursor::offset` and `Selection`) — vim introduces no byte offsets.
 
 use std::ops::Range;
 
 use crate::document::{next_grapheme_offset, Buffer};
 
-/// Which character-find motion a [`Motion::FindChar`] carries (`f F t T`),
-/// also recorded in `VimState::last_find` so `;` / `,` can replay (or
-/// reverse) the last one.  Defined here in the editor layer — rather than
-/// alongside the rest of the vim state in `input::vim` — so the `Motion`
-/// enum can name it without inverting the input→editor dependency.
+/// Which character-find motion a [`Motion::FindChar`] carries, also recorded in
+/// `VimState::last_find` for `;` / `,` to replay.  Defined in the editor layer,
+/// not with the rest of the vim state, so `Motion` can name it without
+/// inverting the input→editor dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindKind {
     Forward,      // f — land *on* the next occurrence
@@ -29,13 +21,11 @@ pub enum FindKind {
     BackwardTill, // T — land one char after the previous occurrence
 }
 
-/// A resolved Normal-mode motion.  The variants are the CP2 core set, the
-/// CP3 charwise `h`/`l` and `cw`/`cW` targets, the CP5 find / paragraph /
-/// matching-pair motions, and the counted line jump.
+/// A resolved Normal-mode motion.
 ///
-/// `n` / `N` are deliberately *not* here: they walk the live
-/// `EditorState::search` match list rather than resolving an offset from
-/// the buffer alone, so they run through `feed`'s `search_repeat` instead.
+/// `n` / `N` are deliberately absent: they walk the live `EditorState::search`
+/// match list rather than resolving from the buffer alone, so they run through
+/// `feed`'s `search_repeat`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Motion {
     Left,                     // h (operator target)
@@ -60,12 +50,10 @@ pub enum Motion {
     MatchingPair,             // %
 }
 
-/// The span an operator (`d`/`c`/`y`) should act on, resolved from a
-/// motion or a doubled operator.  Charwise spans carry an explicit
-/// char-offset range; linewise spans carry inclusive buffer-line indices
-/// so the operator layer can compute the full-line content range, the
-/// delete range (which may consume a trailing/leading newline), and the
-/// register text without re-deriving line boundaries from char offsets.
+/// The span an operator (`d`/`c`/`y`) acts on.  Linewise spans carry line
+/// indices rather than offsets so the operator layer can derive the content
+/// range, the delete range (which may consume a newline) and the register text
+/// without recovering line boundaries from char offsets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpRange {
     /// `[start, end)` char offsets — `e`/`$`/`w`/… etc.
@@ -74,10 +62,9 @@ pub enum OpRange {
     Lines { first: usize, last: usize },
 }
 
-/// Character class for word motions.  `w`/`e`/`b` distinguish runs of
-/// "word" characters (alphanumeric + `_`) from runs of punctuation;
-/// `W`/`E`/`B` treat every non-blank character as a single class.  Shared
-/// with `text_object` (the `iw`/`aw` word objects use the same classes).
+/// Character class for word motions: `w`/`e`/`b` separate word characters
+/// (alphanumeric + `_`) from punctuation, while `W`/`E`/`B` treat every
+/// non-blank as one class.  Shared with `text_object`'s `iw`/`aw`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Class {
     Blank,
@@ -100,8 +87,6 @@ fn char_at(buf: &Buffer, offset: usize) -> char {
 }
 
 /// Resolve `motion` to a target char offset, starting from `cursor`.
-/// `count` is honoured for the word motions; CP2 callers pass `1`
-/// (count-driven repeats arrive in CP3).
 pub fn resolve_motion(motion: Motion, count: u32, cursor: usize, buf: &Buffer) -> usize {
     let count = count.max(1);
     match motion {
@@ -132,12 +117,10 @@ pub fn resolve_motion(motion: Motion, count: u32, cursor: usize, buf: &Buffer) -
 
 // ── Operator ranges ───────────────────────────────────────────────────────────
 
-/// Resolve a motion into the [`OpRange`] an operator should act on, given
-/// the effective `count`.  Charwise motions become a `[start, end)` char
-/// range (end-inclusive for `e`/`E`, end-exclusive otherwise); `gg`/`G`
-/// become linewise spans.  A forward word motion (`w`/`W`) that would
-/// spill onto a later line is clamped to the end of the cursor's line —
-/// vim's rule that `dw` on the last word of a line never joins lines.
+/// Resolve a motion into the [`OpRange`] an operator acts on.  Charwise motions
+/// become a `[start, end)` range, `gg`/`G` linewise spans.  A forward word
+/// motion spilling onto a later line is clamped to the cursor's line end —
+/// vim's rule that `dw` on a line's last word never joins lines.
 pub fn resolve_motion_range(motion: Motion, count: u32, cursor: usize, buf: &Buffer) -> OpRange {
     match motion {
         Motion::DocStart => OpRange::Lines {
@@ -148,8 +131,8 @@ pub fn resolve_motion_range(motion: Motion, count: u32, cursor: usize, buf: &Buf
             first: buf.char_to_line(cursor),
             last: last_content_line(buf),
         },
-        // A line jump is linewise in either direction: `d5G` from below
-        // line 5 deletes *up* to it, exactly as `dgg` does.
+        // Linewise in either direction: `d5G` from below line 5 deletes *up*
+        // to it, as `dgg` does.
         Motion::GoToLine(n) => {
             let line = buf.char_to_line(cursor);
             let target = goto_line_index(buf, n);
@@ -168,12 +151,8 @@ pub fn resolve_motion_range(motion: Motion, count: u32, cursor: usize, buf: &Buf
             let lo = cursor.min(target);
             let mut hi = cursor.max(target);
             // Inclusive-end motions land *on* the last affected char, so the
-            // operator range must extend one grapheme past it:
-            //  - `e`/`E` (and the `cw`/`cW` current-word-end targets);
-            //  - a forward find (`df(` / `dt(` include the landing char);
-            //  - `%` (the matched bracket is deleted with `d%`).
-            // Backward finds and a `%` that found nothing fall through as the
-            // default `[lo, hi)` span (exclusive), which is already correct.
+            // range extends one grapheme past it.  Backward finds and a `%`
+            // that found nothing fall through as the exclusive default.
             let inclusive = match motion {
                 Motion::WordEnd
                 | Motion::BigWordEnd
@@ -191,8 +170,8 @@ pub fn resolve_motion_range(motion: Motion, count: u32, cursor: usize, buf: &Buf
     }
 }
 
-/// Linewise span for a vertical operator target (`dj` / `dk`): `count`
-/// lines below (or above) the cursor's line, clamped to the document.
+/// Linewise span for `dj` / `dk`: `count` lines below or above the cursor's,
+/// clamped to the document.
 pub fn vertical_line_range(buf: &Buffer, cursor: usize, count: u32, down: bool) -> OpRange {
     let line = buf.char_to_line(cursor);
     let last = buf.line_count().saturating_sub(1);
@@ -208,8 +187,8 @@ pub fn vertical_line_range(buf: &Buffer, cursor: usize, count: u32, down: bool) 
     }
 }
 
-/// Linewise span for a doubled operator (`dd` / `yy` / `cc`): `count`
-/// lines starting at the cursor's line, clamped to the document.
+/// Linewise span for a doubled operator (`dd` / `yy` / `cc`): `count` lines from
+/// the cursor's, clamped to the document.
 pub fn doubled_line_range(buf: &Buffer, cursor: usize, count: u32) -> OpRange {
     let line = buf.char_to_line(cursor);
     let last = buf.line_count().saturating_sub(1);
@@ -222,8 +201,8 @@ pub fn doubled_line_range(buf: &Buffer, cursor: usize, count: u32) -> OpRange {
 
 // ── Word motions ────────────────────────────────────────────────────────────
 
-/// Step `count` graphemes left (`false`) or right (`true`), clamped to the
-/// cursor's line (vim `h`/`l` never cross a line boundary).
+/// Step `count` graphemes, clamped to the cursor's line — vim `h`/`l` never
+/// cross a line boundary.
 fn step_horizontal(buf: &Buffer, cursor: usize, count: u32, forward: bool) -> usize {
     let mut pos = cursor;
     if forward {
@@ -253,7 +232,6 @@ fn word_forward(buf: &Buffer, mut pos: usize, count: u32, big: bool) -> usize {
         if pos >= len {
             break;
         }
-        // Skip the rest of the current word-class run, then skip blanks.
         let start = class(char_at(buf, pos), big);
         if start != Class::Blank {
             while pos < len && class(char_at(buf, pos), big) == start {
@@ -277,7 +255,7 @@ fn word_end(buf: &Buffer, mut pos: usize, count: u32, big: bool) -> usize {
         if pos + 1 >= len {
             return len.saturating_sub(1);
         }
-        // Always advance at least one, then skip blanks to enter the word.
+        // Advance at least one, then skip blanks into the word.
         pos += 1;
         while pos < len && class(char_at(buf, pos), big) == Class::Blank {
             pos += 1;
@@ -285,7 +263,6 @@ fn word_end(buf: &Buffer, mut pos: usize, count: u32, big: bool) -> usize {
         if pos >= len {
             return len.saturating_sub(1);
         }
-        // Walk to the last char of this word-class run.
         let cls = class(char_at(buf, pos), big);
         while pos + 1 < len && class(char_at(buf, pos + 1), big) == cls {
             pos += 1;
@@ -294,14 +271,11 @@ fn word_end(buf: &Buffer, mut pos: usize, count: u32, big: bool) -> usize {
     pos
 }
 
-/// `cw` / `cW` target: the last char of the *current* word-class run,
-/// then `count - 1` further `e` steps.  Unlike `e`, it does **not** skip
-/// the current word when the cursor already sits on its last char — vim's
-/// rule that `cw` changes only up to the end of the word the cursor is in
-/// (so `cw` on a single-char word, or on a word's final char, changes just
-/// that word rather than running into the next one).  When the cursor is
-/// on a blank `change_word_to_word_end` never routes here, so the blank
-/// case below is defensive only.
+/// `cw` / `cW` target: the last char of the *current* word-class run, plus
+/// `count - 1` further `e` steps.  Unlike `e`, it does not skip the current word
+/// when the cursor already sits on its last char — vim's rule that `cw` changes
+/// only up to the end of the word the cursor is in.  The blank case is
+/// defensive: `change_word_to_word_end` never routes a blank here.
 fn current_word_end(buf: &Buffer, cursor: usize, count: u32, big: bool) -> usize {
     let len = buf.len_chars();
     if cursor >= len {
@@ -314,8 +288,7 @@ fn current_word_end(buf: &Buffer, cursor: usize, count: u32, big: bool) -> usize
             pos += 1;
         }
     }
-    // Remaining words use the normal `e` semantics (advance into the next
-    // word), so the count counts the current word as the first.
+    // Remaining words use `e` semantics, so the current word is the first.
     if count > 1 {
         pos = word_end(buf, pos, count - 1, big);
     }
@@ -329,15 +302,13 @@ fn word_backward(buf: &Buffer, mut pos: usize, count: u32, big: bool) -> usize {
             break;
         }
         pos -= 1;
-        // Skip blanks backward onto the previous word's last char.
         while pos > 0 && class(char_at(buf, pos), big) == Class::Blank {
             pos -= 1;
         }
         if class(char_at(buf, pos), big) == Class::Blank {
-            // Reached the start of the buffer over blanks only.
+            // Reached the buffer start over blanks only.
             break;
         }
-        // Walk back to the first char of this word-class run.
         let cls = class(char_at(buf, pos), big);
         while pos > 0 && class(char_at(buf, pos - 1), big) == cls {
             pos -= 1;
@@ -348,17 +319,14 @@ fn word_backward(buf: &Buffer, mut pos: usize, count: u32, big: bool) -> usize {
 
 // ── Find / paragraph / matching-pair motions ──────────────────────────────────
 
-/// `f`/`F`/`t`/`T`: find the `count`-th occurrence of `target` on the
-/// cursor's line and return the landing offset.  Forward finds (`f`/`t`)
-/// scan right of the cursor; backward finds (`F`/`T`) scan left.  `t`/`T`
-/// stop one char short of the match.  Bounded to the current line; a miss
-/// leaves the cursor put.
+/// `f`/`F`/`t`/`T`: the `count`-th occurrence of `target` on the cursor's line,
+/// with `t`/`T` stopping one char short.  Bounded to the line; a miss leaves the
+/// cursor put.
 ///
-/// `skip_adjacent` is set only for a `;`/`,` *repeat* of a `t`/`T`: it steps
-/// over a match sitting immediately in the search direction, so repeating
-/// `t` advances past the char it is already resting before instead of
-/// getting stuck on it (matching vim's default `;`).  It is a no-op for
-/// `f`/`F` (which already advance past the char the cursor sits on).
+/// `skip_adjacent` is set only for a `;`/`,` repeat of `t`/`T`: it steps over a
+/// match sitting immediately in the search direction, so a repeat advances
+/// rather than sticking on the char it already rests before.  A no-op for
+/// `f`/`F`, which already advance past the cursor's own char.
 fn find_char(
     buf: &Buffer,
     cursor: usize,
@@ -377,7 +345,6 @@ fn find_char(
     let found = if forward {
         let mut pos = None;
         let mut i = cursor + 1;
-        // Repeat of `t`: jump past an immediately-adjacent match.
         if skip_adjacent && till && i < lend && char_at(buf, i) == target {
             i += 1;
         }
@@ -395,7 +362,6 @@ fn find_char(
     } else {
         let mut pos = None;
         let mut i = cursor;
-        // Repeat of `T`: jump past an immediately-adjacent match.
         if skip_adjacent && till && i > lstart && char_at(buf, i - 1) == target {
             i -= 1;
         }
@@ -421,11 +387,8 @@ fn find_char(
     }
 }
 
-/// Resolve a `;`/`,` repeat of the last character-find.  Identical to a
-/// fresh find for `f`/`F`, but for `t`/`T` it skips a match sitting
-/// immediately in the search direction, so repeating `t` advances past the
-/// char it is resting before (matching vim's default `;`) instead of
-/// staying stuck on it.
+/// A `;`/`,` repeat of the last character-find — a fresh find, except that
+/// `t`/`T` skip an immediately adjacent match.  See [`find_char`].
 pub fn resolve_find_repeat(
     buf: &Buffer,
     cursor: usize,
@@ -438,17 +401,16 @@ pub fn resolve_find_repeat(
     )
 }
 
-/// Whether buffer `line` is a paragraph boundary — a completely empty line
-/// (vim does not treat a whitespace-only line as a boundary).
+/// Is `line` a paragraph boundary?  Completely empty — vim does not count a
+/// whitespace-only line.
 fn is_blank_line(buf: &Buffer, line: usize) -> bool {
     buf.line(line)
         .map(|s| s.trim_end_matches('\n').is_empty())
         .unwrap_or(true)
 }
 
-/// `}` (`forward`) / `{`: move `count` paragraphs, landing on the start of
-/// the bounding empty line.  Running off the end clamps to end-of-buffer
-/// (`}`) or the buffer start (`{`).
+/// `}` / `{`: move `count` paragraphs, landing on the bounding empty line's
+/// start and clamping at either end of the buffer.
 fn paragraph(buf: &Buffer, cursor: usize, count: u32, forward: bool) -> usize {
     let count = count.max(1);
     let last = buf.line_count().saturating_sub(1);
@@ -481,10 +443,10 @@ fn paragraph(buf: &Buffer, cursor: usize, count: u32, forward: bool) -> usize {
     buf.line_to_char(line)
 }
 
-/// `%`: scan from the cursor to the line end for the first bracket of a
-/// `()` / `[]` / `{}` pair, then jump to its match (searching forward from
-/// an opener, backward from a closer, respecting nesting across lines).
-/// No bracket on the line — or an unbalanced one — leaves the cursor put.
+/// `%`: the first `()` / `[]` / `{}` bracket at or right of the cursor on its
+/// line, then its match — forward from an opener, backward from a closer,
+/// respecting nesting across lines.  No bracket, or an unbalanced one, leaves
+/// the cursor put.
 fn matching_pair(buf: &Buffer, cursor: usize) -> usize {
     let len = buf.len_chars();
     let line = buf.char_to_line(cursor);
@@ -556,9 +518,8 @@ fn line_end(buf: &Buffer, pos: usize) -> usize {
     line_end_offset(buf, buf.char_to_line(pos))
 }
 
-/// End of buffer line `line` (its content length from the line start,
-/// excluding any trailing newline).  Shared by `$`, the `dw` line clamp,
-/// and the linewise `cc` content boundary.
+/// End of buffer line `line`, excluding any trailing newline.  Shared by `$`,
+/// the `dw` line clamp, and the linewise `cc` content boundary.
 pub fn line_end_offset(buf: &Buffer, line: usize) -> usize {
     let start = buf.line_to_char(line);
     let content_len = buf
@@ -582,18 +543,15 @@ pub fn first_non_blank(buf: &Buffer, line: usize) -> usize {
     pos
 }
 
-/// Buffer-line index for the 1-based line number `n` carried by a
-/// [`Motion::GoToLine`].  Clamped to the last *content* line so `999G` and
-/// `:$` land where a bare `G` would rather than on the trailing empty line;
-/// `0` is unreachable from the key layer (a leading `0` is `LineStart`) but
-/// resolves to the first line, as `:0` does in vim.
+/// Buffer-line index for a [`Motion::GoToLine`]'s 1-based `n`, clamped to the
+/// last *content* line so `999G` and `:$` land where a bare `G` would.  `0` is
+/// unreachable from the key layer but resolves to line 0, as `:0` does in vim.
 fn goto_line_index(buf: &Buffer, n: u32) -> usize {
     (n.saturating_sub(1) as usize).min(last_content_line(buf))
 }
 
-/// The last line carrying content — the target for `G`.  When the buffer
-/// ends with a newline (producing a trailing empty line), back up to the
-/// line above it, matching vim's `G`.
+/// The last line carrying content — `G`'s target, which backs up over the empty
+/// line a trailing newline produces.
 fn last_content_line(buf: &Buffer) -> usize {
     let len = buf.len_chars();
     let mut last = buf.char_to_line(len);

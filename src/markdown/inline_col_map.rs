@@ -1,13 +1,11 @@
 use pulldown_cmark::{Event, Options, Parser};
 
-/// Bidirectional character-column map between raw Markdown source and
-/// its rendered (inline-markup-collapsed) form for a single line.
+/// Bidirectional character-column map between raw Markdown source and its rendered
+/// (inline-markup-collapsed) form for a single line.
 ///
-/// Built by re-parsing `raw_line` with pulldown-cmark and recording
-/// the raw byte position of every rendered character emitted by inline
-/// `Text`, `Code`, and `SoftBreak`/`HardBreak` events.  Marker bytes
-/// (asterisks, brackets, backtick delimiters, the URL portion of a
-/// link) sit in the gaps between events and are correctly skipped.
+/// Built by re-parsing `raw_line` and recording the raw position of every rendered character
+/// emitted by inline `Text`, `Code`, and break events.  Marker bytes (asterisks, brackets, backtick
+/// delimiters, a link's URL) sit in the gaps between events and are skipped.
 #[derive(Debug, Clone)]
 pub struct InlineColMap {
     rendered_to_raw: Vec<usize>,
@@ -32,16 +30,9 @@ impl InlineColMap {
                 Event::Text(_) => walk.push_text(raw_line, range),
                 Event::Code(s) => walk.push_code(raw_line, &s, range),
                 Event::SoftBreak | Event::HardBreak => walk.push_break(range.start),
-                // No `Event::FootnoteReference` arm: this map is built per
-                // line, so a reference line carries no definition and
-                // pulldown-cmark emits the literal `[^label]` as `Text`
-                // (split into `[`, `^label`, `]`).  Those land in the map as
-                // literal chars; `collapse_footnote_refs` then drops the `^`
-                // entry (and, for a fused run, the abutting `[`) so the
-                // marker occupies `[label]`-many rendered columns — matching
-                // the document renderer (which, having the definition, emits
-                // it via `renderer::reference_marker`) so `rendered_len`
-                // agrees and selection projection stays exact line-wide.
+                // No `FootnoteReference` arm: built per line, there is no definition in scope, so
+                // pulldown emits `[^label]` as literal `Text`.  `collapse_footnote_refs` then
+                // narrows those entries to the renderer's `[label]` marker width.
                 _ => {}
             }
         }
@@ -50,7 +41,7 @@ impl InlineColMap {
         collapse_footnote_refs(raw_line, &mut rendered_to_raw);
         let rendered_len = rendered_to_raw.len().saturating_sub(1);
 
-        // Build the inverse map (raw char idx -> rendered char idx).
+        // Inverse map: raw char idx -> rendered char idx.
         let mut raw_to_rendered = vec![usize::MAX; raw_len + 1];
 
         for (rendered_idx, &raw_char_idx) in rendered_to_raw.iter().enumerate() {
@@ -59,12 +50,9 @@ impl InlineColMap {
             }
         }
 
-        // Past-end entry.
         raw_to_rendered[raw_len] = rendered_len;
 
-        // Backward-fill: marker bytes get the rendered index of the next
-        // visible character (matching paragraph_raw_col_to_rendered_col's
-        // "smallest rendered idx whose raw position is >= raw_col").
+        // Backward-fill: a marker byte takes the rendered index of the next visible character.
         for i in (0..raw_len).rev() {
             if raw_to_rendered[i] == usize::MAX {
                 raw_to_rendered[i] = raw_to_rendered[i + 1];
@@ -86,19 +74,16 @@ impl InlineColMap {
         self.rendered_to_raw[idx]
     }
 
-    /// Rendered char index for a raw char column.  Always returns a value.
-    ///
-    /// When `raw_col` lands on a marker byte (the `[` of `[link]`, the `*`
-    /// of `**bold**`), returns the rendered idx immediately after the marker.
+    /// Rendered char index for a raw char column.  A `raw_char` landing on a marker byte yields
+    /// the rendered index immediately after the marker.
     pub fn raw_to_rendered(&self, raw_char: usize) -> usize {
         let idx = raw_char.min(self.raw_len);
         self.raw_to_rendered[idx]
     }
 
-    /// Same as `raw_to_rendered`, but returns `None` when the walker's
-    /// `rendered_len` doesn't match `actual_rendered_count`.  Headings,
-    /// blockquotes, and list-marker prefixes add rendered glyphs the
-    /// walker can't see, causing the counts to diverge.
+    /// Same as [`Self::raw_to_rendered`], but `None` when `rendered_len` disagrees with
+    /// `actual_rendered_count` — headings, blockquotes, and list markers add rendered glyphs the
+    /// walker can't see, and the caller then falls back to a 1:1 mapping.
     pub fn raw_to_rendered_checked(
         &self,
         raw_char: usize,
@@ -118,8 +103,7 @@ impl InlineColMap {
         self.raw_len
     }
 
-    /// Direct access to the forward map for tests and callers that need
-    /// the full vector (e.g. `rendered_sub_line_to_offset`).
+    /// Direct access to the forward map, for callers needing the whole vector.
     pub fn rendered_to_raw_vec(&self) -> &[usize] {
         &self.rendered_to_raw
     }
@@ -184,12 +168,9 @@ impl CharMapWalk {
     }
 
     fn push_code(&mut self, raw_line: &str, inner: &str, range: std::ops::Range<usize>) {
-        // The range covers the full span including its backtick delimiters
-        // (one or more on each side); the renderer emits only the content,
-        // so the delimiters are skipped like other marker bytes.  pulldown
-        // additionally strips one space from each end of the body when both
-        // ends are spaces (`` ` x ` `` → "x") — detect that to keep each
-        // content char pointing at its true raw position.
+        // `range` spans the backtick delimiters too, which are skipped like other markers.
+        // pulldown also strips one space from each end when both ends are spaces
+        // (`` ` x ` `` → "x") — detect that to keep each content char on its true raw position.
         let slice_end = range.end.min(raw_line.len());
         let slice = &raw_line[range.start..slice_end];
         let delim = slice.bytes().take_while(|&b| b == b'`').count();
@@ -216,28 +197,16 @@ impl CharMapWalk {
 
 // ── Footnote-reference collapse ───────────────────────────────────────────────
 
-/// Collapse every `[^label]` reference in `raw_line` from its literal
-/// 4+ rendered columns down to the renderer's `[label]` marker, in place
-/// on the forward map.
+/// Collapse every literal `[^label]` in `raw_line` down to the renderer's `[label]` marker, in
+/// place on the forward map.
 ///
-/// The literal reference maps `[`, `^`, label chars, `]` 1:1 (pulldown
-/// emits them as `Text`).  The renderer emits `[` + label + `]` — the same
-/// characters *minus the `^`*.  So for a lone reference the only structural
-/// difference is that dropped `^`: removing its forward-map entry leaves
-/// each surviving entry (`[`→`[`, label→label, `]`→`]`) pointing at the
-/// correct raw char, and shrinks the rendered count to match
-/// `renderer::reference_marker`.
+/// The literal form maps 1:1 and the renderer emits the same characters *minus the `^`*, so simply
+/// dropping the `^`'s entry leaves every survivor pointing at the correct raw char and shrinks the
+/// rendered count to match `renderer::reference_marker`.
 ///
-/// Adjacent references fuse — `[^1][^2]` renders as `[1,2]`, one marker —
-/// so each abutting reference additionally loses its `[`.  The entry that
-/// survives at that position is the *previous* reference's `]`, which is
-/// what the rendered comma then points at: clicking the separator lands on
-/// the end of the first reference, and the second reference's now-unmapped
-/// `[` forward-fills onto its own label.
-///
-/// `rendered_to_raw` stores raw *char* indices, so the positions are
-/// computed as char indices too (labels and `[^` are ASCII, but earlier
-/// content on the line may be multi-byte).
+/// Adjacent references fuse (`[^1][^2]` → `[1,2]`, one marker), so each abutting reference also
+/// loses its `[`.  The entry surviving at that position is the previous reference's `]`, which is
+/// what the rendered comma points at.
 fn collapse_footnote_refs(raw_line: &str, rendered_to_raw: &mut Vec<usize>) {
     let dropped = footnote_collapse_char_indices(raw_line);
     if dropped.is_empty() {
@@ -246,36 +215,20 @@ fn collapse_footnote_refs(raw_line: &str, rendered_to_raw: &mut Vec<usize>) {
     rendered_to_raw.retain(|&raw_char| !dropped.contains(&raw_char));
 }
 
-/// Char indices the renderer's marker drops, for every `[^label]`
-/// reference on `raw_line` (non-empty label, no embedded `]`/newline):
-/// the `^` of each reference, plus the `[` of each reference that abuts
-/// the preceding one and so fuses into its marker.
+/// Char indices the renderer's marker drops, for every `[^label]` on `raw_line`: each `^`, plus
+/// the `[` of each reference abutting the previous one.  Definition leaders (`[^label]:`) collapse
+/// the same way, mirroring `footnote_edit::scan`'s recognition rule.
 ///
-/// Definition leaders (`[^label]:`) collapse the same way for
-/// column-mapping purposes — only their body text is selectable and it
-/// sits past the marker — so they're included.  Mirrors
-/// `footnote_edit::scan`'s recognition rule.
-///
-/// **The scan is deliberately definition-blind, so it recognises more than
-/// the parser does.** pulldown-cmark only emits a reference when a matching
-/// definition exists — an undefined `[^x]` stays literal text, and the
-/// renderer prints it verbatim — but `build` is handed one raw line and
-/// nothing else, so this scan has no definition set to consult and collapses
-/// `[^x]` regardless.  On a line mixing the two the map therefore runs short
-/// (two columns per undefined reference that abuts a real one, one otherwise),
-/// `rendered_len` disagrees with the renderer, and `raw_to_rendered_checked`
-/// returns `None` so the caller falls back to the 1:1 approximation — degraded
-/// precision on a broken line, never a panic.  Teaching it the rule would mean
-/// threading the document's definition labels into `build`, which is a
-/// per-line, per-frame path whose only input today is the line's own bytes;
-/// that is what makes it cacheable, and it is not worth spending to sharpen
-/// a line that already degrades safely.  `undefined_reference_falls_back_to_1_1`
-/// pins the fallback — don't "fix" the length check without replacing it.
+/// **The scan is deliberately definition-blind**, so it collapses an undefined `[^x]` that
+/// pulldown leaves as literal text.  On a line mixing the two the map runs short, `rendered_len`
+/// disagrees with the renderer, and `raw_to_rendered_checked` declines so the caller falls back to
+/// 1:1 — degraded precision, never a panic.  Fixing it would mean threading the document's
+/// definition set into `build`, whose only input today is the line's own bytes (which is what makes
+/// it cacheable).  `undefined_reference_falls_back_to_1_1` pins the fallback.
 fn footnote_collapse_char_indices(raw_line: &str) -> Vec<usize> {
     let bytes = raw_line.as_bytes();
     let mut dropped = Vec::new();
-    // Byte index just past the previous reference's `]`, so an abutting
-    // `[` is recognised by equality.
+    // Byte just past the previous reference's `]`, so an abutting `[` is found by equality.
     let mut prev_end: Option<usize> = None;
     let mut char_idx = 0usize; // char index of byte `i`
     let mut i = 0usize;
@@ -286,7 +239,6 @@ fn footnote_collapse_char_indices(raw_line: &str) -> Vec<usize> {
                 j += 1;
             }
             if j < bytes.len() && bytes[j] == b']' && j > i + 2 {
-                // `^` is the char right after `[` (char_idx + 1).
                 dropped.push(char_idx + 1);
                 if prev_end == Some(i) {
                     dropped.push(char_idx);
@@ -321,20 +273,17 @@ mod tests {
     #[test]
     fn bold_text_skips_markers() {
         let map = InlineColMap::build("**Bold text**");
-        // Rendered: "Bold text" = 9 chars
         assert_eq!(map.rendered_len(), 9);
         assert_eq!(map.raw_len(), 13);
-        // Rendered chars map to raw chars 2..10 (inside the **)
         assert_eq!(map.rendered_to_raw(0), 2); // B
         assert_eq!(map.rendered_to_raw(8), 10); // t
         assert_eq!(map.rendered_to_raw(9), 13); // sentinel
-                                                // Inverse: raw marker bytes forward-fill to first content char
-        assert_eq!(map.raw_to_rendered(0), 0); // first *
-        assert_eq!(map.raw_to_rendered(1), 0); // second *
+        assert_eq!(map.raw_to_rendered(0), 0); // marker `*` forward-fills to the first content char
+        assert_eq!(map.raw_to_rendered(1), 0);
         assert_eq!(map.raw_to_rendered(2), 0); // B
         assert_eq!(map.raw_to_rendered(10), 8); // t
         assert_eq!(map.raw_to_rendered(11), 9); // closing *
-        assert_eq!(map.raw_to_rendered(12), 9); // closing *
+        assert_eq!(map.raw_to_rendered(12), 9);
         assert_eq!(map.raw_to_rendered(13), 9); // past end
     }
 
@@ -342,29 +291,29 @@ mod tests {
     fn italic_text_skips_markers() {
         let map = InlineColMap::build("*Italic*");
         assert_eq!(map.rendered_len(), 6);
-        assert_eq!(map.rendered_to_raw(0), 1); // I
-        assert_eq!(map.rendered_to_raw(5), 6); // c
+        assert_eq!(map.rendered_to_raw(0), 1);
+        assert_eq!(map.rendered_to_raw(5), 6);
     }
 
     #[test]
     fn underscore_emphasis_skips_markers() {
         let map = InlineColMap::build("_under_");
         assert_eq!(map.rendered_len(), 5);
-        assert_eq!(map.rendered_to_raw(0), 1); // u
+        assert_eq!(map.rendered_to_raw(0), 1);
     }
 
     #[test]
     fn strikethrough_skips_markers() {
         let map = InlineColMap::build("~~strike~~");
         assert_eq!(map.rendered_len(), 6);
-        assert_eq!(map.rendered_to_raw(0), 2); // s
-        assert_eq!(map.rendered_to_raw(5), 7); // e
+        assert_eq!(map.rendered_to_raw(0), 2);
+        assert_eq!(map.rendered_to_raw(5), 7);
     }
 
     #[test]
     fn highlight_skips_markers() {
         let map = InlineColMap::build("alpha ==beta== gamma");
-        // Rendered: "alpha beta gamma" = 16 chars
+        // Rendered: "alpha beta gamma"
         assert_eq!(map.rendered_len(), 16);
         assert_eq!(&map.rendered_to_raw_vec()[..6], &[0, 1, 2, 3, 4, 5]);
         assert_eq!(&map.rendered_to_raw_vec()[6..10], &[8, 9, 10, 11]);
@@ -378,32 +327,30 @@ mod tests {
     #[test]
     fn nested_bold_italic() {
         let map = InlineColMap::build("**_Bold and italic_**");
-        // Rendered: "Bold and italic" = 15 chars
         assert_eq!(map.rendered_len(), 15);
-        assert_eq!(map.rendered_to_raw(0), 3); // B
+        assert_eq!(map.rendered_to_raw(0), 3);
     }
 
     #[test]
     fn code_span_skips_backticks() {
         let map = InlineColMap::build("`code`");
-        // Rendered: "code" = 4 chars — the backticks are markers.
         assert_eq!(map.rendered_len(), 4);
-        assert_eq!(map.rendered_to_raw(0), 1); // c
-        assert_eq!(map.rendered_to_raw(3), 4); // e
+        assert_eq!(map.rendered_to_raw(0), 1);
+        assert_eq!(map.rendered_to_raw(3), 4);
 
-        // Backtick marker bytes forward-fill like other markers.
-        assert_eq!(map.raw_to_rendered(0), 0); // opening `
-        assert_eq!(map.raw_to_rendered(5), 4); // closing `
+        // Backticks forward-fill like other markers.
+        assert_eq!(map.raw_to_rendered(0), 0);
+        assert_eq!(map.raw_to_rendered(5), 4);
     }
 
     #[test]
     fn double_backtick_code_span_skips_both_delimiters() {
         let map = InlineColMap::build("``a`b``");
-        // Rendered: "a`b" = 3 chars.
+        // Rendered: "a`b".
         assert_eq!(map.rendered_len(), 3);
-        assert_eq!(map.rendered_to_raw(0), 2); // a
+        assert_eq!(map.rendered_to_raw(0), 2);
         assert_eq!(map.rendered_to_raw(1), 3); // inner `
-        assert_eq!(map.rendered_to_raw(2), 4); // b
+        assert_eq!(map.rendered_to_raw(2), 4);
     }
 
     #[test]
@@ -411,7 +358,7 @@ mod tests {
         // pulldown strips one space from each end: `` ` x ` `` → "x".
         let map = InlineColMap::build("` x `");
         assert_eq!(map.rendered_len(), 1);
-        assert_eq!(map.rendered_to_raw(0), 2); // x sits at raw char 2
+        assert_eq!(map.rendered_to_raw(0), 2);
     }
 
     #[test]
@@ -430,7 +377,6 @@ mod tests {
     #[test]
     fn link_collapses_url() {
         let map = InlineColMap::build("[File link](./plan.md)");
-        // Rendered: "File link" = 9 chars
         assert_eq!(map.rendered_len(), 9);
         assert_eq!(
             &map.rendered_to_raw_vec()[..9],
@@ -467,66 +413,41 @@ mod tests {
 
     #[test]
     fn heading_well_formedness_mismatch() {
-        // "## Heading" — pulldown-cmark sees "Heading" (7 chars) but
-        // the renderer emits a styled prefix so the rendered line is
-        // longer.  The map's rendered_len won't match.
+        // The walker sees only "Heading" (7 chars); the renderer's styled prefix makes the real
+        // line longer, so the checked lookup declines.
         let map = InlineColMap::build("## Heading");
-        // Walker only sees the text content "Heading" (7 chars).
         assert_eq!(map.rendered_len(), 7);
-        // A heading renders as e.g. "  Heading" (9 chars) so checked
-        // lookup should return None.
         assert_eq!(map.raw_to_rendered_checked(5, 9), None);
-        // But unchecked still works.
         assert!(map.raw_to_rendered(5) <= map.rendered_len());
     }
 
     #[test]
     fn blockquote_well_formedness_mismatch() {
         let map = InlineColMap::build("> blockquoted text");
-        // Walker sees "blockquoted text" (16 chars) but rendered has
-        // a "▎ " prefix (2 chars extra).
+        // The rendered line carries an extra "▎ " prefix.
         assert_eq!(map.raw_to_rendered_checked(3, 18), None);
     }
 
     #[test]
     fn marker_byte_maps_to_next_visible() {
         let map = InlineColMap::build("[link](url)");
-        // raw col 0 is `[` — should map to rendered col of `l` (0)
-        assert_eq!(map.raw_to_rendered(0), 0);
-        // raw col 5 is `]` — should map to rendered col after `k` (4)
+        assert_eq!(map.raw_to_rendered(0), 0); // `[` → the `l` after it
         assert_eq!(map.raw_to_rendered(5), 4);
     }
 
     #[test]
     fn list_prefix_backward_fills() {
         let map = InlineColMap::build("- **bold** item");
-        // pulldown-cmark treats "- " as a list marker — never emits
-        // Text for it.  The walker sees "bold item" (9 chars) after
-        // collapsing the ** markers.
-        // The "- " prefix chars (raw 0, 1) should backward-fill to
-        // rendered index 0.
+        // pulldown never emits Text for the "- " list marker, so those raw cols backward-fill.
         assert_eq!(map.raw_to_rendered(0), 0);
         assert_eq!(map.raw_to_rendered(1), 0);
-        // "b" of "bold" is at raw col 4 (after "- **"), rendered col 0
         assert_eq!(map.raw_to_rendered(4), 0);
     }
 
-    /// Multi-char-to-single-glyph smart-punctuation substitutions
-    /// (`...` → `…`, `---` → `—`, `--` → `–`) are emitted by
-    /// pulldown-cmark as inlined `Text` events, but the walker advances
-    /// over the raw byte slice rather than the substituted glyph.  As a
-    /// result `rendered_len` reflects the raw char count for these
-    /// spans, not the renderer's actual output.
-    ///
-    /// `raw_to_rendered_checked` against the renderer's actual count
-    /// therefore returns `None` for these lines — callers
-    /// (`paint_selection_overlay`, the cursor indicator) fall back to a
-    /// 1:1 mapping.  That fallback is slightly off past the substitution
-    /// but is the documented contract.
-    ///
-    /// If a future walker change teaches it to consume the substituted
-    /// glyph (so `rendered_len` matches the renderer), this assertion
-    /// will flip and we should update the test + drop the 1:1 fallback.
+    /// The walker advances over the raw bytes of a multi-char smart-punctuation substitution
+    /// (`...` → `…`), not the substituted glyph, so the counts diverge and callers fall back to
+    /// 1:1.  Teaching the walker to consume the glyph would flip this assertion — update the test
+    /// and drop the fallback then.
     #[test]
     fn multi_char_smart_punct_triggers_checked_fallback() {
         for (raw, actual_rendered) in [
@@ -540,19 +461,15 @@ mod tests {
                 None,
                 "smart-punct in {raw:?}: expected fallback (None) but walker matched",
             );
-            // Unchecked still produces a value — must not panic.
+            // Unchecked must still produce a value rather than panic.
             let _ = map.raw_to_rendered(0);
         }
     }
 
-    /// Curly-quote substitutions are 1-raw-char-to-1-rendered-char, so
-    /// counts agree and `checked()` accepts the line.  Each rendered
-    /// position still points at the correct raw char (just a `"` instead
-    /// of the curly glyph), so round-trip holds.
+    /// Curly quotes substitute one char for one, so counts agree and `checked()` accepts the line.
     #[test]
     fn curly_quote_substitution_round_trips() {
         let map = InlineColMap::build("\"hi\"");
-        // 4 raw chars in, 4 rendered chars out.
         assert_eq!(map.rendered_len(), 4);
         assert_eq!(map.raw_len(), 4);
         for rendered_col in 0..map.rendered_len() {
@@ -562,13 +479,10 @@ mod tests {
         assert_eq!(map.raw_to_rendered_checked(0, 4), Some(0));
     }
 
-    /// Multi-byte raw chars (e.g. `é`, `ü`) are >1 byte in UTF-8 but
-    /// only 1 char.  The forward and inverse maps must index by char,
-    /// not byte — otherwise round-trip drifts after the first non-ASCII.
+    /// Both maps must index by char, not byte, or round-trip drifts after the first non-ASCII.
     #[test]
     fn unicode_text_round_trip() {
         let map = InlineColMap::build("café résumé");
-        // Plain text → rendered_len == raw_len
         assert_eq!(map.rendered_len(), map.raw_len());
         for rendered_col in 0..map.rendered_len() {
             let raw_col = map.rendered_to_raw(rendered_col);
@@ -580,10 +494,8 @@ mod tests {
         }
     }
 
-    /// Empty line: only the past-end sentinel exists.  Guards against
-    /// any `saturating_sub(1)` underflow or zero-length indexing in
-    /// the inverse-map fill, and against `checked()` panicking for a
-    /// zero-length actual rendered count.
+    /// Only the past-end sentinel exists: guards the inverse-map fill against underflow and
+    /// zero-length indexing.
     #[test]
     fn empty_line() {
         let map = InlineColMap::build("");
@@ -594,41 +506,30 @@ mod tests {
         assert_eq!(map.raw_to_rendered_checked(0, 2), None);
     }
 
-    /// Querying `raw_to_rendered` past `raw_len` must clamp to the
-    /// sentinel rather than panic.  Real callers (`paint_selection_overlay`)
-    /// can pass `end_raw_col == raw_len`, and a future regression that
-    /// fed `raw_len + 1` would otherwise OOB-panic in release builds
-    /// without the `min` guard.
+    /// A query past `raw_len` must clamp to the sentinel rather than index out of bounds; real
+    /// callers already pass `end_raw_col == raw_len`.
     #[test]
     fn raw_to_rendered_clamps_past_end() {
         let map = InlineColMap::build("hi");
         assert_eq!(map.raw_to_rendered(2), 2);
         assert_eq!(map.raw_to_rendered(999), 2);
-        // Checked variant clamps under the count guard too.
         assert_eq!(map.raw_to_rendered_checked(999, 2), Some(2));
     }
 
-    /// `raw_to_rendered_checked` accepts plain paragraphs (counts agree)
-    /// and rejects heading-style prefixes (counts diverge).  This pins
-    /// the contract the callers rely on.
+    /// Pins the caller contract: any count mismatch, not just a large one, must decline.
     #[test]
     fn checked_accepts_plain_rejects_prefix_mismatch() {
         let map = InlineColMap::build("plain text");
         assert_eq!(map.raw_to_rendered_checked(0, 10), Some(0));
         assert_eq!(map.raw_to_rendered_checked(5, 10), Some(5));
-        // Heading-rendered with a 2-char prefix → mismatch.
         assert_eq!(map.raw_to_rendered_checked(0, 12), None);
-        // Off-by-one too — any mismatch fails.
         assert_eq!(map.raw_to_rendered_checked(0, 11), None);
         assert_eq!(map.raw_to_rendered_checked(0, 9), None);
     }
 
     #[test]
     fn footnote_reference_line_matches_renderer_and_projects_exactly() {
-        // The walker collapses `[^1]` to the renderer's `[1]` marker, so
-        // `rendered_len` matches the renderer's actual output and
-        // `raw_to_rendered_checked` accepts the line — exact projection, no
-        // 1:1 fallback.
+        // The collapse makes `rendered_len` match the renderer, so projection stays exact.
         let map = InlineColMap::build("see[^1] here");
         let actual_rendered = "see[1] here".chars().count(); // 11
         assert_eq!(map.rendered_len(), actual_rendered);
@@ -636,9 +537,6 @@ mod tests {
 
         // Raw "see[^1] here": s0 e1 e2 [3 ^4 15 ]6 ' '7 h8 …
         // Rendered "see[1] here": s0 e1 e2 [3 14 ]5 ' '6 h7 …
-        // The `[` (raw 3) projects to `[` (rendered 3); the digit `1`
-        // (raw 5) to `1` (rendered 4); the text after the marker stays
-        // aligned (raw 8 `h` → rendered 7).
         assert_eq!(map.raw_to_rendered(3), 3);
         assert_eq!(map.raw_to_rendered(5), 4);
         assert_eq!(map.raw_to_rendered(8), 7);
@@ -648,8 +546,7 @@ mod tests {
 
     #[test]
     fn footnote_reference_round_trips() {
-        let map = InlineColMap::build("a[^12]b");
-        // Rendered "a[12]b" = 6 chars.
+        let map = InlineColMap::build("a[^12]b"); // renders as "a[12]b"
         assert_eq!(map.rendered_len(), 6);
         for rendered_col in 0..map.rendered_len() {
             let raw_col = map.rendered_to_raw(rendered_col);
@@ -663,16 +560,13 @@ mod tests {
 
     #[test]
     fn named_footnote_reference_collapses_the_caret_only() {
-        // A named label passes through unchanged inside `[…]`, so only the
-        // `^` collapses: `[^note]` (7 raw) → `[note]` (6 rendered).
+        // Only the `^` collapses: `[^note]` → `[note]`.
         let map = InlineColMap::build("x[^note]y");
         assert_eq!(map.rendered_len(), "x[note]y".chars().count());
     }
 
-    /// Adjacent references fuse into one marker (`[^1][^2]` → `[1,2]`), so
-    /// the collapse drops the second reference's `[` on top of both carets.
-    /// Without that the map would run one column long for every abutting
-    /// pair and every selection past it would project short.
+    /// Adjacent references fuse into one marker, so the collapse must also drop the second `[`;
+    /// otherwise every selection past an abutting pair projects one column short.
     #[test]
     fn adjacent_footnote_references_collapse_into_one_marker() {
         let map = InlineColMap::build("Two.[^1][^2] more");
@@ -688,9 +582,7 @@ mod tests {
         assert_eq!(map.raw_to_rendered(10), 7); // second label
         assert_eq!(map.raw_to_rendered(11), 8); // second `]` → closing `]`
         assert_eq!(map.raw_to_rendered(13), 10); // text after the marker
-
-        // The fused-away `[` (raw 8) forward-fills onto the second label.
-        assert_eq!(map.raw_to_rendered(8), 7);
+        assert_eq!(map.raw_to_rendered(8), 7); // the fused-away `[` fills onto the second label
 
         for rendered_col in 0..map.rendered_len() {
             let raw_col = map.rendered_to_raw(rendered_col);
@@ -702,31 +594,24 @@ mod tests {
         }
     }
 
-    /// A space between references keeps them separate inlines, so they
-    /// render as two markers and neither `[` collapses.
+    /// A space keeps the references separate, so neither `[` collapses.
     #[test]
     fn spaced_footnote_references_stay_separate() {
         let map = InlineColMap::build("Two.[^1] [^2]");
         assert_eq!(map.rendered_len(), "Two.[1] [2]".chars().count());
     }
 
-    /// A run of three fuses into a single `[1,2,3]` marker — two `[`
-    /// drops, not one.
+    /// A run of three fuses into one `[1,2,3]` marker — two `[` drops, not one.
     #[test]
     fn three_adjacent_footnote_references_fuse() {
         let map = InlineColMap::build("x[^1][^2][^3]y");
         assert_eq!(map.rendered_len(), "x[1,2,3]y".chars().count());
     }
 
-    /// An undefined reference is not a footnote — pulldown-cmark leaves
-    /// `[^2]` as literal text and the renderer prints it verbatim — but this
-    /// scan sees one raw line and cannot know that, so it collapses the
-    /// reference anyway and the map runs short.  That is a *safe* wrong
-    /// answer only because the length check catches it: `rendered_len`
-    /// disagrees with the real rendered width, so `raw_to_rendered_checked`
-    /// declines and the caller falls back to 1:1.  Pinned here so a later
-    /// change to the length check can't silently promote the mismatch into
-    /// an exact-looking projection that lands two columns short.
+    /// The definition-blind scan collapses an undefined reference the renderer prints verbatim, so
+    /// the map runs short.  That is safe only because the length check catches it and the caller
+    /// falls back to 1:1 — pinned so a later change can't promote the mismatch into an
+    /// exact-looking projection.
     #[test]
     fn undefined_reference_falls_back_to_1_1() {
         // `[^1]` defined, `[^2]` not: the renderer emits `Two.[1][^2] more`.
@@ -748,7 +633,6 @@ mod tests {
     fn mixed_formatting() {
         let raw = "**bold** *italic* `code` [link](url)";
         let map = InlineColMap::build(raw);
-        // Just verify round-trip for all rendered positions
         for rendered_col in 0..map.rendered_len() {
             let raw_col = map.rendered_to_raw(rendered_col);
             let back = map.raw_to_rendered(raw_col);

@@ -1,41 +1,16 @@
-//! Options form and phase machine for the export flow (`Action::ExportHtml`,
-//! shown in the palette as `Export…`).  Its Format list covers HTML and
-//! every configured `[[export.custom]]` converter.
+//! Options form and phase machine for the export flow.  One modal walks every phase without
+//! leaving the stack — Options, ConfirmOverwrite, Exporting, Success, Error — so the async export,
+//! the overwrite confirmation, and the "open the result" buttons all live in one dismissable place.
 //!
-//! A single modal that walks through several phases without ever leaving
-//! the stack, so the async export, the overwrite confirmation, and the
-//! "open the result" buttons all live in one dismissable place:
+//! **The format is a field, and the rest of the form is the same for every one of them — that is
+//! the point.**  A custom export renders to HTML first and pipes *that* through the converter, so
+//! the stylesheet and both toggles shape a PDF exactly as they shape an HTML file.  The only
+//! per-format string is the success phase's primary button, read off the selected [`ExportFormat`]
+//! rather than branched on, so the widget never learns which backend will run.
 //!
-//! * **Options** — a `Title` text field, two toggles (`Inline images`,
-//!   `Inline diagrams`), a `Stylesheet` pill and the `Format` list, above
-//!   a lone `[ Export ]` button (Esc dismisses; there is no Cancel
-//!   button).  Each setting is separated by a spacer; each toggle carries
-//!   a muted note describing its current (On/Off) state.  Enter exports
-//!   only from the focused button — on any other field it advances focus.
-//!   The body **scrolls** (see [`form_rows`]): the Format list is as long
-//!   as the user's converter list, so it goes last and `[ Export ]` is
-//!   pinned below the scroll window rather than being pushed off a short
-//!   terminal.
-//! * **ConfirmOverwrite** — shown only when the target already exists.
-//! * **Exporting** — a static "Exporting…" notice while the worker runs.
-//! * **Success** — the written path plus `[ Open … ]` / `[ Open folder ]`.
-//! * **Error** — the failure message plus `[ Back ]` to the form.
-//!
-//! **The format is a field, and the rest of the form is the same for
-//! every one of them — that is the point.**  The Format list chooses
-//! HTML or a configured converter; a custom export renders the
-//! document to HTML first and pipes *that* through the converter, so the
-//! stylesheet, the inline-images toggle and the diagrams toggle shape a
-//! PDF exactly as they shape an HTML file.  The only per-format string is
-//! the success phase's primary button, taken from the selected
-//! [`ExportFormat`] rather than branched on here, so the state never
-//! learns which backend will run.
-//!
-//! The widget is UI-only.  All side effects (persisting the chosen options
-//! to config, spawning the export worker, opening the result) happen in the
-//! App-layer adapter `crate::app::modal::export`, which reads the
-//! values off this state when [`ExportResponse`] fires and drives the
-//! phase transitions via the `enter_*` / `set_*` helpers.
+//! The widget is UI-only: persisting options, spawning the worker, and opening the result all
+//! happen in the App-layer adapter `crate::app::modal::export`, which drives the phase transitions
+//! through the `enter_*` / `set_*` helpers.
 
 use std::path::{Path, PathBuf};
 
@@ -68,28 +43,21 @@ const TITLE_CHAR_CAP: usize = 120;
 /// Indent applied to a toggle's explanatory note, under its label.
 const NOTE_INDENT: &str = "  ";
 
-// Current-state explanations for the two toggles.  Each pair reads as
-// "what this setting does right now"; the active one is shown beneath the
-// toggle and swaps as the value flips.
+// Current-state explanations for the two toggles; the active one shows beneath its toggle.
 const IMAGES_NOTE_ON: &str = "Inline images as data:URIs";
 const IMAGES_NOTE_OFF: &str = "Leave images as links";
-const DIAGRAMS_NOTE_ON: &str = "Inline diagrams as SVG";
-const DIAGRAMS_NOTE_OFF: &str = "Leave diagrams as code";
+const FIGURES_NOTE_ON: &str = "Render diagrams and math as images";
+const FIGURES_NOTE_OFF: &str = "Leave diagrams and math as source";
 
 const OPTION_BUTTONS: &[&str] = &["Export"];
 
-/// Rows the options form pins below its scroll window: a spacer and the
-/// `[ Export ]` button row.
+/// Rows pinned below the scroll window: a spacer and the `[ Export ]` button row.
 const FOOTER_ROWS: u16 = 2;
 const OVERWRITE_BUTTONS: &[&str] = &["Overwrite", "Cancel"];
 const ERROR_BUTTONS: &[&str] = &["Back"];
-/// Success-phase second button.  The first is per-format
-/// ([`ExportFormat::open_result`]); this one never varies — every export
-/// writes a file into a folder.
+/// Success-phase second button; the first is per-format ([`ExportFormat::open_result`]).
 const OPEN_FOLDER_BUTTON: &str = "Open folder";
-/// Frame title for every phase of the export flow.  The specific format is
-/// a field *inside* the form now (the Format list), so the title no longer
-/// names it.
+/// Frame title for every phase.  The format is a field inside the form, so the title omits it.
 const FRAME_TITLE: &str = "Export";
 /// Indent for each row of the Format list, under its "Format" label.
 const LIST_INDENT: &str = "  ";
@@ -97,22 +65,15 @@ const LIST_INDENT: &str = "  ";
 const MARKER_SELECTED: &str = "● ";
 const MARKER_UNSELECTED: &str = "○ ";
 
-/// One selectable export format, shown as a row in the modal's Format list.
-///
-/// Everything else about the flow — the rest of the options form, the
-/// phases, the overwrite confirmation, the button geometry — is identical
-/// whichever format is chosen, because a custom export *is* an HTML export
-/// piped through a converter.  So the format contributes only its list
-/// label and the one word the success button needs; the App adapter holds
-/// the matching `ExportJob` (what actually runs) in a parallel list, keyed
-/// by the same index, so the widget never learns which backend will run.
+/// One selectable export format, shown as a row in the Format list.  It contributes only its label
+/// and the success button's wording; the App adapter holds the matching `ExportJob` in a parallel
+/// list keyed by the same index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportFormat {
     /// List-row label — the format's name (`HTML`, `PDF (weasyprint)`).
     pub label: String,
-    /// Success-phase primary button.  HTML has a browser to open into;
-    /// a custom target is handed to whatever the OS associates with its
-    /// extension, so it says `Open file`.
+    /// Success-phase primary button.  HTML opens a browser; a custom target goes to whatever the
+    /// OS associates with its extension.
     pub open_result: String,
 }
 
@@ -144,37 +105,32 @@ pub enum ExportPhase {
     Error,
 }
 
-/// Focus targets within the Options form, in Tab order.  `Format` is the
-/// whole Format list treated as a single focus stop; Up/Down move the
-/// selection within it (see [`ExportState::move_focus_down`]).
+/// Focus targets within the Options form, in Tab order.  `Format` is the whole list treated as one
+/// stop; Up/Down move the selection within it (see [`ExportState::move_focus_down`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OptFocus {
     Title,
     Images,
-    Diagrams,
+    Figures,
     Stylesheet,
     Format,
     Export,
 }
 
 impl OptFocus {
-    /// Tab order, matching the painted order top to bottom — the Format
-    /// list sits last because it is the only variable-length part of the
-    /// form (see [`form_rows`]).
+    /// Tab order, matching the painted order top to bottom.
     const ORDER: [OptFocus; 6] = [
         OptFocus::Title,
         OptFocus::Images,
-        OptFocus::Diagrams,
+        OptFocus::Figures,
         OptFocus::Stylesheet,
         OptFocus::Format,
         OptFocus::Export,
     ];
 
     fn step(self, delta: i32) -> Self {
-        // Every form field is focusable, so the predicate is always true;
-        // the shared wrapping stepper keeps welcome and export on one focus
-        // ring.  Wrapping always yields a slot here, but fall back to `self`
-        // defensively if the ring were ever empty.
+        // Every field is focusable, so the predicate is always true; the shared stepper keeps
+        // welcome and export on one focus ring.
         let cur = Self::ORDER.iter().position(|f| *f == self).unwrap_or(0);
         next_focusable_wrapping(&Self::ORDER, cur, delta, |_| true)
             .map(|i| Self::ORDER[i])
@@ -190,10 +146,8 @@ impl OptFocus {
     }
 }
 
-/// One row of the scrolling options body, in painting order.  The form is
-/// laid out as this skeleton first and painted second, so the scroll window
-/// can drop a row without the click-rect pass having to guess which rows
-/// made it onto the screen.
+/// One row of the scrolling options body.  The form is laid out as this skeleton first and painted
+/// second, so the click-rect pass never has to guess which rows reached the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormRow {
     /// Blank separator row; paints nothing and takes no click.
@@ -202,9 +156,9 @@ enum FormRow {
     Images,
     /// The muted note under the images toggle.
     ImagesNote,
-    Diagrams,
-    /// The muted note under the diagrams toggle.
-    DiagramsNote,
+    Figures,
+    /// The muted note under the figures toggle.
+    FiguresNote,
     Stylesheet,
     /// The `Format` header above the radio rows.
     FormatLabel,
@@ -214,16 +168,10 @@ enum FormRow {
 
 /// The options body, top to bottom.
 ///
-/// **The Format list is last, and that placement is what makes the scroll
-/// usable.**  It is the only variable-length part of the form — one row per
-/// configured converter — so ending with it keeps every fixed control above
-/// the fold: a user with a dozen converters still opens the modal looking
-/// at Title, both toggles and the stylesheet, and scrolls only to reach
-/// further down the list.  Leading with it would push those controls off a
-/// short terminal instead.
-///
-/// `[ Export ]` is deliberately absent: it is pinned below the scroll
-/// window, so the form is always completable however long the list grows.
+/// **The Format list is last, and that placement is what makes the scroll usable**: it is the only
+/// variable-length part of the form, so ending with it keeps every fixed control above the fold.
+/// `[ Export ]` is absent because it is pinned below the scroll window, keeping the form
+/// completable however long the list grows.
 fn form_rows(format_count: usize) -> Vec<FormRow> {
     let mut rows = vec![
         FormRow::Title,
@@ -231,8 +179,8 @@ fn form_rows(format_count: usize) -> Vec<FormRow> {
         FormRow::Images,
         FormRow::ImagesNote,
         FormRow::Spacer,
-        FormRow::Diagrams,
-        FormRow::DiagramsNote,
+        FormRow::Figures,
+        FormRow::FiguresNote,
         FormRow::Spacer,
         FormRow::Stylesheet,
         FormRow::Spacer,
@@ -242,19 +190,15 @@ fn form_rows(format_count: usize) -> Vec<FormRow> {
     rows
 }
 
-/// Body rows to bring into view for the current focus, in ascending order
-/// of importance — the caller reveals them in order, so the last one wins
-/// when the window cannot hold them all.
-///
-/// A toggle is listed *after* its note so that at the fold the control
-/// itself is what stays on screen.  `Export` yields nothing: it lives in
-/// the pinned footer and is always visible.
+/// Body rows to reveal for the current focus, in ascending order of importance — the caller
+/// reveals them in order, so the last wins when the window can't hold them all.  A toggle is listed
+/// *after* its note so the control is what survives at the fold.
 fn focus_reveal_rows(rows: &[FormRow], focus: OptFocus, format_idx: usize) -> Vec<u16> {
     let row_of = |want: FormRow| rows.iter().position(|r| *r == want).map(|i| i as u16);
     let wanted: [Option<FormRow>; 2] = match focus {
         OptFocus::Title => [None, Some(FormRow::Title)],
         OptFocus::Images => [Some(FormRow::ImagesNote), Some(FormRow::Images)],
-        OptFocus::Diagrams => [Some(FormRow::DiagramsNote), Some(FormRow::Diagrams)],
+        OptFocus::Figures => [Some(FormRow::FiguresNote), Some(FormRow::Figures)],
         OptFocus::Stylesheet => [None, Some(FormRow::Stylesheet)],
         OptFocus::Format => [None, Some(FormRow::Format(format_idx))],
         OptFocus::Export => [None, None],
@@ -268,9 +212,8 @@ pub struct ExportChoices {
     /// `<title>` text; `None` when the field was left blank.
     pub title: Option<String>,
     pub inline_images: bool,
-    pub render_diagrams: bool,
-    /// `"builtin"` or a stylesheet path, ready for
-    /// `Stylesheet::from_config_value`.
+    pub render_figures: bool,
+    /// `"builtin"` or a stylesheet path, ready for `Stylesheet::from_config_value`.
     pub stylesheet: String,
 }
 
@@ -294,26 +237,22 @@ pub enum ExportResponse {
 /// Mutable state for an open export modal.
 pub struct ExportState {
     pub phase: ExportPhase,
-    /// Selectable formats, shown as the Format list; index 0 is always
-    /// HTML.  Built by the App adapter, which holds the matching
-    /// `ExportJob`s in the same order.
+    /// Index 0 is always HTML.  Built by the App adapter, which holds the matching `ExportJob`s
+    /// in the same order.
     pub formats: Vec<ExportFormat>,
-    /// Index into `formats` of the chosen format.  Doubles as the Format
-    /// list's highlighted row while that field is focused.
+    /// Chosen format; doubles as the list's highlighted row while the field is focused.
     pub format_idx: usize,
     /// Title field buffer (append-only, like the insert-table fields).
     pub title: String,
     pub inline_images: bool,
-    pub render_diagrams: bool,
-    /// `(display label, config value)` pairs; index 0 is always the
-    /// compiled-in default stylesheet (labelled `Default`, value `builtin`).
+    pub render_figures: bool,
+    /// `(display label, config value)` pairs; index 0 is the compiled-in default stylesheet.
     pub stylesheets: Vec<(String, String)>,
     pub stylesheet_idx: usize,
-    /// Title captured at submit time so it survives an overwrite-confirm
-    /// detour (the title is per-document and never persisted to config).
+    /// Title captured at submit time so it survives an overwrite-confirm detour; it is
+    /// per-document and never persisted to config.
     pub submitted_title: Option<String>,
-    /// Resolved export target; set once the form is submitted.  Reused by
-    /// the overwrite-confirm phase and the export worker.
+    /// Resolved export target, set at submit and reused by the confirm phase and the worker.
     pub target: Option<PathBuf>,
     /// Written file path, shown in the Success phase.
     pub result_path: Option<PathBuf>,
@@ -325,21 +264,16 @@ pub struct ExportState {
     btn_focus: usize,
     /// Absolute rect of the rendered `esc` close hint, for click hit-testing.
     pub esc_button_rect: Option<Rect>,
-    /// Vertical scroll of the options body.  The form scrolls because the
-    /// Format list is as long as the user's converter list; focus drives
-    /// it (`ensure_visible` each render), and the wheel / PgUp / PgDn move
-    /// it directly.
+    /// Vertical scroll of the options body.  Focus drives it (`ensure_visible` each render); the
+    /// wheel and PgUp / PgDn move it directly.
     pub scroll_state: ScrollContainerState,
     // ── Click hit-rects, captured each render ──
-    /// Options-form control rects (None until the form has rendered once,
-    /// and None again for any row the scroll window left off screen).
-    /// `(index into `formats`, rect)` per *painted* format row — the index
-    /// is carried rather than implied by position, because a scrolled list
-    /// paints a window that does not start at format 0.
+    /// `(index into `formats`, rect)` per *painted* format row.  The index is carried rather than
+    /// implied by position, because a scrolled list paints a window not starting at format 0.
     format_rects: Vec<(usize, Rect)>,
     title_rect: Option<Rect>,
     images_rect: Option<Rect>,
-    diagrams_rect: Option<Rect>,
+    figures_rect: Option<Rect>,
     stylesheet_rect: Option<Rect>,
     export_button_rect: Option<Rect>,
     /// Button-row rects for the current message phase (overwrite / success /
@@ -348,19 +282,16 @@ pub struct ExportState {
 }
 
 impl ExportState {
-    /// Build the form, seeded from config plus a discovered stylesheet list.
-    /// `formats` is non-empty (HTML is always present).
+    /// Build the form, seeded from config plus a discovered stylesheet list.  `formats` is
+    /// non-empty (HTML is always present).
     ///
-    /// Focus starts on `Title`, the first row.  It used to start on the
-    /// Format list, which now sits at the *bottom* of the form — starting
-    /// there would open the modal already scrolled past every other
-    /// control.  HTML is preselected, so the common case needs no visit to
-    /// the list at all.
+    /// Focus starts on `Title`: starting on the Format list, which sits at the bottom, would open
+    /// the modal already scrolled past every other control.
     pub fn new(
         formats: Vec<ExportFormat>,
         title: String,
         inline_images: bool,
-        render_diagrams: bool,
+        render_figures: bool,
         stylesheets: Vec<(String, String)>,
         stylesheet_idx: usize,
     ) -> Self {
@@ -370,7 +301,7 @@ impl ExportState {
             format_idx: 0,
             title,
             inline_images,
-            render_diagrams,
+            render_figures,
             stylesheets,
             stylesheet_idx,
             submitted_title: None,
@@ -384,31 +315,28 @@ impl ExportState {
             format_rects: Vec::new(),
             title_rect: None,
             images_rect: None,
-            diagrams_rect: None,
+            figures_rect: None,
             stylesheet_rect: None,
             export_button_rect: None,
             msg_button_rects: Vec::new(),
         }
     }
 
-    /// Drop every cached click hit-rect.  Called at the top of each render
-    /// so that only rows the *current* frame actually painted are
-    /// clickable: a control scrolled out of the window, or dropped because
-    /// the terminal is too short, must not keep answering clicks at a
-    /// position where something else is now drawn.
+    /// Drop every cached click hit-rect, at the top of each render, so only rows this frame
+    /// painted are clickable — a scrolled-away control must not keep answering clicks where
+    /// something else is now drawn.
     fn clear_hit_rects(&mut self) {
         self.esc_button_rect = None;
         self.format_rects.clear();
         self.title_rect = None;
         self.images_rect = None;
-        self.diagrams_rect = None;
+        self.figures_rect = None;
         self.stylesheet_rect = None;
         self.export_button_rect = None;
         self.msg_button_rects.clear();
     }
 
-    /// Scroll the options body by `delta` rows (mouse wheel).  A no-op in
-    /// the message phases, which do not scroll.
+    /// Scroll the options body by `delta` rows.  No-op in the non-scrolling message phases.
     pub fn handle_wheel(&mut self, delta: i32) {
         if self.phase == ExportPhase::Options {
             self.scroll_state.scroll_by(delta);
@@ -453,8 +381,7 @@ impl ExportState {
     // ── Input ──────────────────────────────────────────────────────────────
 
     pub fn handle_key(&mut self, key: &KeyEvent) -> ExportResponse {
-        // Ignore modifier chords so the user can press Ctrl-S etc. without
-        // polluting the title field — Esc (no modifier) still gets through.
+        // Ignore modifier chords so Ctrl-S etc. don't pollute the title field.
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -484,8 +411,7 @@ impl ExportState {
             ExportPhase::Error => match key.code {
                 KeyCode::Esc => ExportResponse::Cancelled,
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    // The single `[ Back ]` button returns to the form; no
-                    // App interaction needed, so handle it in place.
+                    // `[ Back ]` needs no App interaction, so handle it in place.
                     self.phase = ExportPhase::Options;
                     ExportResponse::Continue
                 }
@@ -494,13 +420,9 @@ impl ExportState {
         }
     }
 
-    /// Hit-test a click at terminal `(col, row)` against the rects cached by
-    /// the last render and route it through the same [`ExportResponse`]
-    /// surface as the keyboard.  An `esc` close-hint click cancels in every
-    /// phase.  In the Options form a control click focuses the field and
-    /// applies an `Activate` (flip a toggle / advance the pill); the title
-    /// click only focuses; the `[ Export ]` button submits.  The message
-    /// phases mirror their button keys.
+    /// Hit-test a click against the last render's rects, routing it through the same
+    /// [`ExportResponse`] surface as the keyboard.  A control click focuses the field and applies
+    /// an `Activate`; a title click only focuses.  An `esc` hit cancels in every phase.
     pub fn handle_click(&mut self, col: u16, row: u16) -> ExportResponse {
         if rect_contains(self.esc_button_rect, col, row) {
             return ExportResponse::Cancelled;
@@ -523,8 +445,6 @@ impl ExportState {
                 }
             }),
             ExportPhase::Error => {
-                // The single `[ Back ]` button returns to the form in place,
-                // exactly like its Enter arm.
                 if rect_contains(self.msg_button_rects.first().copied(), col, row) {
                     self.phase = ExportPhase::Options;
                 }
@@ -533,10 +453,9 @@ impl ExportState {
         }
     }
 
-    /// Click routing for the Options form: focus the clicked field, and for
-    /// a control apply an `Activate`; the `[ Export ]` button submits.
+    /// Click routing for the Options form: focus the clicked field, applying an `Activate` to a
+    /// control; the `[ Export ]` button submits.
     fn handle_options_click(&mut self, col: u16, row: u16) -> ExportResponse {
-        // A click on a Format row focuses the list and selects that format.
         // The rect carries its own index, so a scrolled list maps correctly.
         let clicked_format = self
             .format_rects
@@ -557,8 +476,8 @@ impl ExportState {
             self.apply_input(ControlInput::Activate);
             return ExportResponse::Continue;
         }
-        if rect_contains(self.diagrams_rect, col, row) {
-            self.focus = OptFocus::Diagrams;
+        if rect_contains(self.figures_rect, col, row) {
+            self.focus = OptFocus::Figures;
             self.apply_input(ControlInput::Activate);
             return ExportResponse::Continue;
         }
@@ -574,8 +493,7 @@ impl ExportState {
         ExportResponse::Continue
     }
 
-    /// Click routing for a message phase's button row: focus and activate the
-    /// clicked button via `activate`, mapping its index to a response.
+    /// Click routing for a message phase's button row.
     fn handle_message_click(
         &mut self,
         col: u16,
@@ -591,8 +509,7 @@ impl ExportState {
         ExportResponse::Continue
     }
 
-    /// Shared key handling for the two-or-one-button message phases.
-    /// `count` is the button count; `activate` maps the focused index to a
+    /// Shared key handling for the message phases; `activate` maps the focused button index to a
     /// response when Enter / Space fires.
     fn handle_button_key(
         &mut self,
@@ -617,16 +534,14 @@ impl ExportState {
     }
 
     fn handle_options_key(&mut self, key: &KeyEvent) -> ExportResponse {
-        // PgUp / PgDn / Home / End scroll the body.  Up / Down are
-        // deliberately *not* consumed here — they move focus, and the
-        // window follows focus at render time.
+        // PgUp / PgDn / Home / End scroll the body.  Up / Down are deliberately not consumed:
+        // they move focus, and the window follows focus at render time.
         if self.scroll_state.handle_paging_key(key) {
             return ExportResponse::Continue;
         }
         match key.code {
             KeyCode::Esc => ExportResponse::Cancelled,
-            // Tab / BackTab always move *between* fields, whatever is
-            // focused — the Format list is one field to Tab.
+            // Tab always moves *between* fields — the Format list is one field to Tab.
             KeyCode::Tab => {
                 self.focus = self.focus.next();
                 ExportResponse::Continue
@@ -635,9 +550,7 @@ impl ExportState {
                 self.focus = self.focus.prev();
                 ExportResponse::Continue
             }
-            // Up / Down move the selection *within* the Format list when it
-            // is focused, spilling to the neighbouring field at the ends;
-            // plain field navigation everywhere else.
+            // Up / Down move within the focused Format list, spilling at its ends.
             KeyCode::Down => {
                 self.move_focus_down();
                 ExportResponse::Continue
@@ -650,10 +563,8 @@ impl ExportState {
                 self.title.pop();
                 ExportResponse::Continue
             }
-            // Enter only exports from the focused `[ Export ]` button; on any
-            // other field it advances focus (so a run of Enters walks down to
-            // the button) rather than firing the export early or activating a
-            // control — the export Enter exception (see docs/controls-refactor).
+            // Enter exports only from the focused button; elsewhere it advances focus, so a run
+            // of Enters walks down to the button rather than exporting early.
             KeyCode::Enter => {
                 if self.focus == OptFocus::Export {
                     self.submit()
@@ -662,16 +573,14 @@ impl ExportState {
                     ExportResponse::Continue
                 }
             }
-            // Space submits from the button and types into the title; on an
-            // option control it falls through to `control_input_for` (Activate).
+            // Space submits from the button and types into the title; on a control it falls
+            // through to `control_input_for`.
             KeyCode::Char(' ') if self.focus == OptFocus::Export => self.submit(),
             KeyCode::Char(c) if self.focus == OptFocus::Title => {
                 self.push_title_char(c);
                 ExportResponse::Continue
             }
-            // Left / Right (any field) and Space (option controls) route
-            // through the shared control-input mapping → `Control::apply` /
-            // `cycle_index`.  Other keys map to `None` and no-op.
+            // Everything else routes through the shared control-input mapping, or no-ops.
             _ => {
                 if let Some(input) = control_input_for(key.code) {
                     self.apply_input(input);
@@ -681,10 +590,8 @@ impl ExportState {
         }
     }
 
-    /// Down-arrow behaviour in the Options form: within the Format list when
-    /// it is focused (advancing the selection), otherwise to the next field.
-    /// At the bottom of the list it spills to the next field, so the list
-    /// never feels like a trap.
+    /// Down-arrow in the Options form: advances the selection inside a focused Format list, and
+    /// spills to the next field at its bottom so the list is never a trap.
     fn move_focus_down(&mut self) {
         if self.focus == OptFocus::Format && self.format_idx + 1 < self.formats.len() {
             self.format_idx += 1;
@@ -702,13 +609,9 @@ impl ExportState {
         }
     }
 
-    /// Apply a control input to the focused option field via the shared
-    /// transition layer.  Toggles go through [`Control::apply`] (direction-
-    /// bound arrows + Activate-flip); the stylesheet pill cycles its index
-    /// with [`cycle_index`] because its labels are dynamic (not `'static`),
-    /// so it can't be a [`Control::Pill`].  The Format list cycles on
-    /// Left/Right (its up/down is the spilling navigation above), ignoring
-    /// Activate.  Title / Export ignore this.
+    /// Apply a control input to the focused option field.  Toggles go through [`Control::apply`];
+    /// the stylesheet pill uses [`cycle_index`] because its labels are dynamic, not `'static`, so
+    /// it can't be a [`Control::Pill`].  The Format list cycles on Left/Right only.
     fn apply_input(&mut self, input: ControlInput) {
         match self.focus {
             OptFocus::Format => {
@@ -724,11 +627,11 @@ impl ExportState {
                     self.inline_images = v;
                 }
             }
-            OptFocus::Diagrams => {
+            OptFocus::Figures => {
                 if let ControlEvent::Changed(ControlValue::Toggle(v)) =
-                    Control::Toggle.apply(ControlValue::Toggle(self.render_diagrams), input)
+                    Control::Toggle.apply(ControlValue::Toggle(self.render_figures), input)
                 {
-                    self.render_diagrams = v;
+                    self.render_figures = v;
                 }
             }
             OptFocus::Stylesheet => {
@@ -742,8 +645,8 @@ impl ExportState {
         }
     }
 
-    /// Append a typed character to the title field, mirroring the paste path:
-    /// control chars are dropped and the length is capped at [`TITLE_CHAR_CAP`].
+    /// Append a typed character to the title, mirroring the paste path: control chars dropped,
+    /// length capped at [`TITLE_CHAR_CAP`].
     fn push_title_char(&mut self, c: char) {
         if !c.is_control() && self.title.chars().count() < TITLE_CHAR_CAP {
             self.title.push(c);
@@ -773,14 +676,13 @@ impl ExportState {
         ExportChoices {
             title,
             inline_images: self.inline_images,
-            render_diagrams: self.render_diagrams,
+            render_figures: self.render_figures,
             stylesheet,
         }
     }
 
-    /// Insert a bracketed paste into the title field.  No-op outside the
-    /// Options phase or when the title field isn't focused.  Mirrors the
-    /// typing path: control chars stripped, capped at [`TITLE_CHAR_CAP`].
+    /// Insert a bracketed paste into the title field, on the same terms as the typing path.
+    /// No-op unless the title field is focused.
     pub fn paste(&mut self, text: &str) {
         if self.phase != ExportPhase::Options || self.focus != OptFocus::Title {
             return;
@@ -841,7 +743,6 @@ impl<'a> StatefulWidget for ExportView<'a> {
                     owned_line("Exported to".to_owned(), self.theme),
                     owned_line(path, self.theme),
                 ];
-                // The primary button is per-format; the folder one never is.
                 let buttons = [state.open_result_label(), OPEN_FOLDER_BUTTON.to_owned()];
                 let button_refs: Vec<&str> = buttons.iter().map(String::as_str).collect();
                 self.render_message(
@@ -876,31 +777,28 @@ impl<'a> StatefulWidget for ExportView<'a> {
 
 impl<'a> ExportView<'a> {
     fn render_options(&self, area: Rect, buf: &mut Buffer, state: &mut ExportState) {
-        let labels: [&str; 4] = ["Title", "Inline images", "Inline diagrams", "Stylesheet"];
+        let labels: [&str; 4] = ["Title", "Inline images", "Inline figures", "Stylesheet"];
         let label_w = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-        // Own the pill labels so the later `pill_spans` borrow doesn't pin
-        // `state` across the `state.esc_button_rect` assignment below.
+        // Own the pill labels so the later `pill_spans` borrow doesn't pin `state` across the
+        // `state.esc_button_rect` assignment below.
         let style_labels: Vec<String> = state.stylesheets.iter().map(|(l, _)| l.clone()).collect();
         let style_label_refs: Vec<&str> = style_labels.iter().map(String::as_str).collect();
         let control_w = TITLE_FIELD_WIDTH
             .max(toggle_width())
             .max(pill_width(&style_label_refs));
         let row_w = label_w + 2 + control_w;
-        // A toggle's note may be wider than the control rows; size to
-        // whichever is widest so an explanation never clips.
+        // A note may be wider than the control rows; size to whichever is widest.
         let note_w = [
             IMAGES_NOTE_ON,
             IMAGES_NOTE_OFF,
-            DIAGRAMS_NOTE_ON,
-            DIAGRAMS_NOTE_OFF,
+            FIGURES_NOTE_ON,
+            FIGURES_NOTE_OFF,
         ]
         .iter()
         .map(|n| NOTE_INDENT.len() + n.chars().count())
         .max()
         .unwrap_or(0);
-        // The Format list: a "Format" label row, then one row per format,
-        // indented with a radio marker.  Its width can exceed the control
-        // rows when a converter has a long name.
+        // The Format list can exceed the control rows when a converter has a long name.
         let format_w = state
             .formats
             .iter()
@@ -909,10 +807,8 @@ impl<'a> ExportView<'a> {
             .unwrap_or(0);
         let content_width = row_w.max(note_w).max(format_w) as u16;
 
-        // Every hit-rect is re-derived below, from the rows that actually
-        // paint.  Clearing first is what keeps a row scrolled out of the
-        // window — or dropped by a short terminal — from leaving a
-        // clickable ghost at a position nothing is drawn at.
+        // Clearing first is what keeps a row scrolled out of the window from leaving a clickable
+        // ghost where nothing is drawn.
         state.clear_hit_rects();
 
         let rows = form_rows(state.formats.len());
@@ -925,11 +821,9 @@ impl<'a> ExportView<'a> {
         };
         let modal_area = centered_rect_for_content(content, area);
 
-        // Resolve the scroll window *before* `draw_frame`, so the frame's
-        // chrome sees the post-clamp scroll — the settings-overlay shape.
-        // `ensure_visible` is what makes keyboard focus drive the scroll:
-        // there is no separate scroll cursor, Tab and the arrows move
-        // focus and the window follows.
+        // Resolve the scroll window *before* `draw_frame` so the chrome sees the post-clamp
+        // scroll.  `ensure_visible` is what makes focus drive the scroll: there is no separate
+        // scroll cursor.
         let inner_h = modal_area.height.saturating_sub(VERTICAL_CHROME_ROWS);
         let list_height = inner_h.saturating_sub(FOOTER_ROWS);
         state.scroll_state.observe(rows.len() as u16, list_height);
@@ -960,10 +854,8 @@ impl<'a> ExportView<'a> {
             width: inner.width,
             height: list_height.min(inner.height),
         };
-        // Each row's hit-rect spans the full `label + control` run from the
-        // body's left edge, so a click on the label operates the control too
-        // (matching the settings overlay).  `label_w + 2` is the styled label
-        // column (see `render_row`); `control_w` the uniform control width.
+        // A row's hit-rect spans the whole `label + control` run, so a click on the label
+        // operates the control too (matching the settings overlay).
         let hit_w = ((label_w + 2 + control_w) as u16).min(inner.width);
         let scroll = state.scroll_state.scroll as usize;
 
@@ -1004,14 +896,14 @@ impl<'a> ExportView<'a> {
                 FormRow::ImagesNote => {
                     self.render_note(buf, row_area, images_note(state.inline_images));
                 }
-                FormRow::Diagrams => {
-                    let focused = state.focus == OptFocus::Diagrams;
-                    let control = toggle_spans(state.render_diagrams, focused, false, self.theme);
-                    self.render_row(buf, row_area, "Inline diagrams", label_w, focused, control);
-                    state.diagrams_rect = Some(control_rect(row_area.x, row_area.y, hit_w));
+                FormRow::Figures => {
+                    let focused = state.focus == OptFocus::Figures;
+                    let control = toggle_spans(state.render_figures, focused, false, self.theme);
+                    self.render_row(buf, row_area, "Inline figures", label_w, focused, control);
+                    state.figures_rect = Some(control_rect(row_area.x, row_area.y, hit_w));
                 }
-                FormRow::DiagramsNote => {
-                    self.render_note(buf, row_area, diagrams_note(state.render_diagrams));
+                FormRow::FiguresNote => {
+                    self.render_note(buf, row_area, figures_note(state.render_figures));
                 }
                 FormRow::Stylesheet => {
                     let focused = state.focus == OptFocus::Stylesheet;
@@ -1036,9 +928,8 @@ impl<'a> ExportView<'a> {
                         .render(row_area, buf);
                 }
                 FormRow::Format(idx) => {
-                    // Clone the label out before touching `format_rects`:
-                    // the paint borrows `state.formats` immutably and the
-                    // rect push needs it mutably.
+                    // Clone the label out first: the paint borrows `state.formats` immutably and
+                    // the rect push needs it mutably.
                     let Some(label) = state.formats.get(idx).map(|f| f.label.clone()) else {
                         continue;
                     };
@@ -1065,10 +956,8 @@ impl<'a> ExportView<'a> {
             );
         }
 
-        // Pinned footer: a spacer, then the button row.  `[ Export ]` sits
-        // *outside* the scroll window on purpose — it is the one control
-        // the form cannot be completed without, and the list above it is
-        // as long as the user's converter list.
+        // `[ Export ]` sits outside the scroll window on purpose: it is the one control the form
+        // cannot be completed without.
         let button_y = viewport.y + viewport.height + 1;
         if button_y < inner.y + inner.height {
             let button_area = Rect {
@@ -1102,8 +991,7 @@ impl<'a> ExportView<'a> {
             MARKER_UNSELECTED
         };
         let spans = if focused {
-            // Focused row: a filled block spanning marker + label, padded
-            // so the fill reads as one affordance.
+            // Pad the fill so marker + label read as one affordance.
             let text = format!("{LIST_INDENT}{marker}{label}");
             let pad = (area.width as usize).saturating_sub(text.chars().count());
             vec![Span::styled(
@@ -1111,7 +999,7 @@ impl<'a> ExportView<'a> {
                 controls::focused_style(self.theme),
             )]
         } else if selected {
-            // Selected but unfocused: emphasise the marker glyph only.
+            // Selected but unfocused: emphasize the marker glyph only.
             vec![
                 Span::styled(LIST_INDENT, self.theme.modal_item),
                 Span::styled(marker, self.theme.modal_item_selected_unfocused),
@@ -1138,18 +1026,15 @@ impl<'a> ExportView<'a> {
         focused: bool,
         control: Vec<Span<'static>>,
     ) {
-        // `label_w + 2` reserves the 2-cell gap between label and control as
-        // part of the (styled) label column, so a focused row's fill spans
-        // label → widget — the unified control-row composition.
+        // `label_w + 2` folds the gap into the styled label column, so a focused row's fill spans
+        // label → widget.
         let spans = control_row_spans(label, label_w + 2, control, focused, false, self.theme);
         Paragraph::new(Line::from(spans))
             .style(self.theme.modal_bg)
             .render(area, buf);
     }
 
-    /// Render a muted, indented explanatory note for the row above, into
-    /// `area`.  Styled like the settings overlay's descriptions
-    /// (`modal_description`).
+    /// Render a muted, indented note for the row above, styled like the settings descriptions.
     fn render_note(&self, buf: &mut Buffer, area: Rect, text: &str) {
         Paragraph::new(Line::from(Span::styled(
             format!("{NOTE_INDENT}{text}"),
@@ -1159,8 +1044,7 @@ impl<'a> ExportView<'a> {
         .render(area, buf);
     }
 
-    /// Render a centered message body plus an optional button row.  Shared
-    /// by every non-form phase.
+    /// Render a centered message body plus an optional button row, for every non-form phase.
     #[allow(clippy::too_many_arguments)]
     fn render_message(
         &self,
@@ -1172,9 +1056,8 @@ impl<'a> ExportView<'a> {
         lines: Vec<Line<'static>>,
         buttons: &[&str],
     ) {
-        // A message phase owns none of the form's rects; clearing here
-        // keeps a click after a phase change from landing on a control the
-        // form painted before the flow moved on.
+        // A message phase owns none of the form's rects, so a click after a phase change must not
+        // land on a control the form painted earlier.
         state.clear_hit_rects();
         let has_buttons = !buttons.is_empty();
         let natural_line_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
@@ -1183,30 +1066,21 @@ impl<'a> ExportView<'a> {
         } else {
             0
         };
-        // Cap the body width so a long message wraps instead of being
-        // truncated at the modal edge — a converter's error text (a
-        // weasyprint CSS complaint, a pandoc stderr dump) is unbounded and
-        // used to run straight off the frame.  Bounded by the button row
-        // below (so a short message never squeezes the buttons) and by the
-        // prose cap above, exactly like a prose `ModalView`.
+        // Cap the body width so an unbounded converter error wraps rather than running off the
+        // frame.  Bounded below by the button row and above by the prose cap.
         let content_w = natural_line_w
             .min(PROSE_CONTENT_WIDTH.max(buttons_w))
             .max(buttons_w);
-        // Reserve the body's *wrapped* height, measured at the inner width
-        // the frame will actually hand back.  Mirror `draw_frame`'s
-        // padding rule (`compute_pad_h` at the prospective modal width) so
-        // the rows reserved here match the rows painted below; a flat
-        // `lines.len()` left a wrapped error clipped off the bottom.
+        // Reserve the body's *wrapped* height at the inner width the frame will hand back,
+        // mirroring `draw_frame`'s padding rule — a flat `lines.len()` clipped a wrapped error.
         let prospective_modal_w = content_w.saturating_add(2 * MAX_PAD_H).min(area.width);
         let prospective_pad_h = compute_pad_h(prospective_modal_w, content_w, MAX_PAD_H);
         let body_render_w = prospective_modal_w
             .saturating_sub(2 * prospective_pad_h)
             .max(1);
         let body_rows = wrapped_rows(&lines, body_render_w);
-        // Rows the footer needs once it has wrapped, asked at the width
-        // the frame will actually give it: `[ Open in browser ]  [ Open
-        // folder ]` is 38 columns, so a terminal under about 40 puts the
-        // pair on two rows and the modal has to be a row taller for it.
+        // The footer's wrapped height: the success pair is 38 columns, so a terminal under about
+        // 40 splits it across two rows and the modal must be a row taller.
         let footer_rows = if has_buttons {
             footer_row_count(buttons, content_w, area.width, MAX_PAD_H)
         } else {
@@ -1244,11 +1118,8 @@ impl<'a> ExportView<'a> {
             if y >= bottom {
                 return;
             }
-            // Each message line is a logical paragraph that may wrap over
-            // several rows (a long error, a deep path), so advance `y` by
-            // how many rows it actually occupies at the inner width — and
-            // render it with the same `Wrap { trim: false }` the height
-            // was measured against.
+            // Each line is a paragraph that may wrap, so advance `y` by the rows it actually
+            // occupies, rendered with the same `Wrap { trim: false }` the height was measured at.
             let rows = wrapped_rows(std::slice::from_ref(&line), inner.width);
             let height = rows.min(bottom.saturating_sub(y));
             let row = Rect {
@@ -1297,16 +1168,16 @@ fn images_note(on: bool) -> &'static str {
     }
 }
 
-/// Current-state note for the "Inline diagrams" toggle.
-fn diagrams_note(on: bool) -> &'static str {
+/// Current-state note for the "Inline figures" toggle.
+fn figures_note(on: bool) -> &'static str {
     if on {
-        DIAGRAMS_NOTE_ON
+        FIGURES_NOTE_ON
     } else {
-        DIAGRAMS_NOTE_OFF
+        FIGURES_NOTE_OFF
     }
 }
 
-/// One-cell-high control hit-rect at `(x, y)` spanning `width` cells.
+/// One-cell-high control hit-rect at `(x, y)`.
 fn control_rect(x: u16, y: u16, width: u16) -> Rect {
     Rect {
         x,
@@ -1346,7 +1217,6 @@ mod tests {
     }
 
     fn state() -> ExportState {
-        // Two formats so the Format list is exercised: HTML and one custom.
         ExportState::new(
             vec![
                 ExportFormat::html(),
@@ -1369,7 +1239,7 @@ mod tests {
         assert_eq!(s.focus, OptFocus::Title, "focus starts on the first row");
         for expected in [
             OptFocus::Images,
-            OptFocus::Diagrams,
+            OptFocus::Figures,
             OptFocus::Stylesheet,
             OptFocus::Format,
             OptFocus::Export,
@@ -1381,7 +1251,7 @@ mod tests {
     }
 
     /// Up/Down move the selection within the Format list when it is
-    /// focused, spilling to the neighbouring field at the ends.
+    /// focused, spilling to the neighboring field at the ends.
     #[test]
     fn arrows_move_within_the_format_list_then_spill() {
         let mut s = state(); // 2 formats, idx 0
@@ -1462,8 +1332,7 @@ mod tests {
         s.focus = OptFocus::Stylesheet;
         s.handle_key(&key(KeyCode::Right)); // paper.css
 
-        // Enter off the button advances focus instead of exporting —
-        // Stylesheet → Format → Export.
+        // Enter off the button advances focus instead of exporting.
         assert_eq!(s.handle_key(&key(KeyCode::Enter)), ExportResponse::Continue);
         assert_eq!(s.focus, OptFocus::Format);
         assert_eq!(s.handle_key(&key(KeyCode::Enter)), ExportResponse::Continue);
@@ -1475,7 +1344,7 @@ mod tests {
             ExportResponse::Submit(ExportChoices {
                 title: Some("My Doc".to_owned()),
                 inline_images: true,
-                render_diagrams: true,
+                render_figures: true,
                 stylesheet: "/cfg/export/paper.css".to_owned(),
             })
         );
@@ -1582,7 +1451,7 @@ mod tests {
     fn renders_options_form() {
         let backend = TestBackend::new(70, 22);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut s = state(); // inline_images off, render_diagrams on
+        let mut s = state(); // inline_images off, render_figures on
         terminal
             .draw(|frame| {
                 let view = ExportView {
@@ -1604,14 +1473,13 @@ mod tests {
         assert!(content.contains("HTML"), "HTML format row: {content}");
         assert!(content.contains("Inline images"), "images row: {content}");
         assert!(content.contains("Stylesheet"), "stylesheet row: {content}");
-        // Each toggle carries a note reflecting its current state: images is
-        // off, diagrams on.
+        // Each toggle's note reflects its current state: images off, diagrams on.
         assert!(
             content.contains(IMAGES_NOTE_OFF),
             "images-off note: {content}"
         );
         assert!(
-            content.contains(DIAGRAMS_NOTE_ON),
+            content.contains(FIGURES_NOTE_ON),
             "diagrams-on note: {content}"
         );
     }
@@ -1620,12 +1488,11 @@ mod tests {
     fn toggle_note_swaps_with_state() {
         assert_eq!(images_note(true), IMAGES_NOTE_ON);
         assert_eq!(images_note(false), IMAGES_NOTE_OFF);
-        assert_eq!(diagrams_note(true), DIAGRAMS_NOTE_ON);
-        assert_eq!(diagrams_note(false), DIAGRAMS_NOTE_OFF);
+        assert_eq!(figures_note(true), FIGURES_NOTE_ON);
+        assert_eq!(figures_note(false), FIGURES_NOTE_OFF);
     }
 
-    /// Render the modal once into a headless backend so the click hit-rects
-    /// are populated on `s`.
+    /// Render once into a headless backend so `s`'s click hit-rects are populated.
     fn render_modal(s: &mut ExportState, w: u16, h: u16) {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1702,12 +1569,8 @@ mod tests {
         );
     }
 
-    /// A converter's error text is unbounded (a weasyprint CSS complaint,
-    /// a pandoc stderr dump), so the Error phase must *wrap* it rather than
-    /// run it off the modal edge.  The regression: a long message rendered
-    /// on one un-wrapped row, so everything past the frame was truncated —
-    /// exactly the part a user needs to diagnose the failure.  Assert both
-    /// the head and a sentinel at the very tail are on screen.
+    /// Regression: an unbounded converter error rendered on one un-wrapped row, truncating
+    /// exactly the tail a user needs to diagnose the failure.
     #[test]
     fn a_long_error_message_wraps_instead_of_truncating() {
         let (w, h) = (70u16, 24u16);
@@ -1775,11 +1638,8 @@ mod tests {
         assert!(content.contains("Open folder"), "{content}");
     }
 
-    /// The Format list shows every configured format, and the rest of the
-    /// form is shared across all of them — the intermediate HTML is what a
-    /// converter reads, so every option still applies.  If a format ever
-    /// grew its own fields it would mean per-target branching had crept
-    /// into the widget, which the shared form exists to prevent.
+    /// Every option applies to every format, since a converter reads the intermediate HTML.  A
+    /// format growing its own fields would mean per-target branching crept into the widget.
     #[test]
     fn the_format_list_shows_every_format_and_shares_the_form() {
         let mut s = ExportState::new(
@@ -1820,7 +1680,7 @@ mod tests {
             "custom row: {content}"
         );
         // Every shared option is present regardless of format.
-        for expected in ["Title", "Inline images", "Inline diagrams", "Stylesheet"] {
+        for expected in ["Title", "Inline images", "Inline figures", "Stylesheet"] {
             assert!(content.contains(expected), "{expected} missing: {content}");
         }
     }
@@ -1832,10 +1692,8 @@ mod tests {
         s
     }
 
-    /// The success phase names what it will actually open, per the chosen
-    /// format.  HTML goes to a browser; a `.pdf` goes to whatever the OS
-    /// associates with it, so with the custom format selected the button
-    /// must not promise a browser.
+    /// The success button names what will actually open, so a custom format must not promise a
+    /// browser.
     #[test]
     fn the_success_button_names_the_selected_format() {
         let mut s = state_with_selected(vec![ExportFormat::html(), ExportFormat::custom("PDF")], 1);
@@ -1863,8 +1721,7 @@ mod tests {
         assert!(content.contains("Open folder"), "{content}");
     }
 
-    /// Both success buttons keep working whichever format is selected: the
-    /// response surface is shared, so a click must not depend on the label.
+    /// The response surface is shared, so a success click must not depend on the button label.
     #[test]
     fn custom_success_buttons_still_resolve_to_open_and_folder() {
         let mut s = state_with_selected(vec![ExportFormat::html(), ExportFormat::custom("PDF")], 1);
@@ -1886,10 +1743,8 @@ mod tests {
 
     // ── Scrolling options body ────────────────────────────────────────────
 
-    /// The variable-length part of the form is last, so every fixed control
-    /// sits above it and a long converter list can only push *itself* out of
-    /// view.  `[ Export ]` is not a body row at all — it is pinned below the
-    /// scroll window.
+    /// The variable-length list is last, so a long converter list can only push *itself* out of
+    /// view; `[ Export ]` is not a body row at all.
     #[test]
     fn the_form_rows_end_with_the_format_list() {
         let rows = form_rows(3);
@@ -1911,15 +1766,14 @@ mod tests {
         for control in [
             FormRow::Title,
             FormRow::Images,
-            FormRow::Diagrams,
+            FormRow::Figures,
             FormRow::Stylesheet,
         ] {
             assert!(rows.iter().position(|r| *r == control).unwrap() < list_start);
         }
     }
 
-    /// A toggle is revealed *after* its note, so when only one of the two
-    /// fits it is the control that stays on screen.
+    /// A toggle is revealed *after* its note, so the control is what survives at the fold.
     #[test]
     fn focus_reveal_puts_the_control_last() {
         let rows = form_rows(2);
@@ -1951,10 +1805,8 @@ mod tests {
         )
     }
 
-    /// The regression this scroll exists for: with more converters than the
-    /// terminal has rows, `[ Export ]` must still be painted and clickable.
-    /// Before the pinned footer it was simply dropped off the bottom, while
-    /// its stale hit-rect stayed live.
+    /// Regression: with more converters than terminal rows, `[ Export ]` used to drop off the
+    /// bottom while its stale hit-rect stayed live.
     #[test]
     fn a_long_format_list_keeps_the_export_button_on_screen() {
         let mut s = state_with_formats(12);
@@ -1978,9 +1830,7 @@ mod tests {
         );
     }
 
-    /// A control the scroll window left off screen leaves **no** hit-rect
-    /// behind.  A stale rect is the one failure a clipped control can
-    /// produce that lies: the row is invisible but still answers clicks, at
+    /// A control scrolled off screen must leave **no** hit-rect: a stale one answers clicks at
     /// coordinates now showing something else.
     #[test]
     fn a_row_scrolled_out_of_view_leaves_no_click_rect() {
@@ -2001,9 +1851,8 @@ mod tests {
         assert!(s.stylesheet_rect.is_none());
     }
 
-    /// A click on a scrolled list resolves to the format actually under the
-    /// pointer.  The rects carry their own index precisely because the
-    /// painted window does not start at format 0.
+    /// A click on a scrolled list resolves to the format under the pointer — the reason the rects
+    /// carry their own index.
     #[test]
     fn a_click_on_a_scrolled_list_selects_the_row_under_the_pointer() {
         let mut s = state_with_formats(12);
@@ -2046,8 +1895,7 @@ mod tests {
         assert_eq!(s.scroll_state.scroll, 0);
     }
 
-    /// PgDn / PgUp page the body; Up / Down are left alone so they can keep
-    /// moving focus (and the window follows focus at render time).
+    /// PgDn / PgUp page the body; Up / Down are left alone so they keep moving focus.
     #[test]
     fn paging_keys_scroll_but_arrows_still_move_focus() {
         let mut s = state_with_formats(12);
@@ -2065,8 +1913,7 @@ mod tests {
         assert_eq!(s.scroll_state.scroll, 0);
     }
 
-    /// Moving focus back up from the list scrolls the fixed controls back
-    /// into view — the window follows focus in both directions.
+    /// The window follows focus in both directions.
     #[test]
     fn focus_moving_back_up_scrolls_the_controls_into_view() {
         let mut s = state_with_formats(12);

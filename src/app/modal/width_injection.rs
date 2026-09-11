@@ -1,17 +1,7 @@
-//! Column-width-injection warning.  Shown the first time a
-//! user commits a column-border drag on a table without an existing
-//! `<!-- tui-columns: ... -->` comment.  Buttons:
-//!   0 → `Continue` — write the comment for this table; ask again next time.
-//!   1 → `Continue and don't ask again` — flip
-//!       `config.table.warn_on_width_injection` to false and persist it.
-//! Escape (or the `esc` close hint) discards the live width preview
-//! without writing.
-//!
-//! The pending table-byte-start is stored in
-//! [`crate::editor::EditorState::pending_column_widths_commit`] (set by
-//! the column-border drag's release handler), not on the modal — both
-//! `commit_pending_column_widths` and `cancel_pending_column_widths`
-//! read it from there.
+//! Warning shown when a column-border drag would inject a `<!-- tui-columns: ... -->`
+//! comment into a table that has none.  Escape discards the live width preview.  The
+//! pending table lives in [`crate::editor::EditorState::pending_column_widths_commit`],
+//! not on the modal.
 
 use std::any::Any;
 
@@ -49,9 +39,7 @@ impl WidthInjectionWarning {
         }
     }
 
-    /// Map a resolved response to an outcome.  Shared by the key and
-    /// click paths so a mouse click on a button behaves exactly like
-    /// pressing it.
+    /// Map a chrome response to an outcome; shared by the key and click paths.
     fn resolve(&mut self, response: ModalResponse) -> ModalOutcome {
         match response {
             ModalResponse::Continue => ModalOutcome::Continue,

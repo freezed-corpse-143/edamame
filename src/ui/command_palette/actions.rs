@@ -1,27 +1,14 @@
-//! Static catalogue of `Action`s that the command palette exposes,
-//! plus their user-facing labels.  Pulled out of `command_palette.rs`
-//! so the parent file is widget plumbing without the long action list.
+//! Static catalogue of the `Action`s the command palette exposes, plus their labels.
 
 use crate::config::Action;
 
-/// Every Action variant we expose in the palette.  Ordering doesn't
-/// matter — `build_entries` re-sorts.  Cursor-movement and selection
-/// actions are excluded: they have no meaning when dispatched from a
-/// modal palette (the cursor's already moved by the time the user
-/// clicks `Move Right`).
+/// Every Action exposed in the palette; `build_entries` re-sorts, so order is irrelevant.
+/// Cursor-movement and selection actions are excluded: they are meaningless from a modal.
+/// `OpenConfigFolder` lives on the settings overlay instead.
 pub(super) const ALL_ACTIONS: &[Action] = &[
-    // Palette-only entries.  `OpenConfigFolder` is no
-    // longer surfaced here — it lives on the first row of the
-    // settings overlay (the "Open Config folder" entry), which is
-    // where users go to discover config-file locations.  Surfacing
-    // it twice was redundant and made the palette noisier.
     Action::ShowMarkdownCheatSheet,
-    // The manual, shipped inside the binary.  The index first, then one
-    // entry per page so fuzzy search finds a topic by name without
-    // having to go through the index.  Written out rather than derived
-    // from `docs::ALL_DOCS` because this is a `const` array; the two are
-    // held in step by
-    // `tests::the_palette_lists_every_embedded_page_exactly_once`.
+    // One entry per manual page, written out because this is a `const`; held in step with
+    // `docs::ALL_DOCS` by `tests::the_palette_lists_every_embedded_page_exactly_once`.
     Action::OpenDoc(crate::docs::DocId::Index),
     Action::OpenDoc(crate::docs::DocId::GettingStarted),
     Action::OpenDoc(crate::docs::DocId::Editing),
@@ -41,8 +28,7 @@ pub(super) const ALL_ACTIONS: &[Action] = &[
     Action::ExportHtml,
     Action::OpenInExternalEditor,
     Action::ToggleTableButtons,
-    // Persisted setting toggles — the settings-overlay booleans, also
-    // reachable via the palette's search-for-a-thing flow.
+    // The settings-overlay booleans.
     Action::ToggleBigH1,
     Action::ToggleLineNumbers,
     Action::ToggleBlinkCursor,
@@ -60,39 +46,30 @@ pub(super) const ALL_ACTIONS: &[Action] = &[
     Action::DeleteFootnote,
     Action::RenumberFootnotes,
     Action::FixListNumbering,
-    // File ops.  `Action::Open` is omitted while it remains a stub
-    // (`NOT_YET_IMPLEMENTED`) — listing it here would offer the user a
-    // command that can only flash "not implemented".
+    // `Action::Open` is omitted while it remains a `NOT_YET_IMPLEMENTED` stub.
     Action::Save,
     Action::SaveAs,
-    // History.
     Action::Undo,
     Action::Redo,
-    // Clipboard.
     Action::Copy,
     Action::Cut,
     Action::Paste,
-    // Formatting.
     Action::BoldSelection,
     Action::ItalicizeSelection,
     Action::InlineCodeSelection,
     Action::StrikethroughSelection,
     Action::HighlightSelection,
-    // Selection / mode.
     Action::SelectAll,
     Action::ExitToPreview,
     Action::ToggleRawMode,
     Action::EnterEditMode,
     Action::Quit,
-    // List + checkbox.
     Action::ToggleCheckbox,
-    // Navigation (link / nav stack).
     Action::FollowLinkUnderCursor,
     Action::NavigateBack,
     Action::NavigateForward,
     Action::GoToSection,
-    // Tables — surface only the structural ops.  Cell navigation
-    // (Tab/Shift+Tab) doesn't make sense from a palette.
+    // Tables: structural ops only; cell navigation makes no sense from a palette.
     Action::TableMoveRowUp,
     Action::TableMoveRowDown,
     Action::TableMoveColumnLeft,
@@ -105,8 +82,7 @@ pub(super) const ALL_ACTIONS: &[Action] = &[
     Action::TableDeleteColumn,
 ];
 
-/// User-facing label for an [`Action`].  Returning `None` excludes the
-/// action from the palette entirely.
+/// User-facing label for an [`Action`]; `None` excludes it from the palette.
 pub(super) fn label_for(action: &Action) -> Option<&'static str> {
     Some(match action {
         Action::ShowMarkdownCheatSheet => "Show Markdown cheat sheet",
@@ -182,12 +158,8 @@ mod tests {
 
     #[test]
     fn the_palette_lists_every_embedded_page_exactly_once() {
-        // `ALL_ACTIONS` is hand-written, so adding a page to
-        // `docs::ALL_DOCS` without adding its entry here would leave it
-        // reachable only by a link from another page — silently, with
-        // nothing failing to compile.  Pinned for the same reason
-        // `indexed_safe_themes_are_registered` pins the theme list
-        // against `BUILTIN_THEMES`.
+        // `ALL_ACTIONS` is hand-written: a page added to `docs::ALL_DOCS` but not here would be
+        // silently unreachable except via links from another page.
         let listed: Vec<DocId> = ALL_ACTIONS
             .iter()
             .filter_map(|a| match a {

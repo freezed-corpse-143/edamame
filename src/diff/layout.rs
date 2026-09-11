@@ -1,36 +1,20 @@
 //! Visual-line model and layout cache for the diff view.
 //!
-//! `DiffState` owns the diff *content* (hunks, ropes, decisions); the
-//! *layout* — how that content maps to a flat sequence of stacked
-//! old-above-new lines, and how many wrapped visual rows each line
-//! occupies at a given width — is derived data that both the renderer
-//! ([`crate::ui::diff_view`]) and the scroll arithmetic
-//! ([`crate::editor::EditorState::total_visual_rows_for_mode`],
-//! scroll-into-view) need.
+//! `DiffState` owns the diff *content*; the *layout* — the flat sequence of stacked
+//! old-above-new lines and each line's wrapped row count at a given width — is derived data
+//! shared by the renderer ([`crate::ui::diff_view`]) and the scroll arithmetic.
 //!
-//! Building the flat sequence and wrapping every line is `O(total
-//! lines)`.  It was previously recomputed on *every* event-loop
-//! iteration (the per-frame `compute_doc_dims` calls
-//! `total_visual_rows_for_mode`, and the renderer rebuilt the list
-//! again), which made scrolling and hunk navigation visibly laggy on
-//! large diffs.
+//! Building it is `O(total lines)` and every event-loop iteration asks for it, so it is cached on
+//! `DiffState` behind a `RefCell`: the flat list is built once and a small LRU of per-width
+//! prefix-sum caches ([`VisualRowCache`]) answers row queries in `O(1)` / `O(log N)`.
 //!
-//! The layout is invariant for a given (hunk list, new-side parse)
-//! pair — decisions and focus changes don't alter the line set or its
-//! wrapping — so we cache it on `DiffState` behind a `RefCell`.  The
-//! line *set* depends on the parse as well as on the hunks (which
-//! blocks are clean, and how many rendered rows each contributes), so
-//! installing or dropping a parse invalidates too — which
-//! [`DiffState::set_rendered_parse`] does for every caller.  (The focused decision
-//! divider *renders* a longer prompt than the others, but the divider
-//! is pinned to a single row in the row cache — see `with_layout` — so
-//! its row count, and thus all scroll math, stays focus-independent.)
-//! The flat line list is
-//! built once, and a small LRU of per-width prefix-sum caches
-//! ([`VisualRowCache`]) answers row-count / scroll-position queries in
-//! `O(1)` / `O(log N)`.  Anything that mutates the hunk list (e.g. a
-//! reconcile, or a future Edit mode) calls
-//! [`DiffState::invalidate_layout`] to force a rebuild.
+//! The layout is invariant for a given (hunk list, new-side parse) pair — decisions and focus
+//! don't alter it, since the decision divider is pinned to one row in the row cache regardless of
+//! the longer prompt the focused one paints.  Installing or dropping a parse changes the line set,
+//! so [`DiffState::set_rendered_parse`] invalidates; so does
+//! [`DiffState::invalidate_layout`] after any reshape of the hunk list.
+//!
+//! See `docs/dev/diff-review.md`.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -45,20 +29,16 @@ use crate::ui::line_render::visual_rows_for_line;
 use super::hunk::Decision;
 use super::state::DiffState;
 
-/// One *logical* line in the diff view.  Expanded into one or more
-/// visual rows at paint time according to word-wrap; the scroll offset
-/// indexes visual rows, not `DiffVisualLine` entries.
+/// One *logical* line in the diff view.  Wrapped into one or more visual rows at paint time; the
+/// scroll offset indexes visual rows, not these entries.
 #[derive(Debug, Clone)]
 pub struct DiffVisualLine {
     pub source: DiffLineSource,
-    /// Line index into the originating rope (`new_rope` for `Context`
-    /// / `NewAdd`, `old_rope` for `OldDelete`).  For
-    /// [`DiffLineSource::ContextRendered`] it is instead an index into
-    /// `DiffState::parsed_new`'s rendered `lines` — the row is already a
-    /// laid-out `ratatui::Line`, not source text.
+    /// Line index into the originating rope (`new_rope` for `Context` / `NewAdd`, `old_rope` for
+    /// `OldDelete`).  For [`DiffLineSource::ContextRendered`] it is instead an index into
+    /// `DiffState::parsed_new`'s already laid-out `lines`.
     pub rope_line: usize,
-    /// Index into `DiffState::hunks`, when this line belongs to a
-    /// hunk.  `None` for `Context` lines.
+    /// Index into `DiffState::hunks`; `None` for context lines.
     pub hunk_idx: Option<usize>,
 }
 
@@ -70,21 +50,12 @@ pub enum DiffLineSource {
     OldDelete,
     /// Add-side line, borrowed from `new_rope`.
     NewAdd,
-    /// Unchanged line shown as *rendered* Markdown, taken from
-    /// `DiffState::parsed_new`.  `DiffVisualLine::rope_line` is an index
-    /// into `parsed_new.lines`, **not** into a rope (see its doc).
-    ///
-    /// Deliberately fieldless, like every other variant: `DiffLineSource`
-    /// is `Copy`, compared with `==` in the renderer and the row cache,
-    /// and passed by value to [`line_marker`] — a payload variant would
-    /// churn all of that to carry an index the struct already has a slot
-    /// for.
+    /// Unchanged line shown as *rendered* Markdown; `rope_line` indexes `parsed_new.lines`, not a
+    /// rope.  Fieldless like every other variant so `DiffLineSource` stays `Copy` and cheaply
+    /// comparable — the index already has a slot on the struct.
     ContextRendered,
-    /// Synthetic divider carrying the accept/reject checkbox, emitted
-    /// between a hunk's delete and add lines (so it sits below a
-    /// delete-only hunk and above an add-only one — always at the
-    /// old/new boundary).  Has no backing rope line; its text is
-    /// derived from the hunk's live `Decision`.
+    /// Synthetic divider carrying the accept/reject checkbox, always emitted at the hunk's
+    /// old/new boundary.  No backing rope line; its text comes from the hunk's live `Decision`.
     Decision,
 }
 
@@ -93,24 +64,12 @@ pub enum DiffLineSource {
 pub struct DiffLayoutCache {
     /// Flat visual-line sequence; built once per layout version.
     lines: Option<Vec<DiffVisualLine>>,
-    /// LRU (cap [`ROW_CACHE_CAP`]) of per-width prefix-sum caches over
-    /// `lines`.  Two distinct widths are queried per frame (the
-    /// scrollbar-decide width and the post-scrollbar display width),
-    /// matching the raw-mode cache rationale, so a single slot would
-    /// thrash.
+    /// LRU (cap [`ROW_CACHE_CAP`]) of per-width prefix-sum caches.  Two widths are queried per
+    /// frame — scrollbar-decide and post-scrollbar display — so a single slot would thrash.
     row_caches: Vec<VisualRowCache>,
-    /// Memoised [`rendered_row_index`] over `lines` — width-independent,
-    /// so it sits beside `lines` rather than inside a row cache, and is
-    /// dropped with them.
-    ///
-    /// Built on first request, not alongside `lines`: its only consumers
-    /// are the two image paths, so a review of a document with no images
-    /// never pays for it.  Memoising matters because the diff-side
-    /// decode dispatch runs from `App::prepare_viewport` — once per
-    /// event-loop iteration for the whole length of the review — and a
-    /// fresh scan there is O(rendered rows) plus a `HashMap` allocation
-    /// at the frame cadence, against an editor-mode counterpart that is
-    /// O(images).
+    /// Memoised [`rendered_row_index`].  Width-independent, so it lives beside `lines` and is
+    /// dropped with them; built on first request because only the two image paths want it.  The
+    /// memo matters because the diff-side decode dispatch runs once per event-loop iteration.
     rendered_index: Option<HashMap<usize, usize>>,
 }
 
@@ -119,10 +78,8 @@ pub struct DiffLayoutCache {
 const ROW_CACHE_CAP: usize = 2;
 
 impl DiffState {
-    /// Build the flat visual-line sequence.  Walks hunks in document
-    /// order; between hunks emits `Context` lines from `new_rope`,
-    /// then per hunk emits `OldDelete` lines (from `old_rope`)
-    /// followed by `NewAdd` lines (from `new_rope`).
+    /// Build the flat visual-line sequence for a fully raw review: context between hunks, then
+    /// each hunk's deletes, divider, and adds.
     fn build_visual_lines(&self) -> Vec<DiffVisualLine> {
         let mut out: Vec<DiffVisualLine> = Vec::new();
         let new_rope = self.new_buffer.rope();
@@ -130,7 +87,6 @@ impl DiffState {
         let mut new_cursor: usize = 0;
 
         for (i, h) in self.hunks.iter().enumerate() {
-            // Emit context up to the hunk's new-side start.
             while new_cursor < h.new_lines.start && new_cursor < new_lines {
                 out.push(DiffVisualLine {
                     source: DiffLineSource::Context,
@@ -139,15 +95,9 @@ impl DiffState {
                 });
                 new_cursor += 1;
             }
-            // Skip over the new-side range so we don't double-emit it
-            // as context.  Even for `Delete` (new_lines empty) this is
-            // a no-op.
+            // Skip the new-side range so it isn't also emitted as context.
             new_cursor = h.new_lines.end;
 
-            // Stacked order: deletes above, the decision divider, then
-            // adds below.  The divider always sits at the old/new
-            // boundary, so it lands below a delete-only hunk and above
-            // an add-only one.
             for l in h.old_lines.clone() {
                 out.push(DiffVisualLine {
                     source: DiffLineSource::OldDelete,
@@ -182,32 +132,19 @@ impl DiffState {
         out
     }
 
-    /// Build the flat visual-line sequence for a *rendered* review:
-    /// unchanged blocks emit their pre-rendered rows, changed regions
-    /// keep exactly the raw stacked presentation [`Self::build_visual_lines`]
-    /// produces.
+    /// Build the flat visual-line sequence for a *rendered* review: unchanged blocks emit their
+    /// pre-rendered rows, changed regions keep [`Self::build_visual_lines`]'s raw stacked form.
     ///
-    /// The document is partitioned by block ([`block_spans`]); a maximal
-    /// run of consecutive *touched* blocks is a raw region, and the hunk
-    /// list itself is never reshaped.  Snapping hunk ranges out to block
-    /// boundaries instead would collapse the per-row table hunks
-    /// `engine::split_table_hunk` produces back into one whole-table
-    /// hunk; a display-only partition leaves `hunks`, `decisions`,
-    /// `HunkId` stability, `reconcile_with_disk` and `resolved_rope`
-    /// untouched.
+    /// The partition is display-only ([`block_spans`]); the hunk list is never reshaped.  Snapping
+    /// hunk ranges out to block boundaries would collapse the per-row table hunks
+    /// `engine::split_table_hunk` produces back into one whole-table hunk.
     fn build_visual_lines_rendered(&self, parsed: &ParsedDoc) -> Vec<DiffVisualLine> {
         let total_lines = self.new_buffer.rope().len_lines();
         let (spans, owners) = block_spans(self, parsed, total_lines);
-        // A new side with *no blocks at all* — reachable, and only, when
-        // the file was truncated to empty on disk (`> notes.md`, a failed
-        // save, a partial sync), which `App::enter_diff_mode` hands
-        // straight through from the watcher.  There is nothing to render,
-        // and no span for the whole-document delete's boundary line 0 to
-        // be emitted against: the loop below never runs, the trailing
-        // `emit_boundary_hunks(total_lines)` looks at line 1, and the
-        // hunk is dropped.  In release that is a *blank* review of a real
-        // change, with `all_resolved()` false so `Esc` refuses to finish.
-        // Fall back to the raw walk, which has no such gap.
+        // A new side with *no blocks at all* means the file was truncated to empty on disk.  The
+        // whole-document delete would then have no span to be emitted against and the review
+        // would be blank, with `all_resolved()` false so `Esc` refuses to finish.  The raw walk
+        // has no such gap.
         if spans.is_empty() {
             return self.build_visual_lines();
         }
@@ -216,7 +153,7 @@ impl DiffState {
         let mut i = 0usize;
         while i < spans.len() {
             if spans[i].touched {
-                // Maximal run of touched blocks = one raw region.
+                // A maximal run of touched blocks is one raw region.
                 let start = i;
                 let mut j = i;
                 while j < spans.len() && spans[j].touched {
@@ -226,10 +163,8 @@ impl DiffState {
                 self.emit_raw_region(&region, &owners, &mut out);
                 i = j;
             } else {
-                // A delete-only hunk whose insertion point is exactly
-                // this block's first line touches no block at all: its
-                // rows are emitted *between* two rendered runs, at the
-                // boundary it names.
+                // A delete-only hunk anchored exactly on this block's first line touches no
+                // block, so its rows go between the two rendered runs.
                 self.emit_boundary_hunks(spans[i].lines.start, &owners, &mut out);
                 for row in spans[i].rows.clone() {
                     out.push(DiffVisualLine {
@@ -244,11 +179,8 @@ impl DiffState {
         // A boundary delete at end-of-document sits past every span.
         self.emit_boundary_hunks(total_lines, &owners, &mut out);
 
-        // Exactly once, not merely at least once: a hunk emitted twice
-        // paints two decision dividers for one decision, and the second
-        // would silently disagree with the first the moment the user
-        // presses `y`.  The divider is the countable marker because
-        // `emit_hunk` always emits exactly one per call.
+        // Exactly once, not merely at least once: two dividers for one decision would disagree
+        // the moment the user presses `y`.
         debug_assert!(
             (0..self.hunks.len()).all(|hi| out
                 .iter()
@@ -260,18 +192,14 @@ impl DiffState {
         out
     }
 
-    /// Emit one raw region: today's stacked walk, restricted to the line
-    /// range `region` and to the hunks the partition assigned to it.
+    /// Emit one raw region: the stacked walk restricted to `region` and to the hunks the
+    /// partition assigned to it.
     ///
-    /// **The ordering assumption is stated rather than assumed.**  The
-    /// whole-document walk is a monotone `new_cursor` loop that would
-    /// silently drop or double-emit a hunk under the overlapping or
-    /// unsorted hunk lists the table split can produce (a straddling
-    /// hunk and a contained one can share table lines).  Here context is
-    /// emitted only when the hunk actually starts ahead of the cursor,
-    /// the hunk's own rows are emitted unconditionally, and the cursor
-    /// only ever moves forward.  A hunk may end up with no context ahead
-    /// of it; it is never dropped.
+    /// **Hunks are not assumed disjoint or sorted** — the table split can produce a straddling
+    /// hunk and a contained one sharing table lines, which a monotone-cursor walk would drop or
+    /// double-emit.  Here context is emitted only when the hunk starts ahead of the cursor, the
+    /// hunk's own rows unconditionally, and the cursor only moves forward: a hunk may end up with
+    /// no context ahead of it, but is never dropped.
     fn emit_raw_region(
         &self,
         region: &Range<usize>,
@@ -284,18 +212,16 @@ impl DiffState {
                 HunkOwner::Region { start_line } => {
                     start_line >= region.start && start_line < region.end
                 }
-                // A boundary delete landing *inside* a raw region is part
-                // of it; one landing on its far edge belongs to the clean
-                // block that starts there.
+                // A boundary delete inside a raw region is part of it; one on its far edge
+                // belongs to the clean block starting there.
                 HunkOwner::Boundary { line } => line >= region.start && line < region.end,
             };
             if !in_region {
                 continue;
             }
             let h = &self.hunks[hi];
-            // Context runs up to the hunk's *own* new-side start — the
-            // owner's `start_line` names the block that put it in this
-            // region, which is at or before it.
+            // Context runs to the hunk's *own* new-side start; the owner's `start_line` names
+            // the block that put it in this region, which is at or before that.
             let anchor = h.new_lines.start;
             while new_cursor < anchor.min(region.end) {
                 out.push(DiffVisualLine {
@@ -333,8 +259,7 @@ impl DiffState {
         }
     }
 
-    /// The stacked old-above-new rows for one hunk: deletes, the
-    /// decision divider, then adds — byte-identical to what
+    /// The stacked rows for one hunk — deletes, divider, adds — identical to what
     /// [`Self::build_visual_lines`] emits.
     fn emit_hunk(&self, hunk_idx: usize, out: &mut Vec<DiffVisualLine>) {
         let h = &self.hunks[hunk_idx];
@@ -359,15 +284,9 @@ impl DiffState {
         }
     }
 
-    /// Run `f` with the cached flat visual-line list and the
-    /// prefix-sum row cache for `width`, building or refreshing either
-    /// as needed.  All scroll / total-row / scroll-into-view queries
-    /// route through here so the expensive build + per-line wrap runs
-    /// at most once per (layout version, width).
-    ///
-    /// `pub(crate)` because it hands out a borrow of the crate-private
-    /// [`VisualRowCache`]; the public surface is [`Self::total_visual_rows`]
-    /// and [`Self::focused_hunk_visual_row`].
+    /// Run `f` with the cached line list and the prefix-sum row cache for `width`, building
+    /// either as needed.  Every scroll / row-count query routes through here, so the build and
+    /// per-line wrap run at most once per (layout version, width).
     pub(crate) fn with_layout<R>(
         &self,
         width: usize,
@@ -381,13 +300,9 @@ impl DiffState {
         f(lines, rc)
     }
 
-    /// As [`Self::with_layout`], plus the memoised map from a rendered
-    /// line index to its position in the flat line list (see
-    /// [`DiffLayoutCache::rendered_index`]).
-    ///
-    /// The single door to that map, so the diff-side decode dispatch and
-    /// the diff image-snapshot builder place images against exactly the
-    /// rows the painter walks — and neither rebuilds it per frame.
+    /// As [`Self::with_layout`], plus the memoised rendered-line → flat-position map.  The single
+    /// door to it, so the decode dispatch and the image-snapshot builder agree on the rows the
+    /// painter walks and neither rebuilds the map per frame.
     pub(crate) fn with_layout_index<R>(
         &self,
         width: usize,
@@ -406,17 +321,13 @@ impl DiffState {
         f(lines, rc, index)
     }
 
-    /// Populate `cache.lines` and promote-or-build the row cache for
-    /// `width`.  Shared by [`Self::with_layout`] and
-    /// [`Self::with_layout_index`] so the two can never disagree about
-    /// what a layout version contains.
+    /// Populate `cache.lines` and promote-or-build the row cache for `width`.  Shared by both
+    /// `with_layout*` entry points so they can't disagree about a layout version's contents.
     fn ensure_layout(&self, cache: &mut DiffLayoutCache, width: usize) {
         if cache.lines.is_none() {
             cache.lines = Some(match self.parsed_new.as_ref() {
                 Some(parsed) => self.build_visual_lines_rendered(parsed),
-                // No parse installed — the first frame of a review, whose
-                // deferred build `prepare_viewport` has not resolved yet
-                // → the whole review stays raw, exactly as before.
+                // No parse yet (the first frame of a review): the whole review stays raw.
                 None => self.build_visual_lines(),
             });
         }
@@ -428,39 +339,25 @@ impl DiffState {
             let built = {
                 let lines = cache.lines.as_ref().expect("lines built above");
                 VisualRowCache::build(lines.len(), width, |i| {
-                    // The decision divider is a single-row status strip
-                    // that never wraps (the renderer paints it with
-                    // `wrap = false`).  Pinning it to one row here keeps
-                    // the wrap cache — and therefore every scroll
-                    // computation — independent of which hunk is focused,
-                    // even though the focused divider's text is longer
-                    // (it spells out the accept/reject prompt).  Without
-                    // the pin, focusing a hunk on a very narrow terminal
-                    // could change a divider's wrapped height and
-                    // silently desync the cached total.
+                    // The divider never wraps (the renderer paints it with `wrap = false`).
+                    // Pinning it to one row keeps every scroll computation independent of which
+                    // hunk is focused, even though the focused divider's prompt is longer.
                     if lines[i].source == DiffLineSource::Decision {
                         1
                     } else if lines[i].source == DiffLineSource::ContextRendered {
-                        // A rendered row is measured as the `Line` the
-                        // painter will hand to `render_line_from_visual`
-                        // — the same call `PreviewView` makes — so its
-                        // wrap and the diff's scroll math agree by
-                        // construction.  Placed ahead of the `line_text`
-                        // call below, which has nothing to say about it.
+                        // Measured as the very `Line` the painter will hand to
+                        // `render_line_from_visual`, so wrap and scroll math agree by
+                        // construction.
                         self.parsed_new
                             .as_ref()
                             .and_then(|p| p.lines.get(lines[i].rope_line))
                             .map_or(1, |l| visual_rows_for_line(l, width))
                     } else {
-                        // Measure the marker *with* the text, and through
-                        // `visual_rows_for_line` rather than
-                        // `visual_rows_of_str`: `render_line` derives a
-                        // hanging indent from a line's leading marker, and
-                        // `- ` / `+ ` / a two-space context prefix all match
-                        // its recognized shapes (raw bullet, indented
-                        // continuation).  Measuring flat here while the
-                        // painter wrapped at indent 2 would desync every
-                        // scroll computation on any line that wraps.
+                        // Measure the marker *with* the text, and via `visual_rows_for_line`:
+                        // `render_line` derives a hanging indent from a leading marker, and `- `
+                        // / `+ ` / the two-space context prefix all match its recognized shapes.
+                        // Measuring flat while the painter wraps at indent 2 desyncs every
+                        // wrapping line.
                         let text = format!(
                             "{}{}",
                             line_marker(lines[i].source),
@@ -475,16 +372,13 @@ impl DiffState {
         }
     }
 
-    /// Total wrapped visual rows for the diff at `width`.  `O(1)` after
-    /// the first build at that width.  Used by the bottom scrollbar and
-    /// by viewport / scroll clamping.
+    /// Total wrapped visual rows at `width`; `O(1)` after the first build at that width.
     pub fn total_visual_rows(&self, width: usize) -> usize {
         self.with_layout(width, |_, rc| rc.total())
     }
 
-    /// Visual-row offset (at `width`) of the first row of the focused
-    /// hunk, so the caller can scroll it into view.  Returns 0 when the
-    /// focused id is stale or the hunk has no rendered line.
+    /// Visual-row offset of the focused hunk's first row, for scroll-into-view.  Returns 0 when
+    /// the focused id is stale or the hunk has no rendered line.
     pub fn focused_hunk_visual_row(&self, width: usize) -> usize {
         let Some(focused_idx) = self.focused_idx() else {
             return 0;
@@ -497,9 +391,8 @@ impl DiffState {
         })
     }
 
-    /// Drop the cached layout so the next query rebuilds it.  Called
-    /// after any reshape of the hunk list (e.g. a reconcile, or a
-    /// future Edit mode); a cheap safety valve while the list is fixed.
+    /// Drop the cached layout so the next query rebuilds it.  Call after any reshape of the hunk
+    /// list.
     pub fn invalidate_layout(&self) {
         let mut cache = self.layout.borrow_mut();
         cache.lines = None;
@@ -509,17 +402,12 @@ impl DiffState {
     }
 }
 
-/// Map each rendered-line index shown as `ContextRendered` to its
-/// position in the diff's flat line list.
+/// Map each `ContextRendered` line index to its position in the flat line list, by one scan of
+/// the same slice the painter walks.
 ///
-/// One scan of the layout's own `lines` — the same slice the painter
-/// walks — so the rows the decode dispatch reasons about are exactly the
-/// rows the snapshot builder places.
-///
-/// Private: the memo in [`DiffLayoutCache::rendered_index`] is the only
-/// caller, and [`DiffState::with_layout_index`] the only door, so the
-/// map cannot be rebuilt per frame by a new consumer or outlive the
-/// `lines` it was scanned from.
+/// Private on purpose: [`DiffLayoutCache::rendered_index`] is the only caller and
+/// [`DiffState::with_layout_index`] the only door, so the map can neither be rebuilt per frame nor
+/// outlive the `lines` it was scanned from.
 fn rendered_row_index(lines: &[DiffVisualLine]) -> HashMap<usize, usize> {
     lines
         .iter()
@@ -537,52 +425,36 @@ struct BlockSpan {
     /// Half-open rendered-line range into `parsed.lines`; empty for a
     /// block that renders nothing.
     rows: Range<usize>,
-    /// True when a hunk's change lands in this block, so its lines are
-    /// shown as raw source instead of rendered rows.
+    /// A hunk's change lands here, so these lines show as raw source, not rendered rows.
     touched: bool,
 }
 
 /// Where one hunk's rows get emitted.
 #[derive(Debug, Clone, Copy)]
 enum HunkOwner {
-    /// The hunk touches at least one block; it is emitted inside the raw
-    /// region containing the block whose span starts at `start_line`.
+    /// Emitted inside the raw region containing the block whose span starts at `start_line`.
     Region { start_line: usize },
-    /// A delete-only hunk whose insertion point falls exactly on a block
-    /// boundary, so it touches no block: its rows are emitted at `line`,
-    /// between two rendered runs.
+    /// A delete-only hunk anchored exactly on a block boundary, so it touches no block; emitted
+    /// at `line`, between two rendered runs.
     Boundary { line: usize },
 }
 
 /// Partition the new side by block, and decide where each hunk's rows go.
 ///
-/// **Every source-map block gets a span, zero-row blocks included.**  A
-/// block that renders nothing is still real and still carries source
-/// lines — a standalone HTML comment, a `<!-- tui-columns: [...] -->`
-/// hint, a blank run collapsed by `preserve_blank_lines = false`.  If
-/// such a block had no span, a hunk confined to it would mark nothing
-/// touched, would fall inside no raw region, and its delete / decision /
-/// add rows would never be emitted: the user would review a diff that
-/// does not contain the change, while `all_resolved()` still let them
-/// resolve it.  So zero rendered rows is a property of a clean block's
-/// *emission*, never of its *existence*.
+/// **Every source-map block gets a span, zero-row blocks included.**  A block that renders nothing
+/// (a standalone HTML comment, a collapsed blank run) still carries source lines; without a span,
+/// a hunk confined to it would touch nothing, fall in no raw region, and vanish from the review
+/// while `all_resolved()` still let the user resolve it.
 ///
-/// The walk shape is [`crate::editor::state_source_lines`]'s, which
-/// solves the same problem for the line-number gutter: source-map block
-/// space (not `ParsedDoc::blocks`, which misses the blank-line virtual
-/// blocks and the phantom trailing one), byte ranges read out of
-/// `ParsedDoc::source` rather than the live buffer, and a *running*
-/// newline count — `byte_to_line` is O(byte) and would make this
-/// quadratic.
+/// The walk shape is [`crate::editor::state_source_lines`]'s: source-map block space (not
+/// `ParsedDoc::blocks`, which misses virtual blank blocks and the phantom trailing one), byte
+/// ranges out of `ParsedDoc::source`, and a *running* newline count — `byte_to_line` is O(byte)
+/// and would make this quadratic.
 ///
-/// Each span runs from its own first line to the *next* block's first
-/// line, rather than being derived from its byte range: pulldown-cmark
-/// ranges absorb trailing blank lines that already have virtual blocks
-/// of their own, so range-derived spans would overlap.  The last span
-/// runs to `len_lines()`, which includes ropey's phantom line past the
-/// trailing newline — that is what keeps the spans a total partition,
-/// and it is the same line the raw walk emits as a trailing empty
-/// context row.
+/// Each span runs to the *next* block's first line rather than being derived from its own byte
+/// range, because pulldown-cmark ranges absorb trailing blank lines that have virtual blocks of
+/// their own and would overlap.  The last span runs to `len_lines()`, ropey's phantom line
+/// included, which is what makes the spans a total partition.
 fn block_spans(
     diff: &DiffState,
     parsed: &ParsedDoc,
@@ -599,8 +471,7 @@ fn block_spans(
             .original_range_for_block(block_idx)
             .unwrap_or(scanned..scanned);
         let start = range.start.min(contents.len());
-        // Advance the running count before anything else, so it stays
-        // honest even for a block we then record as row-less.
+        // Advance the running count first, so it stays honest for a row-less block too.
         if start > scanned {
             block_line += contents.as_bytes()[scanned..start]
                 .iter()
@@ -608,10 +479,8 @@ fn block_spans(
                 .count();
             scanned = start;
         }
-        // A row-less block's `rendered_lines_for_block` is its
-        // *neighbour's* range (the map's documented fallback), so the
-        // `own` count — not the range — is what decides whether it has
-        // rows at all.  Keep the entry either way.
+        // A row-less block's `rendered_lines_for_block` is its *neighbour's* range (the map's
+        // documented fallback), so the `own` count is what decides whether it has rows.
         let rows = if parsed.block_own_line_count(block_idx) == 0 {
             0..0
         } else {
@@ -634,8 +503,7 @@ fn block_spans(
         spans[i].lines.end = end;
     }
     if let Some(first) = spans.first_mut() {
-        // A document whose first block starts past byte 0 would otherwise
-        // leave its opening lines outside the partition.
+        // A first block starting past byte 0 would leave the opening lines outside the partition.
         first.lines.start = 0;
     }
     debug_assert!(
@@ -645,18 +513,14 @@ fn block_spans(
         "block spans must partition every source line of the new side"
     );
 
-    // Mark touched blocks.  Hunks are *not* assumed disjoint or sorted:
-    // after the table split a straddling hunk and a contained one can
-    // share table lines, so this accumulates into a flag per block and
-    // overlap is harmless.
+    // Hunks are *not* assumed disjoint or sorted (see `emit_raw_region`), so this accumulates a
+    // flag per block and overlap is harmless.
     let mut owners: Vec<HunkOwner> = Vec::with_capacity(diff.hunks.len());
     for h in &diff.hunks {
         let mut first_touched: Option<usize> = None;
         if h.new_lines.is_empty() {
-            // Delete-only: the block that *strictly* contains the
-            // insertion point.  Landing exactly on a boundary touches
-            // nothing, which is the good case — the deleted lines show
-            // between two rendered blocks.
+            // Delete-only: the block *strictly* containing the insertion point.  Landing on a
+            // boundary touches nothing, which is the good case.
             let point = h.new_lines.start;
             for (bi, sp) in spans.iter().enumerate() {
                 if sp.lines.start < point && point < sp.lines.end {
@@ -679,11 +543,8 @@ fn block_spans(
                 line: h.new_lines.start,
             }),
             None => {
-                // Should be unreachable: a non-empty new-side range
-                // always intersects some span, because the spans cover
-                // every line.  Losing a hunk is worse than showing one
-                // extra block raw, so widen the nearest block rather
-                // than dropping it.
+                // Unreachable — the spans cover every line.  Losing a hunk is worse than showing
+                // one extra block raw, so widen the nearest block rather than dropping it.
                 debug_assert!(false, "every hunk must land in a raw region");
                 let bi = spans
                     .iter()
@@ -697,8 +558,7 @@ fn block_spans(
             }
         }
     }
-    // Second pass: flag the blocks each owning hunk covers.  Done after
-    // the owner decision so an overlapping pair can't disturb it.
+    // Flagged in a second pass, after the owner decision, so an overlapping pair can't disturb it.
     for (hi, owner) in owners.iter().enumerate() {
         if !matches!(owner, HunkOwner::Region { .. }) {
             continue;
@@ -718,9 +578,8 @@ fn block_spans(
     (spans, owners)
 }
 
-/// Raw text of a diff visual line, stripped of its trailing `\n`.  For
-/// the synthetic `Decision` divider this is the checkbox plus a resolved
-/// label (`[ ]` while pending, `[Y] Accepted`, `[N] Rejected`).
+/// Raw text of a diff visual line, stripped of its trailing `\n`.  The `Decision` divider yields
+/// its checkbox text instead.
 pub fn line_text(diff: &DiffState, dvl: &DiffVisualLine) -> String {
     if dvl.source == DiffLineSource::Decision {
         let dec = dvl
@@ -729,11 +588,8 @@ pub fn line_text(diff: &DiffState, dvl: &DiffVisualLine) -> String {
             .unwrap_or(Decision::Pending);
         return decision_line_text(dec).to_owned();
     }
-    // A rendered row has no source text — its content is a finished
-    // `Line` in `parsed_new`.  A real arm rather than an `unreachable!`:
-    // this is a `pub fn` reached from `with_layout`'s cache-fill closure,
-    // whose own `ContextRendered` arm means the call never actually
-    // happens, and a panic there is not worth the assertion.
+    // A rendered row has no source text.  A real arm rather than `unreachable!`: this is a
+    // `pub fn`, and a panic is not worth the assertion.
     if dvl.source == DiffLineSource::ContextRendered {
         return String::new();
     }
@@ -751,40 +607,28 @@ pub fn line_text(diff: &DiffState, dvl: &DiffVisualLine) -> String {
     raw.trim_end_matches('\n').to_owned()
 }
 
-/// Leading side marker for a diff visual line — the unified-diff `+ ` /
-/// `- ` convention, with a matching two-space prefix on context lines so
-/// every body column lines up.
+/// Leading `+ ` / `- ` marker, with a matching two-space context prefix so body columns line up.
+/// Unlike the background washes it survives monochrome themes, where every `diff_*` slot is
+/// `Color::Reset`.
 ///
-/// Unlike the add/delete background washes, the marker is correct for
-/// degenerate hunks (a `HunkKind::Delete` hunk visibly has only `- `
-/// rows) and survives monochrome themes, where every `diff_*` palette
-/// slot is `Color::Reset` and color carries nothing.
-///
-/// The marker is *not* part of [`line_text`]: the inline highlight
-/// ranges on a hunk index into the raw line's chars, so the renderer
-/// paints this as a separate leading span rather than concatenating it.
-/// Anything that measures a diff line must include it — see
-/// [`DiffState::with_layout`].
+/// Deliberately *not* part of [`line_text`]: a hunk's inline highlight ranges index the raw line's
+/// chars, so the renderer paints this as a separate leading span.  Anything that *measures* a diff
+/// line must nevertheless include it — see [`DiffState::with_layout`].
 pub fn line_marker(source: DiffLineSource) -> &'static str {
     match source {
         DiffLineSource::OldDelete => "- ",
         DiffLineSource::NewAdd => "+ ",
         DiffLineSource::Context => "  ",
-        // A rendered row is the document, painted at column 0: a marker
-        // would overflow table grids and code-block padding, both of
-        // which the renderer laid out at the full viewport width.  The
-        // markers' alignment reference is the raw context *inside* a
-        // changed region, which is unaffected.
+        // A rendered row is the document painted at column 0; a marker would overflow table
+        // grids and code-block padding laid out at the full viewport width.
         DiffLineSource::ContextRendered => "",
-        // The divider is chrome, not a body line; it spans the full row.
+        // The divider is chrome, not a body line.
         DiffLineSource::Decision => "",
     }
 }
 
-/// Text shown on a hunk's decision divider for a given `Decision`.
-/// Pending shows only the checkbox; resolved states append a label.
-/// The resolved glyphs spell out the yes/no answer (`[Y]` = accept,
-/// `[N]` = reject) so the checkbox reads as the decision itself.
+/// Divider text for a `Decision`.  The resolved glyphs spell out the yes/no answer so the
+/// checkbox reads as the decision itself.
 pub fn decision_line_text(decision: Decision) -> &'static str {
     match decision {
         Decision::Pending => "[ ]",
@@ -803,8 +647,7 @@ mod tests {
         Box::leak(Box::new(Theme::default()))
     }
 
-    /// A review of `old` → `new` with the rendered new-side parse
-    /// installed, as `EditorState::refresh_diff_parse` installs it.
+    /// A review with the rendered new-side parse installed, as `refresh_diff_parse` installs it.
     fn rendered(old: &str, new: &str) -> DiffState {
         let mut st = DiffState::new(old, new).expect("non-empty diff");
         let parsed = ParsedDoc::build(new, theme(), true, 20);
@@ -848,22 +691,18 @@ mod tests {
         let new = "# Title\n\nAlpha.\n\nBRAVO!\n\nCharlie.\n";
         let st = rendered(old, new);
         let rows = rendered_rows(&st);
-        // The untouched heading and the two untouched paragraphs render.
         assert!(rows.iter().any(|r| r.contains("Title")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("Alpha.")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("Charlie.")), "{rows:?}");
         // The heading renders *styled* — its `#` marker is gone.
         assert!(!rows.iter().any(|r| r.contains('#')), "{rows:?}");
-        // The changed paragraph keeps both raw sides.
         assert_eq!(raw_rows(&st, DiffLineSource::OldDelete), vec!["Bravo."]);
         assert_eq!(raw_rows(&st, DiffLineSource::NewAdd), vec!["BRAVO!"]);
     }
 
     #[test]
     fn a_delete_on_a_block_boundary_lands_between_two_rendered_runs() {
-        // Removing a whole paragraph (and its trailing blank) deletes
-        // lines that start exactly on a block boundary, so no block is
-        // touched and every surviving block still renders.
+        // The deleted lines start exactly on a block boundary, so no block is touched.
         let old = "Alpha.\n\nBravo.\n\nCharlie.\n";
         let new = "Alpha.\n\nCharlie.\n";
         let st = rendered(old, new);
@@ -873,8 +712,7 @@ mod tests {
         let rows = rendered_rows(&st);
         assert!(rows.iter().any(|r| r.contains("Alpha.")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("Charlie.")), "{rows:?}");
-        // Nothing survives as a *raw* context line: the deleted lines are
-        // emitted between two fully-rendered runs.
+        // Nothing survives as a *raw* context line.
         assert!(
             raw_rows(&st, DiffLineSource::Context)
                 .iter()
@@ -889,10 +727,9 @@ mod tests {
         let old = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
         let new = "| a | b |\n|---|---|\n| 1 | X |\n| 3 | 4 |\n";
         let st = rendered(old, new);
-        // The row split is untouched by the display partition.
+        // The row split is untouched by the display partition, and the touched table's other
+        // rows stay raw context rather than being painted as a grid.
         assert_eq!(st.hunks.len(), 1);
-        // The table's block is touched, so its untouched rows stay raw
-        // context rather than being painted as a grid.
         let ctx = raw_rows(&st, DiffLineSource::Context);
         assert!(ctx.iter().any(|r| r.contains("| 3 | 4 |")), "{ctx:?}");
         assert_eq!(raw_rows(&st, DiffLineSource::NewAdd), vec!["| 1 | X |"]);
@@ -900,10 +737,7 @@ mod tests {
 
     #[test]
     fn a_change_confined_to_an_html_comment_is_still_reviewable() {
-        // A standalone HTML comment renders no rows at all.  Its lines
-        // must still belong to a block span, or the hunk inside it would
-        // touch nothing, fall in no raw region, and vanish from the
-        // review while `all_resolved()` still let the user resolve it.
+        // A standalone HTML comment renders no rows, but its lines must still have a span.
         let old = "Alpha.\n\n<!-- note: one -->\n\nBravo.\n";
         let new = "Alpha.\n\n<!-- note: two -->\n\nBravo.\n";
         let st = rendered(old, new);
@@ -926,8 +760,7 @@ mod tests {
 
     #[test]
     fn a_change_in_a_collapsed_blank_run_is_still_reviewable() {
-        // The other zero-row case: with `preserve_blank_lines` off, the
-        // extra blanks in a run render nothing.
+        // The other zero-row case: with `preserve_blank_lines` off, extra blanks render nothing.
         let old = "Alpha.\n\n\n\nBravo.\n";
         let new = "Alpha.\n\n\n\nBRAVO!\n";
         let mut st = DiffState::new(old, new).expect("non-empty diff");
@@ -936,8 +769,7 @@ mod tests {
         assert_eq!(raw_rows(&st, DiffLineSource::NewAdd), vec!["BRAVO!"]);
     }
 
-    /// Fixture with a heading, a table, a hidden comment and trailing
-    /// blanks — every block flavour the partition has to cover.
+    /// Every block flavor the partition has to cover.
     const MIXED_NEW: &str = "# Title\n\nAlpha text.\n\n<!-- hidden -->\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nOmega.\n\n\n";
 
     #[test]
@@ -997,11 +829,8 @@ mod tests {
         assert!(row > 0, "rendered context precedes the hunk");
     }
 
-    /// A file truncated to empty on disk parses to *zero* blocks, so the
-    /// block partition is empty and the whole-document delete has no span
-    /// to be emitted against.  Left unhandled the review is blank: no
-    /// lines, no rows, and an unresolvable hunk that `Esc` refuses to
-    /// finish on.  The raw walk has no such gap, so that is the fallback.
+    /// A file truncated to empty parses to *zero* blocks, so the whole-document delete has no
+    /// span to be emitted against and the review would be blank.  The raw walk is the fallback.
     #[test]
     fn a_new_side_truncated_to_empty_still_shows_its_deletion() {
         let old = "# Title\n\nAlpha.\n";
@@ -1028,10 +857,8 @@ mod tests {
         assert!(st.total_visual_rows(80) > 0);
     }
 
-    /// The rendered-row memo is dropped with the lines it was scanned
-    /// from.  Kept stale it would name flat-line positions from the
-    /// previous layout, and the image snapshots built off it would place
-    /// pictures on rows belonging to other blocks.
+    /// The memo must be dropped with the lines it was scanned from; kept stale, image snapshots
+    /// built off it would place pictures on rows belonging to other blocks.
     #[test]
     fn the_rendered_row_memo_follows_the_layout_it_was_built_from() {
         let old = "# Title\n\nAlpha.\n\nBravo.\n";
@@ -1039,8 +866,6 @@ mod tests {
         let mut st = rendered(old, new);
 
         let before = st.with_layout_index(80, |lines, _, index| {
-            // Every `ContextRendered` row is in the map, and each entry
-            // points at a line that really is one.
             for (&row, &pos) in index {
                 assert_eq!(lines[pos].source, DiffLineSource::ContextRendered);
                 assert_eq!(lines[pos].rope_line, row);
@@ -1048,8 +873,7 @@ mod tests {
             index.len()
         });
         assert!(before > 0, "the clean blocks must contribute rows");
-        // Same answer on a second query — the memo is a cache, not a
-        // one-shot.
+        // Same answer on a second query — the memo is a cache, not a one-shot.
         assert_eq!(st.with_layout_index(80, |_, _, index| index.len()), before);
 
         st.set_rendered_parse(None);
@@ -1071,8 +895,8 @@ mod tests {
         assert_eq!(st.total_visual_rows(80), raw.total_visual_rows(80));
     }
 
-    /// Diff with `n` leading context lines, a single-line replace, and
-    /// a trailing context line.  No line wraps at width 80.
+    /// `n` leading context lines, a single-line replace, and a trailing context line.  Nothing
+    /// wraps at width 80.
     fn diff_with_leading_context(n: usize) -> DiffState {
         let mut old = String::new();
         for i in 0..n {
@@ -1088,26 +912,21 @@ mod tests {
 
     #[test]
     fn focused_hunk_row_skips_leading_context() {
-        // 5 context lines precede the change, so the focused hunk's
-        // first visual row is row 5 at a non-wrapping width.
+        // 5 context lines precede the change.
         let st = diff_with_leading_context(5);
         assert_eq!(st.focused_hunk_visual_row(80), 5);
     }
 
     #[test]
     fn total_visual_rows_counts_every_stacked_line() {
-        // 5 context + 1 deleted (`before`) + 1 decision divider + 1
-        // added (`AFTER`) + 1 trailing context (`tail`) + 1 empty
-        // trailing line = 10 rows, none wrapping at width 80.
+        // 5 context + 1 delete + 1 divider + 1 add + 1 trailing context + 1 empty = 10.
         let st = diff_with_leading_context(5);
         assert_eq!(st.total_visual_rows(80), 10);
     }
 
     #[test]
     fn cached_total_survives_repeated_and_multi_width_queries() {
-        // Two widths exercised repeatedly must stay within the LRU and
-        // return stable, correct totals (regression: the pre-cache code
-        // rebuilt + rewrapped on every call).
+        // Two widths must both stay within the LRU and return stable totals.
         let st = diff_with_leading_context(3);
         let a1 = st.total_visual_rows(80);
         let b1 = st.total_visual_rows(40);
@@ -1115,7 +934,6 @@ mod tests {
         let b2 = st.total_visual_rows(40);
         assert_eq!(a1, a2);
         assert_eq!(b1, b2);
-        // Narrower width never yields fewer rows (lines may wrap).
         assert!(b1 >= a1);
     }
 
@@ -1124,7 +942,6 @@ mod tests {
         let st = diff_with_leading_context(4);
         let before = st.total_visual_rows(80);
         st.invalidate_layout();
-        // Same content → same answer after a forced rebuild.
         assert_eq!(st.total_visual_rows(80), before);
     }
 }

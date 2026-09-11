@@ -1,31 +1,19 @@
-//! New-terminal capabilities notice.  Fires once the first time edamame
-//! is launched in a terminal whose fingerprint
-//! ([`crate::terminal::Capabilities::fingerprint`]) hasn't been recorded
-//! in `editor.seen_terminal_fingerprints`.  Body lists every detected
-//! capability (color, images, mouse, keyboard, unicode) with a ✓ or ✗
-//! mark; dismiss appends the current fingerprint to the seen set so the
-//! notice stays quiet on future launches in the same terminal but
-//! re-fires when the user opens edamame somewhere new.
+//! New-terminal capabilities notice, fired the first time edamame runs in a
+//! terminal whose [`fingerprint`](crate::terminal::Capabilities::fingerprint)
+//! isn't in `editor.seen_terminal_fingerprints`.  Dismissing records the
+//! fingerprint, so it stays quiet here but re-fires somewhere new.
 //!
-//! Because a new terminal can be *worse* than the last one (or better),
-//! the notice is not purely informational: an "Adjust settings" button
-//! stacks the welcome modal — the one surface that re-derives
-//! `full_color` / `image_capable` from the live capabilities and gates
-//! theme / images / diagrams accordingly.  The generic settings overlay
-//! is deliberately not the destination; it would happily let the user
-//! enable images on a terminal that quantizes them.  The same surface
-//! is reachable any time via `Action::OpenWelcome`.
+//! A new terminal can be *worse* than the last, so the notice is not purely
+//! informational: "Adjust settings" stacks the welcome modal — the one surface
+//! that re-derives `full_color` / `image_capable` from the live capabilities.
+//! The generic settings overlay is deliberately not the destination; it would
+//! let the user enable images on a terminal that quantizes them.
 //!
-//! When the startup indexed-color theme substitution fires on the same
-//! launch (a first visit to a terminal that also can't render the user's
-//! theme — the common "moved from Ghostty to Terminal.app" case), this
-//! notice absorbs that explanation via
-//! [`with_theme_downgrade`](TerminalCapabilitiesModal::with_theme_downgrade)
-//! and `App::new` suppresses the standalone
-//! [`super::ThemeDowngradeModal`].  Two modals saying overlapping things
-//! about the same terminal, one hiding the other, reads as a bug; the
-//! capabilities summary is the more complete of the two, so it wins and
-//! the downgrade prose joins it.
+//! When the startup indexed-color theme substitution fires on the same launch,
+//! this notice absorbs its explanation via
+//! [`with_theme_downgrade`](TerminalCapabilitiesModal::with_theme_downgrade) and
+//! `App::new` suppresses the standalone [`super::ThemeDowngradeModal`] — two
+//! modals about the same terminal, one hiding the other, reads as a bug.
 
 use std::any::Any;
 
@@ -47,19 +35,15 @@ use crate::ui::{
     ModalResponse, PROSE_CONTENT_WIDTH,
 };
 
-/// Index of the "Adjust settings" button in `buttons`.  Named so the
-/// `resolve` match arm and the button-list order can't drift.
+/// Index of the "Adjust settings" button, named so the `resolve` match arm and
+/// the button-list order can't drift.
 const ADJUST_BUTTON: usize = 0;
 
 /// The manual page this notice points at.
 ///
-/// The one footnote in the crate carrying no fragment, deliberately:
-/// `docs/terminal-compatibility.md` is a page *about* what this modal
-/// just reported, so its opening paragraphs are already the answer to
-/// "what do I do about a ✗".  Landing a reader mid-page — the reason
-/// every other footnote names a section — would skip past that to
-/// whichever capability the fragment happened to name, and this notice
-/// has no way to know which of the five rows the reader cares about.
+/// The one footnote in the crate carrying no fragment, deliberately: the whole
+/// page is about what this modal just reported, and nothing here knows which of
+/// the five rows the reader cares about.
 const DOCS_FOOTNOTE: DocsFootnote = DocsFootnote {
     label: "Terminal compatibility",
     target: ModalLinkTarget {
@@ -69,9 +53,8 @@ const DOCS_FOOTNOTE: DocsFootnote = DocsFootnote {
     trailer: " lists what each capability affects and which terminals support it.",
 };
 
-/// The startup theme substitution, when it fired on this launch — the
-/// user's configured theme, the indexed-color built-in that replaced it,
-/// and the depth that forced it.  See [`crate::ui::theme_downgrade_lines`].
+/// The startup theme substitution, when it fired on this launch.  See
+/// [`crate::ui::theme_downgrade_lines`].
 struct ThemeDowngrade {
     configured: String,
     substituted: &'static str,
@@ -82,17 +65,15 @@ pub struct TerminalCapabilitiesModal {
     fingerprint: String,
     downgrade: Option<ThemeDowngrade>,
     buttons: Vec<ModalButton>,
-    /// Rebuilt every render alongside the body, because the link's
-    /// coordinates depend on how many optional paragraphs (the ✗
-    /// warning, the folded theme downgrade) precede it.
+    /// Rebuilt every render: the link's coordinates depend on how many optional
+    /// paragraphs precede it.
     links: Vec<ModalLink>,
     chrome: ModalChrome,
 }
 
 impl TerminalCapabilitiesModal {
-    /// Build the modal when this terminal's fingerprint isn't in the
-    /// seen set.  Returns `None` when the fingerprint has already been
-    /// recorded.
+    /// Build the modal, or `None` when this terminal's fingerprint is already in
+    /// the seen set.
     pub fn from_capabilities(caps: &Capabilities, seen: &[String]) -> Option<Self> {
         let fingerprint = caps.fingerprint();
         if seen.iter().any(|s| s == &fingerprint) {
@@ -104,30 +85,22 @@ impl TerminalCapabilitiesModal {
             downgrade: None,
             buttons: vec![ModalButton::new("Adjust settings")],
             links: Vec::new(),
-            // Prose paragraphs around the capability rows, and it can
-            // absorb the downgrade explanation too — cap the measure at
-            // the same width the standalone downgrade modal uses so the
-            // two stay visually interchangeable.  The rows themselves
-            // are far narrower than the cap, so they are unaffected.
+            // Capped at the width the standalone downgrade modal uses, so the
+            // two stay visually interchangeable; the rows are narrower anyway.
             chrome: ModalChrome::new(ModalKind::Normal, true)
                 .with_max_content_width(PROSE_CONTENT_WIDTH),
         })
     }
 
-    /// Fold the startup theme substitution's explanation into this
-    /// notice.  `App::new` calls this instead of pushing a separate
-    /// [`super::ThemeDowngradeModal`] whenever both would fire on the
-    /// same launch.
+    /// Fold the startup theme substitution's explanation into this notice, as
+    /// `App::new` does instead of pushing a separate
+    /// [`super::ThemeDowngradeModal`] when both would fire on one launch.
     ///
-    /// Also drops the "Adjust settings" button.  A downgrade means the
-    /// terminal has no 24-bit color, and the welcome modal has nothing
-    /// left to offer there: its theme row is disabled, and images and
-    /// diagrams are force-set to `Never`, leaving only the vim toggle.
-    /// Worse, saving it *persists* those forced values over whatever the
-    /// user chose on their capable terminal — the opposite of the
-    /// session-only promise this notice just made.  So the route stays
-    /// closed here; `Action::OpenWelcome` remains for anyone who wants
-    /// it deliberately.
+    /// Also drops the "Adjust settings" button: a downgrade means no 24-bit
+    /// color, where the welcome modal has only the vim toggle left to offer —
+    /// and saving it would *persist* its forced-off values over whatever the
+    /// user chose on a capable terminal.  `Action::OpenWelcome` still reaches it
+    /// deliberately.
     pub fn with_theme_downgrade(mut self, configured: String, substituted: &'static str) -> Self {
         self.downgrade = Some(ThemeDowngrade {
             configured,
@@ -137,28 +110,17 @@ impl TerminalCapabilitiesModal {
         self
     }
 
-    /// Close, record this terminal's fingerprint as seen, and — when
-    /// `adjust` — stack the welcome modal so the user lands directly on
-    /// the capability-aware settings surface.  Recording happens on
-    /// *both* paths: the notice has served its purpose either way, and
-    /// the welcome modal re-seeds the same fingerprint on save.
+    /// Close, record the fingerprint as seen, and — when `adjust` — stack the
+    /// welcome modal.  Recording happens on both paths: the notice has served
+    /// its purpose either way.
     fn record_outcome(&self, adjust: bool) -> ModalOutcome {
         self.record_outcome_following(adjust, None)
     }
 
-    /// [`Self::record_outcome`], optionally following a body link on
-    /// the way out.
-    ///
-    /// Following one records the fingerprint for the same reason every
-    /// other resolution does: the notice has been read and acted on.
-    /// Leaving it unrecorded would re-fire the notice on the next
-    /// launch purely because the user chose to read the manual instead
-    /// of pressing a button.
-    ///
-    /// The modal closes rather than staying open behind the manual
-    /// page — the destination *is* a document, and a notice floating
-    /// over the page the reader just asked for would cover the thing
-    /// they came to read.
+    /// [`Self::record_outcome`], optionally following a body link on the way
+    /// out.  Doing so records the fingerprint too, or the notice re-fires next
+    /// launch purely because the user read the manual; and it closes rather than
+    /// float over the page the reader just asked for.
     fn record_outcome_following(
         &self,
         adjust: bool,
@@ -179,8 +141,7 @@ impl TerminalCapabilitiesModal {
         }))
     }
 
-    /// Map a link-aware response, deferring everything that is not a
-    /// link to the existing [`Self::resolve`].
+    /// Map a link-aware response, deferring non-links to [`Self::resolve`].
     fn resolve_linkable(&self, response: LinkableResponse) -> ModalOutcome {
         match response {
             LinkableResponse::Modal(r) => self.resolve(r),
@@ -191,12 +152,9 @@ impl TerminalCapabilitiesModal {
         }
     }
 
-    /// Map a resolved response to an outcome.  Shared by the key and
-    /// click paths: every resolution dismisses the notice and records
-    /// the fingerprint; the "Adjust settings" button, when present, also
-    /// opens the welcome modal.  There is deliberately no Dismiss button —
-    /// per convention a dismissable modal is closed with `Esc` or the
-    /// `esc` affordance in its title bar.
+    /// Map a resolved response to an outcome, shared by the key and click
+    /// paths.  There is deliberately no Dismiss button: per convention a
+    /// dismissable modal closes with `Esc` or the title-bar affordance.
     fn resolve(&self, response: ModalResponse) -> ModalOutcome {
         match response {
             ModalResponse::Continue => ModalOutcome::Continue,
@@ -210,8 +168,7 @@ impl TerminalCapabilitiesModal {
 
 impl Modal for TerminalCapabilitiesModal {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &ModalRenderCtx<'_>) {
-        // Paragraphs, not pre-broken display lines: `ModalView` wraps
-        // the body it is handed.
+        // Paragraphs, not pre-broken lines: `ModalView` wraps the body.
         let mut body: Vec<Line<'static>> = Vec::new();
         body.push(Line::raw(
             "It looks like you're using a new terminal application. edamame has \
@@ -234,8 +191,7 @@ impl Modal for TerminalCapabilitiesModal {
                 ctx.theme,
             ));
         }
-        // The trailer describes the button, so it goes when the button
-        // does (see `with_theme_downgrade`).
+        // The trailer describes the button, so it goes when the button does.
         if self.downgrade.is_none() {
             body.push(Line::raw(""));
             body.push(Line::raw(
@@ -243,10 +199,8 @@ impl Modal for TerminalCapabilitiesModal {
                  can be matched to this terminal.",
             ));
         }
-        // The manual pointer sits last so it reads as a footnote to
-        // everything above it.  Appended through the shared helper so
-        // its line index is observed rather than assumed — the optional
-        // warning and downgrade paragraphs above shift it.
+        // Appended through the shared helper so its line index is observed
+        // rather than assumed — the optional paragraphs above shift it.
         self.links = DOCS_FOOTNOTE.append_to(&mut body, self.chrome.focused_link(), ctx.theme);
         self.chrome.render_with_links(
             frame,
@@ -307,9 +261,7 @@ mod tests {
 
     #[test]
     fn a_folded_downgrade_drops_the_welcome_route() {
-        // The welcome modal can only overwrite good settings with the
-        // forced-off ones on a terminal this weak — see
-        // `with_theme_downgrade`.
+        // See `with_theme_downgrade`.
         let modal = TerminalCapabilitiesModal::from_capabilities(&Capabilities::minimal(), &[])
             .expect("unseen fingerprint yields a modal")
             .with_theme_downgrade("Dracula".into(), "256 Dark");
@@ -318,22 +270,17 @@ mod tests {
 
     #[test]
     fn adjust_button_index_matches_its_position() {
-        // `resolve` matches on ADJUST_BUTTON; if the button list is ever
-        // reordered without updating the const, "Adjust settings" would
-        // silently become a plain dismiss.
+        // Reordering the list without updating the const would silently turn
+        // "Adjust settings" into a plain dismiss.
         let modal = TerminalCapabilitiesModal::from_capabilities(&Capabilities::minimal(), &[])
             .expect("unseen fingerprint yields a modal");
         assert_eq!(modal.buttons[ADJUST_BUTTON].label, "Adjust settings");
-        // No Dismiss button — Esc / the `esc` affordance is the
-        // acknowledge path.
         assert_eq!(modal.buttons.len(), 1);
     }
 
-    /// The footnote must name a page that is really embedded.  This
-    /// one carries no fragment (see `DOCS_FOOTNOTE`), so the assertion
-    /// is that the page resolves and parses — and that the fragment is
-    /// still absent, since adding one would silently change where a
-    /// reader lands without failing anything else.
+    /// The footnote must name a page that is really embedded, and must stay
+    /// fragment-less (see `DOCS_FOOTNOTE`) — adding one would silently change
+    /// where a reader lands without failing anything else.
     #[test]
     fn the_docs_link_names_a_page_that_exists() {
         let ModalLinkTarget { id, fragment } = DOCS_FOOTNOTE.target;
@@ -350,7 +297,6 @@ mod tests {
     fn tab_walks_links_before_buttons() {
         let mut modal = TerminalCapabilitiesModal::from_capabilities(&Capabilities::minimal(), &[])
             .expect("unseen fingerprint yields a modal");
-        // One link, one button: the ring is link -> button -> link.
         let tab = KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE);
         assert_eq!(
             modal.chrome.focused_link(),
@@ -374,9 +320,8 @@ mod tests {
         assert_eq!(response, LinkableResponse::Link(0));
     }
 
-    /// With a link focused, Enter must not fall through to the button
-    /// the ring last sat on — that would fire "Adjust settings" while
-    /// the user is looking at a highlighted link.
+    /// Enter on a focused link must not fall through to the button the ring last
+    /// sat on.
     #[test]
     fn enter_on_a_link_does_not_press_the_button() {
         let mut modal = TerminalCapabilitiesModal::from_capabilities(&Capabilities::minimal(), &[])
@@ -402,12 +347,10 @@ mod tests {
     }
 }
 
-/// End-to-end coverage for the body link: render, hit-test the rect the
-/// render recorded, and follow it into a real `App`.
-///
-/// Separate from the unit tests above because this one needs an `App`
-/// and a drawn frame — it is the only test that proves the geometry
-/// the renderer produced is the geometry a click is matched against.
+/// End-to-end coverage for the body link: render, hit-test the rect the render
+/// recorded, and follow it into a real `App` — the only test proving the
+/// geometry the renderer produced is what a click is matched against.  Separate
+/// because it needs an `App` and a drawn frame.
 #[cfg(test)]
 mod click_tests {
     use super::*;
@@ -419,9 +362,7 @@ mod click_tests {
 
     #[test]
     fn clicking_the_docs_link_opens_that_manual_page() {
-        // The link path records the fingerprint, which reaches
-        // `Config::save` — unguarded, that rewrites the developer's own
-        // config file with this test's values.
+        // The link path records the fingerprint, which reaches `Config::save`.
         let _iso = crate::test_env::config_isolation();
         let mut app = make_app();
         let mut modal = TerminalCapabilitiesModal::from_capabilities(&Capabilities::minimal(), &[])
@@ -459,8 +400,7 @@ mod click_tests {
             Some(DOCS_FOOTNOTE.target.id),
             "the click opened the manual page the link named"
         );
-        // Recorded on the link path too, or the notice re-fires next
-        // launch purely because the user read the manual.
+        // Recorded on the link path too, or the notice re-fires next launch.
         assert!(app
             .config
             .editor
@@ -468,11 +408,9 @@ mod click_tests {
             .contains(&Capabilities::minimal().fingerprint()));
     }
 
-    /// A click that misses every link must still resolve the modal the
-    /// way it always did.
+    /// A click missing every link must still resolve the modal as before.
     #[test]
     fn a_click_outside_the_link_does_not_navigate() {
-        // Dismissing records the fingerprint too — same hazard.
         let _iso = crate::test_env::config_isolation();
         let mut app = make_app();
         let mut modal = TerminalCapabilitiesModal::from_capabilities(&Capabilities::minimal(), &[])
@@ -491,7 +429,7 @@ mod click_tests {
         })
         .unwrap();
 
-        // (0, 0) is outside the centred modal entirely.
+        // (0, 0) is outside the centered modal entirely.
         let outcome = modal.handle_click(0, 0, &mut app);
         if let ModalOutcome::CloseAnd(f) = outcome {
             f(&mut app);

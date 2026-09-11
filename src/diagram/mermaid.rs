@@ -1,128 +1,38 @@
-//! Mermaid → SVG → PNG → `DynamicImage` pipeline.
+//! Mermaid → SVG → PNG → `DynamicImage` pipeline.  [`render_mermaid_svg`] serves the HTML
+//! exporter; [`resolve_mermaid`] serves the App decode worker.
 //!
-//! The public entry points are `render_mermaid_svg` (used by the HTML
-//! exporter, which wants SVG strings inline) and `resolve_mermaid` (used
-//! by the App decode worker, which wants a `LoadedImage` ready for the
-//! existing image cache).  Both share `render_mermaid_svg_core` which
-//! wraps the third-party renderer in `catch_unwind` — `mermaid-rs-renderer`
-//! 0.2.1 has several known panic bugs (invalid hex colors, empty
-//! subgraphs, over-wide sequence labels) and a panicking worker thread
-//! would strand the cache entry as `Pending` forever.
+//! Every call into the third-party renderer is wrapped in `catch_unwind`: `mermaid-rs-renderer`
+//! 0.2.x has known panic bugs (invalid hex colors, empty subgraphs, over-wide sequence labels)
+//! and a panicking worker thread would strand the cache entry as `Pending` forever.
 //!
-//! The synthetic-URL format is `diagram-mermaid-<lowercase-hex-sha256>`
-//! — stable across reparses so the image cache reuses renders, and
-//! content-addressed so editing inside a block invalidates only that
-//! block's entry.  The URL is opaque to every other part of the system;
-//! `ImageBlockInfo.source` is the reliable discriminator.
+//! The shared cache-key URL scheme, [`DiagramSource`](super::common::DiagramSource), and
+//! [`DiagramError`] live in [`super::common`]; the LaTeX-math backend in [`super::math`].
 
-use std::fmt::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use sha2::{Digest, Sha256};
+use crate::image::{rasterize_svg, LoadedImage, SvgScaleMode, SvgSizing};
 
-use crate::image::{rasterize_svg, LoadedImage, SvgError, SvgScaleMode, SvgSizing};
+use super::common::{panic_message, DiagramError};
 
-/// Pre-populate the shared fontdb off the hot path.  The App warmup
-/// thread calls this at startup so the first real diagram render
-/// doesn't pay the disk-scan cost.  Also primes mermaid-rs-renderer's
-/// own internal font cache by running a trivial diagram.
-///
-/// The fontdb itself lives in `crate::image::svg` (shared with the
-/// SVG-file rasterizer); this wrapper additionally primes the mermaid
-/// renderer's own font cache.
+/// Pre-populate the shared fontdb (which lives in `crate::image::svg`, shared with the SVG-file
+/// rasterizer and the math backend) and mermaid-rs-renderer's own font cache, off the hot path.
+/// Called by the App warmup thread at startup.
 pub fn warm_fontdb() {
     crate::image::svg::warm_fontdb();
-    // Prime mermaid-rs-renderer's own fontdb too (it maintains its own
-    // via once_cell::sync::Lazy).  Wrapped in catch_unwind because the
-    // upstream crate has known panic bugs and the warmup is
-    // best-effort — and guarded for the same reason every other
-    // `catch_unwind` in the crate is: the process panic hook would
-    // otherwise restore the terminal out from under the TUI this thread
-    // was spawned alongside.  The diagram here is a literal, so this is
-    // the one guarded section that is not about untrusted content; the
-    // hazard is the hook, not the input.  See `terminal::panic_guard`.
+    // Best-effort, so a known upstream panic must not escape.  The guard keeps the process panic
+    // hook from restoring the terminal out from under the running TUI; the diagram is a literal,
+    // so here the hazard is the hook, not the input.  See `terminal::panic_guard`.
     let _expected = crate::terminal::ExpectedPanic::new();
     let _ = catch_unwind(|| {
         let _ = mermaid_rs_renderer::render("flowchart TD\nA-->B\n");
     });
 }
 
-/// Source for a diagram block.  Only `Mermaid` currently ships; the
-/// enum exists so future backends (PlantUML, Graphviz/DOT, D2) can be
-/// added without rewiring `ImageBlockInfo`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum DiagramSource {
-    Mermaid(String),
-}
-
-/// Errors reported by the diagram pipeline.  The renderer / rasterizer /
-/// decoder each have their own variant so the hint line can surface a
-/// specific failure mode.  The variants
-/// carry owned `String` messages rather than source-chained errors so
-/// `DiagramError` stays `Send + Sync` and can be shipped back through
-/// the App's mpsc channel.
-#[derive(Debug, thiserror::Error)]
-pub enum DiagramError {
-    #[error("mermaid render failed: {0}")]
-    RenderFailed(String),
-    #[error("svg parse failed: {0}")]
-    SvgParse(String),
-    #[error("raster failed: {0}")]
-    Raster(String),
-    #[error("png decode failed: {0}")]
-    Decode(String),
-}
-
-/// Map the shared SVG rasterizer's errors onto the diagram-specific
-/// variants so the hint line keeps reporting the right failure mode.
-impl From<SvgError> for DiagramError {
-    fn from(err: SvgError) -> Self {
-        match err {
-            SvgError::Parse(m) => DiagramError::SvgParse(m),
-            SvgError::Raster(m) => DiagramError::Raster(m),
-            SvgError::Decode(m) => DiagramError::Decode(m),
-        }
-    }
-}
-
-/// Prefix shared by every URL produced by [`synthetic_url`]; the
-/// counterpart predicate is [`is_diagram_url`].
-const SYNTHETIC_URL_PREFIX: &str = "diagram-mermaid-";
-
-/// Synthetic cache-key URL for a mermaid source.  Stable across process
-/// invocations — two runs of edamame see the same URL for the same
-/// diagram text.
-pub fn synthetic_url(source: &DiagramSource) -> String {
-    match source {
-        DiagramSource::Mermaid(src) => {
-            let digest = Sha256::digest(src.as_bytes());
-            let mut hex = String::with_capacity(digest.len() * 2);
-            for byte in digest {
-                write!(hex, "{byte:02x}").expect("writing to a String is infallible");
-            }
-            format!("{SYNTHETIC_URL_PREFIX}{hex}")
-        }
-    }
-}
-
-/// True for a synthetic diagram cache key produced by [`synthetic_url`],
-/// as opposed to a document-authored image URL / path.
-pub fn is_diagram_url(url: &str) -> bool {
-    url.starts_with(SYNTHETIC_URL_PREFIX)
-}
-
-/// Maximum mermaid source length we will attempt to render.  The renderer
-/// has no internal length, node-count, or timeout bound, so a pathological
-/// diagram can drive unbounded CPU/RAM on the decode worker (the UI stays
-/// responsive, but the process can OOM).  64 KiB is far larger than any
-/// hand-authored diagram; an over-cap block fails to render and falls back
-/// to the plain code block — a placeholder in the TUI, an escaped `<pre>`
-/// in HTML export.
+/// The renderer has no internal length, node-count, or timeout bound, so a pathological diagram
+/// can drive the decode worker to OOM.  An over-cap block falls back to the plain code block.
 const MAX_MERMAID_SOURCE_BYTES: usize = 64 * 1024;
 
-/// Render a mermaid source to SVG, wrapping any panic or error in a
-/// `DiagramError`.  Used by both the raster path below and the HTML
-/// exporter's diagram branch.
+/// Render a mermaid source to SVG, wrapping any panic or error in a [`DiagramError`].
 pub fn render_mermaid_svg(source: &str) -> Result<String, DiagramError> {
     if source.len() > MAX_MERMAID_SOURCE_BYTES {
         return Err(DiagramError::RenderFailed(format!(
@@ -130,11 +40,9 @@ pub fn render_mermaid_svg(source: &str) -> Result<String, DiagramError> {
             source.len()
         )));
     }
-    // Tells the process panic hook this one is caught, so it neither
-    // restores the terminal out from under a running TUI nor prints the
-    // payload through it.  Scoped to the `catch_unwind` alone — a guard
-    // still live afterwards would silence a panic nobody catches.  See
-    // `terminal::panic_guard`.
+    // Tells the process panic hook this one is caught, so it neither restores the terminal out
+    // from under a running TUI nor prints the payload through it.  Scoped to the `catch_unwind`
+    // alone: a guard still live afterwards would silence a panic nobody catches.
     let outcome = {
         let _expected = crate::terminal::ExpectedPanic::new();
         catch_unwind(AssertUnwindSafe(|| mermaid_rs_renderer::render(source)))
@@ -143,18 +51,12 @@ pub fn render_mermaid_svg(source: &str) -> Result<String, DiagramError> {
     outcome.map_err(|e| DiagramError::RenderFailed(format!("{e:#}")))
 }
 
-/// Render a mermaid source all the way to a `LoadedImage`, suitable for
-/// dropping straight into the image cache.
+/// Render a mermaid source all the way to a `LoadedImage` for the image cache.
 ///
-/// * `url` — the synthetic cache-key URL already computed by the caller
-///   (typically from `ParsedDoc::image_blocks[i].url`).  Carried on the
-///   returned `LoadedImage` so the main-thread cache lookup resolves to
-///   the right entry.
-/// * `max_cells` / `font_size` — the target cell envelope.  Scaled into
-///   pixels and used to size the SVG before rasterization so we never
-///   allocate a pixmap larger than the terminal can display.  Passing
-///   `None` keeps the SVG's natural resolution (used by tests that don't
-///   care about on-screen size).
+/// * `url` — the synthetic cache key the caller already computed; carried on the result so the
+///   main-thread lookup resolves to the right entry.
+/// * `max_cells` / `font_size` — target cell envelope, converted to pixels so the pixmap is never
+///   larger than the terminal can display.  `None` keeps the SVG's natural resolution.
 pub fn resolve_mermaid(
     url: String,
     source: &str,
@@ -162,9 +64,8 @@ pub fn resolve_mermaid(
     font_size: Option<(u16, u16)>,
 ) -> Result<LoadedImage, DiagramError> {
     let svg = render_mermaid_svg(source)?;
-    // Diagrams have no meaningful natural size, so fill the envelope (up
-    // or down).  Fill white because mermaid SVGs are transparent but
-    // meant to be read on a light page.
+    // Diagrams have no meaningful natural size, so fill the envelope either way.  White
+    // background because mermaid SVGs are transparent but meant to be read on a light page.
     let image = rasterize_svg(
         &svg,
         SvgSizing {
@@ -182,30 +83,13 @@ pub fn resolve_mermaid(
     })
 }
 
-/// Best-effort extraction of a message from a `catch_unwind` payload.
-/// Panics in Rust are usually `String` or `&'static str`; anything else
-/// falls back to a generic marker so the cache entry still reports a
-/// failure.
-fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
-        (*s).to_string()
-    } else {
-        "unknown payload".to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use image::DynamicImage;
 
     use super::*;
 
-    // Compile-time check: the render entry point must be `Send` so it
-    // can be called from a `std::thread::spawn`'d worker.  If someone
-    // introduces a non-Send type into the signature this test stops
-    // compiling — effectively a spec constraint frozen in code.
+    // Compile-time check: the render result must be `Send` for the decode worker.
     #[test]
     fn resolve_mermaid_result_is_send() {
         fn assert_send<T: Send>() {}
@@ -213,39 +97,15 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_url_is_stable_for_same_source() {
-        let a = synthetic_url(&DiagramSource::Mermaid("flowchart TD\nA-->B".into()));
-        let b = synthetic_url(&DiagramSource::Mermaid("flowchart TD\nA-->B".into()));
-        assert_eq!(a, b);
-        assert!(a.starts_with("diagram-mermaid-"));
-        // SHA-256 hex is 64 chars; prefix is 16 chars; total 80.
-        assert_eq!(a.len(), "diagram-mermaid-".len() + 64);
-    }
-
-    #[test]
     fn oversized_mermaid_source_is_rejected_before_render() {
-        // Comfortably over the 64 KiB cap; must error out *without*
-        // reaching the renderer (so this test needs no fonts and can't
-        // hit an upstream panic).
+        // Must error out *without* reaching the renderer, so this test needs no fonts.
         let huge = format!("flowchart TD\n{}", "A-->B\n".repeat(20_000));
         assert!(huge.len() > 64 * 1024);
         let err = render_mermaid_svg(&huge).unwrap_err();
         assert!(matches!(err, DiagramError::RenderFailed(_)));
     }
 
-    #[test]
-    fn synthetic_url_differs_for_different_sources() {
-        let a = synthetic_url(&DiagramSource::Mermaid("flowchart TD\nA-->B".into()));
-        let b = synthetic_url(&DiagramSource::Mermaid("flowchart TD\nA-->C".into()));
-        assert_ne!(a, b);
-    }
-
-    // The full renderer is slow (font DB load + layout) and its output
-    // is non-deterministic across font installs, so we only exercise it
-    // in the "does it work at all" sense and skip pixel comparison.
-    // Marked `#[ignore]` because CI may not have system fonts and the
-    // upstream crate has known panics; run locally with
-    // `cargo test -- --ignored mermaid_live`.
+    // Non-deterministic across font installs, so this is a "does it render at all" check only.
     #[test]
     #[ignore = "requires system fonts; upstream has known panics"]
     fn mermaid_live_renders_trivial_flowchart() {
@@ -260,19 +120,14 @@ mod tests {
         assert!(loaded.image.height() > 0);
     }
 
-    // The envelope scaling itself (small upscales, large downscales,
-    // natural-size passthrough) is now exercised in `crate::image::svg`
-    // where the shared `rasterize_svg` lives.
+    // Envelope scaling is exercised in `crate::image::svg`, where `rasterize_svg` lives.
 
-    // Counterfactual: what per-render costs look like when each call
-    // does its own `load_system_fonts()` — the code path we replaced.
-    // Run alongside `mermaid_live_throughput` (below) to quantify the
-    // win.  Ignored for the same reasons the shared-fontdb bench is.
+    // Counterfactual for `mermaid_live_throughput` below: per-render cost when each call does its
+    // own `load_system_fonts()`, the path the shared fontdb replaced.
     #[test]
     #[ignore = "requires system fonts; counterfactual benchmark only"]
     fn mermaid_live_throughput_unshared_fontdb() {
-        // Force a fresh SVG parse per call with its own fontdb — mirrors
-        // the original pre-fix behaviour.
+        // A fresh SVG parse per call with its own fontdb, mirroring the pre-fix path.
         fn rasterize_unshared(svg: &str) -> Result<DynamicImage, DiagramError> {
             let mut opt = usvg::Options::default();
             opt.fontdb_mut().load_system_fonts();
@@ -305,8 +160,7 @@ mod tests {
         let start = std::time::Instant::now();
         for _ in 0..iterations {
             for src in &diagrams {
-                // Call mermaid_rs_renderer to get SVG, then rasterize
-                // with an UNshared fontdb — simulating the old path.
+                // Render, then rasterize with an *unshared* fontdb.
                 if let Ok(svg) = mermaid_rs_renderer::render(src) {
                     let _ = rasterize_unshared(&svg);
                 }
@@ -321,18 +175,11 @@ mod tests {
         );
     }
 
-    // Hot-loop benchmark: render many diagrams back-to-back on one
-    // thread.  After the shared-fontdb fix this stays constant per
-    // iteration; before it, each iteration paid a fresh
-    // `load_system_fonts` (~100–300 ms), so 20 iterations was ~2–6 s
-    // serial (or much worse parallel due to disk thrashing).
-    // Locked behind `--ignored` because it needs system fonts and the
-    // upstream renderer has known panic inputs; run with
-    // `cargo test --lib mermaid_live_throughput -- --ignored --nocapture`.
+    // Hot-loop benchmark.  With the shared fontdb the per-iteration cost stays constant; before
+    // it, each iteration paid a fresh `load_system_fonts` (~100–300 ms).
     #[test]
     #[ignore = "requires system fonts; exercises live mermaid-rs-renderer"]
     fn mermaid_live_throughput() {
-        // Prime the caches the same way the App warmup thread would.
         warm_fontdb();
         let diagrams = [
             "flowchart TD\nA-->B-->C\nC-->D\nD-->A",
@@ -357,10 +204,7 @@ mod tests {
         );
     }
 
-    // Canary for the known-panic-bug class: malformed mermaid input
-    // must yield an `Err`, never a panic (the App worker's
-    // `catch_unwind` wrapper depends on this being true of
-    // `resolve_mermaid` itself too).
+    // Canary: malformed mermaid input must yield an `Err`, never unwind out of the closure.
     #[test]
     #[ignore = "exercises upstream; may panic on some inputs until fixed"]
     fn garbage_input_returns_err_not_panic() {
@@ -371,8 +215,7 @@ mod tests {
             "flowchart TD\n~~~~~~~~~~~",
         ] {
             let result = resolve_mermaid("test".into(), input, None, None);
-            // Either variant is acceptable; what matters is that we
-            // didn't unwind the stack out of the closure.
+            // Either variant is acceptable; not unwinding is the point.
             let _ = result;
         }
     }

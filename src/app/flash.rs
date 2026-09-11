@@ -1,8 +1,6 @@
-//! Transient hint-line message system.  Owns [`MessageKind`],
-//! the [`TransientMessage`] payload, and the App-level hooks for
-//! emitting / expiring / dismissing flash notifications.
-//!
-//! Pulled out of `app.rs` in Step 2 of `refactor-app.md`.
+//! Transient hint-line messages: [`MessageKind`], [`TransientMessage`], and the App hooks
+//! for emitting / expiring them, plus [`App::hint_content`] which decides what the hint
+//! row shows each frame.
 
 use std::time::{Duration, Instant};
 
@@ -14,11 +12,8 @@ use crate::ui::{hint_line_for, HintContent, HintCtx, HintSet, ModalKind};
 use super::modal::{Modal, NoticeModal};
 use super::App;
 
-/// Severity of a [`TransientMessage`].  Drives style selection.
-/// All transient kinds auto-expire after `config.editor.transient_ms`;
-/// situations that need the user to actually acknowledge a message
-/// (errors, rejections, stubs) use [`App::notify`] to push a sticky
-/// [`NoticeModal`] instead.
+/// Severity of a [`TransientMessage`]; drives style selection.  Every kind auto-expires —
+/// anything needing acknowledgement goes through [`App::notify`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
     Info,
@@ -30,17 +25,13 @@ pub enum MessageKind {
 pub(super) struct TransientMessage {
     pub(super) text: String,
     pub(super) kind: MessageKind,
-    /// Wall-clock deadline after which non-error messages auto-expire.
-    /// `None` for sticky errors.
+    /// Auto-expiry deadline; `None` means sticky.
     pub(super) until: Option<Instant>,
 }
 
 impl App {
-    /// Emit a transient message on the hint line.  Auto-expires after
-    /// `config.editor.transient_ms`.  Use for passive confirmations
-    /// (saved, copied, file reloaded, etc.) — anything the user can
-    /// safely miss.  For errors and rejections that need
-    /// acknowledgement, use [`Self::notify`] instead.
+    /// Emit a transient hint-line message for passive confirmations the user can safely
+    /// miss.  Use [`Self::notify`] for anything that needs acknowledgement.
     pub fn flash(&mut self, text: impl Into<String>, kind: MessageKind) {
         let text = text.into();
         let until = Some(Instant::now() + Duration::from_millis(self.config.editor.transient_ms));
@@ -48,17 +39,10 @@ impl App {
         self.needs_draw = true;
     }
 
-    /// Surface a sticky notification as a [`NoticeModal`].  Used for
-    /// errors, rejections, and stub messages — anything the user needs
-    /// to actually see and acknowledge rather than risk missing on the
-    /// hint line.  Pushes onto [`Self::modal_stack`] so the notice
-    /// stacks on top of any modal that triggered it; `Esc` dismisses.
+    /// Surface a sticky [`NoticeModal`] on top of whatever modal triggered it.
     pub fn notify(&mut self, text: impl Into<String>, kind: ModalKind) {
         let text = text.into();
-        // Coalesce: if the topmost modal is already a NoticeModal with
-        // identical text+kind, skip the push so a retry loop (e.g.
-        // repeated save failures) doesn't pile duplicates on the stack
-        // for the user to dismiss one by one.
+        // Coalesce identical consecutive notices so a retry loop doesn't pile up duplicates.
         if let Some(top) = self.modal_stack.top_mut() {
             if let Some(existing) = top.as_any().downcast_ref::<NoticeModal>() {
                 if Modal::kind(existing) == kind && existing.text() == text {
@@ -71,10 +55,7 @@ impl App {
         self.needs_draw = true;
     }
 
-    /// Clear the current transient message if it has auto-expired.
-    /// Called from the main loop before the draw gate so the hint line
-    /// reverts to chords without the user having to press a key.
-    /// Returns true when a redraw is needed.
+    /// Clear an expired transient; returns true when a redraw is needed.
     pub(super) fn expire_transient_if_due(&mut self) -> bool {
         let Some(msg) = self.transient.as_ref() else {
             return false;
@@ -89,15 +70,14 @@ impl App {
         false
     }
 
-    /// The deadline when the current transient expires, if any.
-    /// Contributes to [`App::next_deadline`] so the main loop wakes in
-    /// time to revert the hint line even with no input arriving.
+    /// Expiry of the current transient, if any (feeds [`App::next_deadline`]).
     pub(super) fn transient_deadline(&self) -> Option<Instant> {
         self.transient.as_ref().and_then(|m| m.until)
     }
 
-    /// Build the hint content for this frame.  Prompt > CommandLine >
-    /// Transient > hovered-link > Chords, matching the plan's priority.
+    /// Build the hint content for this frame.  Priority order: Prompt, then CommandLine, then
+    /// Transient, then hovered-link, then Chords — so a `Saved` flash or a file-changed prompt
+    /// is never masked by an idle hover.
     pub(super) fn hint_content(&self) -> HintContent {
         if let Some(prompt) = self.hint_prompt.as_ref() {
             return HintContent::Prompt {
@@ -105,8 +85,6 @@ impl App {
                 chords: prompt.chords.clone(),
             };
         }
-        // A vim command line (`/` `?`) replaces the chord row while the user
-        // is typing it, sitting just below a modal prompt.
         if let Some(cl) = self.vim.as_ref().and_then(|v| v.cmdline.as_ref()) {
             return HintContent::CommandLine {
                 prefix: cl.kind.prefix(),
@@ -125,12 +103,7 @@ impl App {
                 style,
             };
         }
-        // Hovered-link tooltip: while the mouse pointer rests on a link
-        // the hint row shows its raw URL (browser-status-bar style),
-        // replacing the chord row.  A prelude with no chords reuses the
-        // Chords rendering path — plain `hint_label` text on the bar.
-        // Sits below Prompt and Transient so a `Saved` flash or a
-        // file-changed prompt is never masked by an idle hover.
+        // Hover tooltip: a prelude with no chords reuses the Chords rendering path.
         if let Some(url) = self.hovered_link.as_ref() {
             return HintContent::Chords(HintSet {
                 prelude: Some(url.clone()),
@@ -138,13 +111,8 @@ impl App {
                 search_match: None,
             });
         }
-        // Look up chord glyphs against the live KeyMap so any rebind
-        // applied via the keybinds overlay shows up in the hint line
-        // on the very next frame.  Falls back to the compiled-in
-        // defaults during the brief window between `App::new` and the
-        // first `KeyMap::build` in `run` — that path runs only when
-        // building the override-aware keymap fails for unrelated
-        // reasons, and the default keymap always builds.
+        // The live KeyMap so rebinds show on the next frame; the default keymap only
+        // covers the window between `App::new` and the first `KeyMap::build` in `run`.
         let fallback;
         let keymap = match self.keymap.as_ref() {
             Some(km) => km,
@@ -154,17 +122,9 @@ impl App {
                 &fallback
             }
         };
-        // Vim reuses the same contextual + baseline hint row as the default
-        // handler — the modal keys are vim-internal and the status bar badge
-        // already advertises the active sub-mode.
-        // The history-navigation hint surfaces whenever there's somewhere
-        // to go in either direction — the single ⌥←→ chord covers both
-        // NavigateBack and NavigateForward.
-        // A vim VisualLine selection on a single line is charwise-empty, so the
-        // hint line can't infer it from `selection_size` alone — pass the flag
-        // through so the selection row shows under a V-LINE highlight.
-        // `vim_enabled` drops the `Esc Preview` chord: vim owns `Esc` and
-        // never rests in Preview, so the action is unreachable there.
+        // `visual_line`: a single-line V-LINE selection is charwise-empty, so the hint line
+        // can't infer it from the selection alone.  `vim_enabled` drops the `Esc Preview`
+        // chord, unreachable under vim.
         let ctx = HintCtx {
             nav_available: !self.nav_back.is_empty() || !self.nav_forward.is_empty(),
             visual_line: self.vim.as_ref().is_some_and(|v| v.is_visual_line()),
@@ -173,10 +133,8 @@ impl App {
         HintContent::Chords(hint_line_for(&self.editor, keymap, ctx))
     }
 
-    /// Inspect `action` after dispatch and emit the matching flash
-    /// notification.  Centralising this here means every code path
-    /// that calls `Action::Save` / `Copy` / `Cut` gets consistent
-    /// messaging without polluting `edit_ops::apply` with UI concerns.
+    /// Emit the flash matching `action` after dispatch, keeping UI messaging out of
+    /// `edit_ops::apply`.
     pub(super) fn flash_for_action(
         &mut self,
         action: &crate::config::Action,
@@ -198,20 +156,15 @@ impl App {
         }
     }
 
-    /// Flash shown when a modal flow's default-deny gate drops an
-    /// action — shared by diff review and the search flow so a denied
-    /// keypress gets the same "why did nothing happen" feedback in
-    /// both.  `flow` names the flow ("search", "diff review").
+    /// Flash shown when a modal flow's default-deny gate drops an action; `flow` names the
+    /// flow ("search", "diff review").
     pub(super) fn flash_action_unavailable(&mut self, flow: &str) {
         self.flash(format!("Not available during {flow}"), MessageKind::Info);
         self.needs_draw = true;
     }
 
-    /// Persist `config.toml` and flash a `Configuration updated`
-    /// notification on success.  Centralises the save-and-notify
-    /// pattern so every caller (capability suppression, remote-image
-    /// policy, future settings overlay) gets the same UX without
-    /// sprinkling `flash()` calls through the dispatch paths.
+    /// Persist `config.toml` and flash `Configuration updated` on success, or notify on
+    /// failure.
     pub(super) fn save_config_with_flash(&mut self, err_context: &'static str) {
         match self.config.save() {
             Ok(()) => {
@@ -228,11 +181,6 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    //! Exercise the transient-message mechanics directly
-    //! against an `App` instance, bypassing the event loop.  Builds use
-    //! [`Capabilities::default`] and the default config; no terminal is
-    //! ever acquired.
-
     use std::time::Duration;
 
     use super::*;
@@ -255,7 +203,6 @@ mod tests {
     fn expire_transient_clears_only_after_deadline() {
         let mut app = make_app();
         app.flash("Saved", MessageKind::Success);
-        // Force the deadline into the past.
         if let Some(msg) = app.transient.as_mut() {
             msg.until = Some(Instant::now() - Duration::from_millis(1));
         }
@@ -302,8 +249,6 @@ mod tests {
     #[test]
     fn flash_for_action_save_success_emits_saved_flash() {
         let mut app = make_app();
-        // Simulate a successful save: dirty was true before and the
-        // editor-state dirty flag has just flipped to false.
         app.editor.dirty = false;
         app.flash_for_action(&Action::Save, /*dirty_before=*/ true);
         let msg = app.transient.as_ref().expect("flash recorded");
@@ -315,7 +260,6 @@ mod tests {
     fn flash_for_action_save_failure_pushes_error_modal() {
         use crate::app::modal::NoticeModal;
         let mut app = make_app();
-        // Failure: dirty was true and remains true after "save".
         app.editor.dirty = true;
         app.flash_for_action(&Action::Save, /*dirty_before=*/ true);
         assert!(
@@ -360,10 +304,8 @@ mod tests {
         }
     }
 
-    /// The V-LINE row is only correct if `hint_content` actually derives
-    /// `HintCtx::visual_line` from the live vim state — hard-coding it
-    /// `false` would restore the original bug while every `hint_line_for`
-    /// unit test still passed, so assert the wiring end-to-end.
+    /// Pins the wiring end-to-end: hard-coding `HintCtx::visual_line = false` would pass
+    /// every `hint_line_for` unit test while restoring the original bug.
     #[test]
     fn hint_content_derives_visual_line_from_vim_state() {
         use crate::document::Selection;
@@ -372,8 +314,6 @@ mod tests {
         app.editor.buffer.insert(0, "alpha\nbeta\n");
         app.editor.mode = crate::editor::Mode::Rendered;
         app.editor.refresh_parsed();
-        // V-LINE on the first line: charwise-empty, so only the vim state
-        // can tell the hint line a whole line is highlighted.
         app.editor.selection = Some(Selection {
             anchor: 0,
             active: 0,
@@ -394,8 +334,6 @@ mod tests {
             }
             other => panic!("expected Chords, got {other:?}"),
         }
-        // Leaving V-LINE drops the row back to the baseline, proving the
-        // flag is read per frame rather than latched.
         app.vim = Some(VimState::default());
         app.editor.selection = None;
         match app.hint_content() {
@@ -456,12 +394,7 @@ mod tests {
 
     #[test]
     fn save_config_with_flash_emits_feedback() {
-        // `Config::save` *might* fail when no config dir is available
-        // in the test environment.  The success branch records a
-        // transient; the failure branch pushes a NoticeModal — we
-        // accept either so the test is robust to the environment.
-        // Isolated because this drives a real `Config::save`, which
-        // would otherwise rewrite the developer's own config file.
+        // Either outcome is accepted: `Config::save` may fail without a config dir.
         use crate::app::modal::NoticeModal;
         let _iso = crate::test_env::config_isolation();
         let mut app = make_app();

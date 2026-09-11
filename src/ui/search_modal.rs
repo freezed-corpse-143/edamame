@@ -1,17 +1,6 @@
-//! Search-and-replace input modal for `Action::OpenSearch`.
-//!
-//! Two free-text fields ("Search" and "Replace") above a Search /
-//! Cancel button row.  Tab / Shift-Tab and Up / Down move between the
-//! four focus targets; while focus is on a field, character keys insert
-//! at the in-field cursor, Left / Right move it, Home / End jump to the
-//! ends, Backspace / Delete remove characters, and Enter submits.  The
-//! replace field may be left empty — that selects a navigate-only flow
-//! (no Replace / Replace-all keys); any text in it enables the replace
-//! flow.
-//!
-//! The widget is UI-only: the App layer reads the terms when
-//! [`SearchModalResponse::Search`] fires and starts the flow via
-//! `App::enter_search_flow`.
+//! Search-and-replace input modal for `Action::OpenSearch`: two text fields above a Search /
+//! Cancel button row.  An empty replace field selects the navigate-only flow.  UI-only: the App
+//! layer starts the flow via `App::enter_search_flow` when [`SearchModalResponse::Search`] fires.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -71,9 +60,7 @@ pub enum SearchModalResponse {
     Continue,
     /// User dismissed (Escape or the Cancel button).
     Cancelled,
-    /// User confirmed with a non-empty search term.  `replace` is
-    /// `None` when the replace field was left empty (navigate-only
-    /// flow).
+    /// Confirmed with a non-empty search term; `replace` is `None` for the navigate-only flow.
     Search {
         query: String,
         replace: Option<String>,
@@ -83,28 +70,21 @@ pub enum SearchModalResponse {
 /// Mutable state for an open search/replace modal.
 #[derive(Debug, Clone)]
 pub struct SearchModalState {
-    /// The search term being edited.
     pub query: String,
-    /// The replacement text being edited.  Empty selects the
-    /// navigate-only flow.
+    /// Empty selects the navigate-only flow.
     pub replace: String,
-    /// In-field cursor for [`Self::query`], as a char index.
+    /// In-field cursors, as char indices.
     pub query_cursor: usize,
-    /// In-field cursor for [`Self::replace`], as a char index.
     pub replace_cursor: usize,
-    /// Which focus target receives keystrokes.
     pub focus: SearchModalField,
-    /// Last validation message ("Search term required").  Cleared when
-    /// the user mutates a field.
+    /// Last validation message; cleared when the user mutates a field.
     pub last_error: Option<String>,
-    /// Absolute terminal rect of the rendered `esc` close hint.
+    /// Rect of the rendered `esc` close hint, for click hit-testing.
     pub esc_button_rect: Option<Rect>,
 }
 
 impl SearchModalState {
-    /// Build the state, pre-filled when re-opened over an active flow.
-    /// Cursors start at the end of each pre-filled value so the user
-    /// can immediately extend or backspace.
+    /// Build the state, pre-filled when re-opened over an active flow; cursors start at the end.
     pub fn new(query: String, replace: String) -> Self {
         let query_cursor = query.chars().count();
         let replace_cursor = replace.chars().count();
@@ -119,11 +99,8 @@ impl SearchModalState {
         }
     }
 
-    /// Apply a key event.  Mirrors `SaveCopyState::handle_key`, with
-    /// the field-editing arms operating on whichever field is focused.
+    /// Apply a key event.  Mirrors `SaveCopyState::handle_key`; Ctrl/Alt chords are ignored.
     pub fn handle_key(&mut self, key: &KeyEvent) -> SearchModalResponse {
-        // Modifier-augmented chords are ignored so chords don't
-        // pollute the fields.
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -135,8 +112,7 @@ impl SearchModalState {
             KeyCode::Esc => return SearchModalResponse::Cancelled,
             KeyCode::Tab | KeyCode::Down => self.focus = self.focus.next(),
             KeyCode::BackTab | KeyCode::Up => self.focus = self.focus.prev(),
-            // On a field, Left / Right move the in-field cursor; on a
-            // button they swap between Search and Cancel.
+            // Left / Right move the in-field cursor, or swap between the buttons.
             KeyCode::Left => {
                 if self.focus.is_field() {
                     let cursor = self.focused_cursor_mut();
@@ -183,8 +159,7 @@ impl SearchModalState {
                     _ => self.try_search(),
                 };
             }
-            // Space activates a focused button; on a field it falls
-            // through to the `Char` arm and inserts a literal space.
+            // Space activates a button; on a field it falls through to the `Char` arm.
             KeyCode::Char(' ') if !self.focus.is_field() => {
                 return match self.focus {
                     SearchModalField::Cancel => SearchModalResponse::Cancelled,
@@ -202,16 +177,11 @@ impl SearchModalState {
         SearchModalResponse::Continue
     }
 
-    /// Insert a bracketed paste into the focused field (Search or
-    /// Replace) at its in-field cursor.  No-op when focus is on a
-    /// button.
+    /// Paste into the focused field at its cursor; no-op on a button.
     ///
-    /// The payload is **escaped first** (`search::escape::escape`) and
-    /// only then flattened and length-capped by
-    /// [`crate::ui::sanitize_paste`].  These fields are written in
-    /// escape syntax, so a pasted multi-line snippet becomes a working
-    /// `\n`-joined query instead of silently collapsing to one line, and
-    /// a pasted backslash searches for itself.
+    /// The payload is escaped (`search::escape::escape`) **before** [`crate::ui::sanitize_paste`]
+    /// flattens it: the fields are written in escape syntax, so a multi-line paste becomes a
+    /// `\n`-joined query and a pasted backslash searches for itself.
     pub fn paste(&mut self, text: &str) {
         if !self.focus.is_field() {
             return;
@@ -235,10 +205,8 @@ impl SearchModalState {
             return SearchModalResponse::Continue;
         }
         let replace = (!self.replace.is_empty()).then(|| self.replace.clone());
-        // Validate the escapes here so a malformed one lands in the
-        // modal's own error row, with focus on the offending field —
-        // the flow-entry path can only flash, which is a worse place to
-        // correct a typo from.
+        // Validate escapes here so the error lands in the modal's own row with focus on the
+        // offending field; the flow-entry path can only flash.
         if let Err(e) = crate::search::escape::decode(&self.query) {
             self.last_error = Some(e.to_string());
             self.focus = SearchModalField::Query;
@@ -294,18 +262,12 @@ fn remove_char_at(s: &mut String, cursor: usize) {
     }
 }
 
-/// Indent of the note row, aligning it under the input's value column
-/// ("Search " label + a two-cell gap).
+/// Indent of the note row: the "Search " label plus the two-cell gap.
 const NOTE_INDENT: usize = 9;
 
-/// The metadata line under the search field.  The matcher depends on the
-/// flow: a navigate-only search (empty replace field) is smartcase —
-/// case-insensitive unless the query has an uppercase letter — while a
-/// replace flow stays strictly case-sensitive so a lowercase find never
-/// rewrites a casing variant the user didn't type (see
-/// `SearchState::ensure_fresh`).  The escape hint rides on the same row
-/// so the modal keeps its height; `\n` is the escape people come looking
-/// for, and it implies the rest.
+/// The metadata line under the search field.  Navigate-only search is smartcase; a replace flow
+/// is strictly case-sensitive so a lowercase find never rewrites a casing variant the user
+/// didn't type (see `SearchState::ensure_fresh`).  The escape hint shares the row.
 fn matching_mode_note(state: &SearchModalState) -> &'static str {
     if state.replace.is_empty() {
         r"(Smart case · \n for a line break)"
@@ -324,9 +286,7 @@ impl<'a> StatefulWidget for SearchModalView<'a> {
     type State = SearchModalState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        // Layout: search field row + case note row + replace field row
-        // + (optional) 1 error row + 1 spacer + the buttons, which take
-        // more than one row in a terminal too narrow for the pair.
+        // Search row + note row + replace row + optional error row + spacer, then the buttons.
         let base_rows = if state.last_error.is_some() { 5 } else { 4 };
         let label_w = "Replace".chars().count() as u16;
         let longest_value = state
@@ -336,15 +296,12 @@ impl<'a> StatefulWidget for SearchModalView<'a> {
             .max(state.replace.chars().count()) as u16;
         let value_w = (longest_value + 4).max(32);
         let buttons_w = button_row_width(BUTTON_LABELS);
-        // The note row is indented under the value column, so its own
-        // width has to be part of the sizing or it renders clipped.
+        // The indented note row must count toward the width or it renders clipped.
         let note = matching_mode_note(state);
         let note_w = NOTE_INDENT as u16 + note.chars().count() as u16;
         let content_width = (label_w + 2 + value_w).max(buttons_w).max(note_w);
-        // The footer wraps rather than clipping, so its height is a
-        // function of the width the frame will give it.  Reserving a
-        // flat row instead leaves a wrapped button unpainted but still
-        // focusable and still carrying a click rect.
+        // The footer wraps rather than clipping; a flat one-row reservation would leave a
+        // wrapped button unpainted yet still focusable.
         let footer_rows = footer_row_count(BUTTON_LABELS, content_width, area.width, MAX_PAD_H);
         let content = ContentSize {
             width: content_width,
@@ -384,8 +341,6 @@ impl<'a> StatefulWidget for SearchModalView<'a> {
             self.cursor_visible,
         );
         row_y = row_y.saturating_add(1);
-        // Matching-mode note (see `matching_mode_note`), in quiet hint
-        // styling so it reads as metadata, not another field.
         if row_y < inner.y + inner.height {
             let note_area = Rect {
                 x: inner.x,
@@ -433,7 +388,6 @@ impl<'a> StatefulWidget for SearchModalView<'a> {
             }
         }
 
-        // Spacer between fields/error and buttons.
         if row_y < inner.y + inner.height {
             row_y = row_y.saturating_add(1);
         }
@@ -621,8 +575,6 @@ mod tests {
     fn paste_inserts_into_focused_field_and_escapes_newlines() {
         let mut s = SearchModalState::new(String::new(), String::new());
         s.paste("foo\nbar");
-        // The field is written in escape syntax, so a pasted break
-        // survives as `\n` rather than vanishing.
         assert_eq!(s.query, r"foo\nbar", "newline escaped, query targeted");
         assert_eq!(s.query_cursor, 8);
         s.handle_key(&key(KeyCode::Tab)); // focus Replace
@@ -639,7 +591,6 @@ mod tests {
         let mut s = SearchModalState::new(String::new(), String::new());
         s.paste(r"C:\dir");
         assert_eq!(s.query, r"C:\\dir");
-        // …and it decodes back to what was on the clipboard.
         assert_eq!(crate::search::escape::decode(&s.query).unwrap(), r"C:\dir");
     }
 
@@ -663,9 +614,6 @@ mod tests {
 
     #[test]
     fn a_narrow_terminal_wraps_the_footer_and_still_paints_both_buttons() {
-        // The footer wraps rather than clipping, so the modal has to
-        // reserve the rows it wrapped onto.  A flat one-row reservation
-        // leaves Cancel unpainted while Tab still focuses it.
         let backend = TestBackend::new(20, 16);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = SearchModalState::new("a".to_owned(), "b".to_owned());
@@ -718,15 +666,12 @@ mod tests {
         assert!(contents.contains("Search and Replace"), "{contents}");
         assert!(contents.contains("needle"), "{contents}");
         assert!(contents.contains("thread"), "{contents}");
-        // A filled replace field selects the case-sensitive replace flow.
         assert!(contents.contains("(Case sensitive"), "{contents}");
         assert!(contents.contains("Cancel"), "{contents}");
     }
 
     #[test]
     fn note_reflects_smartcase_when_replace_is_empty() {
-        // An empty replace field selects the navigate-only flow, which
-        // matches smartcase — the note must say so, not "(Case sensitive)".
         let backend = TestBackend::new(80, 14);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = SearchModalState::new("needle".to_owned(), String::new());
@@ -748,7 +693,6 @@ mod tests {
             .collect();
         assert!(contents.contains("(Smart case"), "{contents}");
         assert!(!contents.contains("(Case sensitive"), "{contents}");
-        // The escape hint shares the row.
         assert!(contents.contains(r"\n for a line break"), "{contents}");
     }
 }

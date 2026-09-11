@@ -1,13 +1,8 @@
-//! AST post-passes that run after `parse_raw`.
-//!
-//! These transforms mutate the block list emitted by pulldown-cmark into
-//! the shape edamame's renderer wants: image paragraphs become
-//! `Block::ImageBlock`, mermaid code blocks become synthetic image blocks,
-//! pure-comment HTML blocks become `Block::HtmlComment`, trailing
-//! `<!-- tui-columns -->` comments fold into preceding tables, and
-//! blank-separated ("loose") list items are annotated with the number of
-//! blank source lines preceding them so the renderer can reproduce the
-//! legibility spacing while keeping the list a single `Block::List`.
+//! AST post-passes that run after `parse_raw`, reshaping pulldown-cmark's block list for
+//! the renderer: image paragraphs and mermaid code blocks become `Block::ImageBlock`,
+//! pure-comment HTML becomes `Block::HtmlComment`, trailing `<!-- tui-columns -->`
+//! comments fold into preceding tables, and loose list items record the blank source lines
+//! preceding them.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -15,13 +10,9 @@ use std::ops::Range;
 use crate::diagram::DiagramSource;
 use crate::markdown::ast::{Block, Inline};
 
-/// Post-pass: collapse a `Block::Paragraph` whose only substantive inline
-/// is an `Inline::Image` into a `Block::ImageBlock`.  Whitespace-only
-/// leading/trailing `Inline::Text` and soft/hard breaks are tolerated and
-/// stripped.  If `real_ranges` is provided, it is kept 1:1 with `blocks`
-/// (the promotion does not remove blocks, so the range vector is
-/// unchanged; the parameter exists so callers that care about range
-/// alignment can stay symmetric with [`attach_trailing_tui_columns_comments`]).
+/// Collapse a `Block::Paragraph` whose only substantive inline is an `Inline::Image` into
+/// a `Block::ImageBlock`.  `real_ranges` is untouched — the promotion removes no blocks;
+/// the parameter exists for symmetry with [`attach_trailing_tui_columns_comments`].
 pub fn promote_image_paragraphs(
     blocks: &mut [Block],
     _real_ranges: Option<&mut Vec<Range<usize>>>,
@@ -35,21 +26,15 @@ pub fn promote_image_paragraphs(
     }
 }
 
-/// Post-pass: replace every fenced code block whose language tag is
-/// `mermaid` (case-insensitive) with a synthetic `Block::ImageBlock`
-/// whose URL is `diagram-mermaid-<sha256(source)>`.  Returns the
-/// `url → DiagramSource` map so `ParsedDoc` can attach the source to
-/// `ImageBlockInfo` (needed by the decode worker to render the PNG).
+/// Replace every `mermaid`-tagged fenced code block with a synthetic `Block::ImageBlock`,
+/// returning the `url → DiagramSource` map so `ParsedDoc` can hand the source to the
+/// decode worker.
 ///
-/// Only `mermaid` is matched — not `mermaidjs`, `mermaid-diagram`, or
-/// `diagram`.  GitHub and mermaid.js itself accept only the bare
-/// `mermaid` tag, so accepting more would render a diagram in edamame
-/// that silently falls back to a code block everywhere else.
-///
-/// Called from [`crate::document::ParsedDoc::build_with_overrides`]
-/// only — not from [`super::parse`] — so the other consumers of `parse`
-/// (help overlay preview, link-scan helpers, renderer tests) continue to
-/// see the raw code block.
+/// Only the bare `mermaid` tag is matched (not `mermaidjs`, `diagram`, …): GitHub and
+/// mermaid.js accept only that, so accepting more would render here what falls back to a
+/// code block everywhere else.  Called only from
+/// [`crate::document::ParsedDoc::build_with_overrides`], so `parse`'s other consumers
+/// still see the raw code block.
 pub fn promote_diagram_code_blocks(blocks: &mut [Block]) -> HashMap<String, DiagramSource> {
     let mut sources = HashMap::new();
     for block in blocks.iter_mut() {
@@ -62,9 +47,7 @@ pub fn promote_diagram_code_blocks(blocks: &mut [Block]) -> HashMap<String, Diag
         }
         let Block::CodeBlock { content, .. } = std::mem::replace(block, Block::HorizontalRule)
         else {
-            // unreachable per the matcher above, but std::mem::replace
-            // forces us to consume the old value — guard with a safe
-            // fallback rather than an `unwrap_or_unreachable!`.
+            // Unreachable per the matcher above; a safe fallback rather than a panic.
             continue;
         };
         let source = DiagramSource::Mermaid(content);
@@ -78,10 +61,253 @@ pub fn promote_diagram_code_blocks(blocks: &mut [Block]) -> HashMap<String, Diag
     sources
 }
 
-/// Return `Some((alt, url))` iff `inlines` contains exactly one
-/// `Inline::Image` plus optional whitespace-only `Inline::Text` and break
-/// inlines surrounding it.  Returns `None` for paragraphs with mixed
-/// content — those keep their placeholder treatment.
+/// Rescue a `$$…$$`-delimited paragraph that pulldown-cmark left as plain text.
+///
+/// pulldown-cmark's math extension tracks brace nesting: a `$$` closing delimiter that falls
+/// inside an unbalanced `{ … }` group is not treated as a delimiter, so a formula like
+/// `$$x^{123$$` (a half-typed `x^{123}`) never becomes `Event::DisplayMath` — it is emitted as
+/// bare `Text`/`SoftBreak` inlines instead.  Mid-typing, that means a `$$…$$` block silently stops
+/// being math the instant a brace is left open: it is no longer promoted, its reserved image rows
+/// vanish, and the formula reflows to prose — snapping back only once the brace is closed.
+///
+/// This runs before [`promote_display_math_paragraphs`] / [`split_display_math_paragraphs`] and
+/// rewrites such a paragraph back into a single `Inline::Math { display: true }`, so it flows
+/// through the normal promotion and keeps its reserved rows.  The render then fails cleanly on the
+/// invalid LaTeX (placeholder / persisted preview band), exactly like any other broken formula —
+/// the block stays a stable, reserved figure the whole time the braces are unbalanced.
+///
+/// Deliberately conservative: only a paragraph whose *source* is exactly one `$$ … $$` pair (no
+/// interior `$$`, non-empty body), and never one pulldown already parsed as display math.  The
+/// carved `inner` matches pulldown's own source convention — the delimiters stripped, interior
+/// whitespace (including the delimiter-line newlines) kept — so `split_math_ranges` and
+/// `display_math_block_body` treat it identically to a formula pulldown parsed itself.
+pub fn reconstruct_broken_display_math(
+    blocks: &mut [Block],
+    real_ranges: &[Range<usize>],
+    source: &str,
+) {
+    for (block, range) in blocks.iter_mut().zip(real_ranges) {
+        let Block::Paragraph { inlines } = block else {
+            continue;
+        };
+        // Already recognized as display math — pulldown got it right, leave it.
+        if collect_display_math_only(inlines).is_some() {
+            continue;
+        }
+        let Some(raw) = source.get(range.clone()) else {
+            continue;
+        };
+        let trimmed = raw.trim_matches(|c: char| c.is_ascii_whitespace());
+        let Some(inner) = trimmed
+            .strip_prefix("$$")
+            .and_then(|body| body.strip_suffix("$$"))
+        else {
+            continue;
+        };
+        // One `$$…$$` pair with a body: an interior `$$` means multiple formulas or prose, which
+        // we leave to pulldown's own (correct) handling.
+        if inner.is_empty() || inner.contains("$$") {
+            continue;
+        }
+        *inlines = vec![Inline::Math {
+            source: inner.to_string(),
+            display: true,
+        }];
+    }
+}
+
+/// Replace every display-math-only paragraph (one or more `Inline::Math { display: true }`,
+/// separated by breaks and whitespace-only text) with one synthetic `Block::ImageBlock` **per
+/// formula**, URL `diagram-math-<sha256(source)>`.  Returns the `url → DiagramSource` map, merged
+/// into [`promote_diagram_code_blocks`]'s so `ParsedDoc` attaches the source to `ImageBlockInfo`
+/// for the decode worker.
+///
+/// pulldown-cmark folds stacked `$$...$$` blocks (no blank line between) into one paragraph of
+/// `[Math, SoftBreak, Math]`; this re-splits it into one image block per formula, `real_ranges`
+/// rewritten to stay 1:1 with `blocks`.  Paragraphs mixing math with other inlines are left alone.
+/// Called from [`crate::document::ParsedDoc::build_with_overrides`] only — not [`super::parse`] —
+/// like [`promote_diagram_code_blocks`], so other `parse` consumers keep seeing the paragraph.
+pub fn promote_display_math_paragraphs(
+    blocks: &mut Vec<Block>,
+    real_ranges: &mut Vec<Range<usize>>,
+    source: &str,
+) -> HashMap<String, DiagramSource> {
+    let mut sources = HashMap::new();
+    let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
+    let mut out_ranges: Vec<Range<usize>> = Vec::with_capacity(real_ranges.len());
+    for (block, range) in blocks.drain(..).zip(real_ranges.drain(..)) {
+        let Block::Paragraph { inlines } = &block else {
+            out.push(block);
+            out_ranges.push(range);
+            continue;
+        };
+        let Some(math_sources) = collect_display_math_only(inlines) else {
+            out.push(block);
+            out_ranges.push(range);
+            continue;
+        };
+        // Carve each formula's byte range from the paragraph's source
+        // text.  `split_math_ranges` walks the paragraph body locating
+        // `$$` delimiter pairs; a failure to locate them (shouldn't
+        // happen — pulldown already parsed them) falls back to keeping
+        // the paragraph as-is.
+        let Some(piece_ranges) = split_math_ranges(source, &range, math_sources.len()) else {
+            out.push(block);
+            out_ranges.push(range);
+            continue;
+        };
+        for (i, formula) in math_sources.iter().enumerate() {
+            let diagram_source = DiagramSource::Latex(formula.clone());
+            let url = crate::diagram::synthetic_url(&diagram_source);
+            sources.insert(url.clone(), diagram_source);
+            out.push(Block::ImageBlock {
+                alt: "math".to_string(),
+                url,
+            });
+            out_ranges.push(piece_ranges[i].clone());
+        }
+    }
+    *blocks = out;
+    *real_ranges = out_ranges;
+    sources
+}
+
+/// Figures-off counterpart of [`promote_display_math_paragraphs`]: when a display-math-only
+/// paragraph holds more than one `$$...$$` formula (pulldown folds stacked formulas into one
+/// paragraph), split it into one single-formula `Block::Paragraph` per formula so each renders as
+/// its own fenced-style `math` code block — the figures-on block boundaries minus the image.
+/// `real_ranges` is rewritten 1:1, each range carved by [`split_math_ranges`].  A single-formula
+/// paragraph is left untouched (already one block, painted via [`display_math_block_body`]).
+/// Called from [`crate::document::ParsedDoc::build_with_overrides`] only, figures-off branch.
+pub fn split_display_math_paragraphs(
+    blocks: &mut Vec<Block>,
+    real_ranges: &mut Vec<Range<usize>>,
+    source: &str,
+) {
+    let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
+    let mut out_ranges: Vec<Range<usize>> = Vec::with_capacity(real_ranges.len());
+    for (block, range) in blocks.drain(..).zip(real_ranges.drain(..)) {
+        let split = match &block {
+            Block::Paragraph { inlines } => collect_display_math_only(inlines)
+                .filter(|formulas| formulas.len() >= 2)
+                .and_then(|formulas| {
+                    split_math_ranges(source, &range, formulas.len())
+                        .map(|ranges| (formulas, ranges))
+                }),
+            _ => None,
+        };
+        match split {
+            Some((formulas, piece_ranges)) => {
+                for (i, formula) in formulas.into_iter().enumerate() {
+                    out.push(Block::Paragraph {
+                        inlines: vec![Inline::Math {
+                            source: formula,
+                            display: true,
+                        }],
+                    });
+                    out_ranges.push(piece_ranges[i].clone());
+                }
+            }
+            None => {
+                out.push(block);
+                out_ranges.push(range);
+            }
+        }
+    }
+    *blocks = out;
+    *real_ranges = out_ranges;
+}
+
+/// If `inlines` contains only display-math inlines (plus soft/hard breaks
+/// and whitespace-only text between them), return each formula's LaTeX
+/// source in order.  Returns `None` for mixed paragraphs, lone inline
+/// (`$...$`) math, or a paragraph with no display math at all.
+fn collect_display_math_only(inlines: &[Inline]) -> Option<Vec<String>> {
+    let mut formulas: Vec<String> = Vec::new();
+    for inline in inlines {
+        match inline {
+            Inline::Math {
+                source,
+                display: true,
+            } => formulas.push(source.clone()),
+            Inline::Math { .. } => return None, // lone inline $...$
+            Inline::Text(t) if t.trim().is_empty() => {}
+            Inline::SoftBreak | Inline::HardBreak => {}
+            _ => return None,
+        }
+    }
+    (!formulas.is_empty()).then_some(formulas)
+}
+
+/// A figures-off `$$...$$` paragraph stays a `Block::Paragraph` and renders as a fenced-style
+/// `math` code block — the source counterpart of the display-math reveal, like a `` ```mermaid ``
+/// fence when figures are off.
+///
+/// Returns the formula body (LaTeX with the delimiter newlines stripped, for
+/// `Renderer::render_code_block(Some("math"), body, true, …)`) iff `block` is a paragraph whose
+/// only inline is a single **multi-line** `$$\n…\n$$` formula (delimiters on their own lines).
+/// `None` for everything else — a mixed paragraph, stacked formulas, inline `$…$`, or a one-line
+/// `$$x$$` (no delimiter rows to align the fence against).
+///
+/// The renderer and `editor::state::sub_lines_in_block` must agree on this shape: the latter maps
+/// its rendered rows 1:1 onto source lines so the cursor and click hit-test land right.
+pub(crate) fn display_math_block_body(block: &Block) -> Option<String> {
+    let Block::Paragraph { inlines } = block else {
+        return None;
+    };
+    let mut formula: Option<&str> = None;
+    for inline in inlines {
+        match inline {
+            Inline::Math {
+                source,
+                display: true,
+            } if formula.is_none() => formula = Some(source),
+            Inline::Math { .. } => return None, // a second formula, or inline $…$
+            Inline::Text(t) if t.trim().is_empty() => {}
+            Inline::SoftBreak | Inline::HardBreak => {}
+            _ => return None,
+        }
+    }
+    // Require `$$` on their own lines: the source then reads `\n…\n`, and
+    // stripping one newline each side leaves the body whose rendered fence
+    // rows line up 1:1 with the source's two `$$` lines.
+    let inner = formula?.strip_prefix('\n')?.strip_suffix('\n')?;
+    Some(inner.to_string())
+}
+
+/// Split a display-math paragraph's source into `count` byte ranges, one per `$$...$$` formula.
+/// Each range runs from a formula's opening `$$` to just past its closing `$$` (the last extends
+/// to the paragraph end); the whitespace *between* formulas is left out of both — `ParsedDoc::build`
+/// covers it via `extended_ranges`, and absorbing it here would give the preceding formula an extra
+/// reveal row.  `None` when the delimiters cannot be matched (paragraph left as-is).
+///
+/// Assumes each formula is one `$$...$$` pair with no literal `$$` in its body — true for anything
+/// pulldown already parsed as a single `DisplayMath` event; a stray interior `$$` would miscount,
+/// which the `None` fallback does not catch, so this pins the invariant.
+fn split_math_ranges(source: &str, para: &Range<usize>, count: usize) -> Option<Vec<Range<usize>>> {
+    let body = source.get(para.clone())?;
+    let mut ranges = Vec::with_capacity(count);
+    let mut search_from = 0usize;
+    for i in 0..count {
+        let open = body[search_from..].find("$$")? + search_from;
+        // Closing `$$`: find the next occurrence after the opening.
+        let close_rel = body[open + 2..].find("$$")?;
+        let close = open + 2 + close_rel;
+        // If this is the last formula, the range extends to the end of
+        // the paragraph (absorbing trailing soft break / whitespace).
+        let end = if i + 1 == count {
+            body.len()
+        } else {
+            close + 2
+        };
+        ranges.push(para.start + open..para.start + end);
+        search_from = close + 2;
+    }
+    Some(ranges)
+}
+
+/// `Some((alt, url))` iff `inlines` is exactly one `Inline::Image` plus optional
+/// whitespace-only text and breaks.  Mixed content keeps its placeholder treatment.
 fn extract_lone_image(inlines: &[Inline]) -> Option<(String, String)> {
     let mut image: Option<(String, String)> = None;
     for inline in inlines {
@@ -100,11 +326,8 @@ fn extract_lone_image(inlines: &[Inline]) -> Option<(String, String)> {
     image
 }
 
-/// Return true iff `body` consists entirely of one or more well-formed
-/// `<!-- ... -->` HTML comments, possibly separated and surrounded by
-/// whitespace.  Non-comment HTML (e.g. `<div>`) and comments mixed with
-/// other text both return `false` so the renderer still shows the raw
-/// source for those cases.
+/// Whether `body` is entirely well-formed `<!-- ... -->` comments plus whitespace.
+/// Anything else is `false`, so the renderer still shows the raw source for it.
 pub(super) fn is_html_comment_only(body: &str) -> bool {
     let mut rest = body.trim();
     if rest.is_empty() {
@@ -114,8 +337,7 @@ pub(super) fn is_html_comment_only(body: &str) -> bool {
         if !rest.starts_with("<!--") {
             return false;
         }
-        // Locate the end of this comment.  `<!--` is 4 bytes; the closing
-        // `-->` must start at least at index 4 so the delimiters don't
+        // The closing `-->` must start at index 4 or later, so the delimiters can't
         // overlap on strings like `<!-->`.
         let Some(close) = rest[4..].find("-->") else {
             return false;
@@ -125,11 +347,8 @@ pub(super) fn is_html_comment_only(body: &str) -> bool {
     true
 }
 
-/// Post-pass: promote any `Block::Html(body)` whose `body` matches a single
-/// `<!-- ... -->` comment into `Block::HtmlComment(body)`.  The stored
-/// string keeps the delimiters so downstream helpers
-/// (`parse_column_widths_comment`, persistence round-trips) don't need a
-/// variant-specific code path.
+/// Promote comment-only `Block::Html` into `Block::HtmlComment`.  The stored string keeps
+/// its delimiters so downstream helpers need no variant-specific path.
 pub fn promote_html_comments(blocks: &mut [Block]) {
     for block in blocks.iter_mut() {
         if let Block::Html(body) = block {
@@ -141,17 +360,12 @@ pub fn promote_html_comments(blocks: &mut [Block]) {
     }
 }
 
-/// Post-pass: any `Block::HtmlComment` whose body is a valid
-/// `<!-- tui-columns: [..] -->` marker and that directly follows a
-/// `Block::Table` gets consumed — its widths are moved onto the table's
-/// `user_widths` field, and the comment block is removed from the list.
-/// Other comment blocks (including `<!-- tui-columns: [..] -->` comments
-/// that aren't adjacent to a table) are left intact and render as zero
-/// lines.
+/// Fold a `<!-- tui-columns: [..] -->` comment that directly follows a `Block::Table` into
+/// that table's `user_widths`, removing the comment block.  Non-adjacent ones are left
+/// intact and render as zero lines.
 ///
-/// Must run AFTER [`promote_html_comments`] — the generic promotion pass
-/// converts `Block::Html` comments to `Block::HtmlComment`, which this
-/// function then consumes when adjacent to a table.
+/// Must run AFTER [`promote_html_comments`], which is what creates the `HtmlComment`
+/// blocks this consumes.
 pub fn attach_trailing_tui_columns_comments(blocks: &mut Vec<Block>) {
     let mut i = 0;
     while i + 1 < blocks.len() {
@@ -176,38 +390,23 @@ pub fn attach_trailing_tui_columns_comments(blocks: &mut Vec<Block>) {
     }
 }
 
-/// Post-pass: annotate each `ListItem` with the number of blank source
-/// lines directly preceding its marker line (`ListItem::blank_lines_before`).
+/// Annotate each `ListItem` with the blank source lines directly preceding its marker
+/// (`ListItem::blank_lines_before`).
 ///
-/// pulldown-cmark per CommonMark merges blank-separated items into a single
-/// "loose" list.  edamame wants those inter-item blanks visible as their own
-/// rendered lines (a TUI's only way to space a dense list — see the
-/// discussion in `docs`), but *without* fragmenting the list: the block stays
-/// one `Block::List`, and the renderer emits `blank_lines_before` blank lines
-/// ahead of each item.  Keeping the list whole is what lets ordered numbering
-/// come straight from pulldown-cmark (no per-group `start` re-derivation) and
-/// keeps the block↔range vectors trivially 1:1 — no surgery here.
+/// CommonMark merges blank-separated items into one "loose" list; edamame wants those
+/// blanks rendered but *without* fragmenting the block, so the list stays one
+/// `Block::List` and the renderer emits the recorded blanks.  Keeping it whole is what
+/// lets ordered numbering come straight from pulldown-cmark and keeps the block↔range
+/// vectors 1:1.
 ///
-/// The reveal in `RenderedView` maps rendered lines to source lines by
-/// splitting the block's raw text on `\n`, so the count recorded here must
-/// equal the number of blank source lines actually present: only a contiguous
-/// run of blank lines *directly* above item k counts.  Blank lines interior
-/// to the previous item (before a nested code block, between its paragraphs)
-/// reset the run and don't count, and blanks inside a `` ``` ``/`~~~` fence
-/// embedded in an item are skipped entirely.
+/// `RenderedView`'s reveal maps rendered to source lines by splitting the block's raw text
+/// on `\n`, so the recorded count must equal the blanks actually present: only a
+/// contiguous run *directly* above item k counts, and blanks inside an embedded
+/// `` ``` ``/`~~~` fence are skipped entirely.  `ranges` is read-only and stays 1:1.
 ///
-/// `ranges` is read-only here and stays 1:1 with `blocks`.
-///
-/// Scope: top-level lists only.  CommonMark evaluates looseness per-list at
-/// any depth, so a nested sub-list can be loose independently — but we only
-/// annotate the direct items of each top-level `Block::List`, so a loose
-/// *nested* list renders tight (its inter-item blanks are dropped).  This is
-/// a deliberate scope choice, not an oversight: nested support would need a
-/// nested source-range derivation here (`ranges` covers top-level blocks
-/// only) plus multi-level indent tracking in the `RenderedView` reveal
-/// mapping, and blank-separated nested items are rare enough that the added
-/// risk in that reveal code isn't worth it.  See the git history for the
-/// discussion.
+/// Top-level lists only: a loose *nested* list renders tight.  Deliberate — nested support
+/// would need nested range derivation plus multi-level indent tracking in the reveal
+/// mapping, for a rare case.
 pub fn annotate_list_blanks(blocks: &mut [Block], ranges: &[Range<usize>], source: &str) {
     for (block, range) in blocks.iter_mut().zip(ranges.iter()) {
         let Block::List { items, .. } = block else {
@@ -215,9 +414,7 @@ pub fn annotate_list_blanks(blocks: &mut [Block], ranges: &[Range<usize>], sourc
         };
         let list_src = &source[range.clone()];
         let item_offsets = top_level_item_offsets(list_src);
-        // Defensive: if the source scan disagrees with the AST item count
-        // (unusual list formats we don't recognise), leave the list untouched
-        // — every item keeps `blank_lines_before == 0`.
+        // If the source scan disagrees with the AST item count, leave the list untouched.
         if item_offsets.len() != items.len() {
             continue;
         }
@@ -227,8 +424,7 @@ pub fn annotate_list_blanks(blocks: &mut [Block], ranges: &[Range<usize>], sourc
             if let Some(gap_start) =
                 separator_blank_run_start(list_src, between_start, item_offsets[k])
             {
-                // The run [gap_start, item_offsets[k]) is all blank lines by
-                // construction; each contributes one trailing `\n`.
+                // The run is all blank lines by construction; each contributes one `\n`.
                 items[k].blank_lines_before = list_src.as_bytes()[gap_start..item_offsets[k]]
                     .iter()
                     .filter(|&&b| b == b'\n')
@@ -238,9 +434,8 @@ pub fn annotate_list_blanks(blocks: &mut [Block], ranges: &[Range<usize>], sourc
     }
 }
 
-/// Return the byte offsets of every top-level item-start line within
-/// `list_src`.  "Top-level" means the line's leading-whitespace indent
-/// matches the first item's indent — nested content is ignored.
+/// Byte offsets of every top-level item-start line in `list_src` — "top-level" meaning the
+/// indent matches the first item's, so nested content is ignored.
 fn top_level_item_offsets(list_src: &str) -> Vec<usize> {
     let bytes = list_src.as_bytes();
     let mut offsets = Vec::new();
@@ -275,17 +470,10 @@ fn line_end_in_str(s: &str, start: usize) -> usize {
     p
 }
 
-/// Byte offset within `s` where the run of blank lines *directly
-/// preceding* `end` starts, scanning `[start, end)` line by line.
-/// [`annotate_list_blanks`] uses this to decide whether the next item is
-/// separated from the previous one by user-visible whitespace — the count
-/// of blank lines from here to the item is then recorded on the item so the
-/// renderer reproduces the gap.  Returns `None` when the line directly
-/// above `end` isn't blank: blank lines interior to the previous item's
-/// content (before a nested code block, between its paragraphs) are not
-/// separators.  Blank lines that fall between an opening and closing
-/// `` ``` ``/`~~~` fence are ignored, so a code block embedded in a list
-/// item never fragments its enclosing list.
+/// Byte offset where the run of blank lines *directly preceding* `end` starts, scanning
+/// `[start, end)`.  `None` when the line above `end` isn't blank — blanks interior to the
+/// previous item's content are not separators.  Blanks inside a `` ``` ``/`~~~` fence are
+/// ignored, so an embedded code block never fragments its list.
 fn separator_blank_run_start(s: &str, start: usize, end: usize) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut pos = start;
@@ -315,11 +503,9 @@ fn separator_blank_run_start(s: &str, start: usize, end: usize) -> Option<usize>
     run_start
 }
 
-/// Recognise an opening fenced-code-block marker.  Returns the fence
-/// character (`` ` `` or `~`) and its run length, or `None` if `line`
-/// isn't a fence opener.  Indentation up to any depth is permitted —
-/// inside a list item the fence is indented to the item's content
-/// column, and we only need to track the fence/no-fence state.
+/// An opening fence marker: its character (`` ` `` or `~`) and run length.  Indentation of
+/// any depth is permitted — inside a list item the fence sits at the content column, and
+/// only the fence/no-fence state matters here.
 pub fn parse_opening_fence(line: &str) -> Option<(char, usize)> {
     let trimmed = line.trim_start();
     let first = trimmed.chars().next()?;
@@ -337,9 +523,8 @@ pub fn parse_opening_fence(line: &str) -> Option<(char, usize)> {
     Some((first, count))
 }
 
-/// Recognise a closing fence for an open fence of `fence_char` × `min_count`.
-/// Per CommonMark, the closing run must use the same character, be at
-/// least as long, and have only whitespace after it.
+/// A closing fence for an open `fence_char` × `min_count`: same character, at least as
+/// long, whitespace-only after it (CommonMark).
 pub fn is_closing_fence(line: &str, fence_char: char, min_count: usize) -> bool {
     let trimmed = line.trim_start();
     let count = trimmed.chars().take_while(|&c| c == fence_char).count();
@@ -349,10 +534,8 @@ pub fn is_closing_fence(line: &str, fence_char: char, min_count: usize) -> bool 
     trimmed[count..].chars().all(char::is_whitespace)
 }
 
-/// Parse the marker prefix of `line` (a raw line without trailing `\n`).
-/// Returns `(indent, marker_or_delim, optional_number)` — bullet markers
-/// have `None` as the number; ordered markers carry their parsed integer.
-/// Returns `None` for lines that don't start with a recognized marker.
+/// The marker prefix of `line`: `(indent, marker_or_delim, number)`, the number being
+/// `None` for bullets.  `None` when the line starts with no recognized marker.
 fn parse_marker_line(line: &str) -> Option<(String, char, Option<u64>)> {
     let bytes = line.as_bytes();
     let mut i = 0;

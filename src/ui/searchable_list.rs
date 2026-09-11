@@ -1,18 +1,13 @@
-//! Shared, generic fuzzy-searchable list component for modal widgets
-//! (command palette, section picker, theme picker, export-theme).
+//! Shared fuzzy-searchable list component for modal widgets (command palette, section picker,
+//! theme picker, export-theme).
 //!
-//! [`SearchableList`] owns the query / focus / filter / scroll state machine
-//! plus the input-row, divider, and scrollable-list rendering.  Callers supply
-//! the items, a fuzzy-haystack extractor, and a per-row formatter; the
-//! component handles typing, arrow navigation, paging, paste, wheel scroll,
-//! and click-to-submit, emitting a [`ListEvent`] the modal adapter acts on.
+//! [`SearchableList`] owns the query / focus / filter / scroll state machine plus the input-row,
+//! divider, and list rendering.  Callers supply the items, a fuzzy-haystack extractor, and a
+//! per-row formatter; the component emits a [`ListEvent`] the modal adapter acts on.
 //!
-//! The component is *embeddable*: [`SearchableList::render`] paints into any
-//! `Rect`, so a parent can stack extra chrome above or below it (a Dark-mode
-//! toggle, a name field, buttons).  For the common "input + list fills the
-//! whole modal" case, [`draw_searchable_list_modal`] composes the centred,
-//! top-anchored frame around it.  [`fuzzy_filter`] is the shared nucleo
-//! scoring loop.
+//! It is *embeddable*: [`SearchableList::render`] paints into any `Rect`, so a parent can stack
+//! extra chrome above or below it.  [`draw_searchable_list_modal`] composes the centered,
+//! top-anchored frame for the common "input + list fills the whole modal" case.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -31,26 +26,17 @@ use crate::ui::scroll_container::{
     VERTICAL_CHROME_ROWS,
 };
 
-/// Default cap on the scrolling list height for searchable-list modals.
-/// Callers pass their own cap via [`ListModalOpts::max_list_rows`]; the command
-/// palette uses this default, while the section picker passes `u16::MAX` so it
-/// grows to fill the available height instead.
+/// Default cap on the scrolling list height; callers override via
+/// [`ListModalOpts::max_list_rows`] (the section picker passes `u16::MAX` to fill the height).
 pub const MAX_LIST_ROWS: u16 = 20;
 
 /// Rows the input + divider occupy in a [`draw_searchable_list_modal`] body.
 /// Pinned above the scrolling list so they don't move as the body scrolls.
 const PINNED_TOP: u16 = 2;
 
-/// Score `items` against `query` using nucleo's smart-case fuzzy
-/// matcher and return their indices ordered by descending score, with
-/// stable index-order tie-breaking.  Items that don't match are
-/// excluded.  Pass `key` to extract the haystack string from each
-/// item.
-///
-/// The caller's items are expected to be in their canonical order
-/// already (alphabetical for the palette, document order for the
-/// section picker); index-order tie-breaking preserves whatever that
-/// canonical order is.
+/// Score `items` (haystack via `key`) against `query` with nucleo's smart-case fuzzy matcher,
+/// returning matching indices by descending score.  Ties break on index, which preserves the
+/// caller's canonical order (alphabetical for the palette, document order for the picker).
 pub fn fuzzy_filter<T, F: Fn(&T) -> &str>(items: &[T], query: &str, key: F) -> Vec<usize> {
     let mut matcher = Matcher::default();
     let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
@@ -68,25 +54,9 @@ pub fn fuzzy_filter<T, F: Fn(&T) -> &str>(items: &[T], query: &str, key: F) -> V
 }
 
 // ── Generic searchable-list component ───────────────────────────────────────
-//
-// `SearchableList<T>` owns the query/focus/filter/scroll state machine and the
-// input + list rendering shared by every fuzzy-searchable modal (command
-// palette, section picker, theme picker, export-theme).  Callers supply the
-// items, a fuzzy-haystack extractor, and a per-row formatter; the component
-// handles typing, arrow navigation, paging, paste, wheel scroll, and
-// click-to-submit, emitting a [`ListEvent`] the modal adapter acts on.
-//
-// The component is *embeddable*: [`SearchableList::render`] paints an input
-// row, a divider, and the scrollable list into whatever `Rect` the caller
-// gives it, so a parent can stack extra chrome (a Dark-mode toggle, a name
-// field, buttons) above or below it.  For the common "input + list fills the
-// whole modal" case, [`anchor_searchable_modal`] computes the centred,
-// top-anchored frame rect to draw into.
 
-/// One row in the visible (post-filter) list: either a non-selectable section
-/// header (command palette only) or a selectable item, carrying its index into
-/// the caller's `items`.  Returned by a [`SearchableList::with_sections`]
-/// builder to describe the empty-query layout.
+/// One row in the visible (post-filter) list: a non-selectable section header (command palette
+/// only), or a selectable item carrying its index into the caller's `items`.
 #[derive(Debug, Clone)]
 pub enum VisibleRow {
     Header(String),
@@ -114,10 +84,8 @@ pub enum ListEvent {
     Continue,
     /// Esc — caller should close / revert.
     Cancelled,
-    /// The focused *item* changed (carries its index into `items`).  Drives
-    /// live preview (theme picker, section picker).  Emitted only when the
-    /// resolved focused item actually differs from the previous one, so a
-    /// caller can preview unconditionally without re-deduping.
+    /// The focused *item* changed (index into `items`).  Drives live preview; emitted only on a
+    /// real change, so a caller can preview unconditionally without re-deduping.
     FocusChanged(usize),
     /// Enter or a row click (carries the item index into `items`).
     Submitted(usize),
@@ -144,7 +112,7 @@ enum Reveal {
     None,
     /// Scroll the minimum amount to make the focused row visible.
     Ensure,
-    /// Centre the focused row in the visible window (section picker open).
+    /// Center the focused row in the visible window (section picker open).
     Center,
 }
 
@@ -153,10 +121,8 @@ pub struct ListChrome<'a> {
     pub theme: &'a Theme,
     /// App blink phase for the input cursor.
     pub cursor_visible: bool,
-    /// Whether the input field is the active one (the cursor is only drawn
-    /// when both this and `cursor_visible` are true).  Pass `true` for modals
-    /// whose only field is the list query; the export modal passes `false`
-    /// when its Name field has focus.
+    /// Whether the query field is the active one — the cursor needs both this and
+    /// `cursor_visible`.  The export modal passes `false` while its Name field has focus.
     pub field_focused: bool,
     /// Muted hint shown after the prompt when the query is empty.
     pub placeholder: &'a str,
@@ -216,10 +182,8 @@ impl<T> SearchableList<T> {
         list
     }
 
-    /// Supply an empty-query sectioned layout (command palette).  `build`
-    /// returns the display rows — headers interleaved with item indices — for
-    /// the empty-query view.  A non-empty query always falls back to the flat
-    /// fuzzy-ranked list.
+    /// Supply an empty-query sectioned layout (command palette): `build` returns headers
+    /// interleaved with item indices.  A non-empty query falls back to the flat ranked list.
     pub fn with_sections(mut self, build: SectionsFn<T>) -> Self {
         self.section_titles = Some(build);
         self.invalidate();
@@ -277,9 +241,8 @@ impl<T> SearchableList<T> {
         self.focused_item_index().map(|i| &self.items[i])
     }
 
-    /// Pre-focus the item at `item_idx` (an index into `items`) and arrange for
-    /// the next render to scroll it into view.  No-op if the item isn't in the
-    /// current view.
+    /// Pre-focus the item at `item_idx` and scroll it into view on the next render.  No-op if it
+    /// isn't in the current view.
     pub fn focus_item(&mut self, item_idx: usize) {
         self.refresh();
         if let Some(pos) = self
@@ -306,9 +269,8 @@ impl<T> SearchableList<T> {
         self.reveal = Reveal::Center;
     }
 
-    /// Replace the item set (theme picker mode switch): resets the query and
-    /// focus.  Re-focus afterwards with [`focus_item`](Self::focus_item) /
-    /// [`focus_matching`](Self::focus_matching).
+    /// Replace the item set (theme picker mode switch), resetting query and focus.  Re-focus
+    /// afterwards with [`focus_item`](Self::focus_item) / [`focus_matching`](Self::focus_matching).
     pub fn set_items(&mut self, items: Vec<T>) {
         self.items = items;
         self.query.clear();
@@ -379,8 +341,7 @@ impl<T> SearchableList<T> {
         }
     }
 
-    /// Append a bracketed paste to the query (sanitised + flattened) and
-    /// re-filter.
+    /// Append a bracketed paste to the query (sanitized and flattened) and re-filter.
     pub fn paste(&mut self, text: &str) -> ListEvent {
         let clean = crate::ui::sanitize_paste(text);
         if clean.is_empty() {
@@ -438,8 +399,7 @@ impl<T> SearchableList<T> {
             .unwrap_or(0)
     }
 
-    /// Emit [`ListEvent::FocusChanged`] when the focused item differs from the
-    /// last one we reported; otherwise `Continue`.
+    /// Emit [`ListEvent::FocusChanged`] when the focused item differs from the last reported.
     fn focus_event(&mut self) -> ListEvent {
         let cur = self.focused_item_index();
         if cur != self.last_focused_item {
@@ -479,7 +439,6 @@ impl<T> SearchableList<T> {
         };
         self.matched_for_query = Some(self.query.clone());
 
-        // Resolve focus.
         if let Some(target) = self.pending_focus_key.take() {
             self.focused = self
                 .visible
@@ -504,9 +463,8 @@ impl<T> SearchableList<T> {
 
     // ── Render ────────────────────────────────────────────────────────────
 
-    /// Render the input row, divider, and scrollable list into `area` (input
-    /// at the top row, divider below it, list filling the rest).  `fmt` styles
-    /// each row.  Caches the list rect for [`handle_click`](Self::handle_click).
+    /// Render the input row, divider, and scrollable list into `area`, styling each row with
+    /// `fmt`.  Caches the list rect for [`handle_click`](Self::handle_click).
     pub fn render<F>(&mut self, area: Rect, buf: &mut Buffer, chrome: ListChrome<'_>, fmt: F)
     where
         F: Fn(RowCtx<'_, T>) -> Line<'static>,
@@ -603,9 +561,8 @@ impl<T> SearchableList<T> {
     }
 }
 
-/// Paint the `› query` input row, with a muted `placeholder` when the query is
-/// empty.  The block cursor is shown when `cursor_on` (blink phase ∧ field
-/// focused) and is constant-width across blink phases.
+/// Paint the `› query` input row, with a muted `placeholder` when the query is empty.  The block
+/// cursor is drawn when `cursor_on` and is constant-width across blink phases.
 fn render_search_input_row(
     area: Rect,
     buf: &mut Buffer,
@@ -633,13 +590,9 @@ fn render_search_input_row(
         .render(area, buf);
 }
 
-/// Geometry for a searchable-list modal whose body is `pinned_top` rows of
-/// fixed chrome, a scrolling list, and `pinned_bottom` rows of fixed chrome.
-///
-/// Returns the centred modal rect using the top-anchor trick (positioned as if
-/// the list were at its full `max_list_rows` height so the input row doesn't
-/// jump as the match count shrinks while typing), plus the [`ContentSize`] to
-/// hand to [`draw_frame`].
+/// Geometry for a searchable-list modal: `pinned_top` rows of chrome, a scrolling list, then
+/// `pinned_bottom` rows.  The modal rect uses the top-anchor trick — positioned as if the list
+/// were at its full `max_list_rows` height, so the input row doesn't jump as matches shrink.
 pub struct SearchableModalGeometry {
     pub modal_area: Rect,
     pub content: ContentSize,
@@ -771,10 +724,7 @@ mod tests {
 
     #[test]
     fn fuzzy_filter_keeps_matches_and_drops_non_matches() {
-        // Two items contain the query characters; one is unrelated.
-        // Only assert the membership and exclusion contract — leave
-        // the relative ranking of two matches to nucleo's scorer (its
-        // tie-breaking heuristics are an implementation detail).
+        // Only the membership contract; relative ranking is nucleo's business.
         let items = vec!["preview", "copy save", "save it"];
         let result = fuzzy_filter(&items, "save", |s| s);
         assert!(!result.contains(&0), "non-matches must be excluded");
@@ -790,7 +740,6 @@ mod tests {
 
     #[test]
     fn fuzzy_filter_breaks_score_ties_by_input_order() {
-        // Two strings that fuzzy-match identically; the first wins.
         let items = vec!["foo", "foo"];
         let result = fuzzy_filter(&items, "foo", |s| s);
         assert_eq!(result, vec![0, 1]);
@@ -856,10 +805,8 @@ mod tests {
     fn click_on_a_row_submits_that_item() {
         let mut l = list();
         let area = l.list_area_after_render(80, 24);
-        // First visible row is the top of the list (scroll 0).
         let resp = l.handle_click(area.x + 1, area.y);
         assert_eq!(resp, ListEvent::Submitted(0));
-        // A click on the third visible row submits the third item.
         let resp = l.handle_click(area.x + 1, area.y + 2);
         assert_eq!(resp, ListEvent::Submitted(2));
     }
@@ -868,7 +815,6 @@ mod tests {
     fn click_outside_the_list_is_continue() {
         let mut l = list();
         let area = l.list_area_after_render(80, 24);
-        // Above the list.
         assert_eq!(
             l.handle_click(area.x + 1, area.y.saturating_sub(2)),
             ListEvent::Continue
@@ -879,14 +825,12 @@ mod tests {
     fn focus_changed_only_fires_when_the_item_actually_changes() {
         let mut l = list();
         render(&mut l, 80, 24);
-        // Down moves to a new item → FocusChanged.
         assert_eq!(
             l.handle_key(&key(KeyCode::Down)),
             ListEvent::FocusChanged(1)
         );
-        // Up back to item 0 → FocusChanged again (different item).
         assert_eq!(l.handle_key(&key(KeyCode::Up)), ListEvent::FocusChanged(0));
-        // Up at the top can't move → Continue (no spurious preview).
+        // Up at the top can't move: no spurious preview.
         assert_eq!(l.handle_key(&key(KeyCode::Up)), ListEvent::Continue);
     }
 
@@ -905,8 +849,7 @@ mod tests {
 
     #[test]
     fn modal_top_edge_is_stable_while_filtering() {
-        // The top-anchor trick keeps the input row from jumping as the match
-        // count shrinks.  Both the full list and a broad query hit the row cap.
+        // The top-anchor trick keeps the input row from jumping as the match count shrinks.
         let mut l = list();
         let (_, top_empty) = render(&mut l, 80, 40);
         l.handle_key(&key(KeyCode::Char('i'))); // matches every "item-*"

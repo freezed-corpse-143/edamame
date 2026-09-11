@@ -1,26 +1,11 @@
-//! Raw stacked diff view.  Renders a flat sequence of
-//! [`DiffVisualLine`] entries — interleaving unchanged context with
-//! per-hunk old-above-new pairs — to ratatui via the shared
-//! [`crate::ui::line_render`] helper so the trailing-cell bg fill and
-//! word-aware wrap match the other modes.
+//! Stacked diff view: paints the flat [`DiffVisualLine`] sequence (context interleaved with
+//! per-hunk old-above-new pairs) through [`crate::ui::line_render`] so wrap and trailing-cell
+//! fill match the other modes.
 //!
-//! Unchanged regions are painted as *rendered* Markdown when the review
-//! carries a new-side parse (`DiffState::parsed_new`, built by
-//! `EditorState::refresh_diff_parse`): a
-//! `DiffLineSource::ContextRendered` entry is a finished
-//! `ratatui::Line` from that parse, painted at column 0 with no marker
-//! and no diff wash — it *is* the document.  Changed regions keep the
-//! raw stacked old-above-new presentation with their markers, washes,
-//! inline highlights and decision divider.  Without a parse installed
-//! every line is raw — the state a review passes through on its first
-//! frame, and the fallback for a new side that parses to no blocks at
-//! all (see `layout::build_visual_lines_rendered`).
-//!
-//! Rendering the *changed* sides as Markdown too is a separate, larger
-//! change (`docs/dev/plans/diff-mode-plan-phase2.md`): it needs a
-//! source-byte → render-char index map for the inline highlights, N:M
-//! block snapping across two rendered parses, and table sub-diffing in
-//! grid form.
+//! Unchanged regions are painted as *rendered* Markdown when `DiffState::parsed_new` is
+//! installed (`DiffLineSource::ContextRendered` rows are finished lines from that parse, no
+//! marker, no wash); changed regions stay raw with markers, washes, inline highlights, and the
+//! decision divider.  Without a parse every line is raw.  See `docs/dev/diff-review.md`.
 
 use ratatui::{
     buffer::Buffer as TuiBuf,
@@ -39,29 +24,22 @@ use crate::diff::{Decision, DiffState};
 use crate::input::diff_hint;
 use crate::ui::line_render::render_line_from_visual;
 
-/// Per-frame state for [`DiffView`].  The materialised line sequence
-/// and its wrapped-row counts are cached on [`DiffState`] itself (see
-/// [`crate::diff::layout`]) rather than here; what does live here is the
-/// image-snapshot geometry for the review's clean regions, mirroring
-/// `PreviewViewState` / `RenderedViewState`.
+/// Per-frame state for [`DiffView`].  The line sequence and row counts are cached on
+/// [`DiffState`] (see [`crate::diff::layout`]); only image-snapshot geometry lives here.
 #[derive(Debug, Default)]
 pub struct DiffViewState {
-    /// Screen geometry of the images visible in clean (rendered)
-    /// regions, rebuilt by `image_view::build_diff_snapshots_cached` and
-    /// consumed by the `paint_images` pass in `EditorView`.
+    /// Geometry of images visible in clean (rendered) regions; consumed by `EditorView`'s
+    /// `paint_images` pass.
     pub image_snapshots: Vec<crate::ui::ImageLayoutSnapshot>,
-    /// Cache key for the above: `(scroll, area, DiffState::layout_version)`.
-    /// The editor's `parsed_version` tracks a different document and is
-    /// wrong here.
+    /// Cache key: `(scroll, area, DiffState::layout_version)`.  The editor's `parsed_version`
+    /// tracks a different document and is wrong here.
     pub image_snapshots_key: Option<(usize, Rect, u64)>,
 }
 
 pub struct DiffView<'a> {
     pub diff: &'a DiffState,
     pub theme: &'a Theme,
-    /// Visual-row scroll offset, sourced from
-    /// [`crate::editor::EditorState::scroll`] (diff mode reuses the
-    /// canonical scroll field).
+    /// Visual-row scroll offset ([`crate::editor::EditorState::scroll`]).
     pub scroll: usize,
 }
 
@@ -76,8 +54,6 @@ impl<'a> StatefulWidget for DiffView<'a> {
         let scroll = self.scroll;
 
         self.diff.with_layout(width, |lines, rc| {
-            // O(log N) jump to the line containing visual row `scroll`,
-            // plus the sub-row to skip within it — no per-line rewrap.
             let (start_idx, mut skip_first_subrow) = rc.find_visual_row(scroll);
 
             let mut idx = start_idx;
@@ -85,13 +61,10 @@ impl<'a> StatefulWidget for DiffView<'a> {
             while idx < lines.len() && visual_y < area.height {
                 let dvl = &lines[idx];
                 let line = build_line(self.diff, self.theme, dvl);
-                // The decision divider is a single-row status strip
-                // (pinned to one row in the layout cache), so it renders
-                // without wrapping; every other line word-wraps.
+                // The decision divider is pinned to one row in the layout cache, so no wrap.
                 let wrap = dvl.source != DiffLineSource::Decision;
                 let painted =
                     render_line_from_visual(&line, area, buf, visual_y, wrap, skip_first_subrow);
-                // After the first line, never skip sub-rows again.
                 skip_first_subrow = 0;
                 if painted == 0 {
                     break;
@@ -104,10 +77,7 @@ impl<'a> StatefulWidget for DiffView<'a> {
 }
 
 fn build_line(diff: &DiffState, theme: &Theme, dvl: &DiffVisualLine) -> Line<'static> {
-    // An unchanged line in a clean region: hand back the row the
-    // renderer already produced.  No marker, no `line_style`, no wash —
-    // it is the document, and `render_line_from_visual` is the identical
-    // call `PreviewView` makes, so it wraps and fills the same way.
+    // Clean-region line: the renderer's row as-is, no marker, no wash.
     if dvl.source == DiffLineSource::ContextRendered {
         return diff
             .parsed_new
@@ -117,11 +87,8 @@ fn build_line(diff: &DiffState, theme: &Theme, dvl: &DiffVisualLine) -> Line<'st
             .unwrap_or_default();
     }
 
-    // Decision divider: the accept/reject checkbox plus a resolved
-    // label, on its own line between the delete and add sides.  The
-    // decision style carries a background, set on the line base so the
-    // trailing-cell fill paints the whole row — the strip reads as the
-    // actionable divider between the two sides.
+    // Decision divider.  Its style goes on the line base so the trailing-cell fill paints the
+    // whole row.
     if dvl.source == DiffLineSource::Decision {
         let focused = dvl
             .hunk_idx
@@ -130,16 +97,9 @@ fn build_line(diff: &DiffState, theme: &Theme, dvl: &DiffVisualLine) -> Line<'st
             .hunk_idx
             .and_then(|hi| diff.decisions.get(hi).copied())
             .unwrap_or(Decision::Pending);
-        // The focused divider keeps its per-state hue and is bolded so
-        // the actionable checkbox draws the eye.  Unfocused dividers
-        // recede onto the muted `diff_decision_unfocused` strip; a
-        // *resolved* unfocused divider keeps that background but borrows
-        // the focused state's foreground hue (green/red) and adds `DIM`,
-        // so its decision still reads by color while staying quieter than
-        // the focused one.  Deriving the hue from the focused style
-        // (rather than the palette) keeps monochrome themes correct —
-        // there the focused style carries no color, so the unfocused one
-        // stays a plain `DIM` strip and the label text conveys the state.
+        // A resolved unfocused divider borrows the focused state's fg hue over the muted strip
+        // and adds DIM.  Taking the hue from the focused style (not the palette) keeps
+        // monochrome themes correct: no fg there, so it stays a plain DIM strip.
         let style = if focused {
             let base = match dec {
                 Decision::Pending => theme.diff_decision_pending,
@@ -164,25 +124,15 @@ fn build_line(diff: &DiffState, theme: &Theme, dvl: &DiffVisualLine) -> Line<'st
                 }
             }
         };
-        // The focused divider carries a `>` caret and (while pending)
-        // an inline accept/reject prompt; unfocused dividers stay a bare
-        // checkbox / label.  A trailing `(i/n)` position counter numbers
-        // every divider in document order.  Set the line base style so
-        // the trailing-cell fill extends the muted band across the full
-        // row; the prompt span inherits it (bold and all), while the
-        // counter span dims it (and clears the inherited bold) so the
-        // index reads as quiet metadata, not part of the call to action.
-        // `DIM` rather than a muted color keeps the counter recessive in
-        // monochrome themes too, where color can't carry the hierarchy.
+        // The `(i/n)` counter dims and drops the inherited bold; DIM rather than a muted color
+        // so it stays recessive in monochrome themes.
         let position = dvl.hunk_idx.map_or(0, |hi| hi + 1);
         let total = diff.hunks.len();
         let counter_style = Style::default()
             .add_modifier(Modifier::DIM)
             .remove_modifier(Modifier::BOLD);
         let mut spans = decision_divider_spans(theme, dec, focused, diff.read_only);
-        // The counter is the whole content of a read-only unfocused
-        // divider, so it leads the row there rather than trailing a
-        // checkbox that isn't drawn.
+        // On a read-only unfocused divider the counter is the whole row.
         let counter = if spans.is_empty() {
             format!("({position}/{total})")
         } else {
@@ -192,17 +142,8 @@ fn build_line(diff: &DiffState, theme: &Theme, dvl: &DiffVisualLine) -> Line<'st
         return Line::from(spans).style(style);
     }
 
-    // Delete / add / context lines pull their text from the rope; the
-    // decision branch above never needs it, so we only pay the
-    // allocation here.  Each carries a two-cell `line_marker` gutter
-    // (`- ` / `+ ` / two spaces) ahead of its body, so the side reads
-    // without color — including on delete-only and insert-only hunks,
-    // where the divider's spatial "above is old, below is new" claim has
-    // nothing to point at.  Focus selects
-    // both the full-line wash and the within-line highlight: a
-    // non-focused hunk uses the muted `_unfocused` variants of both so
-    // its changed words recede with its background instead of popping at
-    // full saturation.
+    // Focus selects both the full-line wash and the inline highlight, so an unfocused hunk's
+    // changed words recede with its background.
     let text = line_text(diff, dvl);
     let focused = dvl
         .hunk_idx
@@ -225,7 +166,6 @@ fn build_line(diff: &DiffState, theme: &Theme, dvl: &DiffVisualLine) -> Line<'st
         _ => Style::default(),
     };
 
-    // Build the body spans with optional inline highlights.
     let mut body_spans: Vec<Span<'static>> = Vec::new();
     let inline_bg = match dvl.source {
         DiffLineSource::OldDelete if focused => Some(theme.diff_delete_inline),
@@ -277,10 +217,8 @@ fn build_line(diff: &DiffState, theme: &Theme, dvl: &DiffVisualLine) -> Line<'st
         body_spans.push(Span::raw(text.to_owned()));
     }
 
-    // The marker is prepended as its own span rather than folded into
-    // `text`, because the inline highlight ranges above index into the
-    // raw line's chars.  It inherits `line_style`, so the add/delete
-    // wash covers the gutter and the row reads as one band.
+    // The marker is its own span (not folded into `text`) because the inline ranges index the
+    // raw line's chars.
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(body_spans.len() + 1);
     spans.push(Span::raw(line_marker(dvl.source)));
     spans.extend(body_spans);
@@ -288,32 +226,13 @@ fn build_line(diff: &DiffState, theme: &Theme, dvl: &DiffVisualLine) -> Line<'st
     Line::from(spans).style(line_style)
 }
 
-/// Background chip style for one side of the focused pending prompt.
+/// Chip style for one side of the focused pending prompt.
 ///
-/// The chip reuses the *same* `diff_add_line` / `diff_delete_line` wash
-/// the add and delete rows carry, so "Accept" is painted in the literal
-/// color of the block below the divider and "Reject" in the color of the
-/// block above it — the label, its key, and the text it acts on are one
-/// color. Deriving the chip from a fresh palette hue instead would let
-/// it drift from the wash it is supposed to name, and would need a new
-/// theme field in every built-in and user theme.
-///
-/// The washes are meant to be background-only, so the chip takes only
-/// their `bg` and `add_modifier` and pins the foreground from
-/// `theme.normal` — inheriting the divider's `secondary` fg would put a
-/// cyan-ish label on a green fill, and honoring a wash's own fg would do
-/// the same for any theme that set one.  Both washes *are* user-authorable
-/// (they have to be: `blend` is a no-op on non-RGB colors, so on an
-/// indexed palette a hand-picked `bg` is the only way to get a focused
-/// fill at all), so this drops any fg the theme set rather than assuming
-/// none exists.  `Color::Reset` is the pin when `normal` carries no fg,
-/// which keeps the terminal default rather than letting the divider's
-/// through.
-///
-/// In a monochrome theme both washes are a bare `REVERSED` over that
-/// reset fg, so the chips come out identical: there the mapping is
-/// carried by the reject-then-accept order and the `- ` / `+ ` markers,
-/// which is why those, not this, are the load-bearing half of the change.
+/// Reuses the add/delete row wash so each label is painted in the color of the text it acts
+/// on.  Only the wash's `bg` and modifiers are taken; the fg is pinned from `theme.normal`
+/// (`Color::Reset` if none) because inheriting the divider's fg, or a user-set wash fg, would
+/// mis-color the label.  In monochrome themes both chips come out identical, and the mapping
+/// is carried by the reject-then-accept order and the `- ` / `+ ` markers instead.
 fn prompt_chip_style(theme: &Theme, accept: bool) -> Style {
     let wash = if accept {
         theme.diff_add_line
@@ -330,39 +249,16 @@ fn prompt_chip_style(theme: &Theme, accept: bool) -> Style {
     chip
 }
 
-/// Spans shown on a hunk's decision divider, given its decision and
-/// whether it is the focused hunk.
+/// Spans for a hunk's decision divider.
 ///
-/// Unfocused dividers show the bare checkbox / resolved label from
-/// [`decision_line_text`].  The focused divider gains a leading `>`
-/// caret so the active hunk is unmistakable even when its add/delete
-/// wash has scrolled out of view, and the focused *pending* divider
-/// additionally spells the accept/reject keys inline.  Those glyphs come
-/// from the shared `diff_keys` table via [`diff_hint`], so the prompt
-/// can never name a key the input handler doesn't actually honor.
+/// Unfocused: the bare checkbox / label from [`decision_line_text`].  Focused: a leading `>`
+/// caret, plus (while pending) inline accept/reject chips whose keys come from [`diff_hint`]
+/// so they can never disagree with the input handler.  Reject leads and Accept follows to
+/// mirror the old-above/new-below stacking; order, unlike a directional glyph, stays true on
+/// insert-only and delete-only hunks.
 ///
-/// **Reject leads, Accept follows** — reading order mirrors the stacking
-/// (`layout::build_visual_lines` puts the old side above the divider and
-/// the new side below), so the prompt encodes the mapping by position.
-/// Order, unlike a directional glyph, asserts nothing that goes false on
-/// an insert-only or delete-only hunk. The prompt only ever renders on a
-/// *pending* divider, whose base style is the neutral
-/// `diff_decision_pending`, so the chips never land on the green/red
-/// wash of a resolved row.
-///
-/// Only the divider is color-coded; the diff hint row in
-/// `ui::bottom_region` deliberately stays uniform for now.
-///
-/// **A read-only review has no decision vocabulary, so it gets no
-/// checkbox and no prompt** — `[ ]` is an unticked box the user cannot
-/// tick, and the `Reject [n] Accept [y]` chips name keys that answer
-/// "This review is read-only".  The same `DiffState::read_only` flag
-/// that shortens the hint row in `ui::bottom_region::diff_review_chords`
-/// gates them here, so the two surfaces can never advertise different
-/// vocabularies.  What survives is what the divider is *for* in a
-/// viewer: the boundary between the old side above and the new side
-/// below, the `>` focus caret, and the position counter the caller
-/// appends — hence the empty span list for an unfocused one.
+/// A read-only review gets no checkbox and no prompt (it has no decision vocabulary), gated by
+/// the same `DiffState::read_only` flag that shortens the hint row, so the two surfaces agree.
 fn decision_divider_spans(
     theme: &Theme,
     decision: Decision,

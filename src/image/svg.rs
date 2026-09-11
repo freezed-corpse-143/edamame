@@ -1,63 +1,259 @@
-//! SVG → `DynamicImage` rasterization, shared by the SVG-file image
-//! loader and the Mermaid diagram pipeline.
+//! SVG → `DynamicImage` rasterization (usvg → resvg/tiny_skia → PNG → decode), shared by the
+//! SVG-file image loader and the Mermaid diagram pipeline.  The two differ in only two policies:
 //!
-//! Both consumers need the same core machinery — parse an SVG string with
-//! `usvg`, rasterize it with `resvg`/`tiny_skia`, and decode the result
-//! back into a `DynamicImage` for the image cache — but differ in two
-//! policies, expressed via [`SvgSizing`]:
+//! * **Scale mode** ([`SvgScaleMode`]).  A user's `.svg` file has a meaningful natural size, so it
+//!   is only ever downscaled and then displayed 1:1, which is crisp by construction.  A Mermaid
+//!   diagram's dimensions come from layout heuristics, so it scales either way to fill.
+//! * **Background** ([`rasterize_svg`]'s `background`).  Mermaid SVGs are transparent but meant for
+//!   a light page, so that path fills white; a user's SVG keeps its transparency.
 //!
-//! * **Scale mode** ([`SvgScaleMode`]).  A user's `.svg` *file* has a
-//!   meaningful natural size (a badge, an icon), so it is only ever
-//!   *downscaled* to fit the cell envelope — `Resize::Fit` then displays
-//!   it 1:1, which is crisp by construction.  A Mermaid *diagram* carries
-//!   no meaningful natural size (the renderer picks dimensions from
-//!   layout heuristics), so it is scaled *up or down* to fill the
-//!   envelope.
-//! * **Background** ([`rasterize_svg`]'s `background` argument).  Mermaid
-//!   SVGs are transparent but meant to be read on a light page, so the
-//!   diagram path fills white.  A user's SVG keeps its transparency
-//!   (`None`) and composites over the document background like a
-//!   transparent PNG.
-//!
-//! The process-wide [`shared_fontdb`] lives here because both paths parse
-//! SVGs and font-database loading (`load_system_fonts`) is the dominant
-//! cost — sharing one `Arc<Database>` turns every render after the first
-//! into an atomic refcount bump instead of a fresh disk scan.
+//! The process-wide [`shared_fontdb`] lives here because font-database loading dominates the cost
+//! of both paths.
 
 use std::sync::{Arc, OnceLock};
 
 use image::DynamicImage;
 use usvg::fontdb;
 
-/// Process-global font database, loaded lazily on first SVG render.
-/// `fontdb::Database::load_system_fonts` scans every OS font directory
-/// (typically ~100–300 ms on a warm disk cache, slower cold), so running
-/// it per-render made a 20-diagram document spawn 20 concurrent scans —
-/// the dominant cost on initial document load.  Shared here as an
-/// `Arc<Database>` so every SVG decode is an Arc clone plus a ref into
-/// the same underlying tables.
-///
-/// Populated by [`warm_fontdb`] (called off the hot path at startup) and
-/// [`shared_fontdb`] (the fallback on the hot path when the warmup hasn't
-/// completed yet).  Never invalidated — the font install set doesn't
-/// change during a session.
+/// Process-global font database, loaded lazily.  `load_system_fonts` scans every OS font directory
+/// (~100–300 ms warm), so per-render loading made a 20-diagram document spawn 20 concurrent scans.
+/// Populated by [`warm_fontdb`] at startup, or by [`shared_fontdb`] if a render beats it; never
+/// invalidated, since the installed fonts don't change mid-session.
 static SHARED_FONTDB: OnceLock<Arc<fontdb::Database>> = OnceLock::new();
 
-/// Return the process-wide shared `fontdb::Database`, loading system
-/// fonts on first call.  Safe to call from any thread; subsequent calls
-/// are lock-free Arc clones.
+/// The shared `fontdb::Database`, loading system fonts and the bundled KaTeX fonts on first call.
+/// Later calls are lock-free `Arc` clones from any thread.
 fn shared_fontdb() -> Arc<fontdb::Database> {
     SHARED_FONTDB
         .get_or_init(|| {
             let mut db = fontdb::Database::new();
             db.load_system_fonts();
+            pin_generic_families(&mut db);
+            register_bundled_katex_fonts(&mut db);
             Arc::new(db)
         })
         .clone()
 }
 
-/// Pre-populate the shared fontdb off the hot path so the first real SVG
-/// render doesn't pay the disk-scan cost.  Idempotent and thread-safe.
+/// Point the CSS generic families at a face that is actually loaded.
+///
+/// `fontdb::Database::new()` seeds the generics with Windows/macOS names ("Arial", …), and
+/// `load_system_fonts` only overrides them when fontdb's partial fontconfig parser resolves the
+/// config's `<alias>` blocks — which on some distros (Debian 13) it does not, leaving `sans-serif`
+/// pointing at the absent "Arial".  Two paths need a *resolvable* generic: mermaid emits
+/// `font-family="…,sans-serif"`, and RaTeX renders `\text{…}` as `sans-serif`; unresolved, usvg
+/// drops the glyphs and the text vanishes.  Pinning each generic to the first present candidate
+/// closes both gaps (a missing list is a no-op); usvg then falls back per-glyph across the db for
+/// characters that face lacks, so no CJK family needs pinning here.
+fn pin_generic_families(db: &mut fontdb::Database) {
+    fn first_present<'a>(db: &fontdb::Database, candidates: &[&'a str]) -> Option<&'a str> {
+        candidates.iter().copied().find(|name| {
+            db.query(&fontdb::Query {
+                families: &[fontdb::Family::Name(name)],
+                ..Default::default()
+            })
+            .is_some()
+        })
+    }
+    if let Some(f) = first_present(
+        db,
+        &[
+            "DejaVu Sans",
+            "Noto Sans",
+            "Liberation Sans",
+            "Arial",
+            "Helvetica",
+        ],
+    ) {
+        db.set_sans_serif_family(f);
+    }
+    if let Some(f) = first_present(
+        db,
+        &[
+            "DejaVu Serif",
+            "Noto Serif",
+            "Liberation Serif",
+            "Times New Roman",
+        ],
+    ) {
+        db.set_serif_family(f);
+    }
+    if let Some(f) = first_present(
+        db,
+        &[
+            "DejaVu Sans Mono",
+            "Noto Sans Mono",
+            "Liberation Mono",
+            "Courier New",
+        ],
+    ) {
+        db.set_monospace_family(f);
+    }
+}
+
+/// The KaTeX font binaries bundled with the crate (SIL OFL 1.1 — licence
+/// in `src/assets/katex/OFL.txt`, provenance in `FONT_NOTICE.txt`).
+/// These are the faces RaTeX's `<text>` SVG output names (`KaTeX_Main`,
+/// `KaTeX_Math`, …), so registering them makes the shared fontdb
+/// self-sufficient for math rendering on machines without KaTeX
+/// installed.  Paths are manifest-relative so the list is independent of
+/// this file's depth in the source tree.
+const KATEX_FONT_FILES: &[(&str, &[u8])] = &[
+    (
+        "KaTeX_AMS-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_AMS-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Caligraphic-Bold.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Caligraphic-Bold.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Caligraphic-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Caligraphic-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Fraktur-Bold.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Fraktur-Bold.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Fraktur-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Fraktur-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Main-Bold.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Main-Bold.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Main-BoldItalic.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Main-BoldItalic.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Main-Italic.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Main-Italic.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Main-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Main-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Math-BoldItalic.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Math-BoldItalic.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Math-Italic.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Math-Italic.ttf"
+        )),
+    ),
+    (
+        "KaTeX_SansSerif-Bold.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_SansSerif-Bold.ttf"
+        )),
+    ),
+    (
+        "KaTeX_SansSerif-Italic.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_SansSerif-Italic.ttf"
+        )),
+    ),
+    (
+        "KaTeX_SansSerif-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_SansSerif-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Script-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Script-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Size1-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Size1-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Size2-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Size2-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Size3-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Size3-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Size4-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Size4-Regular.ttf"
+        )),
+    ),
+    (
+        "KaTeX_Typewriter-Regular.ttf",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/assets/katex/KaTeX_Typewriter-Regular.ttf"
+        )),
+    ),
+];
+
+/// Register every bundled KaTeX face into `db` (zero-copy binary
+/// sources).  Called once when the shared fontdb initialises; idempotent
+/// by construction.
+fn register_bundled_katex_fonts(db: &mut fontdb::Database) {
+    use std::sync::Arc;
+    // The face family name comes from the font binary itself, so the table
+    // key is unused here — it only documents which file each entry is.
+    for (_name, bytes) in KATEX_FONT_FILES {
+        let _ = db.load_font_source(fontdb::Source::Binary(Arc::new(*bytes)));
+    }
+}
+
+/// Pre-populate the shared fontdb off the hot path.  Idempotent and thread-safe.
 pub fn warm_fontdb() {
     let _ = shared_fontdb();
 }
@@ -65,17 +261,14 @@ pub fn warm_fontdb() {
 /// Whether an SVG may be scaled up to fill the envelope, or only down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SvgScaleMode {
-    /// Downscale only — never balloon a small SVG to fill the envelope;
-    /// its natural size is meaningful.  Used for user `.svg` files.
+    /// Downscale only, for a user `.svg` whose natural size is meaningful.
     Natural,
-    /// Scale up or down to fill the envelope.  Used for synthetic
-    /// diagrams (Mermaid), which have no meaningful natural size.
+    /// Scale either way to fill the envelope, for synthetic diagrams.
     Fill,
 }
 
-/// How an SVG's natural size maps onto the target cell envelope.  A
-/// `None` envelope or font size keeps the natural size verbatim (used by
-/// tests that don't care about on-screen size).
+/// How an SVG's natural size maps onto the cell envelope.  A `None` envelope or font size keeps
+/// the natural size verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SvgSizing {
     pub envelope: Option<(u16, u16)>,
@@ -110,40 +303,27 @@ impl SvgSizing {
     }
 }
 
-/// Longest side, in pixels, any rasterized SVG may occupy.  Guards the
-/// degenerate aspect ratios that [`MAX_RASTER_PIXELS`] alone lets through
-/// (a 1 × 10⁹ SVG has few enough pixels per row to satisfy an area budget
-/// while still being unallocatable).
+/// Longest side any rasterized SVG may occupy.  Catches the degenerate aspect ratios an area
+/// budget alone lets through — a 1 × 10⁹ SVG fits [`MAX_RASTER_PIXELS`] yet is unallocatable.
 const MAX_RASTER_DIM: u32 = 8_192;
 
-/// Hard ceiling on the rasterized pixmap's area, applied **whether or not
-/// a cell envelope is supplied**.
+/// Hard ceiling on pixmap area, applied **whether or not a cell envelope is supplied**.
 ///
-/// The envelope clamp below bounds every on-screen path, but not every
-/// caller has an envelope: `export::html::render_mermaid_png_data_uri`
-/// rasterizes at natural size because the exported PNG isn't sized in
-/// terminal cells.  The SVG it rasterizes is generated from a Mermaid
-/// block in a document the user may not have written, and while
-/// `diagram::mermaid` caps that *source* at 64 KiB, a dense diagram turns
-/// a small source into arbitrarily large layout dimensions — input bound,
-/// output unbound.  4 M pixels is 16 MB of RGBA, far more resolution than
-/// an embedded diagram needs, and it caps what a crafted document can make
-/// us allocate.
-///
-/// Over-budget SVGs are scaled *down* to fit rather than refused: a
-/// legitimately large diagram should still export, just not at its
-/// declared size.
+/// The envelope bounds every on-screen path, but `export::html::render_mermaid_png_data_uri`
+/// rasterizes at natural size — an exported PNG isn't sized in terminal cells.  Its SVG comes from
+/// a Mermaid block in a possibly untrusted document, and while `diagram::mermaid` caps that
+/// *source* at 64 KiB, a dense diagram turns a small source into arbitrarily large layout
+/// dimensions: input bound, output unbound.  4 M pixels is 16 MB of RGBA, ample for an embedded
+/// diagram.  Over-budget SVGs are scaled down rather than refused.
 const MAX_RASTER_PIXELS: u64 = 4_000_000;
 
-/// The factor a `px_w × px_h` pixmap must be multiplied by to fit both
-/// [`MAX_RASTER_DIM`] and [`MAX_RASTER_PIXELS`], aspect ratio preserved.
-/// Returns `1.0` when it already fits — the overwhelmingly common case, so
-/// the enveloped paths are unaffected — and never more than `1.0`.
+/// The factor fitting a `px_w × px_h` pixmap inside both [`MAX_RASTER_DIM`] and
+/// [`MAX_RASTER_PIXELS`], aspect preserved; never above `1.0`, and exactly `1.0` in the common
+/// case.
 ///
-/// Takes the *rounded* pixel dimensions rather than the natural size ×
-/// scale, so that flooring the result is exactly within budget: the
-/// `ceil` that derives those dimensions would otherwise push a
-/// budget-fitting scale back over the line by a pixel per axis.
+/// Takes the *rounded* pixel dimensions rather than natural size × scale, so flooring the result
+/// stays within budget — the `ceil` deriving those dimensions would otherwise push a budget-fitting
+/// scale back over the line by a pixel per axis.
 fn budget_shrink(px_w: u32, px_h: u32) -> f64 {
     let (w, h) = (f64::from(px_w), f64::from(px_h));
     let mut shrink = 1.0f64;
@@ -158,9 +338,8 @@ fn budget_shrink(px_w: u32, px_h: u32) -> f64 {
     shrink
 }
 
-/// Errors from the SVG rasterization pipeline.  Carry owned `String`
-/// messages rather than source-chained errors so the type stays
-/// `Send + Sync` and can be shipped back through the App's mpsc channel.
+/// Errors from the SVG pipeline.  Owned `String` messages, not source-chained errors, so the type
+/// stays `Send + Sync` for the App's mpsc channel.
 #[derive(Debug, thiserror::Error)]
 pub enum SvgError {
     #[error("svg parse failed: {0}")]
@@ -171,33 +350,21 @@ pub enum SvgError {
     Decode(String),
 }
 
-/// Rasterize an SVG string into a `DynamicImage`.
-///
-/// * `sizing` — how the SVG's natural size maps onto the cell envelope
-///   (see [`SvgSizing`]).
-/// * `background` — an optional opaque RGBA fill applied before drawing.
-///   `Some([r, g, b, a])` paints the pixmap with that color first (the
-///   Mermaid path passes white); `None` keeps the SVG's own
-///   transparency, which the image renderer composites over the document
-///   background like a transparent PNG.
+/// Rasterize an SVG string into a `DynamicImage`.  `background` paints the pixmap before drawing
+/// (the Mermaid path passes white); `None` keeps the SVG's own transparency for the renderer to
+/// composite over the document background.
 pub fn rasterize_svg(
     svg: &str,
     sizing: SvgSizing,
     background: Option<[u8; 4]>,
 ) -> Result<DynamicImage, SvgError> {
     let mut opt = usvg::Options {
-        // Use the process-wide shared fontdb (see `SHARED_FONTDB`).  This
-        // is an `Arc::clone` — O(1) atomic increment — instead of a fresh
-        // disk scan per render.
         fontdb: shared_fontdb(),
         ..Default::default()
     };
-    // Refuse to resolve a `<image href>` that is a file path or URL.
-    // usvg's default string resolver *reads local files*, so an untrusted
-    // SVG could pull arbitrary on-disk files into the render — render-only
-    // on screen, but an exfil channel if that SVG is then inlined into an
-    // HTML export.  Embedded `data:` images still resolve via the default
-    // `resolve_data`; only the path/URL branch is neutralized.
+    // usvg's default string resolver *reads local files*, so an untrusted SVG could pull arbitrary
+    // on-disk files into the render — an exfil channel once that SVG is inlined into an HTML
+    // export.  Only the path/URL branch is neutralized; embedded `data:` images still resolve.
     opt.image_href_resolver.resolve_string = Box::new(|_href, _opts| None);
 
     let tree = usvg::Tree::from_str(svg, &opt).map_err(|e| SvgError::Parse(format!("{e}")))?;
@@ -208,17 +375,15 @@ pub fn rasterize_svg(
     let mut scale = sizing.scale_for(natural_w, natural_h);
     let mut px_w = ((natural_w as f32 * scale).ceil() as u32).max(1);
     let mut px_h = ((natural_h as f32 * scale).ceil() as u32).max(1);
-    // Clamp to the envelope so f32 ceiling rounding can never overshoot it
-    // by a pixel — keeps the loader's subsequent `pre_resize` a true
-    // no-op (it only ever downscales past the envelope).
+    // Clamp so f32 ceiling rounding can't overshoot the envelope by a pixel, which keeps the
+    // loader's subsequent `pre_resize` a true no-op.
     if let Some((max_w_px, max_h_px)) = sizing.envelope_px() {
         px_w = px_w.min(max_w_px).max(1);
         px_h = px_h.min(max_h_px).max(1);
     }
-    // Bound the allocation even when no envelope applies — see
-    // `MAX_RASTER_PIXELS`.  The shrink is folded into `scale` as well as
-    // the dimensions because `scale` is the render transform: shrinking the
-    // pixmap alone would crop the drawing instead of fitting it into it.
+    // Bound the allocation even without an envelope (see `MAX_RASTER_PIXELS`).  The shrink folds
+    // into `scale` as well as the dimensions: `scale` is the render transform, so shrinking the
+    // pixmap alone would crop the drawing rather than fit it.
     let shrink = budget_shrink(px_w, px_h);
     if shrink < 1.0 {
         scale = (f64::from(scale) * shrink) as f32;
@@ -228,10 +393,8 @@ pub fn rasterize_svg(
 
     let mut pixmap = resvg::tiny_skia::Pixmap::new(px_w, px_h)
         .ok_or_else(|| SvgError::Raster(format!("pixmap alloc failed: {px_w}x{px_h}")))?;
-    // Paint an opaque background first when requested.  Terminal image
-    // protocols alpha-composite over whatever is already on the cell, so
-    // a transparent SVG meant for a light page (Mermaid) needs the fill
-    // to avoid the document background bleeding through its text.
+    // Terminal image protocols alpha-composite over the cell, so a transparent SVG meant for a
+    // light page needs the fill or the document background bleeds through its text.
     if let Some([r, g, b, a]) = background {
         pixmap.fill(resvg::tiny_skia::Color::from_rgba8(r, g, b, a));
     }
@@ -244,12 +407,10 @@ pub fn rasterize_svg(
     let png_bytes = pixmap
         .encode_png()
         .map_err(|e| SvgError::Raster(format!("png encode: {e}")))?;
-    // The "decode through `ImageReader` + `Limits`" invariant in
-    // `docs/dev/security-invariants.md` covers *external* bytes.  These are
-    // the PNG we encoded one line above, from a pixmap whose dimensions are
-    // already bounded by the envelope and `MAX_RASTER_PIXELS`, so there is
-    // nothing left for a decode limit to constrain.  Don't copy this call
-    // to a site whose bytes came from a file, a socket, or a document.
+    // `docs/dev/security-invariants.md`'s "decode through `ImageReader` + `Limits`" rule covers
+    // *external* bytes.  These are the PNG encoded one line above, from a pixmap already bounded by
+    // the envelope and `MAX_RASTER_PIXELS`.  Don't copy this call to a site fed by a file, a
+    // socket, or a document.
     image::load_from_memory(&png_bytes).map_err(|e| SvgError::Decode(format!("{e}")))
 }
 
@@ -273,13 +434,48 @@ mod tests {
         }
     }
 
+    // ── Bundled KaTeX fonts ──────────────────────────────────────────
+
+    /// The shared fontdb must carry every KaTeX_* family that
+    /// ratex-svg's `<text>` output names (Main, Math, AMS, Caligraphic,
+    /// Fraktur, SansSerif, Script, Size1..4, Typewriter).  LaTeX
+    /// rendering is a text-SVG + shared-fontdb pipeline, so a family
+    /// that fails to resolve would render with a silent system-font
+    /// fallback — glyphs in the wrong face, or missing.  This test is
+    /// the guard rail against RaTeX renaming its internal face table.
+    #[test]
+    fn bundled_katex_families_resolve_in_the_shared_fontdb() {
+        let db = shared_fontdb();
+        let families: std::collections::HashSet<String> = db
+            .faces()
+            .filter_map(|f| f.families.first().map(|(name, _)| name.clone()))
+            .collect();
+        for family in [
+            "KaTeX_Main",
+            "KaTeX_Math",
+            "KaTeX_AMS",
+            "KaTeX_Caligraphic",
+            "KaTeX_Fraktur",
+            "KaTeX_SansSerif",
+            "KaTeX_Script",
+            "KaTeX_Size1",
+            "KaTeX_Size2",
+            "KaTeX_Size3",
+            "KaTeX_Size4",
+            "KaTeX_Typewriter",
+        ] {
+            assert!(
+                families.contains(family),
+                "KaTeX family {family} must be registered in the shared fontdb (faces: {families:?})"
+            );
+        }
+    }
+
     // ── Natural sizing (SVG files) ────────────────────────────────────
 
     #[test]
     fn natural_small_svg_is_not_upscaled() {
-        // 200×150 natural, envelope 80×24 at (8,16) → 640×384 px.  Natural
-        // fits comfortably, so it must stay at its own size (downscale
-        // only): a small icon does not balloon to fill the terminal.
+        // 200×150 natural inside a 640×384 px envelope: downscale-only means it stays put.
         let svg = r##"<?xml version="1.0"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="200" height="150" viewBox="0 0 200 150">
   <rect width="200" height="150" fill="#eef"/>
@@ -291,8 +487,7 @@ mod tests {
 
     #[test]
     fn natural_large_svg_downscales_to_fit_envelope() {
-        // 1600×1200 natural > envelope 640×384.  Fit scale =
-        // min(640/1600, 384/1200) = 0.32 → 512×384 (height-axis limited).
+        // 1600×1200 into 640×384: scale 0.32 → 512×384, height-limited.
         let svg = r##"<?xml version="1.0"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" viewBox="0 0 1600 1200">
   <rect width="1600" height="1200" fill="#eef"/>
@@ -305,7 +500,6 @@ mod tests {
 
     #[test]
     fn natural_preserves_transparency_when_no_background() {
-        // A 10×10 SVG that draws nothing leaves every pixel transparent.
         let svg = r##"<?xml version="1.0"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10"></svg>"##;
         let image = rasterize_svg(svg, natural(None), None).expect("rasterize");
@@ -317,8 +511,7 @@ mod tests {
 
     #[test]
     fn fill_small_svg_upscales_to_envelope() {
-        // Same 200×150 small SVG, but Fill must scale it up:
-        // min(640/200, 384/150) = 2.56 → 512×384 (height limits).
+        // The same small SVG, but Fill scales up by 2.56 → 512×384, height-limited.
         let svg = r##"<?xml version="1.0"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="200" height="150" viewBox="0 0 200 150">
   <rect width="200" height="150" fill="#eef"/>
@@ -352,8 +545,7 @@ mod tests {
 
     // ── Absolute pixmap budget ────────────────────────────────────────
 
-    /// Apply `budget_shrink` the way `rasterize_svg` does — floored, with
-    /// the same one-pixel floor — so the assertions below test the
+    /// `budget_shrink` applied as `rasterize_svg` applies it, so the assertions below test the
     /// dimensions actually allocated.
     fn shrunk(px_w: u32, px_h: u32) -> (u64, u64) {
         let shrink = budget_shrink(px_w, px_h);
@@ -368,16 +560,13 @@ mod tests {
 
     #[test]
     fn budget_shrink_leaves_ordinary_sizes_alone() {
-        // Every enveloped path lands here: a few hundred thousand pixels is
-        // orders of magnitude under the ceiling, so nothing is rescaled.
         assert_eq!(budget_shrink(800, 600), 1.0);
         assert_eq!(budget_shrink(512, 384), 1.0);
     }
 
     #[test]
     fn budget_shrink_caps_area_with_the_aspect_ratio_intact() {
-        // 4000×3000 = 12 M px, three times the 4 M budget → shrink by
-        // sqrt(1/3) ≈ 0.577.
+        // 12 M px, three times the budget → shrink by sqrt(1/3).
         let (w, h) = shrunk(4000, 3000);
         assert!(w * h <= MAX_RASTER_PIXELS, "area {} over budget", w * h);
         let aspect = w as f64 / h as f64;
@@ -386,8 +575,7 @@ mod tests {
 
     #[test]
     fn budget_shrink_caps_the_longest_side_of_a_sliver() {
-        // 100 000 × 4 = 400 K px, comfortably inside the area budget — the
-        // dimension cap is the only thing that catches it.
+        // 400 K px is well inside the area budget; only the dimension cap catches this.
         let (w, h) = shrunk(100_000, 4);
         assert!(w <= u64::from(MAX_RASTER_DIM), "width {w} over the dim cap");
         assert!(h >= 1, "the short axis must not floor away to zero");
@@ -396,10 +584,8 @@ mod tests {
 
     #[test]
     fn oversized_svg_without_an_envelope_is_scaled_into_the_budget() {
-        // The `export::html` Mermaid path passes no envelope, so this is
-        // the only thing standing between a crafted document and an
-        // unbounded pixmap allocation.  4000×3000 natural must come back
-        // inside the budget, still rendered (not refused) and still 4:3.
+        // The `export::html` Mermaid path passes no envelope, so this budget is all that stands
+        // between a crafted document and an unbounded pixmap allocation.
         let svg = r##"<?xml version="1.0"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="4000" height="3000" viewBox="0 0 4000 3000">
   <rect width="4000" height="3000" fill="#eef"/>
@@ -417,11 +603,8 @@ mod tests {
 
     #[test]
     fn image_href_to_local_file_is_not_loaded() {
-        // Write a real opaque-red PNG and reference it by absolute path
-        // from an `<image>` element.  Our resolver refuses path/URL hrefs,
-        // so the element is dropped and the pixel where it would have
-        // drawn stays transparent — the default usvg resolver would have
-        // read the file and painted it red.
+        // The default usvg resolver would read this PNG and paint it red; ours drops the element,
+        // leaving the pixel transparent.
         let dir = tempfile::tempdir().unwrap();
         let png = dir.path().join("secret.png");
         let buf = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]));

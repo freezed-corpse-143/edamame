@@ -1,6 +1,6 @@
 # Syntax highlighting smoke test
 
-Manual smoke fixture. Open with `cargo run -- tests/fixtures/sample_syntax.md`
+Manual smoke fixture. Open with `cargo run -- tests/fixtures/syntax.md`
 and check each block below. Toggle the feature with **Syntax highlighting** in
 the settings overlay to confirm every block falls back to plain code cleanly.
 

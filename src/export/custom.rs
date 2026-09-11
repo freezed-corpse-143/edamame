@@ -8,22 +8,17 @@ use super::html::{render_html, HtmlExportOptions};
 use super::runner::{write_atomically, ExportOutcome};
 use crate::config::CustomExportEntry;
 
-/// Errors that bubble out of a custom-export run.  Wrapped in a plain
-/// `String` when sent across the worker-thread boundary via
-/// [`ExportOutcome`].
+/// Errors from a custom-export run, flattened to a `String` when they cross the worker
+/// boundary via [`ExportOutcome`].
 #[derive(Debug, Error)]
 pub enum CustomExportError {
     #[error("failed to create temporary HTML file: {0}")]
     TempFile(std::io::Error),
     #[error("render failed: {0}")]
     Render(String),
-    /// The command could not be *started* — a missing executable, or a
-    /// bad working directory.  Kept distinct from [`Self::NonZeroExit`]
-    /// (the command ran and failed) because the two send the user to
-    /// completely different places: "install weasyprint / fix the path"
-    /// vs. "read the converter's own error".  Previously an
-    /// `#[from] io::Error` folded this into `TempFile`, so a failed spawn
-    /// was reported as "failed to create temporary HTML file".
+    /// The command could not be *started*.  Distinct from [`Self::NonZeroExit`] because
+    /// the two send the user to different places ("install weasyprint" vs. "read the
+    /// converter's error"); an `#[from] io::Error` once folded this into `TempFile`.
     #[error("failed to run export command '{program}': {source}")]
     Spawn {
         program: String,
@@ -44,25 +39,12 @@ pub enum CustomExportError {
     EmptyCommand,
 }
 
-/// Spawn a worker thread that:
-///   1. Renders `markdown` to HTML (same pipeline as the built-in HTML export).
-///   2. Writes the HTML to a temp file.
-///   3. Runs the user's `entry.command` with `{html}` / `{out}` substitution.
-///   4. Renames the resulting output into place.
+/// Render `markdown` to HTML on a worker thread, write it to a temp file, and run the
+/// user's `entry.command` with `{html}` / `{out}` substituted into *every* argument.
 ///
-/// Substitution is applied to *every* string in `command`, so a user can
-/// write `["pandoc", "{html}", "-o", "{out}"]` or
-/// `["sh", "-c", "weasyprint {html} {out}"]` — whatever their tool needs.
-///
-/// The caller is expected to have run [`crate::export::preflight`] on
-/// `target` first; this function clobbers an existing file if one is
-/// present.  The temp HTML file is dropped (and deleted) when the
-/// function returns, whether the command succeeded or not.
-///
-/// The caller is `crate::app::modal::export`, which reaches here for an
-/// [`ExportJob::Custom`](crate::app::modal::export::ExportJob) exactly
-/// where it would otherwise call [`crate::export::spawn_html_export`] —
-/// same options, same `ExportDone` completion event.
+/// The caller must have run [`crate::export::preflight`] on `target`; this clobbers an
+/// existing file.  The temp HTML is deleted on return either way.  Slots in exactly where
+/// [`crate::export::spawn_html_export`] would — same options, same `ExportDone` event.
 pub fn spawn_custom_export(
     entry: CustomExportEntry,
     markdown: String,
@@ -86,34 +68,19 @@ fn run_custom_export(
         return Err(CustomExportError::EmptyCommand);
     }
 
-    // 1. Render the intermediate HTML to a tempfile the external tool
-    //    can read.  `NamedTempFile` deletes on drop, so a failing
-    //    converter never leaves stray files behind.
+    // `NamedTempFile` deletes on drop, so a failing converter leaves no stray files.
     let html_string = render_html(markdown, html_opts)
         .map_err(|e| CustomExportError::Render(format!("{e:#}")))?;
 
-    // The paths handed to the converter are made **absolute** first.  We
-    // run the command with its working directory set to the document's
-    // folder (so a relative `src="images/logo.png"` *inside* the HTML
-    // resolves the way it did on screen), which means a relative `{html}`
-    // / `{out}` would be resolved against *that* directory rather than the
-    // process cwd — so a document opened by a relative path (`edamame
-    // docs/guide.md`) reaches weasyprint as `docs/guide.pdf`, is opened
-    // against `…/docs`, and dies with `…/docs/docs/guide.pdf: No such file
-    // or directory`.  Absolute paths are cwd-independent and sidestep it
-    // entirely; every later step below uses the absolute forms too, so the
-    // mtime probe and the output all agree on one location.
+    // Absolute, because the command's cwd is the document's folder: a relative `{out}`
+    // from `edamame docs/guide.md` would resolve to `…/docs/docs/guide.pdf`.  Every later
+    // step uses the absolute forms so the mtime probe and the output agree on one location.
     let abs_target = absolutize(target);
 
-    // The temp HTML is written *into the output directory*, not the
-    // system temp dir.  Converters (weasyprint, pandoc, …) resolve a
-    // relative `src="images/logo.png"` against the input file's own
-    // location, so an intermediate under `/tmp` would look for
-    // `/tmp/images/…` and silently drop every non-inlined image — the
-    // common case, since `inline_images` is off by default.  Placing it
-    // beside the document (which is where `abs_target` sits) makes those
-    // paths resolve exactly as they did on screen.  It is absolute because
-    // `abs_target` is, so `tmp_path` — and thus `{html}` — is absolute too.
+    // The temp HTML goes in the *output* directory, not the system temp dir: converters
+    // resolve a relative `src="images/logo.png"` against the input file's own location, so
+    // an intermediate under `/tmp` silently drops every non-inlined image (the common
+    // case — `inline_images` is off by default).
     let out_dir = abs_target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -131,29 +98,19 @@ fn run_custom_export(
     tmp.flush().map_err(CustomExportError::TempFile)?;
     let tmp_path = tmp.path().to_path_buf();
 
-    // Stamp the target *before* running the converter.  Step 3 uses this
-    // to tell "the command wrote the file" apart from "the command left a
-    // stale file from a previous export untouched" — on the overwrite path
-    // the file is present going in, so `exists()` alone would report a
-    // no-op converter as a success and open the old artifact.
+    // Stamp before running, to tell "the command wrote the file" from "a stale file from
+    // a previous export was left untouched": on the overwrite path `exists()` alone would
+    // report a no-op converter as success and open the old artifact.
     let target_before = target_stamp(&abs_target);
 
-    // 2. Run the command in the source document's directory (the output
-    //    directory), so relative references inside the HTML resolve the
-    //    same way they did for the preview.  The `{html}` / `{out}`
-    //    arguments are absolute, so this cwd affects only the HTML's own
-    //    relative asset URLs, never where the output lands.
     let argv = substitute_command(&entry.command, &tmp_path, &abs_target);
     let (program, args) = argv.split_first().expect("non-empty checked above");
 
-    // The document's own directory, which is exactly `out_dir` (the target
-    // sits beside the source, so `abs_target`'s parent *is* the source's).
-    // Deriving it here rather than from `html_opts.source_dir` avoids a
-    // trap: for a repo-root file opened by a bare relative path
-    // (`edamame README.md`), the modal's `target.parent()` is an *empty*
-    // path, and `current_dir("")` fails the spawn with `NotFound` — the
-    // bug that surfaced (misleadingly) as "failed to create temporary HTML
-    // file".  `out_dir` is always an absolute, existing directory.
+    // The cwd is the document's folder, so the HTML's own relative asset URLs resolve as
+    // they did on screen; `{html}` / `{out}` are absolute, so it never moves the output.
+    // Derived from `out_dir` rather than `html_opts.source_dir`: for a repo-root file the
+    // modal's `target.parent()` is the *empty* path, and `current_dir("")` fails the spawn
+    // with `NotFound`.  `out_dir` is always absolute and exists.
     let working_dir = out_dir.clone();
 
     let output = Command::new(program)
@@ -179,12 +136,9 @@ fn run_custom_export(
         });
     }
 
-    // 3. Some tools write directly to `{out}`; others write to stdout
-    //    and we're expected to capture it.  "The converter produced a
-    //    file" means the target exists *and* was written during this run
-    //    — a fresh file, or an existing one whose mtime advanced.  If it
-    //    didn't, fall back to stdout; if that's empty too, the converter
-    //    produced nothing and we must not report the stale file as ours.
+    // Some tools write `{out}`; others write to stdout.  "Produced a file" means the
+    // target exists *and* changed during this run — otherwise fall back to stdout, and if
+    // that is empty too, refuse rather than pass off a stale file as ours.
     let wrote_target = match target_stamp(&abs_target) {
         Some(after) => target_before != Some(after),
         None => false,
@@ -204,38 +158,23 @@ fn run_custom_export(
     Ok(abs_target)
 }
 
-/// Modification time *and* length of `p`, or `None` if it does not exist.
+/// Modification time *and* length of `p` — the "did this run write the file?" signal.
 ///
-/// The pair is the "did this run write the file?" signal: a converter that
-/// writes `{out}` advances one or both.  Length is not redundant with the
-/// timestamp — mtime granularity is a property of the filesystem, and on a
-/// 1-second one (exFAT/FAT32 on removable media, HFS+) a re-export landing
-/// in the same tick as the pre-run stamp reads as unchanged.  That matters
-/// because the caller answers "unchanged" by falling back to the captured
-/// stdout, so a converter that both writes `{out}` and logs to stdout
-/// would have its real output overwritten by its own log text.  Comparing
-/// the length as well narrows that to a same-tick rewrite that is also
-/// byte-identical in *size* — the residual, and the reason this is a pair
-/// rather than a timestamp.  Hashing the file would close it completely
-/// and is not worth reading a multi-megabyte PDF twice per export.
+/// The length is not redundant: on a 1-second-granularity filesystem (exFAT, HFS+) a
+/// re-export inside the pre-run stamp's tick reads as unchanged, and "unchanged" makes the
+/// caller fall back to stdout — overwriting a converter's real output with its own log
+/// text.  The pair narrows that to a same-tick rewrite of identical size.  Hashing would
+/// close it entirely and is not worth reading a multi-megabyte PDF twice per export.
 fn target_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     Some((meta.modified().ok()?, meta.len()))
 }
 
-/// Resolve `p` to an absolute path without requiring it to exist.
-///
-/// The converter runs with its working directory set to the document's
-/// folder, so any relative `{html}` / `{out}` argument would be resolved
-/// against *that* directory rather than the process cwd — turning a
-/// document opened as `edamame docs/guide.md` into a doomed
-/// `…/docs/docs/guide.pdf` write.  Absolute paths are cwd-independent.
-/// `std::path::absolute` normalizes lexically and needs no I/O (unlike
-/// `canonicalize`), so it works for a target that does not exist yet.  It
-/// rejects an *empty* path, though — which is exactly what `target.parent()`
-/// yields for a bare filename — so an empty input falls back to the current
-/// directory (its true meaning), and only a genuinely unavailable cwd
-/// leaves `p` unchanged.
+/// Resolve `p` to an absolute path without requiring it to exist (see `run_custom_export`
+/// for why absolute).  `std::path::absolute` normalizes lexically with no I/O, unlike
+/// `canonicalize`, so a not-yet-created target works — but it rejects the *empty* path,
+/// which is what `target.parent()` yields for a bare filename, so that falls back to the
+/// cwd (its true meaning).
 fn absolutize(p: &Path) -> PathBuf {
     std::path::absolute(p)
         .or_else(|_| std::env::current_dir())
@@ -254,9 +193,8 @@ fn substitute_command(command: &[String], html_path: &Path, out_path: &Path) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Only the `cfg(unix)` spawn tests below drive a worker through a
-    // channel; on Windows they are compiled out and this import would be
-    // unused, which `clippy -D warnings` against the msvc target rejects.
+    // Used only by the `cfg(unix)` spawn tests; unused on Windows, which
+    // `clippy -D warnings` against the msvc target rejects.
     #[cfg(unix)]
     use std::sync::mpsc;
     use tempfile::tempdir;
@@ -267,14 +205,11 @@ mod tests {
             inline_images: false,
             source_dir: Some(dir.to_path_buf()),
             title: None,
-            render_diagrams: false,
+            render_figures: false,
         }
     }
 
-    /// The exact regression from the weasyprint `FileNotFoundError`: a
-    /// relative target must be resolved to an absolute path before it is
-    /// handed to the converter, since the converter's cwd is the document's
-    /// folder, not the process cwd.
+    /// Regression: the weasyprint `FileNotFoundError` from a relative target.
     #[test]
     fn absolutize_makes_a_relative_path_absolute() {
         let abs = absolutize(Path::new("docs/guide.pdf"));
@@ -283,17 +218,15 @@ mod tests {
             "a relative target must absolutize: {abs:?}"
         );
         assert!(abs.ends_with("docs/guide.pdf"), "tail preserved: {abs:?}");
-        // An already-absolute path passes through unchanged.  A real
-        // directory rather than `/tmp/x.pdf`: a `/`-rooted literal has no
-        // drive letter and so is not absolute on Windows.
+        // A real directory, not `/tmp/x.pdf`: a `/`-rooted literal is not absolute on
+        // Windows.
         let dir = tempdir().unwrap();
         let already = dir.path().join("x.pdf");
         assert_eq!(absolutize(&already), already);
     }
 
-    /// `absolutize("")` is the cwd, not the empty path.  `target.parent()`
-    /// is empty for a repo-root file (`edamame README.md`), and an empty
-    /// working directory fails the converter spawn with `NotFound`.
+    /// `target.parent()` is empty for a repo-root file, and an empty working directory
+    /// fails the converter spawn with `NotFound`.
     #[test]
     fn absolutize_empty_path_is_the_cwd() {
         let a = absolutize(Path::new(""));
@@ -304,11 +237,8 @@ mod tests {
         assert_eq!(a, std::env::current_dir().unwrap());
     }
 
-    /// The exact README bug: an *empty* `source_dir` (what the modal used
-    /// to derive from a root-level file's `target.parent()`) must not break
-    /// the run.  The working directory now comes from the target's own
-    /// (absolute) parent, so the converter spawns and writes normally.  The
-    /// absolute target keeps the test out of the repo's own tree.
+    /// Regression: an *empty* `source_dir`, as the modal derived for a root-level file,
+    /// must not break the run.
     #[test]
     #[cfg(unix)]
     fn an_empty_source_dir_does_not_break_the_export() {
@@ -320,7 +250,7 @@ mod tests {
             extension: "copy".into(),
         };
         let opts = HtmlExportOptions {
-            source_dir: Some(PathBuf::new()), // the empty path, as before the fix
+            source_dir: Some(PathBuf::new()),
             ..html_opts(dir.path())
         };
         let (tx, rx) = mpsc::channel();
@@ -331,10 +261,8 @@ mod tests {
         assert!(target.exists());
     }
 
-    /// A command that cannot be started reports a *spawn* failure naming
-    /// the program, not the misleading "failed to create temporary HTML
-    /// file" the old `#[from] io::Error` produced for every `?` in the
-    /// function.
+    /// A spawn failure must name the program, not report "failed to create temporary HTML
+    /// file" as the old blanket `#[from] io::Error` did.
     #[test]
     fn a_missing_executable_reports_a_spawn_failure() {
         let dir = tempdir().unwrap();
@@ -362,11 +290,8 @@ mod tests {
         );
     }
 
-    /// The converter's working directory (the document folder, for the sake
-    /// of the HTML's own relative asset URLs) is *not* where the output
-    /// lands: `{out}` is absolute, so a converter run with a cwd different
-    /// from the target's directory still writes to the target.  This is the
-    /// property whose absence produced `…/docs/docs/guide.pdf`.
+    /// The converter's cwd is not where the output lands — the property whose absence
+    /// produced `…/docs/docs/guide.pdf`.
     #[test]
     #[cfg(unix)]
     fn output_lands_at_the_target_even_when_the_cwd_differs() {
@@ -382,7 +307,6 @@ mod tests {
             command: vec!["cp".into(), "{html}".into(), "{out}".into()],
             extension: "copy".into(),
         };
-        // The converter runs in `work_dir`, a sibling of the target's dir.
         let opts = HtmlExportOptions {
             source_dir: Some(work_dir.clone()),
             ..html_opts(dir.path())
@@ -394,7 +318,6 @@ mod tests {
         let produced = rx.recv().unwrap().unwrap();
         assert_eq!(produced, target, "returned path is the resolved target");
         assert!(target.exists(), "output written at the target, not the cwd");
-        // Nothing leaked into the converter's working directory.
         assert!(!work_dir.join("guide.copy").exists());
     }
 
@@ -435,9 +358,7 @@ mod tests {
         assert!(matches!(err, CustomExportError::EmptyCommand));
     }
 
-    /// Use `cp` (POSIX) to copy the rendered HTML to the target path,
-    /// which is a realistic stand-in for a format converter without
-    /// needing pandoc / weasyprint installed in CI.
+    /// `cp` stands in for a format converter, so CI needs no pandoc / weasyprint.
     #[test]
     #[cfg(unix)]
     fn spawn_custom_export_runs_cp_successfully() {
@@ -490,10 +411,7 @@ mod tests {
         assert!(!target.exists());
     }
 
-    /// A converter that writes to stdout instead of `{out}` is captured.
-    /// `cat {html}` prints the rendered HTML; with no `{out}` the file
-    /// never gets written by the command, so the stdout fallback is what
-    /// produces the output.
+    /// `cat {html}` never writes `{out}`, so only the stdout fallback can produce output.
     #[test]
     #[cfg(unix)]
     fn spawn_custom_export_captures_stdout_when_no_file_is_written() {
@@ -517,11 +435,8 @@ mod tests {
         assert!(body.contains("<h1>hello</h1>"), "stdout was captured");
     }
 
-    /// A no-op converter (exits 0, writes nothing) over a target left by a
-    /// *previous* export must not report success: the file is present, but
-    /// this run did not produce it.  Before the mtime check, the
-    /// `!target.exists()` guard skipped straight to `Ok`, opening the
-    /// stale artifact as if it were fresh.
+    /// A no-op converter over a target left by a *previous* export must not report
+    /// success.  The old `!target.exists()` guard opened the stale artifact as fresh.
     #[test]
     #[cfg(unix)]
     fn spawn_custom_export_rejects_a_no_op_converter_over_a_stale_target() {
@@ -548,17 +463,11 @@ mod tests {
             err.contains("no output"),
             "expected a no-output error, got: {err}"
         );
-        // The stale file is left exactly as it was.
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "old export");
     }
 
-    /// The write check is `(mtime, len)`, not mtime alone: on a
-    /// coarse-granularity filesystem a converter can rewrite the target
-    /// inside the same mtime tick as the pre-run stamp, and the caller
-    /// reads "unchanged" as "fall back to stdout" — which would overwrite
-    /// the converter's real output with its log text.  Pinning the mtime
-    /// simulates that tick; the differing length is what still reports the
-    /// write.
+    /// Pinning the mtime simulates a coarse-granularity filesystem's same-tick rewrite;
+    /// the length half of the stamp is what still reports the write.  See [`target_stamp`].
     #[test]
     fn the_write_check_notices_a_length_change_under_a_pinned_mtime() {
         let dir = tempdir().unwrap();
@@ -566,8 +475,7 @@ mod tests {
         std::fs::write(&target, b"old").unwrap();
         let before = target_stamp(&target).expect("the file exists");
 
-        // Rewrite with different content, then force the original mtime
-        // back so the timestamp half of the stamp cannot see the write.
+        // Force the original mtime back so the timestamp half cannot see the write.
         std::fs::write(&target, b"a longer replacement").unwrap();
         let f = std::fs::File::options().write(true).open(&target).unwrap();
         f.set_times(std::fs::FileTimes::new().set_modified(before.0))
@@ -579,11 +487,8 @@ mod tests {
         assert_ne!(after, before, "the length change still reports the write");
     }
 
-    /// The intermediate HTML is written into the *output* directory, not
-    /// the system temp dir, so a converter reading it resolves relative
-    /// image paths against the document's folder.  The converter here
-    /// records the `{html}` path it was handed; it must live beside the
-    /// target.
+    /// The converter records the `{html}` path it was handed; it must sit beside the
+    /// target, so relative image paths resolve against the document's folder.
     #[test]
     #[cfg(unix)]
     fn intermediate_html_lives_beside_the_target() {
@@ -591,7 +496,6 @@ mod tests {
         let target = dir.path().join("out.txt");
         let entry = CustomExportEntry {
             name: "record".into(),
-            // Write the html path we were given into {out}.
             command: vec![
                 "sh".into(),
                 "-c".into(),

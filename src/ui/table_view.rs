@@ -1,24 +1,14 @@
-//! `TableView` — per-frame layout snapshot plus the row/column-button
-//! rendering needed for mouse-driven row/column drag, column resize,
-//! and row/column delete.
+//! Per-frame table layout snapshots plus the row/column-button rendering behind mouse-driven
+//! reorder, resize, and delete.
 //!
-//! This module deliberately does NOT introduce a standalone `StatefulWidget` for
-//! tables.  The rendered table lines continue to flow through `ParsedDoc`'s
-//! pre-rendered line list so scroll, wrap, and cell-scoped raw reveal keep
-//! working unchanged.  What this module owns is the mouse-facing half of the
-//! table surface:
+//! There is deliberately **no** standalone `StatefulWidget` for tables: the rendered lines keep
+//! flowing through `ParsedDoc`'s pre-rendered line list, so scroll, wrap, and cell-scoped raw
+//! reveal work unchanged.  What lives here is the mouse-facing half — [`build_snapshots`] scans the
+//! visible lines, [`hit_test`](TableLayoutSnapshot::hit_test) maps a click onto one, and
+//! [`paint_handles`] overlays the glyphs after the line-render pass.
 //!
-//!   1. **`TableLayoutSnapshot`** — a per-frame record of where each table's
-//!      columns and data rows sit on screen, plus the optional row-handle
-//!      column and column-handle row.
-//!   2. **`hit_test`** — pure `(col, row)` → `TableHit` lookup on a snapshot.
-//!   3. **`paint_handles`** — writes the `≡` / `⇔` glyphs into the buffer
-//!      after the normal line-render pass has drawn the surrounding content.
-//!   4. **`build_snapshots`** — scans the visible rendered lines for tables
-//!      and produces one snapshot per visible table.
-//!
-//! Snapshots are stored on the `RenderedViewState` so mouse-event handling in
-//! the next frame can hit-test against them.
+//! Snapshots are stored on the `RenderedViewState` so the next frame's mouse handling can hit-test
+//! against them.
 
 use std::ops::Range;
 
@@ -31,44 +21,28 @@ use crate::config::Theme;
 use crate::editor::{table_edit, EditorState};
 use crate::markdown::table_layout;
 
-/// Reorder-handle glyph — `⠿` (U+283F, braille dots 1-2-3-4-5-6).  Used for
-/// BOTH row-reorder (painted in the external left-side gutter at the `│` of
-/// each data row) and column-reorder (painted at the centre of each column's
-/// top `─` border cell).  The "dot grip" convention reads as "drag me".
+/// Reorder-handle glyph, for both row-reorder (in the external left gutter) and column-reorder
+/// (centered on each column's top border cell).  The "dot grip" convention reads as "drag me".
 pub const REORDER_HANDLE_GLYPH: char = '⠿';
-/// Heavy horizontal box-drawing rule used to highlight the destination
-/// separator during a row-handle drag.  Heavier weight (`━`) reads against
-/// the standard `─` separator and `─` border of the surrounding table.
+/// Highlights the destination separator during a row-handle drag; the heavier weight reads against
+/// the table's standard `─`.
 pub const DROP_ROW_GLYPH: char = '━';
-/// Heavy vertical box-drawing rule used to highlight the destination
-/// separator during a column-handle drag.  Heavier weight (`┃`) reads
-/// against the standard `│` border of the surrounding table.
+/// Column-drag counterpart, reading against the standard `│` border.
 pub const DROP_COL_GLYPH: char = '┃';
-/// Column-resize glyph — `⇔` (U+21D4, left-right arrow).  Painted on each
-/// interior `│` of the header row so the user has a visible, hoverable
-/// resize target — but clicks on any part of the interior border (the pipe
-/// and the two columns adjacent to it, within the `±1` tolerance)
-/// still drive a resize.
+/// Column-resize glyph, painted on each interior `│` of the header row as a visible target;
+/// clicks anywhere within the border's `±1` tolerance still resize.
 pub const COLUMN_RESIZE_GLYPH: char = '⇔';
-/// Delete-handle glyph — `✕` (U+2715).  Painted on the table's outer
-/// right `│` (overlaying the border for each data row) and on the
-/// bottom-border row (centred over each column).  Clicks on the glyph
-/// delete that row / column outright; undo restores it.  Gated by the
-/// same `config.table.show_buttons` flag as the reorder / resize
-/// handles.
+/// Delete-handle glyph, painted on the outer right `│` for each data row and on the bottom border
+/// for each column.  A click deletes outright; undo restores.  Gated by `config.table.show_buttons`
+/// like the other handles.
 pub const DELETE_HANDLE_GLYPH: char = '✕';
 
-/// Number of leading rows in a `TableInfo`'s row table that come before the
-/// first data row: row 0 is the header, row 1 is the alignment row, so data
-/// row `i` lives at `HEADER_ROWS + i`.
+/// Rows preceding the first data row (header, then alignment), so data row `i` is at
+/// `HEADER_ROWS + i`.
 pub const HEADER_ROWS: usize = 2;
 
-/// Per-frame snapshot of one visible table's layout.
-///
-/// Screen coordinates (`col_ranges`, `row_ranges`, `row_handle_col`,
-/// `top_border_row`, `header_row`) are in terminal cells, *relative to the document
-/// area*'s origin.  They're valid only for the frame on which they were
-/// built; rebuild on every render.
+/// Per-frame snapshot of one visible table's layout.  Every coordinate is in terminal cells
+/// relative to the document area's origin, and valid only for the frame it was built on.
 #[derive(Debug, Clone)]
 pub struct TableLayoutSnapshot {
     /// Byte offset of this table's first row in the source buffer.
@@ -79,91 +53,59 @@ pub struct TableLayoutSnapshot {
     pub col_count: usize,
     /// Number of TableInfo rows (header + alignment + data).
     pub row_count: usize,
-    /// Per-column character-cell ranges inside the content area of each
-    /// row — `col_ranges[c].start` is the column just after the opening `│`,
-    /// `col_ranges[c].end` is the column of the closing `│`.
+    /// Per-column cell ranges inside a row's content area: `start` is just after the opening `│`,
+    /// `end` is the closing `│` itself.
     pub col_ranges: Vec<Range<u16>>,
-    /// Per-data-row vertical ranges (y).  `row_ranges[i]` spans the rendered
-    /// row that displays `info.rows[2 + i]`.  Only data rows carry a drag
-    /// handle so this intentionally skips the header + alignment.
+    /// Per-data-row vertical ranges; `row_ranges[i]` spans `info.rows[HEADER_ROWS + i]`.  Only
+    /// data rows carry a drag handle, so the header and alignment rows are skipped.
     pub row_ranges: Vec<Range<u16>>,
-    /// Column (doc-area x) where the `⠿` row-reorder glyph is painted.  Sits
-    /// one cell left of the table's outer `│` (i.e. in the external gutter).
-    /// `None` when handles are disabled on this frame.
+    /// Where the `⠿` row-reorder glyph is painted: one cell left of the outer `│`, in the external
+    /// gutter.  `None` when handles are disabled.
     pub row_handle_col: Option<u16>,
-    /// Row (doc-area y) of the `┌─┬─┐` top border, where the column-reorder
-    /// `⠿` glyphs are painted (one per column, centred on the top-border
-    /// cell).  `None` when handles are disabled OR when the top border
-    /// scrolled off the viewport.
+    /// The `┌─┬─┐` top border, carrying one column-reorder glyph per column.  `None` when handles
+    /// are disabled or the border scrolled off.
     pub top_border_row: Option<u16>,
-    /// Row (doc-area y) of the rendered header row.  Used to place the
-    /// `⇔` column-resize glyphs on each interior `│` of the header row.
-    /// `None` when the header scrolled off the viewport.
+    /// The header row, carrying the `⇔` resize glyphs.  `None` when it scrolled off.
     pub header_row: Option<u16>,
-    /// Column (doc-area x) where the `✕` row-delete glyph is painted.
-    /// Sits ON the table's outer right `│` (i.e. the same column as
-    /// `col_ranges.last().end`) — the glyph overlays the border cell
-    /// for each data row.  Resize on data rows therefore shifts to
-    /// "one cell inside the border"; resize on the header (`⇔`),
-    /// alignment, top-border, and bottom-border rows at the same x
-    /// still works because those rows have no delete-row hit and fall
-    /// through to `ColumnBorder`.  `None` when handles are disabled.
+    /// Where the `✕` row-delete glyph is painted: ON the outer right `│`, overlaying the border
+    /// for each data row.  Resize on a data row therefore shifts to one cell inside the border;
+    /// non-data rows have no delete hit and still fall through to `ColumnBorder`.
     pub delete_row_handle_col: Option<u16>,
-    /// Row (doc-area y) of the `└─┴─┘` bottom border, where the
-    /// column-delete `✕` glyphs are painted (one per column, centred on
-    /// the bottom-border cell).  `None` when handles are disabled OR
-    /// when the bottom border scrolled off the viewport.
+    /// The `└─┴─┘` bottom border, carrying the column-delete glyphs.  `None` when handles are
+    /// disabled or the border scrolled off.
     pub bottom_border_row: Option<u16>,
 }
 
-/// What a `(col, row)` click lands on inside a table.
-///
-/// `Cell::row_idx` and `RowHandle::row_idx` are **TableInfo row indices**
-/// (i.e. `HEADER_ROWS + data_index` — header is row 0, alignment is row 1).
+/// What a `(col, row)` click lands on inside a table.  Every `row_idx` is a **TableInfo** row
+/// index (`HEADER_ROWS + data_index`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableHit {
     /// Click inside a data cell's content area.
     Cell { row_idx: usize, col_idx: usize },
-    /// Click on a vertical `│` border.  `col_idx` is `0..=col_count`:
-    /// - `0` is the outer left `│`
-    /// - `col_count` is the outer right `│`
-    /// - `1..col_count` are the interior borders (resize targets).
-    ///
-    /// Only interior borders drive resize; the outer borders are exposed so
-    /// callers can still classify the click precisely.
+    /// Click on a vertical `│` border; `col_idx` is `0..=col_count`, with 0 and `col_count` the
+    /// outer borders.  Only the interior ones drive resize.
     ColumnBorder { col_idx: usize },
     /// Click on the `≡` row-drag glyph next to a data row.
     RowHandle { row_idx: usize },
     /// Click on the `⇔` column-drag glyph above a column.
     ColumnHandle { col_idx: usize },
-    /// Click on the `✕` row-delete glyph on the right outer `│`.
-    /// `row_idx` is a `TableInfo` row index (≥ 2 — header and alignment
-    /// can't be deleted, so they don't carry a delete handle, leaving
-    /// the same border cell as a resize target on those rows).
+    /// Click on the `✕` row-delete glyph.  `row_idx` is ≥ `HEADER_ROWS`: header and alignment
+    /// can't be deleted, so that border cell stays a resize target on those rows.
     DeleteRowHandle { row_idx: usize },
-    /// Click on the `✕` column-delete glyph on the bottom-border row.
-    /// `col_idx` is the 0-indexed column.  Only emitted when the table
-    /// has more than one column (a single-column table can't lose its
-    /// last column).
+    /// Click on the `✕` column-delete glyph.  Only emitted when the table has more than one
+    /// column.
     DeleteColumnHandle { col_idx: usize },
 }
 
 impl TableLayoutSnapshot {
-    /// `TableInfo` row index of the data row nearest to document-relative
-    /// `row`, or `None` when `row` is outside the data-row band entirely.
+    /// `TableInfo` row index of the data row nearest `row`, or `None` outside the data-row band.
     ///
-    /// `row_ranges` covers only the rendered sub-lines of the data rows
-    /// themselves, so consecutive entries are separated by a one-row gap:
-    /// the `├─┼─┤` rule (or, under `table.row_striping`, the blank stripe
-    /// line).  A strict range test therefore answers `None` for every
-    /// *other* row of the gutter, which is what made grabbing the `⠿`
-    /// handle a coin flip and made the drop indicator stall while the
-    /// pointer crossed a separator.  Snapping to the nearest row closes
-    /// those gaps so the whole vertical extent of the table's data rows is
-    /// live.  The band is deliberately bounded at the separator above the
-    /// first data row and the one below the last, so the header /
-    /// alignment rows above it stay un-grabbable (they aren't reorderable)
-    /// and a pointer that has left the table below stops moving the hover.
+    /// Consecutive `row_ranges` entries are separated by a one-row gap (the `├─┼─┤` rule, or the
+    /// blank stripe line), and a strict range test answered `None` on every one — which made
+    /// grabbing the `⠿` handle a coin flip and stalled the drop indicator mid-crossing.  Snapping
+    /// to the nearest row closes the gaps.  The band stops at the separators bounding the first and
+    /// last data rows, so the header stays un-grabbable and a pointer leaving the table below stops
+    /// moving the hover.
     pub fn data_row_at_y(&self, row: u16) -> Option<usize> {
         let first = self.row_ranges.first()?;
         let last = self.row_ranges.last()?;
@@ -179,16 +121,9 @@ impl TableLayoutSnapshot {
         Some(HEADER_ROWS + idx)
     }
 
-    /// 0-indexed column nearest to document-relative `col`, or `None` when
-    /// `col` is outside the table's horizontal extent (the outer `│`
-    /// borders bound it).
-    ///
-    /// Same rationale as [`Self::data_row_at_y`] on the other axis: the
-    /// `col_ranges` entries are separated by the one-cell `│` / `┬`
-    /// vertices, and a strict test drops every click that lands on one —
-    /// including the `┌`/`┬`/`┐` glyphs of the top border, which is
-    /// exactly where a user aiming at a column-reorder handle tends to
-    /// press.
+    /// 0-indexed column nearest `col`, or `None` outside the table's horizontal extent.  Same
+    /// snapping rationale as [`Self::data_row_at_y`]: the `│` / `┬` vertices between `col_ranges`
+    /// entries are exactly where a user aiming at a column handle tends to press.
     pub fn column_at_x(&self, col: u16) -> Option<usize> {
         let first = self.col_ranges.first()?;
         let last = self.col_ranges.last()?;
@@ -202,25 +137,14 @@ impl TableLayoutSnapshot {
             .map(|(i, _)| i)
     }
 
-    /// Hit-test `(col, row)` — both in document-area-relative coordinates —
-    /// against this snapshot.  Returns `None` when the click falls outside
-    /// any tracked region.
+    /// Hit-test document-area-relative `(col, row)` against this snapshot.
     ///
-    /// Precedence: delete handle → row handle → column handle → column
-    /// border → cell.  Delete handles win over `ColumnBorder` because
-    /// the row-delete glyph sits ON the outer right `│` itself — for
-    /// data rows it overlays the border, so a click there deletes the
-    /// row; resize on data rows is still reachable via the cell just
-    /// inside (`border - 1`) or just outside (`border + 1`).  Clicks
-    /// at the same x on header / alignment / top / bottom border rows
-    /// have no delete handle and fall through to `ColumnBorder`, so
-    /// the right column stays resizable from those rows.  Borders are
-    /// hit within `±1` of their `│` col.
+    /// Precedence: delete handle → row handle → column handle → column border → cell.  Delete wins
+    /// over `ColumnBorder` because the row-delete glyph sits ON the outer right `│`; resize on a
+    /// data row stays reachable one cell either side, and non-data rows have no delete hit at all.
+    /// Borders are hit within `±1` of their `│` column.
     pub fn hit_test(&self, col: u16, row: u16) -> Option<TableHit> {
-        // Row-delete handle — click in the right-side external gutter at
-        // the delete-handle column AND within a data-row y-range.  Checked
-        // BEFORE ColumnBorder so the `✕` cell wins over the right-border
-        // resize tolerance window.
+        // Checked before ColumnBorder so the `✕` cell wins over the right border's ±1 window.
         if let Some(handle_col) = self.delete_row_handle_col {
             if col == handle_col {
                 for (i, y_range) in self.row_ranges.iter().enumerate() {
@@ -233,12 +157,8 @@ impl TableLayoutSnapshot {
             }
         }
 
-        // Column-delete handle — the `✕` cell on the bottom-border row,
-        // within `±1` of the painted glyph.  Deliberately NOT the column's
-        // whole width: this is the one destructive hit-test on the border
-        // rows, so a user aiming at a column border from below shouldn't
-        // drop a column instead, and a ±1 window is still a comfortable
-        // target.
+        // Deliberately ±1 of the glyph rather than the column's whole width: this is the one
+        // destructive hit on the border rows, so aiming at a border must not drop a column.
         if let Some(bot_y) = self.bottom_border_row {
             if row == bot_y {
                 for (c, x_range) in self.col_ranges.iter().enumerate() {
@@ -251,9 +171,7 @@ impl TableLayoutSnapshot {
             }
         }
 
-        // Row-reorder handle — click in the external gutter at the row-handle
-        // column, anywhere across the data rows' vertical band (separators
-        // included; see `data_row_at_y`).
+        // Anywhere across the data rows' vertical band, separators included.
         if let Some(handle_col) = self.row_handle_col {
             if col == handle_col {
                 if let Some(row_idx) = self.data_row_at_y(row) {
@@ -262,11 +180,8 @@ impl TableLayoutSnapshot {
             }
         }
 
-        // Column-reorder handle — click on the top-border row (the `┌─┬─┐`
-        // line), anywhere within the table's horizontal extent.  Interior
-        // `│` vertices (`┬` positions) resolve to the adjacent column for
-        // ergonomics — without that, a user who clicks exactly on the `┬`
-        // glyph silently misses the handle and starts a resize instead.
+        // A `┬` vertex resolves to the adjacent column: clicking exactly on one would otherwise
+        // miss the handle and silently start a resize.
         if let Some(top_y) = self.top_border_row {
             if row == top_y {
                 if let Some(col_idx) = self.column_at_x(col) {
@@ -275,12 +190,8 @@ impl TableLayoutSnapshot {
             }
         }
 
-        // Column border / column-resize glyph — clicks anywhere within ±1 of
-        // a vertical `│` border are resize targets, provided the click is on
-        // a row that's actually part of the table (top border, header, or any
-        // data row — interior `│` runs full height).  The resize glyph `⇔`
-        // on the header row is effectively a highlighted sub-region of the
-        // same hit-test area.
+        // Within ±1 of a `│`, provided the row is part of the table.  The header's `⇔` glyph is
+        // just a highlighted sub-region of this same area.
         if self.row_count > 0 && self.row_on_table(row) {
             if let Some(first) = self.col_ranges.first() {
                 let left_border = first.start.saturating_sub(1);
@@ -326,9 +237,8 @@ impl TableLayoutSnapshot {
     }
 }
 
-/// Distance from `v` to `range`, in cells — `0` when `v` is inside it.
-/// Used to snap a pointer position onto the nearest row / column when it
-/// lands on one of the box-drawing cells *between* two ranges.
+/// Distance from `v` to `range` (0 when inside), for snapping a pointer that landed on one of the
+/// box-drawing cells between two ranges.
 fn range_distance(range: &Range<u16>, v: u16) -> u16 {
     if v < range.start {
         range.start - v
@@ -339,11 +249,8 @@ fn range_distance(range: &Range<u16>, v: u16) -> u16 {
     }
 }
 
-/// X of the reorder / delete glyph painted on a column's border cell —
-/// the centre of the column's content span.  Returns `None` for a
-/// zero-width column.  The single derivation shared by `paint_handles`
-/// and the column-delete hit-test, so the `✕` a user sees and the cell
-/// that actually deletes can't drift apart.
+/// Center of a column's content span — where its border-cell glyph is painted.  Shared by
+/// `paint_handles` and the column-delete hit-test so the glyph and the live cell can't drift apart.
 fn column_glyph_x(x_range: &Range<u16>) -> Option<u16> {
     if x_range.end <= x_range.start {
         return None;
@@ -351,46 +258,34 @@ fn column_glyph_x(x_range: &Range<u16>) -> Option<u16> {
     Some(x_range.start + (x_range.end - x_range.start) / 2)
 }
 
-/// Per-frame instruction for `paint_drop_indicator`.  Captures just the
-/// information the painter needs about the active drag — `paint_handles`'s
-/// caller distills `mouse_ops::DragTarget` into one of these so the UI
-/// layer doesn't import the editor-side enum.
+/// Per-frame instruction for `paint_drop_indicator`.  The caller distills `mouse_ops::DragTarget`
+/// into one of these so the UI layer doesn't import the editor-side enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropIndicator {
-    /// Row-drag in progress; highlight the horizontal separator that would
-    /// receive the dropped row.  `hover_row_idx` is the `TableInfo` row
-    /// index the pointer is currently over (≥ 2 for data rows).  The
-    /// painter draws on the separator just *above* that row when dropping
-    /// upward, *below* when downward — derived from `src_row_idx`.
+    /// Row drag: highlight the separator that would receive the drop — above `hover_row_idx` when
+    /// dropping upward, below when downward, as derived from `src_row_idx`.
     Row {
         table_byte_start: usize,
         src_row_idx: usize,
         hover_row_idx: usize,
     },
-    /// Column-drag in progress; highlight the vertical border that would
-    /// receive the dropped column.  Same drop-side semantics as `Row`.
+    /// Column drag; same drop-side semantics as `Row`.
     Column {
         table_byte_start: usize,
         src_col_idx: usize,
         hover_col_idx: usize,
     },
-    /// Column-border resize in progress; show a faint vertical guideline
-    /// at the pointer's current X to indicate where the release will
-    /// commit the new width. Currently driven only by integration tests
-    /// in `tests/ui.rs`; the live column-border drag uses a different
-    /// painting path.
+    /// Resize guideline at the pointer's X.  Driven only by `tests/ui.rs` today; the live
+    /// column-border drag paints through a different path.
     #[allow(dead_code)]
     ColumnBorder { table_byte_start: usize, x: u16 },
 }
 
 // ── Snapshot construction ───────────────────────────────────────────────────
 
-/// Refresh `snapshots` in place when the cache key
-/// (`scroll`, `area`, `parsed_version`, `show_handles`) differs from the
-/// previous frame's; otherwise leave the vector untouched.  Mirrors
-/// `image_view::build_snapshots_cached` and `link_view::build_snapshots_cached`.
-/// `show_handles` is part of the key because it changes the snapshot
-/// contents (handle columns / rows are conditionally populated).
+/// Refresh `snapshots` in place when the cache key (`scroll`, `area`, `parsed_version`,
+/// `show_handles`) changed, mirroring the image and link snapshot caches.  `show_handles` is part
+/// of the key because it changes the snapshot contents.
 pub fn build_snapshots_cached(
     state: &EditorState,
     area: Rect,
@@ -406,13 +301,10 @@ pub fn build_snapshots_cached(
     *cache_key = Some(key);
 }
 
-/// Walk every visible rendered line and build a snapshot for every table
-/// fully or partially on screen.
+/// Build a snapshot for every table fully or partially on screen.
 ///
-/// `show_handles` controls whether snapshots carry the row-handle / column-
-/// handle coordinates (and therefore whether hit-testing classifies clicks
-/// on those cells as handle hits).  Pass `capabilities.mouse && config.table
-/// .show_buttons` from the caller.
+/// `show_handles` controls whether snapshots carry the handle coordinates, and therefore whether
+/// hit-testing classifies clicks on those cells as handle hits.
 pub fn build_snapshots(
     state: &EditorState,
     area: Rect,
@@ -432,20 +324,12 @@ pub fn build_snapshots(
     let mut vis_y: usize = 0;
     let height = area.height as usize;
 
-    // Track the most-recently-started table so multi-row tables merge into
-    // one snapshot.  Keyed by the `table_byte_start` so the same table is
-    // not snapshotted twice.
-    //
-    // The snapshot stays open through border/separator rows (which map to
-    // `info_row_idx == None`) so we don't produce one snapshot per data
-    // row.  We only close it when the rendered line leaves the table
-    // block entirely (either a different block or end of visible range).
+    // The open snapshot stays open through border / separator rows so a multi-row table merges
+    // into one snapshot; it closes only when the rendered line leaves the table block.
     let mut open_table: Option<TableLayoutSnapshot> = None;
     let mut open_table_block: Option<usize> = None; // block byte_start
-                                                    // Per-data-row span accumulator.  Set when a `DataRow` sub-line is
-                                                    // first encountered for that row index, extended by subsequent
-                                                    // continuations, and pushed onto `snap.row_ranges` when a separator
-                                                    // (or end of block) closes the row.
+                                                    // Per-data-row span accumulator: opened by a row's first `DataRow` sub-line, extended by its
+                                                    // continuations, pushed onto `snap.row_ranges` when a separator closes the row.
     let mut current_data_row_y: Option<(usize, Range<u16>)> = None;
 
     while vis_y < height && virtual_idx < total {
@@ -464,20 +348,14 @@ pub fn build_snapshots(
             .source_map
             .original_byte_for_rendered_line(virtual_idx);
         let mut current_block: Option<usize> = None;
-        // sub_kind: classification of this rendered sub-line within its
-        // table block — drives everything from row-handle placement to
-        // row_range accumulation.
+        // Drives everything from row-handle placement to row_range accumulation.
         let mut sub_kind: Option<TableSubLineKind> = None;
         if let Some(bb) = block_byte {
             if let Some(range) = state.parsed.source_map.original_range_for_byte(bb) {
                 let end = range.end.min(source.len());
-                // Use `get` rather than direct indexing: when an in-line edit
-                // has set `parsed_dirty`, the source-map byte ranges are
-                // stale relative to the live buffer and may now land inside
-                // a multi-byte UTF-8 sequence (e.g. an emoji the user just
-                // typed).  Falling back to `""` skips this block's snapshot
-                // for the one frame between the keystroke and the next
-                // parse flush — preferable to panicking.
+                // `get` rather than indexing: while `parsed_dirty` is set the source-map ranges
+                // can land mid-UTF-8-sequence.  Falling back to `""` skips this block's snapshot
+                // for the one frame until the parse flush, rather than panicking.
                 let block_text = source.get(range.start..end).unwrap_or("");
                 if table_edit::is_table_block(block_text) {
                     current_block = Some(range.start);
@@ -524,8 +402,7 @@ pub fn build_snapshots(
             }
 
             if let Some(snap) = open_table.as_mut() {
-                // Fill col_ranges the first time we see a row with `│`
-                // characters (any header or data row produces them).
+                // Fill col_ranges from the first row carrying `│` characters.
                 if snap.col_ranges.is_empty() {
                     let pipes = table_layout::rendered_pipe_positions(line);
                     if pipes.len() == snap.col_count + 1 {
@@ -547,22 +424,18 @@ pub fn build_snapshots(
                         }
                     }
                     Some(TableSubLineKind::Header { sub: 0 }) => {
-                        // Header's first rendered sub-line — anchor the
-                        // column-resize glyph row here.
+                        // Anchor the column-resize glyph row on the header's first sub-line.
                         if show_handles && snap.header_row.is_none() {
                             snap.header_row = Some(y);
                         }
                     }
                     Some(TableSubLineKind::Header { .. }) => {
-                        // Header continuation lines (when the header
-                        // wraps) don't anchor anything beyond what the
-                        // first line already set up.
+                        // A wrapped header's continuation lines anchor nothing new.
                     }
                     Some(TableSubLineKind::ThickSeparator)
                     | Some(TableSubLineKind::ThinSeparator)
                     | Some(TableSubLineKind::BottomBorder) => {
-                        // A separator closes the current data row's
-                        // span — push and reset.
+                        // A separator closes the current data row's span.
                         if let Some((_, range)) = current_data_row_y.take() {
                             snap.row_ranges.push(range);
                         }
@@ -571,9 +444,7 @@ pub fn build_snapshots(
                             && snap.bottom_border_row.is_none()
                             && snap.col_count > 1
                         {
-                            // Single-column tables can't lose their last
-                            // column, so we don't surface the column-delete
-                            // handle for them at all.
+                            // A single-column table can't lose its last column.
                             snap.bottom_border_row = Some(y);
                         }
                     }
@@ -593,18 +464,13 @@ pub fn build_snapshots(
                     None => {}
                 }
 
-                // Row-reorder gutter column — one cell left of the outer `│`.
+                // One cell left of the outer `│`.
                 if show_handles && snap.row_handle_col.is_none() && !snap.col_ranges.is_empty() {
                     let outer_left = snap.col_ranges[0].start.saturating_sub(1);
                     snap.row_handle_col = Some(outer_left.saturating_sub(1));
                 }
-                // Row-delete column — ON the outer right `│` itself
-                // (`col_ranges.last().end`), overlaying the border for
-                // each data row.  `hit_test` checks delete handles
-                // before `ColumnBorder`, so a click on the `✕` cell on
-                // a data row deletes; clicks at the same x on header /
-                // alignment / top / bottom border rows fall through to
-                // `ColumnBorder` and resize the last column.
+                // ON the outer right `│`, overlaying the border for each data row; `hit_test`
+                // checks delete before `ColumnBorder`, so non-data rows still resize here.
                 if show_handles
                     && snap.delete_row_handle_col.is_none()
                     && !snap.col_ranges.is_empty()
@@ -631,29 +497,19 @@ pub fn build_snapshots(
     out
 }
 
-/// Classification of one rendered line within a table block.  Drives
-/// every consumer that needs to map a sub-line index back to a logical
-/// row — `build_snapshots` for hit-testing, `mouse_ops::rendered_sub_line_to_offset`
-/// for click-to-cell mapping.
-///
-/// Replaces the fixed-pattern `table_sub_to_row_idx` math
-/// because multi-row data rows (cells that wrapped) can occupy any
-/// number of consecutive `│`-prefixed lines, breaking the old
-/// alternating-line assumption.
+/// Classification of one rendered line within a table block, for every consumer mapping a sub-line
+/// index back to a logical row.  Fixed-pattern math can't do this job: a wrapped data row occupies
+/// any number of consecutive `│`-prefixed lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableSubLineKind {
     /// Top border (`┌─┬─┐`).  Always sub 0.
     TopBorder,
-    /// One of (potentially several) header lines.  `sub` is the
-    /// 0-indexed row within the header (header always logical row 0
-    /// in `TableInfo.rows`).
+    /// A header line; `sub` is its 0-indexed row within the (possibly wrapped) header.
     Header { sub: usize },
     /// Thick separator under the header (`┝━┿━┥`).
     ThickSeparator,
-    /// One of (potentially several) lines making up data row `row`
-    /// (0-indexed across data rows).  Maps to `TableInfo.rows[row + 2]`
-    /// since header is row 0 and alignment is row 1.  `sub` is the
-    /// 0-indexed visual row within that data row.
+    /// A line of data row `row` (0-indexed across data rows, so `TableInfo.rows[row +
+    /// HEADER_ROWS]`); `sub` is its visual row within that data row.
     DataRow { row: usize, sub: usize },
     /// Thin separator between two data rows (`├─┼─┤`).
     ThinSeparator,
@@ -661,21 +517,12 @@ pub enum TableSubLineKind {
     BottomBorder,
 }
 
-/// Classify every rendered sub-line of a table block by inspecting its
-/// leading box-drawing glyph.  Returns one `TableSubLineKind` per
-/// rendered sub-line.  Length matches `lines.len()` so callers can
-/// look up by `sub_in_block`.
+/// Classify every rendered sub-line of a table block by its leading box-drawing glyph.  The result
+/// is indexed by `sub_in_block`, so its length matches `lines.len()`.
 ///
-/// `lines` is the slice of rendered lines that make up the table block
-/// (i.e. the slice of `parsed.lines[own.start..own.end]`).
-///
-/// When `config.table.row_striping` is on, the renderer
-/// emits a *blank* `│ ... │ ... │` line in place of the `├─┼─┤` rule
-/// between data rows.  We detect those by spotting a `│`-prefixed
-/// line whose only chars are `│` and whitespace, immediately after a
-/// data row — and classify them as `ThinSeparator` so row-counting
-/// logic (and the `cursor_block_revealed` plumbing) keep working
-/// without further changes.
+/// Under `config.table.row_striping` the renderer emits a *blank* `│ … │` line in place of the
+/// `├─┼─┤` rule; those are detected by shape and classified as `ThinSeparator` so the row-counting
+/// logic keeps working.
 pub fn classify_table_sub_lines(lines: &[Line<'_>]) -> Vec<TableSubLineKind> {
     let mut out = Vec::with_capacity(lines.len());
     let mut past_thick = false;
@@ -729,9 +576,7 @@ pub fn classify_table_sub_lines(lines: &[Line<'_>]) -> Vec<TableSubLineKind> {
                 }
             }
             _ => {
-                // Defensive fallback: unrecognized leading glyph.  Treat
-                // as a header line so the snapshot doesn't panic, even
-                // though we don't expect to hit this path.
+                // Unrecognized leading glyph: treat as a header line rather than panicking.
                 TableSubLineKind::Header { sub: 0 }
             }
         };
@@ -740,15 +585,10 @@ pub fn classify_table_sub_lines(lines: &[Line<'_>]) -> Vec<TableSubLineKind> {
     out
 }
 
-/// Stripe-aware separator detector.  Returns `true` for lines whose
-/// only characters are `│` plus NBSP (U+00A0) — the exact shape
-/// produced by `Renderer::blank_table_separator`.  ASCII-space-only
-/// lines explicitly do *not* qualify, so the wrap-continuation line
-/// of a multi-row data row (whose short cells emit `format!(" {}{} ",
-/// "", " ".repeat(pad))` — ASCII spaces only) cannot be misidentified
-/// as a separator.  Data rows may also carry NBSP from code-span pad
-/// cells, but they always sit alongside the renderer's ASCII cell
-/// padding, which disqualifies the line here.
+/// True for lines made only of `│` plus NBSP — the exact shape `Renderer::blank_table_separator`
+/// produces.  ASCII-space-only lines deliberately do *not* qualify, so a wrap-continuation line
+/// (ASCII-padded) can't be mistaken for a separator; a data row carrying NBSP from a code-span pad
+/// still has ASCII cell padding alongside it, which disqualifies it here.
 fn is_blank_stripe_line(line: &Line<'_>) -> bool {
     let mut saw_nbsp = false;
     for c in line.spans.iter().flat_map(|s| s.content.chars()) {
@@ -763,16 +603,10 @@ fn is_blank_stripe_line(line: &Line<'_>) -> bool {
 
 // ── Handle rendering ────────────────────────────────────────────────────────
 
-/// Paint the row/column-button glyphs on top of each snapshot's table.  The
-/// underlying rendered lines have already been drawn; this layer overlays:
-///   * `⠿` in the external left gutter for each data row (row-reorder),
-///   * `⠿` on the centre of each column's top-border cell (column-reorder),
-///   * `⇔` on each interior `│` in the header row (column-resize).
+/// Overlay the row/column-button glyphs on top of already-rendered table lines.
 ///
-/// When `cursor_table_start` is `Some(byte)`, handles paint
-/// only on the snapshot whose `table_byte_start` matches — i.e. the
-/// table the cursor is currently inside.  Pass `None` to paint on every
-/// visible table (the legacy, always-on behaviour used by tests).
+/// `cursor_table_start` limits painting to the table the cursor is inside; `None` paints on every
+/// visible table (used by tests).
 pub fn paint_handles(
     snapshots: &[TableLayoutSnapshot],
     area: Rect,
@@ -780,12 +614,8 @@ pub fn paint_handles(
     theme: &Theme,
     cursor_table_start: Option<usize>,
 ) {
-    // Reorder (`⠿`) and resize (`⇔`) glyphs share `theme.table_handle`
-    // (interactive accent); delete (`✕`) glyphs use the louder
-    // `theme.table_handle_delete` so the destructive affordance stands
-    // out from its neighbours.  The cursor-in-table gating
-    // (`paint_handles_for_cursor_table`) keeps these from painting on
-    // every visible table.
+    // Reorder and resize glyphs share the interactive accent; delete uses the louder
+    // `table_handle_delete` so the destructive affordance stands out.
     let move_style: Style = theme.table_handle;
     let delete_style: Style = theme.table_handle_delete;
     for snap in snapshots {
@@ -797,13 +627,8 @@ pub fn paint_handles(
             // No cursor table — skip painting handles entirely.
             return;
         }
-        // Row-reorder glyph: one per logical data row, painted at the
-        // first rendered sub-line.  Multi-row (wrapped) data rows still
-        // get exactly one glyph — putting one on every wrapped sub-line
-        // reads as visual noise, and the row-drag is dispatched via
-        // hit-testing against the row's full y-range so the user can
-        // still grab anywhere in the gutter even though the glyph only
-        // shows once.
+        // One glyph per logical data row, at its first sub-line: one per wrapped sub-line reads
+        // as noise, and the hit-test covers the row's full y-range anyway.
         if let Some(col) = snap.row_handle_col {
             if col < area.width {
                 for y_range in &snap.row_ranges {
@@ -818,9 +643,8 @@ pub fn paint_handles(
             }
         }
 
-        // Column-reorder glyphs on the top border — centred within each
-        // column's content span so they overlay the `─` between the `┌`/`┬`
-        // corners without disturbing them.
+        // Centered within each column's content span, so they overlay the `─` and leave the
+        // `┌`/`┬` corners intact.
         if let Some(y) = snap.top_border_row {
             if y < area.height {
                 for x_range in &snap.col_ranges {
@@ -837,10 +661,8 @@ pub fn paint_handles(
             }
         }
 
-        // Column-resize glyphs on the header-row `│` borders — every
-        // interior border AND the rightmost outer border (which resizes the
-        // last column).  Does NOT overwrite the leftmost outer `│` since
-        // there's no column to its left to resize.
+        // Every interior border plus the rightmost outer one (which resizes the last column).
+        // Not the leftmost: there is no column to its left.
         if let Some(y) = snap.header_row {
             if y < area.height {
                 for x_range in &snap.col_ranges {
@@ -855,12 +677,8 @@ pub fn paint_handles(
             }
         }
 
-        // Row-delete glyphs ON the right outer `│` — one per data row,
-        // painted at the row's first rendered sub-line.  Skips header
-        // (row_idx 0) and alignment (row_idx 1) because they aren't
-        // deletable; `row_ranges` already only tracks data rows so this
-        // loop naturally does the right thing.  Same multi-row "one
-        // glyph per logical row" rule as the row-reorder gutter.
+        // One per data row, at its first sub-line, like the reorder gutter.  `row_ranges` only
+        // tracks data rows, so the undeletable header and alignment rows are skipped for free.
         if let Some(col) = snap.delete_row_handle_col {
             if col < area.width {
                 for y_range in &snap.row_ranges {
@@ -875,10 +693,8 @@ pub fn paint_handles(
             }
         }
 
-        // Column-delete glyphs on the bottom border — centred within
-        // each column's content span (mirrors the column-reorder
-        // glyphs on the top border).  `bottom_border_row` is `None`
-        // for single-column tables, so no glyph is painted there.
+        // Mirrors the column-reorder glyphs on the top border.  `bottom_border_row` is `None` for
+        // a single-column table, so nothing paints there.
         if let Some(y) = snap.bottom_border_row {
             if y < area.height {
                 for x_range in &snap.col_ranges {
@@ -899,12 +715,9 @@ pub fn paint_handles(
 
 // ── Drop-indicator painter ──────────────────────────────────────────────────
 
-/// Highlight every valid drop separator for an in-progress row / column
-/// drag, with the active hover-target painted at the bright accent and
-/// every other valid drop at a dimmer "candidate" shade.  Runs after
-/// `paint_handles` so the indicator overlays the existing border glyphs.
-/// No-op when no snapshot matches the indicator's `table_byte_start`
-/// (e.g. the drag's source table scrolled off-screen).
+/// Highlight every valid drop separator for an in-progress drag — the hover target at the bright
+/// accent, the other candidates dimmer.  Runs after `paint_handles` so it overlays the border
+/// glyphs.  No-op when no snapshot matches the indicator's table.
 pub fn paint_drop_indicator(
     snapshots: &[TableLayoutSnapshot],
     indicator: &DropIndicator,
@@ -929,16 +742,11 @@ pub fn paint_drop_indicator(
             if src_row_idx < 2 || snap.row_ranges.is_empty() {
                 return;
             }
-            // The active drop target — the separator on the side of the
-            // hover row matching the drag direction.  None when the
-            // pointer is over an out-of-range index.
+            // The separator on the side of the hover row matching the drag direction.
             let active_y = active_row_drop_y(snap, src_row_idx, hover_row_idx);
 
-            // First pass: paint every valid drop separator dimly so the
-            // user sees the full set of options.  Valid separators are
-            // every horizontal border between (and around) the data
-            // rows EXCEPT the two adjacent to the source row — moving a
-            // row to its own slot is a no-op.
+            // Paint every valid drop dimly so the user sees the full set.  The two separators
+            // bounding the source row are excluded — dropping there is a no-op.
             let src_data_idx = src_row_idx - 2;
             let Some(first) = snap.col_ranges.first() else {
                 return;
@@ -950,17 +758,15 @@ pub fn paint_drop_indicator(
             let x_end = last.end;
             let x_max = area.width;
             for (i, y_range) in snap.row_ranges.iter().enumerate() {
-                // Separator above this data row (between row i-1 and i).
+                // Separator above this data row.
                 let above = y_range.start.saturating_sub(1);
-                // Separator below this data row (between row i and i+1
-                // or above the bottom border).
+                // Separator below this data row.
                 let below = y_range.end;
                 for &y in &[above, below] {
                     if y >= area.height {
                         continue;
                     }
-                    // Skip the separators that bound the source row
-                    // (a drop there would be a no-op).
+                    // A drop on the source row's own separators is a no-op.
                     if (i == src_data_idx && (y == above || y == below))
                         || (i + 1 == src_data_idx && y == below)
                         || (i == src_data_idx + 1 && y == above)
@@ -1009,9 +815,7 @@ pub fn paint_drop_indicator(
                 .map(|r| r.end)
                 .unwrap_or(area.height.saturating_sub(1));
             let y_max = area.height;
-            // Every column-border (interior + the two outer borders) is
-            // a candidate drop point, except the two flanking the source
-            // column.
+            // Every border is a candidate except the two flanking the source column.
             let mut borders: Vec<u16> = Vec::with_capacity(snap.col_ranges.len() + 1);
             if let Some(first) = snap.col_ranges.first() {
                 borders.push(first.start.saturating_sub(1));
@@ -1078,8 +882,7 @@ pub fn paint_drop_indicator(
     }
 }
 
-/// Y-coordinate of the active drop separator for a row drag, or `None`
-/// when the pointer is over the source row itself (no drop target).
+/// Y of the active drop separator for a row drag; `None` over the source row itself.
 fn active_row_drop_y(
     snap: &TableLayoutSnapshot,
     src_row_idx: usize,
@@ -1097,8 +900,7 @@ fn active_row_drop_y(
     }
 }
 
-/// X-coordinate of the active drop separator for a column drag, or
-/// `None` when the pointer is on the source column.
+/// X of the active drop separator for a column drag; `None` on the source column.
 fn active_column_drop_x(
     snap: &TableLayoutSnapshot,
     src_col_idx: usize,
@@ -1116,8 +918,7 @@ fn active_column_drop_x(
     }
 }
 
-/// Draw a heavy horizontal rule across `[x_start, x_end]` at row `y`,
-/// clipped at `x_max`.  Helper for the row-drag drop painter.
+/// Heavy horizontal rule across `[x_start, x_end]` at row `y`, clipped at `x_max`.
 fn paint_horizontal_drop(
     buf: &mut TuiBuf,
     x_start: u16,
@@ -1137,8 +938,7 @@ fn paint_horizontal_drop(
     }
 }
 
-/// Draw a heavy vertical rule down `[y_top, y_bot]` at column `x`,
-/// clipped at `y_max`.  Helper for the column-drag drop painter.
+/// Heavy vertical rule down `[y_top, y_bot]` at column `x`, clipped at `y_max`.
 fn paint_vertical_drop(buf: &mut TuiBuf, y_top: u16, y_bot: u16, y_max: u16, x: u16, style: Style) {
     for y in y_top..=y_bot {
         if y >= y_max {
@@ -1197,16 +997,9 @@ mod tests {
 
     #[test]
     fn hit_test_border_tolerates_one_cell_miss() {
-        // Interior border at col_ranges[0].end = 4; click at col 5 should
-        // still resolve to ColumnBorder because the border ±1 window hits.
-        //
-        // NB: col 5 is also col_ranges[1].start; row-on-table check makes
-        // sure we only classify as a border when we're vertically on the
-        // table.  We set row 3 which is in row_ranges[0].
+        // Col 5 is both within the border's ±1 window and `col_ranges[1].start`; borders win.
         let s = snap(vec![1..4, 5..8], vec![3..4, 4..5]);
         let hit = s.hit_test(5, 3).unwrap();
-        // Could be classified as either Border (for ±1 of pipe at col 4)
-        // or Cell(col 1).  Borders take precedence.
         assert!(matches!(
             hit,
             TableHit::ColumnBorder { col_idx: 1 } | TableHit::Cell { col_idx: 1, .. }
@@ -1239,29 +1032,23 @@ mod tests {
         assert_eq!(hit, TableHit::ColumnBorder { col_idx: 1 });
     }
 
-    /// The `├─┼─┤` separator between two data rows sits in the one-row gap
-    /// between consecutive `row_ranges` entries.  A gutter click there used
-    /// to classify as nothing (falling through to the inert left outer
-    /// border), which is what made grabbing the `⠿` handle feel like a coin
-    /// flip on a striped or separator-ruled table.
+    /// Regression: a gutter click on the separator between two data rows used to classify as
+    /// nothing, which made grabbing the `⠿` handle a coin flip.
     #[test]
     fn hit_test_row_handle_covers_the_separator_between_rows() {
         let mut s = snap(vec![5..8], vec![3..4, 5..6]);
         s.row_handle_col = Some(2);
         // y=4 is the separator between data row 0 (y=3) and row 1 (y=5).
         assert_eq!(s.hit_test(2, 4), Some(TableHit::RowHandle { row_idx: 2 }));
-        // The bounding separators count too: above the first row and below
-        // the last.
+        // The bounding separators count too.
         assert_eq!(s.hit_test(2, 2), Some(TableHit::RowHandle { row_idx: 2 }));
         assert_eq!(s.hit_test(2, 6), Some(TableHit::RowHandle { row_idx: 3 }));
         // …but the header / alignment rows above the band do not.
         assert_eq!(s.hit_test(2, 1), None);
     }
 
-    /// The `┬` vertices of the top border are exactly where a user aiming
-    /// at a column-reorder handle tends to press.  They must resolve to an
-    /// adjacent column rather than falling through to `ColumnBorder`, which
-    /// would silently start a resize instead of a reorder.
+    /// A `┬` vertex — where a user aiming at a column handle tends to press — must resolve to an
+    /// adjacent column, not fall through to `ColumnBorder` and silently start a resize.
     #[test]
     fn hit_test_column_handle_covers_the_border_vertices() {
         let mut s = snap(vec![5..8, 9..12], vec![3..4]);
@@ -1279,18 +1066,15 @@ mod tests {
             s.hit_test(12, 1),
             Some(TableHit::ColumnHandle { col_idx: 1 })
         );
-        // Past the table's right edge the column-handle band ends and the
-        // right border's `±1` resize window takes over again.
+        // Past the right edge the handle band ends and the border's ±1 window takes over.
         assert_eq!(
             s.hit_test(13, 1),
             Some(TableHit::ColumnBorder { col_idx: 2 })
         );
     }
 
-    /// The column-delete `✕` is a destructive one-shot, so its hitbox is
-    /// the painted glyph ±1 — not the column's whole width.  That keeps the
-    /// bottom border usable as a resize target and stops a click aimed at a
-    /// border from dropping a column.
+    /// The destructive `✕` gets a glyph ±1 hitbox, not the column's whole width, so the bottom
+    /// border stays usable as a resize target.
     #[test]
     fn hit_test_column_delete_is_scoped_to_the_glyph() {
         let mut s = snap(vec![1..8, 9..16], vec![3..4]);
@@ -1304,7 +1088,7 @@ mod tests {
             s.hit_test(5, 5),
             Some(TableHit::DeleteColumnHandle { col_idx: 0 })
         );
-        // Well away from the glyph: the interior border at x=8 resizes.
+        // Well away from the glyph: the interior border resizes.
         assert_eq!(
             s.hit_test(8, 5),
             Some(TableHit::ColumnBorder { col_idx: 1 })
@@ -1319,11 +1103,8 @@ mod tests {
 
     #[test]
     fn hit_test_returns_delete_row_handle_when_handle_set() {
-        // delete_row_handle_col sits ON the outer right `│`.  With
-        // col_ranges last.end = 8, handle_col = 8 (same column as the
-        // border).  For data rows that click resolves to delete; the
-        // header / alignment rows have no row_range entry and fall
-        // through to ColumnBorder.
+        // The delete column sits ON the outer right `│`, so a data-row click there deletes while
+        // the header / alignment rows fall through to ColumnBorder.
         let mut s = snap(vec![1..4, 5..8], vec![3..4, 4..5]);
         s.delete_row_handle_col = Some(8);
         let hit = s.hit_test(8, 3).unwrap();
@@ -1332,50 +1113,35 @@ mod tests {
         assert_eq!(hit, TableHit::DeleteRowHandle { row_idx: 3 });
     }
 
-    /// With the `✕` glyph painted ON the right border, the cell just
-    /// inside the border (`last.end - 1`) becomes the resize target on
-    /// data rows.  This documents the new contract: the explicit `✕`
-    /// cell deletes; the cell next to it still resizes via the
-    /// `ColumnBorder ±1` tolerance.
+    /// With `✕` painted ON the right border, the cell just inside it is the data-row resize
+    /// target, via the `ColumnBorder ±1` tolerance.
     #[test]
     fn hit_test_cell_just_inside_right_border_still_resizes() {
         let mut s = snap(vec![1..4, 5..8], vec![3..4]);
         s.delete_row_handle_col = Some(8); // same as last.end
-                                           // x=7 is one cell inside the right `│` at x=8 — within the
-                                           // ColumnBorder ±1 window.
+                                           // x=7 is one cell inside the right `│` at x=8 — within the ColumnBorder ±1 window.
         let hit = s.hit_test(7, 3).unwrap();
         assert_eq!(hit, TableHit::ColumnBorder { col_idx: 2 });
     }
 
-    /// On non-data rows (header / alignment / top / bottom border),
-    /// the same x as the delete glyph has no `row_range` match, so the
-    /// click falls through to `ColumnBorder`.  This keeps the right
-    /// column resizable via the header `⇔` glyph (and via clicks on
-    /// the surrounding border rows).
+    /// On a non-data row the delete glyph's x has no `row_range` match, so the click falls
+    /// through to `ColumnBorder` and the right column stays resizable.
     #[test]
     fn hit_test_right_border_on_non_data_row_still_resizes() {
         let mut s = snap(vec![1..4, 5..8], vec![5..6]); // single data row at y=5
         s.delete_row_handle_col = Some(8);
-        // y=3 is in the header / alignment region (between
-        // top_border heuristic at y=3 and the data row at y=5) —
-        // outside row_ranges, so the delete-handle check finds no
-        // row and the click falls through to ColumnBorder.
+        // y=3 is in the header / alignment region, outside `row_ranges`.
         assert_eq!(
             s.hit_test(8, 3),
             Some(TableHit::ColumnBorder { col_idx: 2 })
         );
     }
 
-    /// Disabled delete handles (`None` field) leave the original
-    /// hit-test chain unchanged — the right border on a data row
-    /// resolves to `ColumnBorder`, as it did before delete handles
-    /// existed.  This is what `config.table.show_buttons = false`
-    /// must guarantee.
+    /// What `config.table.show_buttons = false` guarantees: with no delete handle the right border
+    /// on a data row is a plain `ColumnBorder`.
     #[test]
     fn hit_test_falls_through_when_delete_handles_disabled() {
         let s = snap(vec![1..4, 5..8], vec![3..4]);
-        // (8, 3) is the right `│`; with no delete handle, it's just a
-        // border click.
         assert_eq!(
             s.hit_test(8, 3),
             Some(TableHit::ColumnBorder { col_idx: 2 })
@@ -1386,36 +1152,25 @@ mod tests {
     fn hit_test_returns_delete_column_handle_on_bottom_border() {
         let mut s = snap(vec![1..4, 5..8], vec![3..4]);
         s.bottom_border_row = Some(5);
-        // Click in middle of column 0's content range (cols 1..4).
         let hit = s.hit_test(2, 5).unwrap();
         assert_eq!(hit, TableHit::DeleteColumnHandle { col_idx: 0 });
-        // Click in middle of column 1's content range (cols 5..8).
         let hit = s.hit_test(6, 5).unwrap();
         assert_eq!(hit, TableHit::DeleteColumnHandle { col_idx: 1 });
     }
 
-    /// `row_ranges` only tracks data rows, so the delete-row check
-    /// can't fire on a y outside any data-row range.  Combined with
-    /// `hit_test_right_border_on_non_data_row_still_resizes`, this
-    /// ensures the header / alignment rows on the same border column
-    /// keep their resize behaviour.
+    /// `row_ranges` tracks only data rows, so the delete check can't fire outside one.
     #[test]
     fn hit_test_delete_row_handle_skips_header_and_alignment() {
         let mut s = snap(vec![1..4, 5..8], vec![5..6]); // single data row at y=5
         s.delete_row_handle_col = Some(8);
-        // The next assertion — that y=2 produces ColumnBorder, not
-        // DeleteRowHandle — is the actual contract.  See
-        // `hit_test_right_border_on_non_data_row_still_resizes`.
+        // The contract: y=2 gives ColumnBorder, not DeleteRowHandle.
         assert_ne!(
             s.hit_test(8, 2),
             Some(TableHit::DeleteRowHandle { row_idx: 2 })
         );
     }
 
-    /// `build_snapshots_cached` must leave `snapshots` untouched when the
-    /// cache key matches the previous frame.  The `parsed_version` stays
-    /// constant, scroll/area/show_handles don't change — so the second
-    /// call is a no-op.
+    /// An unchanged cache key must leave `snapshots` untouched.
     #[test]
     fn build_snapshots_cached_reuses_output_when_key_matches() {
         use crate::config::Theme;
@@ -1433,7 +1188,7 @@ mod tests {
         let first_len = snapshots.len();
         assert!(first_len > 0, "expected at least one snapshot");
 
-        // Tag the snapshots so we can detect whether they get rebuilt.
+        // Tag the snapshots so a rebuild is detectable.
         snapshots[0].col_count = 999;
         build_snapshots_cached(&state, area, false, &mut snapshots, &mut key);
         assert_eq!(
@@ -1492,18 +1247,12 @@ mod tests {
         assert_eq!(kinds[6], TableSubLineKind::DataRow { row: 1, sub: 0 });
     }
 
-    /// The renderer's `blank_table_separator` line uses
-    /// NBSP-padded cells, distinguishing it from a wrap-continuation
-    /// line whose short cells are ASCII-space-padded.  classify must
-    /// recognise the NBSP-padded `│ … │ … │` line as ThinSeparator
-    /// and treat the next `│`-prefixed line as the next data row.
+    /// The NBSP padding of `blank_table_separator` is what distinguishes it from an
+    /// ASCII-padded wrap continuation; classify must read it as a `ThinSeparator`.
     #[test]
     fn classify_table_sub_lines_blank_stripe_separator() {
         use ratatui::text::Span;
-        // NBSP between pipes for the stripe separator (line index 4).
-        // Wrap continuation (line index 5 here would be ASCII-padded
-        // — but in this fixture the row wraps differently).  Just
-        // check the stripe-separator detection.
+        // NBSP between pipes marks the stripe separator (line index 4).
         let lines = vec![
             Line::from(Span::raw("┌──┬──┐")),
             Line::from(Span::raw("│ a│ b│")),
@@ -1521,9 +1270,8 @@ mod tests {
         assert_eq!(kinds[5], TableSubLineKind::DataRow { row: 1, sub: 0 });
     }
 
-    /// Counterpart to the NBSP test: a wrap-continuation line whose
-    /// short cells are ASCII-space-padded must NOT be misclassified
-    /// as a stripe separator — both cells continue the same data row.
+    /// Counterpart to the NBSP test: an ASCII-padded wrap continuation must not be misclassified
+    /// as a stripe separator.
     #[test]
     fn classify_table_sub_lines_ascii_space_padded_continuation_stays_data() {
         use ratatui::text::Span;

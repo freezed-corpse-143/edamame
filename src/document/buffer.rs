@@ -4,40 +4,26 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ropey::Rope;
 
-/// The newline convention a document uses on disk.
-///
-/// The rope is always stored with pure `\n` line breaks (see
-/// [`normalize_newlines`]); this records what the file used so a save can
-/// reproduce it. New/empty buffers pick the host platform's default —
-/// `Crlf` on Windows, `Lf` everywhere else — via [`LineEnding::default`].
+/// The newline convention a document uses on disk. The rope always holds pure `\n` (see
+/// [`normalize_newlines`]); this records what to write back. The default is the host platform's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LineEnding {
-    /// Unix `\n`.  The default off Windows.
     #[cfg_attr(not(windows), default)]
     Lf,
-    /// Windows `\r\n`.  The default on Windows.
     #[cfg_attr(windows, default)]
     Crlf,
 }
 
 impl LineEnding {
-    /// Classify `text` by its **first** line break: `\r\n` → [`Crlf`],
-    /// a bare `\n` → [`Lf`]. A text with no line break at all adopts the
-    /// platform default ([`LineEnding::default`]) so a one-line file saved
-    /// with a newline appended matches its neighbors.
-    ///
-    /// [`Crlf`]: LineEnding::Crlf
-    /// [`Lf`]: LineEnding::Lf
+    /// Classify `text` by its **first** line break; text with none adopts the platform default.
     pub fn detect(text: &str) -> Self {
         match text.find('\n') {
-            // `find` gives a byte index; a preceding `\r` is one byte.
             Some(i) if i > 0 && text.as_bytes()[i - 1] == b'\r' => LineEnding::Crlf,
             Some(_) => LineEnding::Lf,
             None => LineEnding::default(),
         }
     }
 
-    /// The byte sequence this convention writes for one line break.
     pub fn as_str(self) -> &'static str {
         match self {
             LineEnding::Lf => "\n",
@@ -46,14 +32,9 @@ impl LineEnding {
     }
 }
 
-/// Collapse CRLF to the internal `\n`-only form.
-///
-/// The whole app models a document with pure `\n` line breaks, so every
-/// path that ingests document text from disk (buffer load/reload, the
-/// filesystem watcher, `--diff` reads) funnels through here. Returns the
-/// input untouched — no reallocation — when it holds no `\r`, the common
-/// Unix/macOS case. A lone `\r` (classic-Mac line ends, essentially
-/// extinct) is left as-is: only the `\r` of a `\r\n` pair is removed.
+/// Collapse CRLF to the internal `\n`-only form. Every path that ingests document text (load,
+/// reload, watcher, `--diff`) funnels through here. No reallocation when there is no `\r`; a lone
+/// `\r` is left as-is.
 pub(crate) fn normalize_newlines(text: String) -> String {
     if text.as_bytes().contains(&b'\r') {
         text.replace("\r\n", "\n")
@@ -62,17 +43,8 @@ pub(crate) fn normalize_newlines(text: String) -> String {
     }
 }
 
-/// Expand the internal `\n`-only form back to `ending`'s convention.
-///
-/// The counterpart to [`normalize_newlines`] for the *outgoing* clipboard
-/// boundary — copying document text to another application should hand it
-/// the newline style the document uses, just as a save does (see
-/// [`write_lines`]). `text` is assumed already `\n`-normalized (it comes
-/// from the rope), so [`Lf`] returns it untouched and [`Crlf`] simply
-/// widens each `\n` to `\r\n`.
-///
-/// [`Lf`]: LineEnding::Lf
-/// [`Crlf`]: LineEnding::Crlf
+/// Expand `\n`-normalized `text` to `ending`'s convention: the outgoing clipboard counterpart of
+/// [`normalize_newlines`], so a copy hands other applications the document's own newline style.
 pub(crate) fn encode_newlines(text: &str, ending: LineEnding) -> String {
     match ending {
         LineEnding::Lf => text.to_owned(),
@@ -80,10 +52,8 @@ pub(crate) fn encode_newlines(text: &str, ending: LineEnding) -> String {
     }
 }
 
-/// Write `rope` to `w`, translating each `\n` to `ending`'s byte
-/// sequence. Streams the rope chunk by chunk rather than materializing a
-/// translated `String`: `\n` is a single byte and never straddles a
-/// chunk boundary, so each chunk can be split independently.
+/// Stream `rope` to `w`, translating each `\n` to `ending`. Works chunk by chunk without a
+/// translated `String`: `\n` is one byte, so it never straddles a chunk boundary.
 fn write_lines<W: Write>(rope: &Rope, ending: LineEnding, w: &mut W) -> std::io::Result<()> {
     let crlf = ending == LineEnding::Crlf;
     for chunk in rope.chunks() {
@@ -102,35 +72,20 @@ fn write_lines<W: Write>(rope: &Rope, ending: LineEnding, w: &mut W) -> std::io:
     Ok(())
 }
 
-/// Wraps a `ropey::Rope` with file-level I/O and basic edit operations.
-///
-/// All positions and lengths are in Unicode scalar values (Rust `char`s),
-/// matching ropey's native char-index API.
-///
-/// The rope always holds pure `\n` line breaks; [`line_ending`] records
-/// the on-disk convention so a save reproduces it. See [`LineEnding`] and
-/// [`normalize_newlines`].
-///
-/// [`line_ending`]: Buffer::line_ending
+/// A `ropey::Rope` with file I/O and edit primitives. Positions are in chars (ropey's native
+/// index). The rope always holds pure `\n`; `line_ending` records the on-disk convention.
 #[derive(Debug, Clone)]
 pub struct Buffer {
     rope: Rope,
     /// The file this buffer was loaded from or last saved to.
     path: Option<PathBuf>,
-    /// The newline convention to write on save. Detected on load,
-    /// platform-default for a new buffer.
     line_ending: LineEnding,
-    /// Monotonically-increasing counter bumped on every content mutation.
-    /// Consumers that cache buffer-derived data (e.g. the raw-mode visual
-    /// row cache in `EditorState`) compare this against their stored
-    /// version to invalidate stale entries without rebuilding eagerly.
-    /// Wraps on overflow — wrap-equality is fine because adjacent edits
-    /// always differ, and wrap-around requires 2^64 mutations.
+    /// Bumped on every content mutation so consumers can invalidate cached derived data by a
+    /// cheap comparison. Wrapping is fine: adjacent edits always differ.
     version: u64,
 }
 
 impl Buffer {
-    /// Create an empty buffer with no associated file.
     pub fn new() -> Self {
         Self {
             rope: Rope::new(),
@@ -140,12 +95,7 @@ impl Buffer {
         }
     }
 
-    /// Create a buffer pre-filled with `text` and no associated file.
-    ///
-    /// The pathless entry point: used by `App::load_doc_into_editor`
-    /// for a page of the embedded manual, whose text lives in the
-    /// binary rather than on disk, and by integration tests in
-    /// `tests/`.
+    /// Pathless buffer from `text`; used for embedded manual pages and by tests.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> Self {
         let line_ending = LineEnding::detect(text);
@@ -158,10 +108,7 @@ impl Buffer {
         }
     }
 
-    /// Create a buffer wrapping a pre-built rope with no associated
-    /// file.  Used by the diff subsystem (`DiffState::new`) so the
-    /// new-side text gets the same `Buffer` API as the main buffer
-    /// without re-allocating the rope from a `String`.
+    /// Pathless buffer over a pre-built rope (the diff new side), avoiding a `String` round-trip.
     pub fn from_rope(rope: Rope) -> Self {
         Self {
             rope,
@@ -171,11 +118,7 @@ impl Buffer {
         }
     }
 
-    /// Load a file from disk into the buffer.
-    ///
-    /// Detects the file's line-ending convention (from its first line
-    /// break) and normalizes the rope to pure `\n`; a later save
-    /// reproduces the detected convention.
+    /// Load from disk, detecting the line ending and normalizing the rope to `\n`.
     pub fn load_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read file: {}", path.display()))?;
@@ -188,8 +131,7 @@ impl Buffer {
         })
     }
 
-    /// Empty buffer associated with `path`, used when the user names a
-    /// file that does not yet exist.  Saving will create the file.
+    /// Empty buffer for a `path` that does not exist yet; saving creates it.
     pub fn for_new_file(path: &Path) -> Self {
         Self {
             rope: Rope::new(),
@@ -199,21 +141,10 @@ impl Buffer {
         }
     }
 
-    /// Rebuild a buffer from a fresh on-disk read.  Used by
-    /// `App::reload_buffer_from_disk` when an external edit replaces
-    /// the file under us.  The new buffer's `version` starts at
-    /// `previous_version.wrapping_add(1)` so the monotonic-version
-    /// invariant other consumers rely on (e.g. the autosave
-    /// edit-detection check in `tick_autosave`) is preserved across
-    /// the buffer swap.  Unlike [`Self::load_file`], the bytes come
-    /// from the caller — the watcher worker has already read them —
-    /// so there is no second disk hit and no chance of racing the
-    /// next watcher event.  `contents` is normalized to pure `\n` here
-    /// (the watcher may hand it over verbatim); `line_ending` is passed in
-    /// rather than re-detected — the caller carries the buffer's existing
-    /// convention forward so an external rewrite does not flip a `Crlf`
-    /// document to `Lf` merely because the delivered bytes were already
-    /// normalized upstream.
+    /// Rebuild after an external edit, from bytes the watcher already read (no second disk hit).
+    /// `version` continues from `previous_version` so the monotonic invariant survives the swap;
+    /// `line_ending` is carried forward rather than re-detected, since the delivered bytes may
+    /// already be normalized and must not flip a `Crlf` document to `Lf`.
     pub fn reload(
         path: &Path,
         contents: &str,
@@ -228,9 +159,7 @@ impl Buffer {
         }
     }
 
-    /// Write the buffer contents to disk at the associated path.
-    ///
-    /// Returns an error if no path is set.
+    /// Write to the associated path; errors if there is none.
     pub fn save_file(&self) -> Result<()> {
         let path = self
             .path
@@ -239,10 +168,8 @@ impl Buffer {
         self.write_to_disk(path)
     }
 
-    /// Stream the rope to `path`, translating `\n` to the buffer's
-    /// [`line_ending`](Self::line_ending) on the way out.  The shared
-    /// write primitive behind every save path; a `BufWriter` keeps the
-    /// per-line `\r\n` translation from turning into a syscall per line.
+    /// The write primitive behind every save path. Buffered so the per-line `\r\n` translation
+    /// is not a syscall per line.
     fn write_to_disk(&self, path: &Path) -> Result<()> {
         let ctx = || format!("Failed to write file: {}", path.display());
         let file = std::fs::File::create(path).with_context(ctx)?;
@@ -253,78 +180,50 @@ impl Buffer {
         Ok(())
     }
 
-    /// Save to an explicit path and adopt it as the buffer's associated
-    /// path.  The shared write primitive behind every "Save As" flow
-    /// (command palette, a path-less `Save`, vim `:w <path>` / `:saveas`,
-    /// and the file-deleted recovery flow) via
-    /// [`crate::app::App::save_buffer_as`], plus integration tests in
-    /// `tests/`.
-    ///
-    /// Overwrites `path` **unconditionally** — this is the low-level
-    /// force primitive.  Callers are responsible for confirming an
-    /// overwrite of a *different* existing file first (see
-    /// [`Self::would_overwrite`] and the `OverwriteConfirmModal` flow);
-    /// saving over the buffer's own path is a normal in-place save and
-    /// needs no confirmation.
+    /// Save to `path` and adopt it as the associated path. Overwrites **unconditionally**;
+    /// callers confirm via [`Self::would_overwrite`] first.
     pub fn save_as(&mut self, path: &Path) -> Result<()> {
         self.write_to_disk(path)?;
         self.path = Some(path.to_owned());
         Ok(())
     }
 
-    /// True when writing to `path` would clobber a *different* existing
-    /// file — i.e. `path` already exists and is not this buffer's own
-    /// associated path.  Saving over the buffer's current file is a
-    /// normal in-place save (never an "overwrite" in this sense), so a
-    /// Save As to the seeded current path passes.  Callers use this to
-    /// decide whether to confirm before [`Self::save_as`], which writes
-    /// unconditionally.
-    ///
-    /// Comparison is by stored path value, so an unusual spelling of the
-    /// same file (e.g. relative vs. absolute) may prompt a harmless extra
-    /// confirmation — saying yes simply re-saves that same file.
+    /// True when `path` exists and is not this buffer's own path (an in-place save is never an
+    /// overwrite). Compared by path value, so a different spelling of the same file may prompt a
+    /// harmless extra confirmation.
     pub fn would_overwrite(&self, path: &Path) -> bool {
         path.exists() && self.path.as_deref() != Some(path)
     }
 
-    /// Write the buffer contents to `path` without touching the
-    /// buffer's associated path.  The user keeps editing the original
-    /// file; `path` receives a snapshot of the current contents.
+    /// Write a snapshot to `path` without changing the associated path.
     pub fn save_copy(&self, path: &Path) -> Result<()> {
         self.write_to_disk(path)
     }
 
     // ── Query ─────────────────────────────────────────────────────
 
-    /// The file path associated with this buffer, if any.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
 
-    /// The newline convention this buffer writes on save.
     pub fn line_ending(&self) -> LineEnding {
         self.line_ending
     }
 
-    /// Override the newline convention used for subsequent saves.
     pub fn set_line_ending(&mut self, line_ending: LineEnding) {
         self.line_ending = line_ending;
     }
 
-    /// Total number of Unicode scalar values in the buffer.
     pub fn len_chars(&self) -> usize {
         self.rope.len_chars()
     }
 
-    /// Total number of lines (including a trailing empty line if the buffer
-    /// ends with a newline).
+    /// Line count, including the empty line after a trailing newline.
     pub fn line_count(&self) -> usize {
         self.rope.len_lines()
     }
 
-    /// Return the content of line `idx` (0-indexed) as an owned `String`.
-    ///
-    /// Returns `None` if `idx >= line_count()`.
+    /// Line `idx` including its trailing newline; `None` when out of range.
     pub fn line(&self, idx: usize) -> Option<String> {
         if idx >= self.rope.len_lines() {
             return None;
@@ -332,74 +231,58 @@ impl Buffer {
         Some(self.rope.line(idx).to_string())
     }
 
-    /// Return the entire buffer contents as a `String`.
     pub fn contents(&self) -> String {
         self.rope.to_string()
     }
 
-    /// Return a reference to the underlying rope for read-only access.
     pub fn rope(&self) -> &Rope {
         &self.rope
     }
 
-    /// Return the char offset for the start of `line_idx` (0-indexed).
     pub fn line_to_char(&self, line_idx: usize) -> usize {
         self.rope.line_to_char(line_idx)
     }
 
-    /// Return the line index (0-indexed) that contains `char_idx`.
     pub fn char_to_line(&self, char_idx: usize) -> usize {
         self.rope.char_to_line(char_idx)
     }
 
-    /// Return the line index (0-indexed) that contains `byte_idx`.
-    /// Convenience for the common `char_to_line(byte_to_char(b))` pair —
-    /// callers that have a byte offset (block ranges, source-map
-    /// lookups) avoid the double-call and the chance of getting the
-    /// argument order wrong.
     pub fn byte_to_line(&self, byte_idx: usize) -> usize {
         self.rope.char_to_line(self.rope.byte_to_char(byte_idx))
     }
 
-    /// Buffer line index for the `raw_line_idx`-th line within a block
-    /// whose byte range starts at `block_byte_start`.
+    /// Buffer line of the `raw_line_idx`-th line of a block starting at `block_byte_start`.
     pub fn block_line_to_buffer_line(&self, block_byte_start: usize, raw_line_idx: usize) -> usize {
         let block_start_char = self.rope.byte_to_char(block_byte_start);
         let block_start_line = self.rope.char_to_line(block_start_char);
         block_start_line + raw_line_idx
     }
 
-    /// Monotonic version counter — increments on every content mutation.
-    /// Consumers cache derived state keyed by `(version, ...)` so
-    /// invalidation is a cheap `u64` comparison.
+    /// Mutation counter; see the `version` field.
     pub fn version(&self) -> u64 {
         self.version
     }
 
     // ── Edit ──────────────────────────────────────────────────────
 
-    /// Insert `text` at char offset `char_idx`.
     pub fn insert(&mut self, char_idx: usize, text: &str) {
         self.rope.insert(char_idx, text);
         self.version = self.version.wrapping_add(1);
     }
 
-    /// Insert a single char at char offset `char_idx`.
-    /// Used by tests in this crate.
+    /// Used by tests.
     #[allow(dead_code)]
     pub fn insert_char(&mut self, char_idx: usize, ch: char) {
         self.rope.insert_char(char_idx, ch);
         self.version = self.version.wrapping_add(1);
     }
 
-    /// Remove chars in the range `start..end` (char offsets).
     pub fn remove(&mut self, start: usize, end: usize) {
         self.rope.remove(start..end);
         self.version = self.version.wrapping_add(1);
     }
 
-    /// Remove a single char at `char_idx` (if in bounds).
-    /// Used by tests in this crate.
+    /// Remove the char at `char_idx` if in bounds. Used by tests.
     #[allow(dead_code)]
     pub fn remove_char(&mut self, char_idx: usize) {
         if char_idx < self.rope.len_chars() {
@@ -408,41 +291,25 @@ impl Buffer {
         }
     }
 
-    /// Return a slice of the buffer as a `String`, from `start` to `end`
-    /// (char offsets, exclusive end).
+    /// The chars `start..end` as a `String`.
     pub fn slice_to_string(&self, start: usize, end: usize) -> String {
         self.rope.slice(start..end).to_string()
     }
 
-    /// Return the source between byte offsets `start..end` as a `String`,
-    /// or `None` when the range is out of bounds or lands mid-character.
-    ///
-    /// The byte-addressed counterpart of [`Buffer::slice_to_string`], for
-    /// the callers that already hold a byte range — a source-map block
-    /// range, say.  The whole point is to *not* be `contents()`: a link
-    /// hit-test runs on every mouse-move event, and materializing the
-    /// document to slice one block out of it is O(document) per pointer
-    /// report.  Non-panicking (ropey's `get_byte_slice`) so the caller
-    /// keeps the defensive fallback it had when it was slicing a `String`.
+    /// The bytes `start..end` as a `String`, or `None` when out of bounds or mid-character.
+    /// Exists so per-mouse-move callers (link hit-test) need not materialize `contents()`.
     pub fn byte_slice_to_string(&self, start: usize, end: usize) -> Option<String> {
         self.rope
             .get_byte_slice(start..end)
             .map(|slice| slice.to_string())
     }
 
-    /// Total length of the buffer in bytes.
     pub fn len_bytes(&self) -> usize {
         self.rope.len_bytes()
     }
 
-    /// Replace the underlying rope wholesale while preserving the
-    /// buffer's `path`.  Bumps `version` so downstream consumers
-    /// (autosave detector, raw-view visual-row cache, parsed-doc
-    /// invalidation) treat the swap as a fresh mutation.  Used by the
-    /// diff-mode resolution path to swap the merged rope in place
-    /// (§3, §6).  The caller is responsible for refreshing
-    /// any derived state on `EditorState` (`refresh_parsed`,
-    /// `update_cursor_block`, clamping the cursor).
+    /// Replace the rope wholesale (diff resolution), keeping `path` and bumping `version`. The
+    /// caller refreshes `EditorState`'s derived state (parse, cursor block, cursor clamp).
     pub fn set_rope(&mut self, rope: Rope) {
         self.rope = rope;
         self.version = self.version.wrapping_add(1);
@@ -471,14 +338,12 @@ mod tests {
     #[test]
     fn byte_slice_to_string_extracts_a_range_and_declines_a_bad_one() {
         let b = buf("héllo wörld");
-        // `é` is two bytes, so the byte range is not the char range.
         assert_eq!(b.byte_slice_to_string(0, 6).as_deref(), Some("héllo"));
         assert_eq!(
             b.byte_slice_to_string(0, b.len_bytes()).as_deref(),
             Some("héllo wörld")
         );
-        // Mid-character and out-of-bounds both decline rather than panic —
-        // the link hit-test relies on that for its defensive fallback.
+        // Mid-character and out-of-bounds decline rather than panic.
         assert_eq!(b.byte_slice_to_string(2, 6), None);
         assert_eq!(b.byte_slice_to_string(0, b.len_bytes() + 1), None);
     }
@@ -487,7 +352,7 @@ mod tests {
     fn new_buffer_is_empty() {
         let b = Buffer::new();
         assert_eq!(b.len_chars(), 0);
-        assert_eq!(b.line_count(), 1); // ropey always reports at least one line
+        assert_eq!(b.line_count(), 1);
     }
 
     #[test]
@@ -498,15 +363,11 @@ mod tests {
         let missing = dir.path().join("absent.md");
 
         let mut b = buf("body");
-        // Path-less buffer: any existing target is an overwrite; a
-        // nonexistent one is not.
         assert!(b.would_overwrite(&existing));
         assert!(!b.would_overwrite(&missing));
 
-        // Saving over the buffer's own file is never an "overwrite".
         b.path = Some(existing.clone());
         assert!(!b.would_overwrite(&existing));
-        // …but a *different* existing file still is.
         let other = dir.path().join("other.md");
         std::fs::write(&other, "y").expect("seed");
         assert!(b.would_overwrite(&other));
@@ -537,14 +398,14 @@ mod tests {
     #[test]
     fn remove_char_in_bounds() {
         let mut b = buf("hello");
-        b.remove_char(2); // remove first 'l'
+        b.remove_char(2);
         assert_eq!(b.contents(), "helo");
     }
 
     #[test]
     fn remove_char_out_of_bounds_is_noop() {
         let mut b = buf("hi");
-        b.remove_char(100); // must not panic
+        b.remove_char(100);
         assert_eq!(b.contents(), "hi");
     }
 
@@ -568,9 +429,9 @@ mod tests {
     fn line_to_char_and_char_to_line() {
         let b = buf("abc\ndef\nghi");
         assert_eq!(b.line_to_char(0), 0);
-        assert_eq!(b.line_to_char(1), 4); // after "abc\n"
-        assert_eq!(b.line_to_char(2), 8); // after "abc\ndef\n"
-        assert_eq!(b.char_to_line(5), 1); // 'd' is on line 1
+        assert_eq!(b.line_to_char(1), 4);
+        assert_eq!(b.line_to_char(2), 8);
+        assert_eq!(b.char_to_line(5), 1);
     }
 
     #[test]
@@ -583,10 +444,7 @@ mod tests {
         let copy = dir.path().join("copy.md");
         buf.save_copy(&copy)?;
 
-        // The copy was written.
         assert_eq!(std::fs::read_to_string(&copy)?, "# Hello");
-        // The buffer's associated path is unchanged — that's the
-        // semantic difference from `save_as`.
         assert_eq!(buf.path(), Some(original.as_path()));
         Ok(())
     }
@@ -616,33 +474,22 @@ mod tests {
     fn detect_classifies_by_first_line_break() {
         assert_eq!(LineEnding::detect("a\r\nb\r\n"), LineEnding::Crlf);
         assert_eq!(LineEnding::detect("a\nb\n"), LineEnding::Lf);
-        // First break wins: a bare `\n` up front reads as Lf even when a
-        // later line is CRLF.
         assert_eq!(LineEnding::detect("a\nb\r\n"), LineEnding::Lf);
-        // A leading `\r\n` still counts (the `\r` sits at index 0's
-        // predecessor of the first `\n`).
         assert_eq!(LineEnding::detect("\r\nx"), LineEnding::Crlf);
-        // No line break at all → platform default.
         assert_eq!(LineEnding::detect("no newline"), LineEnding::default());
     }
 
     #[test]
     fn normalize_newlines_strips_only_crlf_pairs() {
         assert_eq!(normalize_newlines("a\r\nb\r\n".to_owned()), "a\nb\n");
-        // Already-LF text is returned untouched (and does not reallocate,
-        // though that we cannot assert directly).
         assert_eq!(normalize_newlines("a\nb\n".to_owned()), "a\nb\n");
-        // A lone `\r` (not part of a pair) is preserved.
         assert_eq!(normalize_newlines("a\rb".to_owned()), "a\rb");
     }
 
     #[test]
     fn encode_newlines_widens_only_for_crlf() {
-        // Lf is the identity on already-`\n` text.
         assert_eq!(encode_newlines("a\nb\n", LineEnding::Lf), "a\nb\n");
-        // Crlf widens each `\n`.
         assert_eq!(encode_newlines("a\nb\n", LineEnding::Crlf), "a\r\nb\r\n");
-        // Round-trips with normalize_newlines (the clipboard boundary).
         let lf = "one\ntwo\nthree";
         let crlf = encode_newlines(lf, LineEnding::Crlf);
         assert_eq!(normalize_newlines(crlf), lf);
@@ -656,7 +503,6 @@ mod tests {
 
         let buf = Buffer::load_file(&path)?;
         assert_eq!(buf.line_ending(), LineEnding::Crlf);
-        // The rope holds no `\r`: every consumer sees pure `\n`.
         assert_eq!(buf.contents(), "# Title\n\nBody\n");
         assert!(!buf.contents().contains('\r'));
         Ok(())
@@ -684,8 +530,6 @@ mod tests {
         let out = dir.path().join("out.md");
         buf.save_copy(&out)?;
 
-        // Read back the raw bytes (not `read_to_string`, which would not
-        // reveal the `\r`): CRLF was reproduced verbatim.
         let raw = std::fs::read(&out)?;
         assert_eq!(raw, b"one\r\ntwo\r\n");
         Ok(())
@@ -710,7 +554,6 @@ mod tests {
         std::fs::write(&path, original)?;
 
         let buf = Buffer::load_file(&path)?;
-        // Save back in place.
         buf.save_file()?;
         assert_eq!(std::fs::read(&path)?, original);
         Ok(())
@@ -718,14 +561,12 @@ mod tests {
 
     #[test]
     fn edits_to_a_crlf_buffer_still_save_as_crlf() -> Result<()> {
-        // An inserted newline is a bare `\n` in the rope, but the save
-        // translation applies to it too — no mixed endings on disk.
+        // An inserted bare `\n` is translated on save too: no mixed endings on disk.
         let dir = tempfile::tempdir()?;
         let src = dir.path().join("crlf.md");
         std::fs::write(&src, "a\r\nb\r\n")?;
         let mut buf = Buffer::load_file(&src)?;
 
-        // Insert "X\n" at the start.
         buf.insert(0, "X\n");
         let out = dir.path().join("out.md");
         buf.save_copy(&out)?;
@@ -752,7 +593,6 @@ mod tests {
     fn reload_carries_the_ending_forward_and_normalizes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("doc.md");
-        // Watcher may hand over verbatim CRLF bytes; reload normalizes.
         let reloaded = Buffer::reload(&path, "p\r\nq\r\n", 7, LineEnding::Crlf);
         assert_eq!(reloaded.contents(), "p\nq\n");
         assert_eq!(reloaded.line_ending(), LineEnding::Crlf);

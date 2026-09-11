@@ -1,23 +1,16 @@
-//! Monochrome built-in theme — no color escapes, only text attribute
-//! modifiers (bold / italic / underline / reversed / dim).  Recommended
-//! for terminals reporting `ColorDepth::Ansi16` or `NoColor`; selected
-//! automatically on first launch when color support is limited.
+//! Monochrome built-in theme: no color escapes, only text attribute modifiers.  Chosen
+//! automatically on first launch when the terminal reports `Ansi16` or `NoColor`.
 //!
-//! Every palette slot resolves to [`Color::Reset`] so any site that
-//! reads `theme.palette.<x>` directly (big-H1 background, table border
-//! bg, command-palette / theme-picker rows, …) still produces a
-//! color-free escape: the terminal's own default fg/bg shows through.
-//! Text attributes are preserved because they work over SGR regardless
-//! of color depth.
+//! Every palette slot is [`Color::Reset`], so even a site reading `theme.palette.*` directly emits
+//! a color-free escape and the terminal's own default fg/bg shows through.  Attributes are kept
+//! because SGR works at any color depth.
 
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::config::theme::{Palette, Theme};
 
-/// Colorless palette — every slot resolves to the terminal's own
-/// default fg/bg via [`Color::Reset`].  `light` is `false` only
-/// because the field is non-optional; for the appearance-mode filter
-/// monochrome is classified as dark (the registry name pins this).
+/// Colorless palette.  `light` is `false` only because the field is non-optional; the
+/// appearance-mode filter classifies monochrome by its registry name.
 pub fn palette() -> Palette {
     let r = Color::Reset;
     Palette {
@@ -69,13 +62,9 @@ pub fn theme() -> Theme {
         code_block_lang: Style::default().add_modifier(Modifier::ITALIC),
         code_block_text: Style::default(),
 
-        // Syntax highlighting with no colour to spend.  Only the two
-        // classes that carry meaning without one are marked: a comment
-        // is set apart because it is *not* code, and a keyword because
-        // it is the load-bearing word on its line.  Types, functions,
-        // strings and numbers stay plain — marking them too would turn
-        // most of a line into attributes and distinguish nothing, which
-        // is the same reasoning as this file's other flat fields.
+        // With no color to spend, only the two classes that carry meaning without one are marked:
+        // a comment because it is *not* code, a keyword because it leads its line.  Marking more
+        // would turn most of a line into attributes and distinguish nothing.
         syntax_keyword: Style::default().add_modifier(Modifier::BOLD),
         syntax_string: Style::default(),
         syntax_comment: Style::default().add_modifier(Modifier::DIM),
@@ -84,11 +73,9 @@ pub fn theme() -> Theme {
         syntax_function: Style::default(),
         syntax_attribute: Style::default(),
         blockquote_bar: Style::default(),
-        // DIM rather than ITALIC: a colorless theme has no wash to give
-        // the quote, and a blanket italic is exactly what left
-        // `*emphasis*` inside a quote with nothing to say (issue #33).
-        // Dimming marks the region while leaving bold / italic / the
-        // reversed code span free to read on top of it.
+        // DIM, not ITALIC: with no wash available, a blanket italic left `*emphasis*` inside a
+        // quote with nothing to say (issue #33).  Dimming marks the region and leaves bold /
+        // italic / reversed free to read on top.
         blockquote_text: Style::default().add_modifier(Modifier::DIM),
         rule: Style::default(),
         frontmatter_delimiter: Style::default(),
@@ -141,9 +128,7 @@ pub fn theme() -> Theme {
 
         modal_bg: Style::default().add_modifier(Modifier::REVERSED),
         modal_title_normal: Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        // Monochrome can't color-code urgency; warning/error fall
-        // back to BOLD + REVERSED + DIM so the title still reads as
-        // distinct chrome on dim-aware terminals.
+        // No color for urgency; DIM keeps the title distinct on dim-aware terminals.
         modal_title_warning: Style::default()
             .add_modifier(Modifier::BOLD | Modifier::REVERSED | Modifier::DIM),
         modal_title_error: Style::default()
@@ -152,18 +137,13 @@ pub fn theme() -> Theme {
         modal_item: Style::default().add_modifier(Modifier::REVERSED),
         modal_item_hint: Style::default().add_modifier(Modifier::REVERSED),
         modal_item_selected: Style::default().add_modifier(Modifier::BOLD),
-        // Monochrome can't color-code distinction; `DIM` reads as
-        // "marked but quiet" — distinct from BOLD (focused selection)
-        // and plain (unselected) without using REVERSED (which is
-        // already the unselected `modal_item` state in monochrome).
+        // DIM reads as "marked but quiet", distinct from BOLD (focused) and plain (unselected)
+        // without REVERSED, which is already the unselected `modal_item` state here.
         modal_item_selected_unfocused: Style::default().add_modifier(Modifier::DIM),
         modal_item_selected_hint: Style::default().add_modifier(Modifier::BOLD),
         modal_description: Style::default().add_modifier(Modifier::REVERSED),
         modal_section_heading: Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        // Focused input matches `modal_button_focused` (REVERSED|BOLD)
-        // — filled.  Unfocused input is plain BOLD (no fill), so it
-        // reads as "an input here" without competing with the focused
-        // element, mirroring the colored theme's filled-vs-outlined
+        // Filled when focused, plain BOLD when not — the colored themes' filled-vs-outlined
         // pattern.
         modal_input_unfocused: Style::default().add_modifier(Modifier::BOLD),
         modal_input_focused: Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
@@ -171,10 +151,7 @@ pub fn theme() -> Theme {
 
         normal: Style::default(),
         selection: Style::default().add_modifier(Modifier::REVERSED),
-        // Non-focused search matches dim instead of inverting, so the
-        // three tiers (plain text / muted match / `selection`-reversed
-        // focused match) stay distinct without color — the same
-        // tiering the diff unfocused styles use.
+        // Dim rather than invert, so plain / muted / focused stay three distinct tiers.
         selection_muted: Style::default().add_modifier(Modifier::DIM),
         status_mode_search: Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
         active_line: Style::default(),
@@ -182,38 +159,28 @@ pub fn theme() -> Theme {
 
         line_number: Style::default().add_modifier(Modifier::DIM),
 
-        // Scrollbar — glyphs alone disambiguate track from thumb;
-        // active state inverts so monochrome users still see it.
+        // Glyphs alone separate track from thumb; the active state inverts.
         scrollbar_track: Style::default(),
         scrollbar_thumb: Style::default(),
         scrollbar_thumb_active: Style::default().add_modifier(Modifier::REVERSED),
 
-        // Diff mode — monochrome fallback per §7.  Line bg
-        // can't be a saturated mix, so we use REVERSED on the whole
-        // line; inline highlights add BOLD on top to stand out from
-        // the line bg.  Status / hint bars in diff mode become
-        // REVERSED + BOLD so the mode shift is visible without color.
+        // No saturated line bg available, so a changed line REVERSES and its inline highlights
+        // add BOLD on top.
         diff_add_line: Style::default().add_modifier(Modifier::REVERSED),
         diff_delete_line: Style::default().add_modifier(Modifier::REVERSED),
-        // Non-focused hunks dim instead of inverting, so the three
-        // tiers (context plain / unfocused dim / focused reversed)
-        // stay distinct without color.
+        // Context plain / unfocused dim / focused reversed: three tiers without color.
         diff_add_line_unfocused: Style::default().add_modifier(Modifier::DIM),
         diff_delete_line_unfocused: Style::default().add_modifier(Modifier::DIM),
         diff_add_inline: Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
         diff_delete_inline: Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
-        // Unfocused hunks dim their inline highlights too (no REVERSED,
-        // so they don't pop against the dimmed line) — matching the
-        // unfocused-line DIM tier.
+        // No REVERSED here, so an unfocused hunk's inline highlights don't pop off its dim line.
         diff_add_inline_unfocused: Style::default().add_modifier(Modifier::DIM),
         diff_delete_inline_unfocused: Style::default().add_modifier(Modifier::DIM),
-        // No color: the checkbox label ("Accepted" / "Rejected") plus
-        // bold/dim distinguishes the decision states.
+        // The label ("Accepted" / "Rejected") plus bold/dim carries the decision state.
         diff_decision_pending: Style::default().add_modifier(Modifier::DIM),
         diff_decision_accepted: Style::default().add_modifier(Modifier::BOLD),
         diff_decision_rejected: Style::default().add_modifier(Modifier::BOLD),
-        // Unfocused divider recedes to DIM, matching the unfocused-line
-        // tier (the label still spells the decision).
+        // Recedes to DIM like an unfocused line; the label still spells the decision.
         diff_decision_unfocused: Style::default().add_modifier(Modifier::DIM),
         status_mode_diff: Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
         status_bar_diff: Style::default().add_modifier(Modifier::REVERSED),

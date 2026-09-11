@@ -29,90 +29,54 @@ pub(crate) use self::paint::{
     paint_search_overlays, paint_substitute_preview_overlays, paint_yank_flash,
 };
 use self::raw_text::raw_line_byte_start;
-pub(crate) use self::raw_text::{raw_block_cursor, raw_source_lines, revealed_source_line_count};
+pub(crate) use self::raw_text::{
+    raw_block_cursor, raw_source_lines, revealed_source_line_count, revealed_source_lines,
+};
 
-/// State for the `RenderedView` widget.
-///
-/// Owned by `EditorViewState`; updated every frame from `EditorState`.
+/// State for the `RenderedView` widget; owned by `EditorViewState`, updated every frame.
 #[derive(Debug, Default)]
 pub struct RenderedViewState {
     /// First visible rendered line (scroll offset).
     pub scroll: usize,
-    /// Snapshots of every visible table, captured at the end of the last
-    /// render.  Used by mouse-event handling to hit-test against the
-    /// columns, borders, and buttons of the table under the pointer.
+    /// Every visible table, captured at the end of the last render, for mouse hit-testing.
     pub table_snapshots: Vec<TableLayoutSnapshot>,
-    /// Snapshots of every visible `Block::ImageBlock`, captured at the end
-    /// of the last render.  Used as the hit-test surface
-    /// for images (click detection); future work may add expand /
-    /// open UX.
+    /// Every visible `Block::ImageBlock`, captured at the end of the last render, for
+    /// mouse hit-testing.
     pub image_snapshots: Vec<ImageLayoutSnapshot>,
-    /// Cache key for `image_snapshots`: `(scroll, area, parsed_version)`.
-    /// When the tuple matches on the next frame, the snapshot vector is
-    /// reused instead of recomputed — avoids the O(lines × images)
-    /// geometry scan when nothing that affects image layout has changed.
+    /// Cache key for `image_snapshots`: `(scroll, area, parsed_version)`. A match reuses the
+    /// vector instead of repeating the O(lines × images) geometry scan.
     pub image_snapshots_key: Option<(usize, Rect, u64)>,
-    /// Snapshots of every visible Markdown link, captured at the end of
-    /// the last render.  Used by the mouse dispatch to hit-test
-    /// against link spans — plain click in Preview or Ctrl-click in
-    /// Rendered/Raw fires `FollowLink`.
+    /// Every visible Markdown link, captured at the end of the last render, for mouse
+    /// hit-testing (plain click in Preview, Ctrl-click in Rendered/Raw).
     pub link_snapshots: Vec<LinkLayoutSnapshot>,
-    /// Cache key for `link_snapshots`: `(scroll, area, parsed_version)`.
-    /// Mirrors `image_snapshots_key`.  The link snapshot build walks
-    /// `parsed.blocks` and calls `visual_rows_for_line` for every
-    /// visible line — expensive on large documents — so skipping it
-    /// when layout inputs haven't changed is a major per-frame win.
+    /// Cache key for `link_snapshots`, as `image_snapshots_key`. The uncached build calls
+    /// `visual_rows_for_line` for every visible line, which dominated idle CPU.
     pub link_snapshots_key: Option<(usize, Rect, u64)>,
-    /// Cache key for `table_snapshots`:
-    /// `(scroll, area, parsed_version, show_handles)`.  Skips the
-    /// per-frame visible-line walk when nothing that affects table
-    /// layout has changed — the same coalescing strategy used for
-    /// images and links.
+    /// Cache key for `table_snapshots`: `(scroll, area, parsed_version, show_handles)`.
     pub table_snapshots_key: Option<(usize, Rect, u64, bool)>,
-    /// Absolute `(x, y)` terminal cell where the rendered-mode cursor
-    /// indicator was painted this frame, or `None` when the cursor was
-    /// drawn via a raw-reveal / cell-overlay path (which composite the
-    /// cursor themselves) or wasn't visible.  `EditorView` re-stamps this
-    /// cell with the resolved cursor style after the search-match / selection
-    /// overlays run, so an overlay can't bury the cursor.
+    /// Absolute `(x, y)` cell where the cursor indicator was painted this frame, or `None`
+    /// when a raw-reveal / cell-overlay path composited the cursor itself. `EditorView`
+    /// re-stamps this cell after the search / selection overlays so they can't bury it.
     pub cursor_screen: Option<(u16, u16)>,
 }
 
-/// Hybrid rendered/raw editing view.
-///
-/// Every rendered block is shown as styled Markdown EXCEPT the block that
-/// contains the cursor, which is replaced by the raw source text with an
-/// inline cursor.
+/// Hybrid rendered/raw editing view: every block is styled Markdown except the cursor's,
+/// which shows raw source with an inline cursor.
 pub struct RenderedView<'a> {
     pub state: &'a EditorState,
     pub theme: &'a Theme,
-    /// When true, the table renderer paints the row/column buttons —
-    /// `⠿` reorder grips, `⇔` resize glyph, `✕` delete glyphs — over
-    /// each visible table.  Controlled by `config.table.show_buttons`
-    /// AND `capabilities.mouse` (the App zeros the first when the
-    /// second is false), so terminals without mouse reporting never
-    /// show inert glyphs.
-    ///
-    /// Buttons only paint on the table that contains the
-    /// cursor — moving the cursor out of the table hides them so they
-    /// never compete with the rendered content during navigation.  The
-    /// gating is enforced by `paint_handles_for_cursor_table` in
-    /// `table_view`.
+    /// Paint the `⠿` / `⇔` / `✕` table buttons. Reflects `config.table.show_buttons` AND
+    /// `capabilities.mouse` (the App zeros the first when the second is false). Buttons paint
+    /// only on the cursor's table (`paint_handles_for_cursor_table` in `table_view`).
     pub show_table_buttons: bool,
-    /// When `Some`, an in-progress table drag is highlighted
-    /// after the handles are painted.  `None` when no relevant drag is
-    /// active.
+    /// In-progress table drag to highlight after the handles are painted.
     pub drop_indicator: Option<crate::ui::table_view::DropIndicator>,
-    /// The active vim Visual flavor, if any: the stored half-open `selection`
-    /// is widened for the overlay paint via `vim_ops::visual_span` — inclusive
-    /// of the char under the cursor in charwise Visual, whole rows in
-    /// VisualLine.  `selection` itself is never snapped, and `None` (default
-    /// handler, or vim outside Visual) paints the raw span — see
-    /// `docs/vim-implementation-plan.md` §2.6.
+    /// Active vim Visual flavor: the half-open `selection` is widened for the overlay paint
+    /// via `vim_ops::visual_span` (inclusive of the cursor char in charwise, whole rows in
+    /// VisualLine); `selection` itself is never snapped.
     pub visual_kind: Option<VisualKind>,
-    /// Resolved block-cursor style for this frame, already accounting for
-    /// the view mode and vim sub-mode (`app::cursor_style`).  Used for the
-    /// inline cursor indicator and the table-cell cursor overlay.
+    /// Block-cursor style for this frame, already resolved for view mode and vim sub-mode
+    /// (`app::cursor_style`).
     pub cursor_style: Style,
 }
 
@@ -129,16 +93,10 @@ impl<'a> StatefulWidget for RenderedView<'a> {
         let cursor_offset = editor.cursor.offset;
         let cursor_byte = editor.buffer.rope().char_to_byte(cursor_offset);
 
-        // When `parsed_dirty` is set, an in-line edit has left `source_map`
-        // byte ranges stale — the cursor's live byte offset may no longer
-        // fall inside its block's recorded range.  Use the cached
-        // `cursor_block_idx` / `cursor_block_line_range` (captured at the
-        // last cursor-move's `update_cursor_block`) which remain valid
-        // because in-line edits don't cross a block boundary or shift
-        // buffer line indices.  When the parse is fresh, consult
-        // `source_map` directly so tests that set `cursor.offset`
-        // without calling `update_cursor_block` still observe the
-        // cursor's real block.
+        // With `parsed_dirty` set, `source_map` ranges are stale, so use the cached
+        // `cursor_block_idx` / `cursor_block_line_range` (in-line edits don't cross a block
+        // boundary). When fresh, consult `source_map` directly so tests that set
+        // `cursor.offset` without `update_cursor_block` see the real block.
         let use_cache = editor.parsed_dirty;
         let cursor_block_idx = if use_cache {
             editor.cursor_block_idx.unwrap_or_else(|| {
@@ -161,13 +119,9 @@ impl<'a> StatefulWidget for RenderedView<'a> {
             .rendered_lines_for_block(cursor_block_idx);
         let cursor_block_own = editor.parsed.block_own_line_count(cursor_block_idx);
 
-        // Raw source text for the cursor's block, and where the cursor sits
-        // inside it.  The two must be derived together: the line index is an
-        // index *into* this source.  When the parse is stale, rebuild both
-        // from the cached buffer-line range so we see the typed characters
-        // that haven't been re-parsed yet; otherwise use the shared
-        // `raw_block_cursor`, which `cursor_rendered_line_idx` also calls so
-        // the view and the cursor-row report can't disagree.
+        // The raw line index is an index *into* this source, so derive both together. A stale
+        // parse rebuilds from the cached buffer-line range so unparsed typing is visible;
+        // otherwise `raw_block_cursor` is shared with `cursor_rendered_line_idx`.
         let (raw_block_source, cursor_raw_line, cursor_col) =
             match (use_cache, editor.cursor_block_line_range.clone()) {
                 (true, Some(range)) => {
@@ -190,46 +144,26 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                 }
             };
 
-        // Split raw source into lines.
         let raw_lines: Vec<&str> = raw_source_lines(&raw_block_source);
 
-        // Map the cursor's raw source line to a rendered line within the
-        // block.  For tables the rendered layout is: top border, header
-        // (one or more lines), thick separator (alignment row), then
-        // (data row(s), thin separator)*, and finally the bottom border.
-        // Cells may now wrap, so any single TableInfo row can
-        // span multiple rendered sub-lines.  Use the box-drawing-glyph
-        // classifier to find the FIRST sub-line of the target row — the
-        // raw-text replacement always lands on that line.  We must
-        // never replace a border or separator line with raw text.
         let is_table = table_edit::is_table_block(&raw_block_source);
         let is_setext = detect_setext(&raw_block_source).is_some();
-        // In a fenced code block only the fence lines de-render — the
-        // opening one is the language label the renderer turns into
-        // ` rust ` styling.  Body lines render the same as their raw form
-        // (just with code-block background and one leading pad cell), so
-        // de-rendering inside the block is visual churn at best and
-        // clobbers the last code line at worst.  The rule itself lives in
-        // `markdown::code_layout::line_allows_raw_reveal`.
+        // In a fenced code block only the fence lines de-render (body rows already render
+        // 1:1); the rule lives in `markdown::code_layout::line_allows_raw_reveal`.
         let cursor_block_ast = editor
             .parsed
             .real_ranges
             .iter()
             .position(|r| r.start <= cursor_byte && cursor_byte < r.end)
             .and_then(|i| editor.parsed.blocks.get(i));
-        // Mermaid code blocks are post-processed into synthetic
-        // `Block::ImageBlock`s.  When the cursor enters one, every
-        // rendered row of the block (where the image placeholder
-        // otherwise sits) is replaced with the corresponding raw-source
-        // line so the user can see and edit the mermaid source — same
-        // affordance as a fenced code block.
+        // Diagram blocks (mermaid fences and `$$...$$` math) are synthetic `Block::ImageBlock`s;
+        // with the cursor inside, every reserved row shows the corresponding raw line, like a
+        // fenced code block.
+        let is_diagram_block = editor.parsed.is_diagram_reveal_block(cursor_block_idx);
         let is_mermaid_block = editor.parsed.is_mermaid_block(cursor_block_idx);
-        // Big-text H1: `Renderer::try_render_h1_big` emits 4 big-text rows
-        // plus the `─` rule (5 own lines), versus the plain 2-line H1.
-        // While the cursor is inside the block we collapse the big-text
-        // region back to the raw `# Title` line and leave the bottom rule
-        // line rendered so the user edits a stable single line — matches
-        // the user's "collapse to raw while editing" preference.
+        let is_latex_block = editor.parsed.is_latex_block(cursor_block_idx);
+        // Big-text H1 (4 big-text rows + rule vs. the plain 2-line H1) collapses to the raw
+        // `# Title` line plus the rendered rule while the cursor is inside.
         let is_big_h1_block = matches!(
             cursor_block_ast,
             Some(crate::markdown::Block::Heading {
@@ -237,10 +171,8 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                 ..
             })
         ) && cursor_block_own > 2;
-        // A blockquote paints a background wash across its rows, so the one
-        // row revealed as raw source has to keep it — otherwise the line the
-        // user is editing drops out of the quote it visibly belongs to (the
-        // same reason a revealed mermaid body row keeps the code surface).
+        // A revealed row inside a blockquote keeps the quote's wash, or the line being edited
+        // drops out of the quote it visibly belongs to.
         let reveal_base = if matches!(
             cursor_block_ast,
             Some(crate::markdown::Block::BlockQuote { .. })
@@ -249,22 +181,15 @@ impl<'a> StatefulWidget for RenderedView<'a> {
         } else {
             self.theme.normal
         };
-        // True when the cursor's current line is allowed to de-render: any
-        // non-code-block line, a fenced block's opening-fence line, or its
-        // closing-fence line where one has actually been typed (the renderer
-        // reserves a trailing padded row for it; revealing that row shows the
-        // ``` glyphs).  Single derivation, shared with the mouse hit-test: a
-        // click mapped against raw text on a row the view never revealed
-        // lands on the wrong character (see `markdown::code_layout`).
+        // Single derivation shared with the mouse hit-test: a click mapped against raw text on
+        // a row the view never revealed lands on the wrong character.
         let code_block_allows_reveal = crate::markdown::code_layout::line_allows_raw_reveal(
             cursor_block_ast,
             cursor_raw_line,
             &raw_lines,
         );
-        // Which rendered sub-line of the block gets the raw-text
-        // replacement.  Shared with `cursor_rendered_line_idx` (and, through
-        // it, the mouse hit-test's revealed-line shortcut) so the three can
-        // never disagree about which row is showing raw source.
+        // Shared with `cursor_rendered_line_idx` (and the mouse hit-test's revealed-line
+        // shortcut) so the three agree on which row shows raw source.
         let cursor_in_block = crate::editor::state::cursor_sub_line_in_block(
             &editor.parsed,
             cursor_byte,
@@ -274,15 +199,8 @@ impl<'a> StatefulWidget for RenderedView<'a> {
             &raw_lines,
             cursor_raw_line,
         );
-        // Wrapped-cell case: when the cursor sits in a data-row cell that
-        // wraps onto multiple rendered sub-lines (or is in a row whose
-        // *other* cells wrap), build a per-chunk overlay so each
-        // rendered sub of the cell can be painted with its own raw
-        // chunk.  Returns `None` for non-data rows and for single-sub
-        // rows (existing `compute_cell_overlay` /
-        // `compute_cell_chunk_overlay` paths handle those).  Raw text
-        // wrapping to more chunks than the row's rendered height
-        // scrolls vertically inside the row's sub-lines.
+        // Data-row cell in a row that wraps: one raw chunk per rendered sub. `None` for
+        // non-data and single-sub rows, which the single-line overlays handle.
         let wrapped_cell = if is_table && cursor_raw_line >= 2 {
             compute_wrapped_cell_overlay(
                 editor,
@@ -295,37 +213,45 @@ impl<'a> StatefulWidget for RenderedView<'a> {
             None
         };
 
-        // When in a wrapped cell, the cursor's actual sub-line lives
-        // at `row_first_line_idx + cursor_sub`.  For non-wrapped cells
-        // it's the row's first sub.
         let cursor_rendered_line = match &wrapped_cell {
             Some(w) => w.row_first_line_idx + w.cursor_sub,
             None => cursor_block_lines.start + cursor_in_block,
         };
 
-        // Cleared each frame; the indicator path below records the cursor's
-        // screen cell so `EditorView` can re-stamp it over later overlays.
+        // Recorded by the indicator path below so `EditorView` can re-stamp it over overlays.
         view_state.cursor_screen = None;
 
-        // Determine the scroll offset; sync from editor state.
         view_state.scroll = editor.scroll;
         let scroll = view_state.scroll;
-        let (mut virtual_idx, mut first_sub_row) =
-            editor.rendered_line_at_visual_row(scroll, area.width as usize);
+        // Reflow-reveal-aware start: `EffectiveRows` is the identity unless the cursor rests in a
+        // reflowed, revealed paragraph, in which case the block's one rendered flow line is
+        // replaced by its `M` raw source lines.  A viewport that opens *inside* that block then
+        // starts on one of those raw lines (`start_raw`), not the rendered line.
+        let effective = editor.effective_rows(area.width as usize);
+        let reflow_reveal_range = effective.block_rendered();
+        let (mut virtual_idx, mut first_sub_row, mut start_raw): (
+            usize,
+            usize,
+            Option<(usize, usize)>,
+        ) = match effective.line_at_visual_row(scroll) {
+            crate::editor::effective_rows::RowHit::Rendered { line, sub } => (line, sub, None),
+            crate::editor::effective_rows::RowHit::Raw { raw_line, sub } => (
+                reflow_reveal_range.as_ref().map(|r| r.start).unwrap_or(0),
+                0,
+                Some((raw_line, sub)),
+            ),
+        };
 
-        // Jitter suppression: if the cursor only recently moved to this line,
-        // keep showing the block as rendered until the reveal delay has elapsed.
+        // Jitter suppression: keep the block rendered until the reveal delay elapses.
         let reveal_raw = editor.cursor_block_revealed();
         let cursor_visible = editor.cursor_visible();
 
         let cursor_indicator_style = self.cursor_style;
 
         let total_rendered = editor.parsed.lines.len();
-        // Long-line wrapping is enabled in rendered-edit mode.
         let wrap = true;
 
-        // Selection: compute the selected raw byte range once; per-line overlay
-        // logic will intersect it with each line's byte range.
+        // Selected byte range, intersected per line below.
         let selection_bytes = editor.selection.map(|s| {
             let r = crate::editor::vim_ops::visual_span(&s, &editor.buffer, self.visual_kind);
             let rope = editor.buffer.rope();
@@ -336,8 +262,6 @@ impl<'a> StatefulWidget for RenderedView<'a> {
             .source_map
             .original_range_for_byte(cursor_byte);
 
-        // Walk rendered lines from scroll offset. For each line, render it
-        // normally EXCEPT cursor_rendered_line, which is shown as raw text.
         let mut vis_y: usize = 0;
         while vis_y < height {
             if virtual_idx >= total_rendered {
@@ -346,15 +270,10 @@ impl<'a> StatefulWidget for RenderedView<'a> {
 
             let skip_rows = first_sub_row;
             let rows_used;
-            // Setext headings reveal all of their raw lines (the title and
-            // the `===` / `---` underline) at once, on their corresponding
-            // rendered positions — not just the single line the cursor is on.
             let in_cursor_block =
                 virtual_idx >= cursor_block_lines.start && virtual_idx < cursor_block_lines.end;
-            // Sub-line index within `wrapped_cell.subs` if `virtual_idx`
-            // lands on one of the wrapped cell's chunks — multi-sub
-            // overlay paints raw chunks across all those subs so the
-            // cell's wrap is preserved when the cursor enters it.
+            // Index into `wrapped_cell.subs` when `virtual_idx` is one of the wrapped cell's
+            // chunks.
             let wrapped_sub_idx_opt: Option<usize> = wrapped_cell.as_ref().and_then(|w| {
                 let end = w.row_first_line_idx + w.subs.len();
                 if virtual_idx >= w.row_first_line_idx && virtual_idx < end {
@@ -363,13 +282,62 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                     None
                 }
             });
-            if reveal_raw && is_big_h1_block && in_cursor_block {
-                // Big-H1 collapse: the cursor's raw line (`# Title`) goes on
-                // the FIRST sub-line of the block; the remaining big-text
-                // rows blank out so we don't see half of a glyph above /
-                // below the editable text; the final sub-line keeps the
-                // rendered rule (`─` × viewport) so the H1 separator stays
-                // visible while editing.
+            if reveal_raw && in_cursor_block && effective.has_reveal() {
+                // A reflowed paragraph reveals as its stacked raw source lines: the rendered form
+                // was one wrapped flow, the raw form is `M` source lines, so paint them all in
+                // this one iteration (the block occupies a single rendered line, so `virtual_idx`
+                // then advances straight past it).  `EffectiveRows` already made scroll, gutter,
+                // and mouse count these rows.  Only the first painted raw line honors `skip_rows`,
+                // for a viewport opening mid-block.
+                let (first_raw, first_sub) = start_raw.take().unwrap_or((0, 0));
+                let block_start = block_range_for_cursor.as_ref().map(|r| r.start);
+                // Trailing blanks absorbed into the block range own their own rows, so stack only
+                // the content lines (matches `EffectiveRows` and `revealed_raw_row_count`).
+                let reveal_count =
+                    revealed_source_line_count(&raw_block_source).min(raw_lines.len());
+                let mut used = 0usize;
+                for (raw_idx, &raw_text) in raw_lines
+                    .iter()
+                    .enumerate()
+                    .take(reveal_count)
+                    .skip(first_raw)
+                {
+                    if vis_y + used >= height {
+                        break;
+                    }
+                    let sub_skip = if raw_idx == first_raw { first_sub } else { 0 };
+                    let sel_cols = selection_bytes.zip(block_start).and_then(|((sa, sb), bs)| {
+                        let raw_line_start_in_block =
+                            raw_line_byte_start(&raw_block_source, raw_idx);
+                        let raw_line_start_abs = bs + raw_line_start_in_block;
+                        let raw_line_end_abs = raw_line_start_abs + raw_text.len();
+                        let start_byte = sa.max(raw_line_start_abs).min(raw_line_end_abs);
+                        let end_byte = sb.max(raw_line_start_abs).min(raw_line_end_abs);
+                        if start_byte >= end_byte {
+                            return None;
+                        }
+                        let start_col = raw_text[..start_byte - raw_line_start_abs].chars().count();
+                        let end_col = raw_text[..end_byte - raw_line_start_abs].chars().count();
+                        Some((start_col, end_col))
+                    });
+                    let styled = make_raw_line_over(raw_text, sel_cols, self.theme, reveal_base);
+                    let cursor_override = (cursor_visible && raw_idx == cursor_raw_line)
+                        .then_some((cursor_col, cursor_indicator_style));
+                    let rows = render_line_with_cursor_from_visual(
+                        &styled,
+                        area,
+                        buf,
+                        (vis_y + used) as u16,
+                        wrap,
+                        cursor_override,
+                        sub_skip,
+                    ) as usize;
+                    used += rows;
+                }
+                rows_used = used;
+            } else if reveal_raw && is_big_h1_block && in_cursor_block {
+                // `# Title` on the first sub-line, the other big-text rows blanked, the last
+                // sub-line keeps the rendered rule.
                 let sub = virtual_idx - cursor_block_lines.start;
                 let last_sub = cursor_block_own.saturating_sub(1);
                 if sub == last_sub {
@@ -401,8 +369,7 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                     ) as usize;
                 }
             } else if reveal_raw && is_setext && in_cursor_block {
-                // Setext headings reveal every rendered row of the block
-                // to its matching raw-source line in one pass.
+                // Every rendered row of the block reveals its matching raw line.
                 let sub = virtual_idx - cursor_block_lines.start;
                 let raw_text = raw_lines.get(sub).copied().unwrap_or("");
                 let cursor_on_this = cursor_raw_line == sub;
@@ -433,24 +400,11 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                     skip_rows,
                 ) as usize;
             } else if reveal_raw && is_mermaid_block && in_cursor_block {
-                // Mermaid blocks reveal as if they were a regular fenced
-                // ```mermaid``` code block — the same way they'd appear
-                // when the `diagrams` setting is disabled.  Each reserved
-                // row gets:
-                //
-                //   * row 0 (opening fence) → ` mermaid ` language label,
-                //     or the raw `` ```mermaid `` line with cursor when
-                //     the cursor is on row 0.
-                //   * body rows → raw source text painted on the code-
-                //     block background; cursor / selection overlays
-                //     applied per char.
-                //   * the last raw row (closing `` ``` ``) → a padded
-                //     placeholder row, or the raw fence with cursor when
-                //     the cursor sits on the closing fence.
-                //   * rows past the end of the source (reserved height
-                //     exceeds the source line count) → padded code-block
-                //     background so the entire reservation reads as one
-                //     continuous code block.
+                // Reveal as a regular fenced code block: row 0 shows the language label (or
+                // the raw fence when the cursor is on it), body rows raw source on the code
+                // background, the closing fence a padded placeholder (or the raw fence with
+                // cursor), and rows past the source padded so the reservation reads as one
+                // block.
                 let sub = virtual_idx - cursor_block_lines.start;
                 let raw_text = raw_lines.get(sub).copied().unwrap_or("");
                 let cursor_on_this = cursor_raw_line == sub;
@@ -477,42 +431,114 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                 });
 
                 let styled = if cursor_on_this && (is_opening_fence_row || is_closing_fence_row) {
-                    // Fence row with cursor on it: reveal the raw fence
-                    // text (matches a regular fenced code block's reveal
-                    // behaviour for the opening / closing fence rows).
                     make_raw_line_with_selection(raw_text, sel_cols, self.theme)
                 } else if is_opening_fence_row {
-                    // No cursor: paint the language label as a code block
-                    // would emit it.  Falls back to raw source for any
-                    // language that isn't `mermaid` so the row still
-                    // shows something sensible.
+                    // Falls back to raw source for a non-`mermaid` language.
                     let lang = raw_text.trim_start_matches(['`', '~']);
                     let lang = if lang.is_empty() { "mermaid" } else { lang };
                     ratatui::text::Line::styled(format!(" {} ", lang), self.theme.code_block_lang)
                 } else if is_closing_fence_row {
-                    // No cursor: padded closing-fence row (NBSP-filled,
-                    // code-block background) — same as the renderer's
-                    // reserved closing row for a fenced code block.
                     ratatui::text::Line::styled(
                         "\u{00A0}".repeat(width.max(1)),
                         self.theme.code_block_text,
                     )
                 } else if in_source {
-                    // Body row.  Apply the code-block background so the
-                    // block reads as code; selection overlaid per char.
                     make_code_styled_body_line(raw_text, sel_cols, self.theme)
                 } else {
-                    // Past the end of the source: pad with code-block
-                    // background so the reservation looks continuous.
                     ratatui::text::Line::styled(
                         "\u{00A0}".repeat(width.max(1)),
                         self.theme.code_block_text,
                     )
                 };
 
-                // The cursor (bar/block) is painted onto the resolved cell —
-                // on the fence-with-cursor and body rows alike — keeping the
-                // wrapped layout computed from the bare source text.
+                // The cursor is painted onto the resolved cell so the wrap comes from the
+                // bare source text.
+                let cursor_override = (cursor_on_this && cursor_visible)
+                    .then_some((cursor_col, cursor_indicator_style));
+                rows_used = render_line_with_cursor_from_visual(
+                    &styled,
+                    area,
+                    buf,
+                    vis_y as u16,
+                    wrap,
+                    cursor_override,
+                    skip_rows,
+                ) as usize;
+            } else if reveal_raw && is_latex_block && in_cursor_block {
+                // `$$...$$` math blocks reveal as a code block, styled like
+                // the mermaid fence: the opening `$$` becomes a ` math `
+                // language header (`code_block_lang`), the body rows carry
+                // the code surface (`code_block_text`), and the closing `$$`
+                // is a padded blank row on that same surface.  The opening /
+                // closing rows reveal their literal `$$` only when the
+                // cursor lands on them (like a fence's edges).
+                //
+                // With the math preview on, the reveal reserves a top band
+                // for the rendered formula and paints the source *below* it
+                // (so the image keeps the block's top edge and doesn't
+                // jump): band rows paint empty — `image_view` overlays the
+                // formula there — and the source rows shift down by `band`
+                // (`latex_source_offset`).  With the preview off, `band` is
+                // 0 and the source paints from row 0.  Either way the
+                // formula's URL hashes its source, so moving the cursor out
+                // collapses the block back to a freshly rendered image.
+                let band = editor.parsed.latex_source_offset(cursor_block_idx);
+                let sub = virtual_idx - cursor_block_lines.start;
+                // Source line under this rendered row, or `None` for a
+                // band row (which paints empty behind the formula overlay).
+                let src_idx = sub.checked_sub(band).filter(|&s| s < raw_lines.len());
+                let raw_text = src_idx
+                    .and_then(|s| raw_lines.get(s))
+                    .copied()
+                    .unwrap_or("");
+                let cursor_on_this = src_idx == Some(cursor_raw_line);
+                // Delimiter rows only when the block has separate opening /
+                // closing lines (a one-line `$$x$$` is neither).  The
+                // closing `$$` is matched by its text, not by `len - 1`: a
+                // math paragraph's byte range can absorb the blank line that
+                // follows it, so `raw_lines` may carry a trailing empty
+                // entry past the real closing delimiter — indexing the last
+                // entry would miss it and leave the closing `$$` styled as a
+                // body row.
+                let is_opening = src_idx == Some(0) && raw_lines.len() >= 2;
+                let is_closing = !is_opening
+                    && src_idx.is_some()
+                    && raw_lines.len() >= 2
+                    && raw_text.trim() == "$$";
+                let width = area.width as usize;
+                let sel_cols = src_idx.zip(selection_bytes).and_then(|(s, (sa, sb))| {
+                    let block_start = block_range_for_cursor.as_ref()?.start;
+                    let raw_line_start_in_block = raw_line_byte_start(&raw_block_source, s);
+                    let raw_line_start_abs = block_start + raw_line_start_in_block;
+                    let raw_line_end_abs = raw_line_start_abs + raw_text.len();
+                    let start_byte = sa.max(raw_line_start_abs).min(raw_line_end_abs);
+                    let end_byte = sb.max(raw_line_start_abs).min(raw_line_end_abs);
+                    if start_byte >= end_byte {
+                        return None;
+                    }
+                    let start_col = raw_text[..start_byte - raw_line_start_abs].chars().count();
+                    let end_col = raw_text[..end_byte - raw_line_start_abs].chars().count();
+                    Some((start_col, end_col))
+                });
+                let styled = if src_idx.is_none() {
+                    // Band row: transparent so the formula image shows.
+                    make_raw_line_with_selection("", None, self.theme)
+                } else if cursor_on_this && (is_opening || is_closing) {
+                    // Cursor on a delimiter row: reveal the literal `$$`.
+                    make_raw_line_with_selection(raw_text, sel_cols, self.theme)
+                } else if is_opening {
+                    // No cursor: ` math ` header, code-block language surface.
+                    ratatui::text::Line::styled(" math ", self.theme.code_block_lang)
+                } else if is_closing {
+                    // No cursor: padded blank row on the code surface.
+                    ratatui::text::Line::styled(
+                        "\u{00A0}".repeat(width.max(1)),
+                        self.theme.code_block_text,
+                    )
+                } else {
+                    // Body row: code surface, cursor / selection per char.
+                    make_code_styled_body_line(raw_text, sel_cols, self.theme)
+                };
                 let cursor_override = (cursor_on_this && cursor_visible)
                     .then_some((cursor_col, cursor_indicator_style));
                 rows_used = render_line_with_cursor_from_visual(
@@ -525,12 +551,8 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                     skip_rows,
                 ) as usize;
             } else if let (true, Some(sub_idx)) = (reveal_raw, wrapped_sub_idx_opt) {
-                // Multi-sub wrapped-cell overlay: paint the rendered row
-                // first (so neighbouring cells and borders stay), then
-                // overlay the appropriate raw wrap chunk into the
-                // active cell's column range.  Each sub of the cell
-                // gets its own chunk so the cell's natural wrap is
-                // preserved while the cursor edits inside it.
+                // Paint the rendered row first (neighboring cells and borders stay), then
+                // overlay this sub's raw chunk into the active cell.
                 let w = wrapped_cell
                     .as_ref()
                     .expect("wrapped_sub_idx implies wrapped_cell");
@@ -541,9 +563,7 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                             as usize;
                     let sel_in_cell = selection_bytes.and_then(|(sa, sb)| {
                         let block_start = block_range_for_cursor.as_ref()?.start;
-                        // Every chunk of the wrapped cell is a slice of
-                        // a single raw row (`cursor_raw_line`), so the
-                        // raw-row start byte is the same for every sub.
+                        // Every chunk is a slice of the single raw row `cursor_raw_line`.
                         let raw_line_start_in_block =
                             raw_line_byte_start(&raw_block_source, cursor_raw_line);
                         let cell_byte_start =
@@ -573,15 +593,9 @@ impl<'a> StatefulWidget for RenderedView<'a> {
             } else if reveal_raw && virtual_idx == cursor_rendered_line && code_block_allows_reveal
             {
                 let raw_text = raw_lines.get(cursor_raw_line).copied().unwrap_or("");
-                // Prefer cell-scoped reveal for table rows — replace only the
-                // active cell's content area with raw text, keeping the box-
-                // drawing borders and neighbouring cells rendered.  Two cell
-                // overlays are tried in order: `compute_cell_overlay` for
-                // cells whose raw text fits in the rendered cell width, and
-                // `compute_cell_chunk_overlay` for wider raw cells (e.g.
-                // `**_word_**` in a 5-cell column) — the latter horizontally
-                // scrolls the cell, showing the chunk that contains the
-                // cursor.
+                // Table rows prefer a cell-scoped reveal, keeping borders and neighboring
+                // cells rendered: `compute_cell_overlay` when the raw text fits, else
+                // `compute_cell_chunk_overlay`, which scrolls the cell horizontally.
                 let line_opt = editor.parsed.lines.get(virtual_idx);
                 let cell_overlay = if is_table {
                     line_opt.and_then(|line| compute_cell_overlay(raw_text, line, cursor_col))
@@ -599,10 +613,6 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                         render_line_from_visual(line, area, buf, vis_y as u16, wrap, skip_rows)
                             as usize;
 
-                    // Compute selection highlight inside this cell.  The cell's
-                    // absolute byte range is [cell_byte_start, cell_byte_end);
-                    // intersect with the selection and map back to char cols
-                    // within `overlay.raw_text`.
                     let sel_in_cell = selection_bytes.and_then(|(sa, sb)| {
                         let block_start = block_range_for_cursor.as_ref()?.start;
                         let raw_line_start_in_block =
@@ -629,8 +639,7 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                         cursor_visible.then_some(self.cursor_style),
                     );
                 } else {
-                    // Non-table block (or pipe-mismatched table line — e.g.
-                    // mid-edit alignment row): full-line raw reveal.
+                    // Non-table block, or a pipe-mismatched table line (mid-edit alignment row).
                     let sel_cols = selection_bytes.and_then(|(sa, sb)| {
                         let block_start = block_range_for_cursor.as_ref()?.start;
                         let raw_line_start_in_block =
@@ -662,23 +671,14 @@ impl<'a> StatefulWidget for RenderedView<'a> {
             } else if virtual_idx == cursor_rendered_line
                 && (!reveal_raw || !code_block_allows_reveal)
             {
-                // Show the rendered version with a cursor indicator at
-                // the cursor's column.  Two cases land here:
-                //   1. The jitter-delay window before `reveal_raw` flips
-                //      to true — drawing the indicator now avoids a
-                //      visible column-jump when the reveal fires.
-                //   2. A code-block body / closing-fence line where we
-                //      intentionally suppress de-render — the cursor
-                //      still needs to be visible on top of the rendered
-                //      code.
+                // Rendered line plus a cursor indicator: the jitter-delay window before
+                // `reveal_raw` (drawing it now avoids a column jump when the reveal fires),
+                // or a code-block body / closing-fence line that never de-renders.
                 if let Some(line) = editor.parsed.lines.get(virtual_idx) {
                     let raw_text = raw_lines.get(cursor_raw_line).copied().unwrap_or("");
-                    // Paragraph lines with inline links / code spans shift the
-                    // cursor's rendered column relative to its raw column.  The
-                    // inverse of the click handler's map keeps the indicator
-                    // where the click landed, avoiding a visible jump when the
-                    // raw reveal fires.  `None` when the line isn't a plain
-                    // paragraph (heading/list/blockquote) — caller falls back.
+                    // Inline links / code spans shift the rendered column; the inverse of the
+                    // click handler's map keeps the indicator where the click landed. `None`
+                    // for non-paragraph lines.
                     let inline_col = block_range_for_cursor.as_ref().and_then(|br| {
                         let actual_rendered: usize =
                             line.spans.iter().map(|s| s.content.chars().count()).sum();
@@ -690,37 +690,22 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                             .raw_to_rendered_checked(cursor_col, actual_rendered)
                     });
                     let visual_col = if let Some(w) = &wrapped_cell {
-                        // Wrapped-cell mapping resolves cursor offset →
-                        // (sub-line, col-in-sub) using `wrap_cell_with_indices`,
-                        // then converts col-in-sub to a rendered x by adding
-                        // the cell's leading-pipe column.
                         w.visual_col
                     } else if is_table {
-                        // Raw col → rendered col isn't 1:1 for table rows:
-                        // padded cells shift the cursor column.  Walk pipe
-                        // positions so the jitter-delay indicator lands at
-                        // the same visual col the cell overlay will use on
-                        // reveal — avoids a cursor jump at the delay edge.
+                        // Padded cells shift the column; land on the same visual col the cell
+                        // overlay will use on reveal.
                         table_raw_col_to_rendered_col(raw_text, line, cursor_col)
                             .unwrap_or(cursor_col)
                     } else if let Some(crate::markdown::Block::CodeBlock { fenced, .. }) =
                         cursor_block_ast
                     {
-                        // A code *body* row never de-renders, so this is the
-                        // steady state rather than a jitter-window glimpse:
-                        // the renderer paints the raw text behind one pad
-                        // cell (plus, for an indented block, minus the
-                        // stripped indent), and without the shift the
-                        // indicator sits one cell LEFT of its character on
-                        // every code line — issue #28.  Fence rows carry
-                        // unrelated text (the ` lang ` label / an NBSP
-                        // placeholder) and reveal within `RAW_REVEAL_DELAY`,
-                        // so leave their brief pre-reveal frame 1:1.
-                        //
-                        // This arm sits ahead of the list arm on purpose: a
-                        // code line whose text happens to read `- foo` would
-                        // otherwise be claimed by the list-marker sniff and
-                        // shifted by a marker width it doesn't have.
+                        // Body rows never de-render, so this is the steady state: the renderer
+                        // paints raw text behind one pad cell (minus the stripped indent for an
+                        // indented block) — without the shift the indicator sits one cell LEFT
+                        // on every code line (issue #28). Fence rows reveal within
+                        // `RAW_REVEAL_DELAY`, so stay 1:1. This arm precedes the list arm on
+                        // purpose: a code line reading `- foo` must not be claimed by the
+                        // list-marker sniff.
                         if crate::markdown::code_layout::is_code_fence_row(
                             *fenced,
                             cursor_raw_line,
@@ -736,11 +721,8 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                         cursor_block_ast,
                         Some(crate::markdown::Block::MetadataBlock { .. })
                     ) {
-                        // Frontmatter renders verbatim, so the raw column IS
-                        // the rendered one.  The arm has to sit ahead of the
-                        // list sniff below: a YAML sequence entry (`  - tag`)
-                        // reads as a list marker and would otherwise shift the
-                        // indicator by a marker width the row doesn't have.
+                        // Verbatim, so raw col == rendered col. Precedes the list sniff: a YAML
+                        // sequence entry (`  - tag`) reads as a list marker.
                         cursor_col
                     } else if let Some(col) =
                         list_raw_col_to_rendered_col(raw_text, line, cursor_col)
@@ -765,14 +747,11 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                         skip_rows,
                     );
                     rows_used = rows as usize;
-                    // Record where the indicator landed so `EditorView` can
-                    // re-stamp it after the search / selection overlays.
                     view_state.cursor_screen = cursor_cell;
                 } else {
                     rows_used = 1;
                 }
             } else {
-                // Normal rendered line.
                 if let Some(line) = editor.parsed.lines.get(virtual_idx) {
                     rows_used =
                         render_line_from_visual(line, area, buf, vis_y as u16, wrap, skip_rows)
@@ -782,23 +761,20 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                 }
             }
 
-            // Paint the selection overlay across the line's visual rows if
-            // the line's block is part of the active selection and this is
-            // NOT a line that already painted its own selection (cursor's
-            // raw line, setext-revealed lines, or any sub of the active
-            // wrapped cell — the cell-overlay paths above handle their own
-            // selection highlighting per chunk).
+            // Lines that painted their own selection (the revealed line, setext / mermaid /
+            // wrapped-cell subs) are skipped.
             if let Some((sa, sb)) = selection_bytes {
                 let setext_revealed = reveal_raw && is_setext && in_cursor_block;
-                let mermaid_revealed = reveal_raw && is_mermaid_block && in_cursor_block;
+                let diagram_revealed = reveal_raw && is_diagram_block && in_cursor_block;
                 let wrapped_revealed = reveal_raw && wrapped_sub_idx_opt.is_some();
-                // Reads as three separate suppression cases; clippy's
-                // collapse hides which condition gates which.
+                let reflow_revealed = reveal_raw && in_cursor_block && effective.has_reveal();
+                // Separate suppression cases; clippy's collapse hides which is which.
                 #[allow(clippy::nonminimal_bool)]
                 if !(reveal_raw && virtual_idx == cursor_rendered_line && code_block_allows_reveal)
                     && !setext_revealed
-                    && !mermaid_revealed
+                    && !diagram_revealed
                     && !wrapped_revealed
+                    && !reflow_revealed
                 {
                     paint_byte_range_overlay(
                         editor,
@@ -823,21 +799,8 @@ impl<'a> StatefulWidget for RenderedView<'a> {
             first_sub_row = 0;
         }
 
-        // Build per-frame snapshots of every visible table, then
-        // paint the row/column-button glyphs over the rendered content.
-        // The snapshots are retained on `RenderedViewState` so the next
-        // mouse event can hit-test against them.  The cached variant
-        // skips the visible-line walk when scroll, area, parsed-doc
-        // version, AND
-        // the show-handles flag all match the previous frame.
-        //
-        // Handles paint only on the table the cursor is
-        // currently inside — keeps the affordance visible during the
-        // table-edit interaction without competing with surrounding
-        // content during ordinary navigation.  Snapshots are still
-        // captured for every visible table so mouse hit-testing on
-        // adjacent tables continues to work even though no glyph is
-        // painted on them.
+        // Snapshots are captured for every visible table (mouse hit-testing on adjacent
+        // tables), but handles paint only on the cursor's table.
         table_view::build_snapshots_cached(
             self.state,
             area,
@@ -867,12 +830,7 @@ impl<'a> StatefulWidget for RenderedView<'a> {
             );
         }
 
-        // Build per-frame snapshots of every visible image block.
-        // Image painting itself happens in `EditorView::render` (after this
-        // widget returns) because it needs mutable access to the cache.
-        // The `_cached` variant skips the O(lines × images) scan when
-        // scroll, area, and parsed-doc version all match the previous
-        // frame's.
+        // Image painting itself happens in `EditorView::render`, which has the cache.
         image_view::build_snapshots_cached(
             self.state,
             area,
@@ -881,12 +839,6 @@ impl<'a> StatefulWidget for RenderedView<'a> {
             &mut view_state.image_snapshots_key,
         );
 
-        // Build link snapshots for mouse hit-testing.  Cached
-        // by `(scroll, area, parsed_version)` — rebuilt only when
-        // something that affects link layout actually changed.  The
-        // uncached walk calls `visual_rows_for_line` for every visible
-        // line, which is O(chars) per line and dominated idle CPU on
-        // large documents.
         link_view::build_snapshots_cached(
             self.state,
             area,
@@ -899,13 +851,8 @@ impl<'a> StatefulWidget for RenderedView<'a> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Byte offset of the table block the cursor is currently inside, or
-/// `None` when the cursor isn't in a table.  Used to gate the drag-
-/// handle painter so handles only show on the active table.
-///
-/// Walks the snapshot list rather than reparsing — the snapshots
-/// already carry every visible table's `table_byte_start`, and we can
-/// match by checking whether the cursor's byte falls in `[start, end)`.
+/// Byte offset of the table block the cursor is inside, or `None`; gates the drag-handle
+/// painter. Walks the snapshots rather than reparsing.
 fn cursor_table_block_start(
     state: &EditorState,
     snapshots: &[crate::ui::table_view::TableLayoutSnapshot],

@@ -1,8 +1,5 @@
 //! Shared helpers used across the renderer's block / inline pipelines.
-//!
-//! Free functions only — none of these depend on `Renderer`.  Living
-//! together in one file keeps the table and list submodules focused on
-//! their own layout logic.
+//! Free functions only — none of these depend on `Renderer`.
 
 use std::path::Path;
 
@@ -12,32 +9,25 @@ use ratatui::text::Span;
 use crate::config::Theme;
 use crate::markdown::table_layout::preferred_cut;
 
-/// One character from a styled sequence, tagged with the style its
-/// source span carried.  Used by the table renderer's inline-aware
-/// wrap pipeline so bold / italic / code-span styling survives a cell
-/// breaking across multiple rendered rows.
+/// One character tagged with its source span's style, so the table renderer's
+/// inline-aware wrap keeps styling across a cell's row breaks.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct StyledChar {
     pub(super) ch: char,
     pub(super) style: Style,
 }
 
-/// Whitespace that wrapping may break at or drop — i.e. everything
-/// `char::is_whitespace` matches EXCEPT NBSP (U+00A0).  Table cells use
-/// NBSP for the code-span pad cells (the rendered stand-ins for the raw
-/// backticks; see `Renderer::cell_styled_chars`), and those must travel
-/// with the code token across wrap breaks instead of being trimmed like
-/// an inter-word space.
+/// Whitespace that wrapping may break at or drop: everything
+/// `char::is_whitespace` matches except NBSP (U+00A0).  Table cells use NBSP for
+/// code-span pad cells, which must travel with the code token across a break
+/// rather than being trimmed like an inter-word space.
 pub(super) fn is_soft_break_space(ch: char) -> bool {
     ch.is_whitespace() && ch != '\u{00A0}'
 }
 
-/// Tokenize a styled char sequence into runs of leading-whitespace +
-/// non-whitespace, mirroring `split_soft`.  A token always begins with
-/// any whitespace that preceded its non-whitespace tail; chained
-/// whitespace continues the same token until the next word boundary.
-/// NBSP counts as a word char (`is_soft_break_space`), so code-span
-/// pads bind to their code token.
+/// Tokenize into runs of leading-whitespace + non-whitespace, mirroring
+/// `split_soft`.  NBSP counts as a word char, so code-span pads bind to their
+/// code token.
 fn tokenize_styled(chars: &[StyledChar]) -> Vec<Vec<StyledChar>> {
     let mut tokens: Vec<Vec<StyledChar>> = Vec::new();
     let mut tok: Vec<StyledChar> = Vec::new();
@@ -60,11 +50,8 @@ fn tokenize_styled(chars: &[StyledChar]) -> Vec<Vec<StyledChar>> {
     tokens
 }
 
-/// Wrap a sequence of styled chars into rows of width ≤ `width`,
-/// breaking on whitespace where possible.  A token whose width
-/// exceeds `width` is hard-split at character boundaries.  Mirrors
-/// the algorithm in `table_layout::wrap_cell` but operates on
-/// `StyledChar` so per-char styles are preserved across breaks.
+/// Wrap styled chars into rows of width ≤ `width`, hard-splitting an over-wide
+/// token.  Mirrors `table_layout::wrap_cell` but preserves per-char styles.
 ///
 /// Returns at least one (possibly empty) row.
 pub(super) fn wrap_styled_chars(chars: &[StyledChar], width: usize) -> Vec<Vec<StyledChar>> {
@@ -99,9 +86,7 @@ pub(super) fn wrap_styled_chars(chars: &[StyledChar], width: usize) -> Vec<Vec<S
             current_w += w;
         } else {
             rows.push(std::mem::take(&mut current));
-            // Drop leading whitespace of the wrapped token before
-            // placing it on the new row — matches `wrap_cell`'s
-            // `trim_start` behaviour.  NBSP pads survive the trim so a
+            // Match `wrap_cell`'s `trim_start`.  NBSP pads survive it, so a
             // code span starting the new row keeps its leading pad cell.
             let trimmed: Vec<StyledChar> = token
                 .iter()
@@ -129,11 +114,9 @@ pub(super) fn wrap_styled_chars(chars: &[StyledChar], width: usize) -> Vec<Vec<S
     rows
 }
 
-/// Hard-split a token whose char-count exceeds `width` into chunks
-/// of size ≤ `width`, preferring to break just after a punctuation
-/// character (`table_layout::is_break_after`) in the trailing half of
-/// each chunk.  Counterpart of `table_layout::hard_split` for styled
-/// sequences.
+/// Hard-split an over-wide token into chunks of size ≤ `width`, preferring a
+/// break just after punctuation.  Styled counterpart of
+/// `table_layout::hard_split`.
 fn hard_split_styled(token: &[StyledChar], width: usize) -> Vec<Vec<StyledChar>> {
     if width == 0 || token.is_empty() {
         return vec![token.to_vec()];
@@ -149,9 +132,7 @@ fn hard_split_styled(token: &[StyledChar], width: usize) -> Vec<Vec<StyledChar>>
     rows
 }
 
-/// Append a `StyledChar` slice as a sequence of `Span`s, coalescing
-/// runs of consecutive chars that share the same style.  Keeps the
-/// output line tight without losing any style transitions.
+/// Append a `StyledChar` slice as `Span`s, coalescing same-style runs.
 pub(super) fn extend_with_styled_chars(out: &mut Vec<Span<'static>>, chars: &[StyledChar]) {
     if chars.is_empty() {
         return;
@@ -172,18 +153,15 @@ pub(super) fn extend_with_styled_chars(out: &mut Vec<Span<'static>>, chars: &[St
     }
 }
 
-/// Truncate `text` to at most `width` character cells.  Used by the table
-/// renderer's single-line path when an inline-formatted cell's rendered
-/// width exceeds the column allocation: rather than overflowing the
-/// trailing border we fall back to plain text and append a `…` to signal
-/// the truncation.
+/// Truncate `text` to at most `width` character cells.  The table renderer's
+/// single-line path uses this rather than overflow the trailing border when an
+/// inline-formatted cell exceeds its column allocation.
 pub(super) fn truncate_to_width(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
 }
 
-/// Fallback display text for a link/image whose bracket content is empty:
-/// the full URL for web-style targets (anything with a scheme or a `#` fragment),
-/// otherwise the final path component of the file path.
+/// Display text for a link/image with empty bracket content: the full URL for
+/// web-style targets (a scheme or a `#` fragment), else the file name.
 pub(super) fn link_fallback(url: &str) -> String {
     if has_url_scheme(url) || url.starts_with('#') {
         return url.to_string();
@@ -195,9 +173,8 @@ pub(super) fn link_fallback(url: &str) -> String {
         .unwrap_or_else(|| url.to_string())
 }
 
-/// Pick the right link style for `url`.  Heading anchors (`#section`)
-/// and local file paths read as more peripheral than full web links
-/// per theming.md, so they get the dim variants.
+/// Link style by URL kind; anchors and local paths take the dim variants.
+/// See docs/dev/theming.md.
 pub(super) fn link_style_for(url: &str, theme: &Theme) -> Style {
     if url.starts_with('#') {
         theme.link_heading

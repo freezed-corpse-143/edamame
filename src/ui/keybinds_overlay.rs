@@ -1,22 +1,9 @@
-//! Keybindings overlay.
+//! Keybindings overlay: a categorized view + editor.  Enter on a row arms one-press chord capture.
 //!
-//! Combined view + editor for keybindings.  Rows are grouped into
-//! categories (Editor, Navigation, Links, List, Table, …) so the user
-//! can scan related chords at a glance, and Enter on any row arms a
-//! one-press chord-capture mode for that row.
-//!
-//! Edits are *buffered*: rebinds mutate an internal draft `KeyMap`
-//! and draft `KeyBindingOverrides` that the overlay owns from open
-//! to close.  Nothing is written back to the live keymap or to
-//! `keybindings.toml` until the user activates the `[ Save ]` button
-//! (Tab into it, or click).  `[ Cancel ]` and Esc both discard the
-//! draft so a mistaken rebind is trivially undoable.
-//!
-//! Conflict detection delegates to [`KeyMap::rebind`] against the
-//! draft, so chains of pending edits (e.g. swapping two bindings)
-//! are checked against each other rather than against the original
-//! keymap.  The resulting error surfaces inline via
-//! [`KeybindsState::last_error`].
+//! Edits are buffered in a draft `KeyMap` / `KeyBindingOverrides` owned by the overlay; nothing
+//! reaches the live keymap or `keybindings.toml` until `[ Save ]`.  Conflicts are checked by
+//! [`KeyMap::rebind`] against the draft, so chained edits (e.g. swapping two bindings) are checked
+//! against each other, and surface via [`KeybindsState::last_error`].
 
 mod categories;
 
@@ -42,51 +29,38 @@ use crate::ui::scroll_container::{
     VERTICAL_CHROME_ROWS,
 };
 
-/// Width of the action-label column in the keybinds overlay (column count
-/// of the padded slot before the chord begins).  Sized to fit the longest
-/// action name without clipping; chords sit in the remaining width.
+/// Width of the action-label column; sized to fit the longest action name.
 const LABEL_PAD: usize = 22;
 
-/// Maximum horizontal padding per side for the keybinds overlay.
-/// Twice the default [`MAX_PAD_H`](crate::ui::scroll_container::MAX_PAD_H): the
-/// overlay's content is narrow, and the extra slack absorbs most
-/// "Already bound to …" error strings without re-flowing the modal
-/// wider while the user is still in capture mode.
+/// Twice the default [`MAX_PAD_H`](crate::ui::scroll_container::MAX_PAD_H): the slack absorbs
+/// most "already bound to …" errors without re-flowing the modal wider mid-capture.
 const KEYBINDS_MAX_PAD_H: u16 = 8;
 
 const CAPTURE_HINT: &str = "Press a key… (Esc to cancel)";
-/// Footer buttons, left-to-right.  Cancel is the leading (left) button so
-/// the destructive-by-default option matches the user's reading order and
-/// matches the keyboard flow: `Down` from the list lands on Cancel first.
+/// Footer buttons, left-to-right; `Down` from the list lands on Cancel first.
 const BUTTON_LABELS: &[&str] = &["Cancel", "Save"];
 
 /// Outcome of dispatching a key event to the keybinds overlay.
 #[derive(Debug, Clone)]
 pub enum KeybindsResponse {
     Continue,
-    /// User discarded the draft (Esc, Cancel button, or close hint).
-    /// Caller drops the overlay without touching the live keymap.
+    /// Draft discarded; the live keymap is untouched.
     Cancelled,
-    /// User activated the Save button.  Carries the draft keymap and
-    /// overrides, ready to be installed into the app and persisted to
-    /// `keybindings.toml`.
+    /// Carries the draft, ready to install and persist to `keybindings.toml`.
     Save {
         keymap: KeyMap,
         overrides: KeyBindingOverrides,
     },
 }
 
-/// One row in the overlay.  `Header` rows are display-only — the
-/// focus skips over them; `Binding` rows are editable.
+/// `Header` rows are display-only and skipped by focus; `Binding` rows are editable.
 #[derive(Debug, Clone)]
 enum Row {
     Header(&'static str),
     Binding { action: Action, label: &'static str },
 }
 
-/// Which focus group currently receives keystrokes.  The Save/Cancel
-/// buttons sit outside the scrollable list and are reachable via Tab
-/// or by Down-arrowing past the last binding row.
+/// Which focus group receives keystrokes; the buttons sit outside the scrollable list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusArea {
     List,
@@ -96,64 +70,34 @@ pub enum FocusArea {
 
 /// Mutable state for an open keybinds overlay.
 pub struct KeybindsState {
-    /// Index into [`Self::rows`].  Never rests on a `Header`: it is
-    /// seeded to the first `Binding` row by [`Self::open`], stepped by
-    /// [`Self::move_focus`] (which skips headers), and every other
-    /// assignment site — [`Self::focus_action`] and the click router in
-    /// [`Self::handle_click`] — guards on the row being a `Binding`
-    /// first.  A new assignment site owes the same guard; `rows` is
-    /// built once in `open` and never rebuilt, so nothing re-snaps a
-    /// stale index.  Only meaningful when [`Self::focus_area`] is
-    /// `List`, but kept across area transitions so Tab-back lands on
-    /// the user's last row.
+    /// Index into [`Self::rows`].  Invariant: never rests on a `Header` — every assignment site
+    /// guards on the row being a `Binding` (a new site owes the same guard).  Kept across
+    /// focus-area transitions so Tab-back lands on the user's last row.
     pub focused: usize,
-    /// Which focus group is active: the list, the Save button, or
-    /// the Cancel button.
     pub focus_area: FocusArea,
-    /// `true` while the focused row is in chord-capture mode: the next
-    /// non-modifier key press becomes the new binding in the draft.
+    /// Chord-capture mode: the next non-modifier key press becomes the draft binding.
     pub capturing: bool,
-    /// Last error message produced by an invalid value.  Cleared on
-    /// the next successful edit, cancel, or focus move.
+    /// Cleared on the next successful edit, cancel, or focus move.
     pub last_error: Option<String>,
-    /// Vertical scroll bookkeeping for the row table.  Up/Down move
-    /// `focused` and pull the viewport via `ensure_visible`; PgUp/PgDn
-    /// and the mouse wheel drive `scroll_state.scroll` directly without
-    /// touching focus.
+    /// Up/Down move `focused` and pull the viewport via `ensure_visible`; PgUp/PgDn and the
+    /// wheel drive `scroll` directly without touching focus.
     pub scroll_state: ScrollContainerState,
-    /// Absolute terminal rect of the rendered `esc` close hint.
     pub esc_button_rect: Option<Rect>,
-    /// Cached terminal rect of the `[ Cancel ]` button, populated each
-    /// render and consumed by [`Self::handle_click`].
     pub cancel_button_rect: Option<Rect>,
-    /// Cached terminal rect of the `[ Save ]` button, populated each
-    /// render and consumed by [`Self::handle_click`].
     pub save_button_rect: Option<Rect>,
-    /// Per-binding-row hit rects in absolute terminal coords for the
-    /// currently visible portion of the list.  Each tuple is `(row index
-    /// into [`Self::rows`], rect)`; only `Binding` rows are recorded.
-    /// Rebuilt on every render so scroll / resize stay accurate.
+    /// `(index into rows, rect)` for the visible `Binding` rows; rebuilt every render.
     pub row_hit_rects: Vec<(usize, Rect)>,
-    /// Draft keymap — starts as a clone of the live keymap and is
-    /// mutated by every rebind.  Returned to the caller on Save and
-    /// discarded on Cancel.
+    /// Clone of the live keymap, mutated by every rebind.
     pub draft_keymap: KeyMap,
-    /// Draft overrides matching [`Self::draft_keymap`].
     pub draft_overrides: KeyBindingOverrides,
-    /// All rows, including category headers.  Built once at
-    /// construction time from the static `CATEGORIES` table; cheap to
-    /// clone for tests.
+    /// Built once from `CATEGORIES` and never rebuilt.
     rows: Vec<Row>,
-    /// For each `rows[i]`, the body-line index where that row renders.
-    /// Pre-computed at construction time — the row list is static once
-    /// the overlay is open, so the offsets never change.
+    /// Body-line index where `rows[i]` renders (headers add a blank separator).
     focus_offsets: Vec<usize>,
 }
 
 impl KeybindsState {
-    /// Construct the overlay state with a draft cloned from the live
-    /// keymap and overrides.  Mutations stay in the draft until the
-    /// user saves.
+    /// Open with a draft cloned from the live keymap and overrides.
     pub fn open(keymap: &KeyMap, overrides: &KeyBindingOverrides, vim_enabled: bool) -> Self {
         let rows = build_rows(vim_enabled);
         let focus_offsets = compute_focus_offsets(&rows);
@@ -176,11 +120,7 @@ impl KeybindsState {
         state
     }
 
-    /// The action of the currently focused row, if any.  Used by the
-    /// inline unit tests below to query the row layout without exposing
-    /// the internal `Row` enum.  `#[allow(dead_code)]` is required
-    /// because the only callers are in `#[cfg(test)]` blocks, which the
-    /// dead-code lint does not see on a non-test compile.
+    /// Test-only accessor; `dead_code` allowed because the callers are `#[cfg(test)]`.
     #[allow(dead_code)]
     pub fn focused_action(&self) -> Option<Action> {
         match self.rows.get(self.focused) {
@@ -189,12 +129,8 @@ impl KeybindsState {
         }
     }
 
-    /// Move `focused` to the row whose `Binding.action == target`.
-    /// Returns true on success.  Used by tests in this module and by
-    /// the `tests/palette.rs` integration tests.  Marked
-    /// `#[allow(dead_code)]` because integration tests live in a
-    /// separate crate that the dead-code lint cannot see — without the
-    /// attribute the lib compile errors under `-D warnings`.
+    /// Focus the row bound to `target`; returns `false` if absent.  Used only by tests (incl.
+    /// `tests/palette.rs`), hence `dead_code` allowed.
     #[allow(dead_code)]
     pub fn focus_action(&mut self, target: &Action) -> bool {
         for (idx, row) in self.rows.iter().enumerate() {
@@ -209,21 +145,16 @@ impl KeybindsState {
         false
     }
 
-    /// Apply a key event.  In capture mode, the next non-modifier key
-    /// press becomes the new chord in the draft keymap.
+    /// Apply a key event.
     pub fn handle_key(&mut self, key: &KeyEvent) -> KeybindsResponse {
         if self.capturing {
             return self.handle_capture_key(key);
         }
 
-        // PgUp/PgDn/Home/End move the viewport without touching focus.
         if self.scroll_state.handle_paging_key(key) {
             return KeybindsResponse::Continue;
         }
 
-        // Tab / Shift-Tab cycle across focus groups.  Allow these even
-        // when focus is in the list so the user can reach the Save /
-        // Cancel buttons without arrow-navigating to the bottom row.
         match (key.code, key.modifiers) {
             (KeyCode::Tab, KeyModifiers::NONE) => {
                 self.cycle_focus(1);
@@ -243,20 +174,13 @@ impl KeybindsState {
     }
 
     fn handle_capture_key(&mut self, key: &KeyEvent) -> KeybindsResponse {
-        // Bare Esc cancels capture within the overlay; binding Esc
-        // itself requires hand-editing `keybindings.toml`.  The
-        // `modifiers == NONE` guard is intentional: Esc-with-modifiers
-        // (e.g. `Shift+Esc`, `Ctrl+Esc`) is a perfectly valid chord and
-        // should fall through to the rebind path below rather than
-        // exiting capture.
+        // Bare Esc cancels capture (binding Esc itself needs hand-editing `keybindings.toml`);
+        // Esc-with-modifiers is a valid chord and falls through to the rebind path.
         if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
             self.capturing = false;
             self.last_error = None;
             return KeybindsResponse::Continue;
         }
-        // Ignore bare modifier presses (Ctrl/Shift/Alt held alone) so
-        // the user can naturally hold a modifier and then press the
-        // actual key.
         if is_bare_modifier(key) {
             return KeybindsResponse::Continue;
         }
@@ -264,12 +188,8 @@ impl KeybindsState {
             Some(Row::Binding { action, .. }) => action.clone(),
             _ => return KeybindsResponse::Continue,
         };
-        // Build the `parse_key`-compatible form directly.  Going via
-        // `format_key` + `replace('-', '+')` would mangle keys whose
-        // own glyph is `-` or `+` (`"-"` → `"+"` → UnparseableKey).
-        // `None` means the key has no parseable spelling (e.g. media
-        // keys, lock keys) — surface that rather than writing an
-        // un-parseable string into the overrides.
+        // Build the `parse_key` form directly: going via `format_key` + `replace('-', '+')`
+        // mangles the `-` and `+` keys.  `None` (media/lock keys) has no parseable spelling.
         let new_key = match format_key_parseable(key) {
             Some(s) => s,
             None => {
@@ -289,9 +209,7 @@ impl KeybindsState {
                 action: existing_action,
                 ..
             }) => {
-                // Display the chord in human-readable form (`Ctrl-Q`)
-                // rather than the normalized `ctrl+q` carried by the
-                // error, so the message matches the rest of the UI.
+                // Human-readable `Ctrl-Q`, not the normalized `ctrl+q` carried by the error.
                 let display_key = format_key(key);
                 self.last_error = Some(format!(
                     "'{display_key}' is already bound to {existing_action}"
@@ -313,10 +231,6 @@ impl KeybindsState {
             }
             KeyCode::Down => {
                 if !self.move_focus(1) {
-                    // Already on the last binding — Down crosses into
-                    // the Cancel button (the leading/leftmost footer
-                    // button) so the user can reach the buttons without
-                    // hunting for Tab.
                     self.focus_area = FocusArea::Cancel;
                     self.last_error = None;
                 }
@@ -337,7 +251,6 @@ impl KeybindsState {
         match key.code {
             KeyCode::Esc => self.cancel(),
             KeyCode::Up => {
-                // Return focus to the last list row the user was on.
                 self.focus_area = FocusArea::List;
                 self.last_error = None;
                 KeybindsResponse::Continue
@@ -359,8 +272,7 @@ impl KeybindsState {
         }
     }
 
-    /// Cycle Tab focus: List → Cancel → Save → List.  Order matches the
-    /// visual button order (Cancel left, Save right).
+    /// Cycle Tab focus: List → Cancel → Save → List (visual button order).
     fn cycle_focus(&mut self, delta: i32) {
         const ORDER: [FocusArea; 3] = [FocusArea::List, FocusArea::Cancel, FocusArea::Save];
         let cur = ORDER
@@ -372,9 +284,6 @@ impl KeybindsState {
         self.last_error = None;
     }
 
-    /// Emit Save.  Hands the draft keymap + overrides back to the
-    /// caller, which is responsible for installing them on the app and
-    /// writing `keybindings.toml`.
     fn save(&mut self) -> KeybindsResponse {
         KeybindsResponse::Save {
             keymap: self.draft_keymap.clone(),
@@ -386,21 +295,15 @@ impl KeybindsState {
         KeybindsResponse::Cancelled
     }
 
-    /// Step the focus by `delta` rows, skipping over `Header` rows.
-    /// Returns `true` if focus moved, `false` if it would have run off
-    /// either end — letting the caller decide whether to cross into
-    /// the button row.
+    /// Step focus by `delta` rows, skipping headers.  Returns `false` when it would run off
+    /// either end, so the caller can cross into the button row.
     fn move_focus(&mut self, delta: i32) -> bool {
         if let Some(idx) = next_focusable(&self.rows, self.focused, delta, |r| {
             matches!(r, Row::Binding { .. })
         }) {
             self.focused = idx;
-            // Navigating away from a row drops any sticky conflict
-            // message that was tied to it.
             self.last_error = None;
-            // ensure_visible operates on body-line coords (headers
-            // and blank separators inflate the body past the row
-            // count), so translate via the pre-computed focus_offsets.
+            // ensure_visible takes body-line coords, not row indices.
             let body_row = self.focus_offsets.get(self.focused).copied().unwrap_or(0) as u16;
             self.scroll_state.ensure_visible(body_row);
             true
@@ -409,21 +312,11 @@ impl KeybindsState {
         }
     }
 
-    /// Apply a left-button click at terminal coords `(col, row)`.
-    ///
-    /// During capture mode every click except the `esc` close hint is
-    /// ignored — the user must complete or cancel the in-flight chord
-    /// before mousing elsewhere.  Outside capture mode:
-    /// - clicking the `esc` hint or the Cancel button discards the
-    ///   draft;
-    /// - clicking the Save button hands the draft back to the caller;
-    /// - clicking a binding row focuses it and arms capture immediately
-    ///   (so the next keystroke becomes the new chord).
+    /// Apply a left-button click.  During capture only the `esc` hint responds (and it cancels
+    /// capture, not the overlay); otherwise a click on a binding row focuses it and arms capture.
     pub fn handle_click(&mut self, col: u16, row: u16) -> KeybindsResponse {
         if self.capturing {
             if rect_contains(self.esc_button_rect, col, row) {
-                // Match the Esc-key behaviour: only cancel capture, not
-                // the whole overlay.
                 self.capturing = false;
                 self.last_error = None;
             }
@@ -470,23 +363,13 @@ impl<'a> StatefulWidget for KeybindsView<'a> {
     type State = KeybindsState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        // Build all body lines first.  Headers introduce a blank
-        // separator above themselves (except at the top), so the
-        // expanded line count is greater than `state.rows.len()` and
-        // must be computed up-front for accurate scroll bookkeeping.
         let body_lines = build_body_lines(state, &state.draft_keymap, self.theme);
 
         let content_width = keybinds_content_width(state);
 
-        // Pinned-bottom footer layout:
-        //   1 spacer + the buttons   (always)
-        //   + 1 capture hint         (when capturing)
-        //   + 1 error                (when last_error present)
-        //
-        // The buttons wrap rather than clipping, so their height is a
-        // function of the width the frame will give them.  Reserving a
-        // flat row instead leaves a wrapped button unpainted but still
-        // focusable and still carrying a click rect.
+        // Footer: spacer + buttons (always), + capture hint, + error.  The buttons wrap rather
+        // than clip, so their row count depends on the width the frame will give them; a flat
+        // one-row reservation leaves a wrapped button unpainted yet still focusable.
         let extra_status = (state.capturing as u16) + (state.last_error.is_some() as u16);
         let footer_rows =
             footer_row_count(BUTTON_LABELS, content_width, area.width, KEYBINDS_MAX_PAD_H);
@@ -506,11 +389,8 @@ impl<'a> StatefulWidget for KeybindsView<'a> {
         state
             .scroll_state
             .observe(body_lines.len() as u16, table_height);
-        // NB: do NOT call ensure_visible here.  Doing so would snap
-        // scroll back to the focused row on every redraw, undoing
-        // wheel/PgUp/PgDn scrolls that intentionally moved the
-        // viewport without changing focus.  ensure_visible runs only
-        // when focus actually moves (see KeybindsState::move_focus).
+        // Do NOT call ensure_visible here: it would undo wheel/PgUp/PgDn scrolls on every
+        // redraw.  It runs only when focus moves (see `move_focus`).
 
         let layout = draw_frame(
             rect,
@@ -561,7 +441,6 @@ impl<'a> StatefulWidget for KeybindsView<'a> {
             );
         }
 
-        // Pinned footer: capture hint, error, spacer, buttons.
         let mut footer_y = inner.y + table_height;
         if state.capturing {
             let hint_area = Rect {
@@ -595,7 +474,6 @@ impl<'a> StatefulWidget for KeybindsView<'a> {
             .render(err_area, buf);
             footer_y += 1;
         }
-        // Spacer (always reserved).
         footer_y += 1;
         let button_area = Rect {
             x: inner.x,
@@ -603,8 +481,6 @@ impl<'a> StatefulWidget for KeybindsView<'a> {
             width: inner.width,
             height: (inner.y + inner.height).saturating_sub(footer_y),
         };
-        // Button order on screen matches BUTTON_LABELS: Cancel (idx 0)
-        // on the left, Save (idx 1) on the right.
         let focused_idx = match state.focus_area {
             FocusArea::Cancel => 0,
             FocusArea::Save => 1,
@@ -612,13 +488,9 @@ impl<'a> StatefulWidget for KeybindsView<'a> {
         };
         let button_rects =
             render_button_row(button_area, buf, BUTTON_LABELS, focused_idx, self.theme);
-        // BUTTON_LABELS is [Cancel, Save]; render_button_row returns
-        // rects in the same order.
         state.cancel_button_rect = button_rects.first().copied();
         state.save_button_rect = button_rects.get(1).copied();
 
-        // Record hit rects for visible binding rows so a click on a
-        // chord can focus + arm capture without re-deriving the layout.
         state.row_hit_rects.clear();
         for (row_idx, row) in state.rows.iter().enumerate() {
             if !matches!(row, Row::Binding { .. }) {
@@ -645,8 +517,7 @@ impl<'a> StatefulWidget for KeybindsView<'a> {
     }
 }
 
-/// Build the full body line list, mirroring the renderer above so
-/// scroll bookkeeping uses identical line counts.
+/// Build the body lines; must agree with [`compute_focus_offsets`] on line counts.
 fn build_body_lines<'a>(state: &KeybindsState, keymap: &KeyMap, theme: &'a Theme) -> Vec<Line<'a>> {
     let mut lines: Vec<Line<'_>> = Vec::with_capacity(state.rows.len() + 2);
     for (idx, row) in state.rows.iter().enumerate() {
@@ -663,9 +534,6 @@ fn build_body_lines<'a>(state: &KeybindsState, keymap: &KeyMap, theme: &'a Theme
             Row::Binding { action, label } => {
                 let focused = idx == state.focused && state.focus_area == FocusArea::List;
                 let capturing = focused && state.capturing;
-                // The capture prompt lives in the pinned footer; the
-                // chord cell shows `…` so the row still has a visible
-                // affordance while the user picks a chord.
                 let chord = if capturing {
                     "…".to_owned()
                 } else {
@@ -685,13 +553,8 @@ fn build_body_lines<'a>(state: &KeybindsState, keymap: &KeyMap, theme: &'a Theme
     lines
 }
 
-/// The chord text shown for `action`.  Diff-review and search-flow
-/// actions aren't in the runtime [`KeyMap`] — they're hard-bound in
-/// the shared `diff_keys` / `search_keys` tables — so their glyph
-/// comes from [`diff_hint`] / [`crate::search::search_hint`]; every
-/// other action reads its bound key from the keymap as usual.
-/// Without this the "Diff Review" and "Search" categories would
-/// render most rows with a blank key cell.
+/// Chord text for `action`.  Diff-review and search-flow actions are hard-bound, not in the
+/// [`KeyMap`], so their glyph comes from [`diff_hint`] / [`crate::search::search_hint`].
 fn display_chord(keymap: &KeyMap, action: &Action) -> String {
     let hint = diff_hint(action);
     if !hint.is_empty() {
@@ -704,9 +567,7 @@ fn display_chord(keymap: &KeyMap, action: &Action) -> String {
     keymap.first_key_for(action).unwrap_or_default()
 }
 
-/// For each `rows[i]`, the body-line index where that row renders.
-/// Computed once at construction; used by `ensure_visible` to translate
-/// focused-row index into the body coords the scroll state operates in.
+/// Body-line index where each `rows[i]` renders (see [`KeybindsState::focus_offsets`]).
 fn compute_focus_offsets(rows: &[Row]) -> Vec<usize> {
     let mut offsets = Vec::with_capacity(rows.len());
     let mut line: usize = 0;
@@ -731,10 +592,8 @@ fn compute_focus_offsets(rows: &[Row]) -> Vec<usize> {
     offsets
 }
 
-/// Content-aware width: max over rows of `marker(2) + label_pad +
-/// chord_w`, plus the longest header (`— Title —`), the capture hint,
-/// the button row, and the longest error.  Sized over the whole row
-/// set so width doesn't jiggle as focus moves.
+/// Widest of all rows, the capture hint, the button row, and the error, so the width doesn't
+/// jiggle as focus moves.
 fn keybinds_content_width(state: &KeybindsState) -> u16 {
     const FOCUS_MARKER_WIDTH: usize = 2;
     let row_max = max_row_width(&state.rows, |r| match r {
@@ -750,18 +609,13 @@ fn keybinds_content_width(state: &KeybindsState) -> u16 {
     row_max.max(err_max).max(hint_w).max(buttons_w)
 }
 
-/// Detect a key event that is *only* a modifier key being held down
-/// (no real key yet).  With crossterm's keyboard-enhancement enabled,
-/// `KeyCode::Modifier(_)` events are emitted when Ctrl/Shift/Alt are
-/// pressed in isolation; we swallow these so the user can naturally
-/// hold a modifier and then press the actual key.
+/// With crossterm's keyboard enhancement, a modifier pressed alone arrives as its own event;
+/// capture swallows it so the user can hold the modifier and then press the key.
 fn is_bare_modifier(key: &KeyEvent) -> bool {
     matches!(key.code, KeyCode::Modifier(_))
 }
 
-/// Point-in-rect test for an optional cached hit rect.  `None` always
-/// misses so callers can pass an unpopulated rect (e.g. before the
-/// first render) without a separate guard.
+/// Point-in-rect test; `None` (not yet rendered) always misses.
 fn rect_contains(rect: Option<Rect>, col: u16, row: u16) -> bool {
     match rect {
         Some(r) => col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height,
@@ -769,14 +623,8 @@ fn rect_contains(rect: Option<Rect>, col: u16, row: u16) -> bool {
     }
 }
 
-/// Build the row list from the static category table.  Headers and
-/// bindings interleave exactly the way they appear on screen.  Adding
-/// a category here is the only edit needed to surface a new section
-/// in the overlay.
-///
-/// When `vim_enabled` is true the `Preview mode` row (`ExitToPreview`)
-/// is dropped: vim's NORMAL is the resting mode that replaces Preview,
-/// so the action is a no-op and the row would only mislead.
+/// Build the row list from `CATEGORIES`.  With vim enabled the `ExitToPreview` row is dropped:
+/// NORMAL replaces Preview as the resting mode, so the action is a no-op.
 fn build_rows(vim_enabled: bool) -> Vec<Row> {
     let mut rows = Vec::new();
     for (title, bindings) in CATEGORIES {
@@ -817,9 +665,6 @@ mod tests {
 
     #[test]
     fn hard_bound_flow_actions_display_their_table_glyphs() {
-        // Diff-review and search-flow actions aren't in the runtime
-        // keymap; their chord cells must come from the shared hint
-        // tables instead of rendering blank.
         let km = keymap();
         assert_eq!(display_chord(&km, &Action::DiffAcceptHunk), "y");
         assert_eq!(display_chord(&km, &Action::SearchNext), "Tab");
@@ -827,25 +672,19 @@ mod tests {
         assert_eq!(display_chord(&km, &Action::SearchReplace), "r");
         assert_eq!(display_chord(&km, &Action::SearchReplaceAll), "a");
         assert_eq!(display_chord(&km, &Action::SearchExit), "Esc");
-        // The opener is a normal keymap binding, formatted for display.
         assert_eq!(display_chord(&km, &Action::OpenSearch), "Ctrl-F");
     }
 
     #[test]
     fn initial_focus_is_first_binding_not_a_header() {
         let state = open();
-        // The initial row is "Save file" under the Editor header.
         assert_eq!(state.focused_action(), Some(Action::Save));
         assert_eq!(state.focus_area, FocusArea::List);
     }
 
     #[test]
     fn down_skips_over_header_rows() {
-        // Walks Down through the entire list and asserts every focus
-        // transition that crosses a category boundary lands on the
-        // first Binding row of the next category (not on the Header
-        // itself).  This holds for *every* boundary regardless of the
-        // specific actions in each category, so reordering CATEGORIES
+        // Derives the expected crossings from the row table itself so reordering CATEGORIES
         // can't make the test pass for the wrong reason.
         let mut state = open();
         let rows = state.rows.clone();
@@ -854,8 +693,6 @@ mod tests {
             starting_header.is_some(),
             "initial focus must be inside a category"
         );
-        // Build the expected sequence of (header, first action) pairs
-        // from the row table itself.
         let mut category_starts: Vec<(&'static str, Action)> = Vec::new();
         let mut last_header: Option<&'static str> = None;
         for r in &rows {
@@ -870,12 +707,10 @@ mod tests {
         }
         let mut crossings: Vec<(&'static str, Action)> = Vec::new();
         let mut prev_header = starting_header;
-        // Cap the walk — far more steps than any plausible row count.
         for _ in 0..rows.len() + 8 {
             let before = state.focused;
             state.handle_key(&key(KeyCode::Down));
             if state.focused == before {
-                // Hit the bottom of the list.
                 break;
             }
             let now = current_header(&rows, state.focused);
@@ -885,8 +720,6 @@ mod tests {
                 prev_header = now;
             }
         }
-        // Skip the first entry of `category_starts` — that's the user's
-        // starting category, not a crossing.
         let expected: Vec<_> = category_starts.into_iter().skip(1).collect();
         assert_eq!(
             crossings, expected,
@@ -898,9 +731,7 @@ mod tests {
         );
     }
 
-    /// Walk backward through `rows` from `idx` and return the nearest
-    /// preceding `Header` title.  Used by the boundary-crossing test
-    /// instead of hard-coding the layout.
+    /// Nearest `Header` title at or before `idx`.
     fn current_header(rows: &[Row], idx: usize) -> Option<&'static str> {
         rows[..=idx].iter().rev().find_map(|r| match r {
             Row::Header(t) => Some(*t),
@@ -952,12 +783,8 @@ mod tests {
 
     #[test]
     fn pageup_capture_round_trips_through_format_and_parse() {
-        // Regression for review issue #1: format_key emits `PgUp` /
-        // `PgDn` for KeyCode::PageUp/PageDown; parse_key must accept
-        // those back so capture doesn't surface an UnparseableKey
-        // error.  Bare PgUp would conflict with ScrollPageUp's default
-        // binding, so capture Shift+PgUp instead — same code path,
-        // different chord.
+        // Regression: parse_key must accept the `PgUp` spelling format_key emits.  Shift+PgUp
+        // avoids the conflict with ScrollPageUp's default binding.
         let mut state = open();
         assert!(state.focus_action(&Action::Save));
         state.handle_key(&key(KeyCode::Enter));
@@ -977,12 +804,7 @@ mod tests {
     #[test]
     fn unsupported_keycode_surfaces_inline_error_and_keeps_capture() {
         use crossterm::event::MediaKeyCode;
-        // Media keys (and other KeyCode variants without a parseable
-        // spelling) must NOT be written into the overrides as the
-        // Debug-stringified form — they have no round-trip and would
-        // surface as UnparseableKey on next load.  The capture handler
-        // should reject them with an "Unsupported key" error and stay
-        // in capture mode so the user can try a different chord.
+        // A Debug-stringified media key would surface as UnparseableKey on next load.
         let mut state = open();
         assert!(state.focus_action(&Action::Save));
         state.handle_key(&key(KeyCode::Enter));
@@ -997,7 +819,6 @@ mod tests {
             "expected 'Unsupported' in error, got: {:?}",
             state.last_error
         );
-        // Save's binding is untouched in the draft.
         assert_eq!(
             state.draft_keymap.first_key_for(&Action::Save).as_deref(),
             Some("Ctrl-S")
@@ -1006,11 +827,7 @@ mod tests {
 
     #[test]
     fn hyphen_and_plus_keys_are_capturable() {
-        // Regression: capturing `-` or `+` used to mangle the chord
-        // because the old normalisation went through `format_key`'s
-        // dash-separated form (`replace('-', '+')` turned `"-"` into
-        // `"+"` and then UnparseableKey).  Both must round-trip cleanly
-        // through capture → rebind → format_key.
+        // Regression: see the `format_key_parseable` note in `handle_capture_key`.
         let mut state = open();
         assert!(state.focus_action(&Action::Save));
         state.handle_key(&key(KeyCode::Enter));
@@ -1042,9 +859,6 @@ mod tests {
 
     #[test]
     fn conflict_error_uses_human_readable_chord() {
-        // Regression: the conflict error used to surface the
-        // `parse_key`-normalized form (`ctrl+q`) carried by the error
-        // value.  It should match the rest of the UI (`Ctrl-Q`).
         let mut state = open();
         assert!(state.focus_action(&Action::Save));
         state.handle_key(&key(KeyCode::Enter));
@@ -1126,7 +940,6 @@ mod tests {
     #[test]
     fn down_from_last_binding_focuses_cancel_first() {
         let mut state = open();
-        // Walk to the very last binding row.
         loop {
             let before = state.focused;
             state.handle_key(&key(KeyCode::Down));
@@ -1134,15 +947,12 @@ mod tests {
                 break;
             }
         }
-        // The final iteration's Down crossed into the button row —
-        // Cancel first (it's the leading/leftmost footer button).
         assert_eq!(state.focus_area, FocusArea::Cancel);
     }
 
     #[test]
     fn enter_on_save_button_emits_save_response() {
         let mut state = open();
-        // Make one change so the test verifies the drafts come back.
         assert!(state.focus_action(&Action::Save));
         state.handle_key(&key(KeyCode::Enter));
         state.handle_key(&key(KeyCode::F(7)));
@@ -1163,7 +973,6 @@ mod tests {
         assert!(state.focus_action(&Action::Save));
         state.handle_key(&key(KeyCode::Enter));
         state.handle_key(&key(KeyCode::F(7)));
-        // Sanity: draft has the rebind.
         assert_eq!(
             state.draft_keymap.first_key_for(&Action::Save).as_deref(),
             Some("F7")
@@ -1176,7 +985,6 @@ mod tests {
     #[test]
     fn escape_in_list_cancels_overlay_without_save() {
         let mut state = open();
-        // A rebind in the draft must NOT survive Esc.
         assert!(state.focus_action(&Action::Save));
         state.handle_key(&key(KeyCode::Enter));
         state.handle_key(&key(KeyCode::F(7)));
@@ -1220,8 +1028,6 @@ mod tests {
 
     #[test]
     fn excluded_actions_are_not_rows() {
-        // PgUp / PgDown were removed from the overlay — confirm both
-        // via the Action set the row builder produces.
         let rows = build_rows(false);
         for excluded in [Action::ScrollPageUp, Action::ScrollPageDown] {
             for row in &rows {
@@ -1237,8 +1043,6 @@ mod tests {
 
     #[test]
     fn editor_section_includes_mode_switching() {
-        // Per review, "Preview mode" and "Toggle raw/render" sit
-        // under Editor (not a separate View category).
         let rows = build_rows(false);
         let mut current_header: Option<&'static str> = None;
         for row in &rows {
@@ -1258,9 +1062,6 @@ mod tests {
 
     #[test]
     fn vim_mode_hides_preview_mode_row() {
-        // Vim's NORMAL replaces Preview as the resting mode, so the
-        // `Preview mode` (ExitToPreview) row is a no-op and must not
-        // appear when vim is enabled.  Without vim it still shows.
         let default_rows = build_rows(false);
         assert!(
             default_rows.iter().any(|r| matches!(
@@ -1277,7 +1078,6 @@ mod tests {
             )),
             "Preview mode row should be hidden with vim enabled"
         );
-        // The rest of the Editor section is untouched (Save still present).
         assert!(vim_rows.iter().any(|r| matches!(
             r,
             Row::Binding { action, .. } if *action == Action::Save
@@ -1286,7 +1086,6 @@ mod tests {
 
     #[test]
     fn vim_overlay_initial_focus_is_valid() {
-        // The dropped row must not strand initial focus on a header.
         let state = open_vim();
         assert!(matches!(
             state.rows.get(state.focused),
@@ -1364,15 +1163,12 @@ mod tests {
 
     #[test]
     fn keybinds_pgdown_scroll_survives_subsequent_render() {
-        // Regression: ensure_visible used to run on every render and
-        // would snap scroll back to the focused row, so PgDn / mouse
-        // wheel could not move the viewport past the focused binding.
+        // Regression: ensure_visible used to run on every render and snap scroll back.
         let mut state = open();
         render(&mut state, 80, 18);
         state.handle_key(&key(KeyCode::PageDown));
         let scroll_after_pgdn = state.scroll_state.scroll;
         assert!(scroll_after_pgdn > 0, "PgDn must advance scroll");
-        // The next render must NOT undo the scroll.
         render(&mut state, 80, 18);
         assert_eq!(
             state.scroll_state.scroll, scroll_after_pgdn,
@@ -1392,8 +1188,6 @@ mod tests {
 
     #[test]
     fn keybinds_wheel_scroll_survives_subsequent_render() {
-        // Regression: same root cause as the PgDn test — wheel scroll
-        // must persist across renders.
         let mut state = open();
         render(&mut state, 80, 18);
         state.scroll_state.scroll_by(5);
@@ -1429,9 +1223,6 @@ mod tests {
 
     #[test]
     fn keybinds_modal_uses_raised_horizontal_padding() {
-        // The overlay opts into KEYBINDS_MAX_PAD_H (8) per side.  Pin
-        // both the wide-terminal cap and the narrow shrink-to-MIN
-        // behaviour so a future change doesn't silently drop the slack.
         use crate::ui::scroll_container::{compute_pad_h, MIN_PAD_H};
         assert_eq!(
             compute_pad_h(200, 30, KEYBINDS_MAX_PAD_H),
@@ -1443,8 +1234,6 @@ mod tests {
             MIN_PAD_H,
             "narrow-terminal pad_h must still degrade to MIN_PAD_H"
         );
-        // End-to-end: in a wide terminal the modal rect includes the
-        // raised padding on each side.
         use crate::ui::scroll_container::{centered_rect_for_content, ContentSize};
         use ratatui::layout::Rect;
         let state = open();
@@ -1469,11 +1258,7 @@ mod tests {
 
     #[test]
     fn a_narrow_terminal_wraps_the_footer_and_still_paints_both_buttons() {
-        // The footer wraps rather than clipping, so the overlay has to
-        // reserve the rows it wrapped onto — and it raises `max_pad_h`
-        // to 8, so the reservation must ask at *that* padding.  A flat
-        // one-row reservation leaves Save unpainted while Tab still
-        // focuses it.
+        // The footer reservation must be computed at KEYBINDS_MAX_PAD_H, not the default.
         let mut state = open();
         let contents = render(&mut state, 20, 24);
         assert!(contents.contains("[ Cancel ]"), "{contents}");
@@ -1519,7 +1304,6 @@ mod tests {
     fn click_on_binding_row_focuses_and_arms_capture() {
         let mut state = open();
         render(&mut state, 80, 40);
-        // Find the cached rect for Action::Copy and click inside it.
         let (row_idx, rect) = state
             .row_hit_rects
             .iter()
@@ -1544,12 +1328,10 @@ mod tests {
         assert!(state.focus_action(&Action::Save));
         state.handle_key(&key(KeyCode::Enter));
         assert!(state.capturing);
-        // A click on the Save button mid-capture must NOT save.
         let save_rect = state.save_button_rect.expect("Save rect populated");
         let resp = state.handle_click(save_rect.x + 2, save_rect.y);
         assert!(matches!(resp, KeybindsResponse::Continue));
         assert!(state.capturing, "non-esc clicks must not exit capture");
-        // A click on the Esc hint mid-capture cancels capture only.
         let esc_rect = state.esc_button_rect.expect("Esc rect populated");
         let resp = state.handle_click(esc_rect.x, esc_rect.y);
         assert!(matches!(resp, KeybindsResponse::Continue));

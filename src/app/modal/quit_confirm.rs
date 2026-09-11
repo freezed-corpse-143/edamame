@@ -1,7 +1,4 @@
-//! Two buttons: Save / Discard.  Save persists the buffer then exits;
-//! failure surfaces a sticky error transient and aborts the quit.
-//! Discard exits without saving.  Escape (or the `esc` close hint)
-//! dismisses without quitting.
+//! Quit-confirm modal: Save / Discard.  A failed save aborts the quit; Escape dismisses it.
 
 use std::any::Any;
 
@@ -22,9 +19,7 @@ pub struct QuitConfirmModal {
 }
 
 impl QuitConfirmModal {
-    /// Build the prompt body with the supplied display name (typically
-    /// the buffer's filename, or "Current buffer" when unsaved with
-    /// no path).
+    /// `display_name` is the buffer's filename, or "Current buffer" when it has no path.
     pub fn new(display_name: &str) -> Self {
         let body = vec![
             Line::raw(format!("{display_name} has unsaved changes.")),
@@ -38,9 +33,7 @@ impl QuitConfirmModal {
         }
     }
 
-    /// Map a resolved response to an outcome.  Shared by the key and
-    /// click paths so a mouse click on a button behaves exactly like
-    /// pressing it.
+    /// Shared by the key and click paths so a click behaves exactly like pressing the button.
     fn resolve(&mut self, response: ModalResponse) -> ModalOutcome {
         match response {
             ModalResponse::Continue => ModalOutcome::Continue,
@@ -52,9 +45,7 @@ impl QuitConfirmModal {
                         Err(_) => app.notify("Save failed — quit aborted", ModalKind::Error),
                     }
                 } else {
-                    // No path yet — prompt for one, then quit once the
-                    // buffer is written.  Cancelling the prompt aborts
-                    // the quit, leaving the buffer intact.
+                    // No path yet — prompt for one; cancelling the prompt aborts the quit.
                     app.open_save_as_modal(Some(Box::new(|app| app.should_quit = true)));
                 }
             })),
@@ -117,10 +108,7 @@ impl Modal for QuitConfirmModal {
 
 #[cfg(test)]
 mod tests {
-    //! App-level wiring for the quit-confirm modal.  Driving
-    //! `App::open_quit_confirm` and `App::dispatch_modal_key` directly
-    //! exercises both the push and the per-button outcome without
-    //! standing up the event loop.
+    //! App-level wiring, driven through `App` directly rather than the event loop.
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -132,8 +120,6 @@ mod tests {
         let mut app = make_app();
         app.open_quit_confirm();
         assert!(app.modal_stack.contains::<QuitConfirmModal>());
-        // Button-label invariants are covered by the QuitConfirmModal
-        // constructor; here we just assert the modal is on the stack.
     }
 
     #[test]
@@ -147,10 +133,7 @@ mod tests {
 
     #[test]
     fn click_on_esc_hint_dismisses_modal() {
-        // Exercises `App::dispatch_modal_click` end-to-end: render the
-        // modal once to populate `state.esc_button_rect`, then click
-        // inside that rect.  The modal must close via the same
-        // pop-dispatch-push pipeline used by real mouse events.
+        // Render once to populate `state.esc_button_rect`, then click inside it.
         use crate::app::modal::types::ModalRenderCtx;
         use crate::config::{Config, Theme};
         use ratatui::backend::TestBackend;
@@ -183,11 +166,9 @@ mod tests {
             .and_then(|m| m.chrome.state.esc_button_rect)
             .expect("esc rect populated after render");
 
-        // Click outside the rect first — modal stays open.
         app.dispatch_modal_click(0, 0);
         assert!(app.modal_stack.contains::<QuitConfirmModal>());
 
-        // Click inside the rect — modal closes via the click router.
         app.dispatch_modal_click(rect.x, rect.y);
         assert!(!app.modal_stack.contains::<QuitConfirmModal>());
         assert!(!app.should_quit, "esc-click must not trigger Save/Discard");
@@ -198,7 +179,7 @@ mod tests {
         let mut app = make_app();
         app.editor.dirty = true;
         app.open_quit_confirm();
-        // Tab onto the Discard button (index 1) and press Enter.
+        // Tab onto Discard (index 1), then Enter.
         app.dispatch_modal_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 40, 80);
         app.dispatch_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 40, 80);
         assert!(!app.modal_stack.contains::<QuitConfirmModal>());
@@ -207,11 +188,7 @@ mod tests {
 
     #[test]
     fn click_on_discard_button_quits() {
-        // Fix A end-to-end: a left-click on the rendered `[ Discard ]`
-        // footer button drives the same Discard outcome as Tab+Enter,
-        // through the real pop-dispatch-push click router.  Before the
-        // shared chrome hit-tested footer buttons, this click was a
-        // no-op.
+        // Regression: before the shared chrome hit-tested footer buttons, this click was a no-op.
         use crate::app::modal::types::ModalRenderCtx;
         use crate::config::{Config, Theme};
         use ratatui::backend::TestBackend;
@@ -238,7 +215,7 @@ mod tests {
             })
             .unwrap();
 
-        // Button index 1 is [ Discard ]; click its centre.
+        // Button index 1 is [ Discard ].
         let rect = app
             .modal_stack
             .top_mut()

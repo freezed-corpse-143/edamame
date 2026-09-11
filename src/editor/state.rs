@@ -14,16 +14,12 @@ use crate::search::SearchState;
 
 // ── Cursor blink ─────────────────────────────────────────────────────
 
-/// Fallback blink cadence used when no config value is supplied (e.g.
-/// `CursorBlink::default()` in tests).  Mirrors `EditorConfig`'s
-/// `cursor_blink_ms` default so behaviour matches a fresh install.
+/// Fallback blink cadence when no config value is supplied.  Mirrors `EditorConfig`'s
+/// `cursor_blink_ms` default so behavior matches a fresh install.
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
-/// Tracks the on/off phase of a blinking cursor.
-///
-/// When `blinking` is true the cursor alternates between visible and hidden
-/// on the `interval` cadence.  Any cursor movement resets the phase to
-/// visible so the cursor is always immediately apparent after a keypress.
+/// On/off phase of a blinking cursor.  Any cursor movement resets the phase to visible, so the
+/// cursor is immediately apparent after a keypress.
 #[derive(Debug, Clone)]
 pub struct CursorBlink {
     blinking: bool,
@@ -44,9 +40,8 @@ impl Default for CursorBlink {
 }
 
 impl CursorBlink {
-    /// Build from config: `blinking` toggles the effect on/off and
-    /// `interval_ms` sets the cadence.  A zero `interval_ms` falls back
-    /// to the default cadence so a stray `0` can't spin the redraw loop.
+    /// A zero `interval_ms` falls back to [`BLINK_INTERVAL`] so a stray `0` can't spin the redraw
+    /// loop.
     pub fn from_config(blinking: bool, interval_ms: u64) -> Self {
         let interval = if interval_ms == 0 {
             BLINK_INTERVAL
@@ -61,9 +56,8 @@ impl CursorBlink {
         }
     }
 
-    /// Re-apply config to an existing blink so the settings-overlay
-    /// toggle takes effect live.  Resets the phase to visible so the
-    /// cursor reappears immediately when blinking is turned off.
+    /// Re-apply config live (settings overlay), resetting the phase so the cursor reappears
+    /// immediately when blinking is turned off.
     pub fn apply_config(&mut self, blinking: bool, interval_ms: u64) {
         self.blinking = blinking;
         if interval_ms != 0 {
@@ -72,12 +66,9 @@ impl CursorBlink {
         self.reset();
     }
 
-    /// Whether blinking is turned on at all, independent of the current
-    /// phase.  `is_visible` folds the two together for painting; this
-    /// exposes just the configured half, so a test can assert that a
-    /// freshly built `EditorState` picked the setting up (the two sites
-    /// that build one have drifted on exactly this before — see
-    /// `app::configure_new_editor`).
+    /// Just the configured half — `is_visible` folds phase in.  Split out so a test can assert a
+    /// freshly built `EditorState` picked the setting up; the two construction sites have drifted
+    /// on exactly this before.
     pub fn is_blinking(&self) -> bool {
         self.blinking
     }
@@ -87,15 +78,13 @@ impl CursorBlink {
         !self.blinking || self.visible
     }
 
-    /// Reset the blink cycle: cursor becomes visible and the timer restarts.
-    /// Call this whenever the cursor moves or an edit occurs.
+    /// Make the cursor visible and restart the timer.  Call on any cursor move or edit.
     pub fn reset(&mut self) {
         self.visible = true;
         self.last_toggle = Instant::now();
     }
 
-    /// Advance the blink state.  Returns `true` if visibility changed
-    /// (i.e. a redraw is needed).
+    /// Advance the blink state; `true` when visibility changed and a redraw is needed.
     pub fn tick(&mut self) -> bool {
         if !self.blinking {
             return false;
@@ -109,8 +98,7 @@ impl CursorBlink {
         }
     }
 
-    /// The `Instant` at which the next toggle will fire, or `None` when
-    /// blinking is disabled.
+    /// When the next toggle fires, or `None` when blinking is disabled.
     pub fn next_toggle(&self) -> Option<Instant> {
         if self.blinking {
             Some(self.last_toggle + self.interval)
@@ -122,344 +110,236 @@ impl CursorBlink {
 
 // ── Image reveal ─────────────────────────────────────────────────────
 
-/// The row reservation the raw-source reveal wants for the one image block
-/// the cursor is resting in.  See [`EditorState::image_reveal`].
+/// The row reservation the raw-source reveal wants for the image block the cursor rests in.  See
+/// [`EditorState::image_reveal`].
 ///
-/// **The block is identified by `ordinal` *and* `url`, and both halves are
-/// load-bearing.**  The renderer's override callback is reached once per
-/// image block with exactly those two facts, and matching on the URL alone
-/// collapses *every* block sharing it — a document that repeats one image
-/// (a logo in a header and a footer) would shrink its other copies to the
-/// revealed block's line count and jump the text below them, for as long as
-/// the cursor rested here.  The URL is kept alongside as a staleness check:
-/// a reservation held across an in-line edit (see
-/// `EditorState::image_reveal_target`) can end up naming a block that is no
-/// longer an image, and requiring both means such a pair simply matches
-/// nothing and every block keeps its natural height, rather than the
-/// ordinal silently sliding onto the next image.
+/// **Both `ordinal` and `url` are load-bearing.**  Matching on the URL alone would collapse every
+/// block sharing it (one logo used twice).  The URL is the staleness check: a reservation held
+/// across an in-line edit can name a block that is no longer an image, and requiring both means
+/// such a pair matches nothing rather than sliding onto the next image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImageReveal {
-    /// Index of the block among the document's image blocks, in document
-    /// order — the same index space as `ParsedDoc::image_blocks`.
+    /// Index into `ParsedDoc::image_blocks`.
     pub(crate) ordinal: usize,
-    /// The block's image URL: a `![alt](url)` target, or a diagram's
-    /// synthetic `diagram-mermaid-<sha256>` key.
+    /// A `![alt](url)` target, or a diagram's synthetic `diagram-mermaid-<sha256>` key.
     pub(crate) url: String,
-    /// Rendered rows to reserve: one per revealed raw source line.
+    /// Rendered rows to reserve for the raw-source reveal: one per
+    /// revealed raw source line.
     pub(crate) rows: usize,
+    /// Rows reserved for a live rendering of the formula, painted as a
+    /// band at the block's **top** with the editable raw source below it —
+    /// so the formula keeps the position it had before the reveal opened
+    /// instead of jumping down under the source.  Non-zero only for
+    /// `$$...$$` math blocks, and only when `EditorState::math_preview` is
+    /// on (a preview is useless for mermaid — the whole point of its reveal
+    /// is seeing the source — and ordinary images have a single source
+    /// line).  Math formulas re-render on every keystroke, so this is how
+    /// the user watches the formula take shape while typing.  The editor
+    /// override reserves `preview_rows + rows`; `ParsedDoc::math_source_offset`
+    /// records the band so the row ⇄ source-line mapping paints the source
+    /// beneath it.
+    pub(crate) preview_rows: usize,
 }
 
-/// All mutable state owned by the editor.
-///
-/// `EditorState` is the single source of truth for the document contents,
-/// cursor position, selection, undo/redo history, and current mode.
-/// It is mutated by `edit_ops::apply()` and read by the UI layer.
+/// All mutable state owned by the editor: the single source of truth for document contents,
+/// cursor, selection, history, and mode.  Mutated by `edit_ops::apply`, read by the UI layer.
 pub struct EditorState {
     pub buffer: Buffer,
     pub cursor: Cursor,
     pub selection: Option<Selection>,
-    /// Preview-mode selection in rendered (visible) coordinates.  Populated
-    /// only when `mode == Mode::Preview` — switching to Rendered or Raw
-    /// clears it because those modes drive selection from the raw buffer.
+    /// Preview-mode selection in rendered coordinates; cleared on a switch to Rendered or Raw,
+    /// which select from the raw buffer instead.
     pub visual_selection: Option<VisualSelection>,
     pub history: History,
     pub mode: Mode,
     pub parsed: ParsedDoc,
-    /// Whether the buffer has unsaved changes since last save.
+    /// Unsaved changes since the last save.
     ///
-    /// Autosave keys off the pair `(dirty, Buffer::version())` —
-    /// `App::tick_autosave` arms its debounce timer whenever the
-    /// version bumps *and* `dirty` is true, and clears the pending
-    /// timer when `dirty` flips back to false.  Any future code path
-    /// that clears `dirty` without going through a save (e.g. a
-    /// "discard changes" / revert action) is fine, but a path that
-    /// sets `dirty = true` without bumping `Buffer::version()` would
-    /// silently never trigger autosave — keep the two in lockstep.
+    /// Autosave keys off the pair `(dirty, Buffer::version())`, so a path that sets `dirty = true`
+    /// without bumping `Buffer::version()` would silently never autosave — keep the two in
+    /// lockstep.  Clearing `dirty` without a save (a revert) is fine.
     pub dirty: bool,
-    /// Internal clipboard (kill-ring). Used as fallback when arboard is
-    /// unavailable.
+    /// Internal clipboard, used when arboard is unavailable.
     pub kill_ring: String,
     /// Scroll offset in visual rows for the active mode.
     pub scroll: usize,
-    /// Block index the cursor is currently inside (used for jitter suppression).
+    /// Block the cursor is inside; used for reveal jitter suppression.
     pub cursor_block_idx: Option<usize>,
-    /// Buffer line index the cursor is currently on (used to reset the reveal
-    /// timer per logical line rather than per block).
+    /// Cursor's buffer line, so the reveal timer resets per logical line rather than per block.
     pub cursor_line_idx: Option<usize>,
-    /// When the cursor last moved to a new buffer line. The raw/de-rendered view
-    /// for the cursor block is shown only after `RAW_REVEAL_DELAY` has elapsed
-    /// without further movement on the same line, preventing jitter when scrolling
-    /// quickly through multi-line elements such as tables.
+    /// When the cursor last moved to a new buffer line.  The raw reveal waits `RAW_REVEAL_DELAY`
+    /// without further movement, which is what stops multi-line elements flickering under fast
+    /// cursor movement.
     pub cursor_block_entered_at: Option<Instant>,
-    /// When the last click-driven table row / column delete landed.
-    ///
-    /// Guards the `✕` handles against an accidental double-click on one
-    /// button without ever going permanently dead.  The multi-click chord
-    /// can't do this job: its window restarts on every press, so under
-    /// sustained clicking it never expires and every press after the first
-    /// is swallowed forever.  Anchoring to the delete itself means a
-    /// deliberate repeat always gets through one `TABLE_DELETE_COOLDOWN`
-    /// later, however fast the user is clicking.  Stamped by
-    /// `mouse_ops::table_drag`'s two delete helpers, and only on a delete
-    /// that actually applied.
+    /// Latch for a "reveal as one unit" block (a mermaid diagram or a reflowed paragraph): once
+    /// such a block reveals on a dwell it stays revealed while the cursor is inside it, even as
+    /// line moves re-arm [`Self::cursor_block_entered_at`].  So scrolling *through* one never
+    /// reveals it (the delay re-arms per line like every other block), a dwell does, and moving
+    /// within a revealed one never flashes it collapsed.  Reset on crossing into another block
+    /// ([`Self::update_cursor_block`]); set by [`Self::latch_cursor_reveal`].
+    pub cursor_reveal_latched: bool,
+    /// When the last click-driven table row / column delete landed, guarding the `✕` handles
+    /// against an accidental double-click.  Anchored to the delete rather than the multi-click
+    /// chord, whose window restarts on every press and so would never expire under sustained
+    /// clicking.  Stamped only on a delete that actually applied.
     pub last_table_delete_at: Option<Instant>,
-    /// True while a mouse click-and-drag is in progress.  While true the
-    /// cursor's block is never de-rendered, so the user's drag selection
-    /// stays anchored to the rendered characters they clicked on — if the
-    /// block reveals to raw mid-drag, the visible columns shift and the
-    /// anchor would jump.
+    /// While a drag is in progress the cursor's block is never de-rendered: revealing raw
+    /// mid-drag would shift the visible columns and jump the selection anchor.
     pub drag_in_progress: bool,
-    /// Optional theme reference — used to re-render after edits.
+    /// Theme the rendered lines were produced with.
     theme: &'static Theme,
     /// Whether to preserve multiple consecutive blank lines between blocks.
     preserve_blank_lines: bool,
-    /// Whether Up/Down navigate by visual lines (true) or logical lines (false).
+    /// Whether Up/Down navigate by visual lines rather than logical ones.
     pub visual_line_nav: bool,
-    /// Ceiling (in rendered rows) for each `Block::ImageBlock` — propagated
-    /// from `Config::image::max_height` so the renderer, navigation, and
-    /// `image_view::paint_images` all agree on the reserved row count.
+    /// Row ceiling per `Block::ImageBlock`, from `Config::image::max_height`, so renderer,
+    /// navigation, and `image_view::paint_images` agree on the reservation.
     pub image_max_height: usize,
-    /// Ceiling (in rendered cells) for the horizontal extent of an
-    /// image block's bounding box.  Used alongside `image_max_height`
-    /// and `image_font_size` to compute the aspect-aware row count per
-    /// decoded image — wide images reserve fewer rows than
-    /// `image_max_height` because they fit in width before height.
+    /// Cell ceiling on an image block's width.  With `image_max_height` and `image_font_size` it
+    /// gives the aspect-aware row count — a wide image fits in width first and reserves fewer rows.
     pub image_max_width: usize,
-    /// Font size (width, height) in pixels reported by the detected
-    /// image picker.  Default `(10, 20)` mirrors
-    /// `Picker::from_fontsize`'s Halfblocks default.  Together with
-    /// `image_max_width × image_max_height` this sets the bounding box
-    /// in pixels used for aspect-aware row computation.
+    /// Font size in pixels from the detected image picker; the default mirrors
+    /// `Picker::from_fontsize`'s Halfblocks default.
     pub image_font_size: (u16, u16),
-    /// Decoded-image cache keyed by URL, retained across reparses so
-    /// ordinary edits don't invalidate the expensive `StatefulProtocol`
-    /// encoding.  Populated by the App's image-decode worker thread via
-    /// `AppEvent::ImageReady` / `AppEvent::ImageFailed`.
+    /// Decoded-image cache keyed by URL, retained across reparses so ordinary edits don't
+    /// invalidate the expensive `StatefulProtocol` encoding.  Filled by the decode worker.
     pub images: ImageCache,
-    /// When `false`, every image block collapses to its one-line
-    /// `[Image: alt]` placeholder — the row override short-circuits to
-    /// `Some(1)` so no blank rows are reserved.  Set by the App when the
-    /// user declines image rendering (images-enabled prompt `No` /
-    /// `Never`, or `config.images.enabled = "never"`).  Default `true`
-    /// preserves the cache-driven layout for tests and for the `Ask` /
-    /// `Always` paths.
+    /// When `false`, every image block collapses to its one-line `[Image: alt]` placeholder.  Set
+    /// by the App when the user declines image rendering.
     pub images_enabled: bool,
-    /// Counterpart to [`Self::images_enabled`] for diagram blocks
-    /// (mermaid, etc.).  Image blocks whose `source` field is `Some(_)`
-    /// honour this flag instead of `images_enabled` — so a user can opt
-    /// in to images but not diagrams (or vice-versa).  Default `true`.
+    /// [`Self::images_enabled`]'s counterpart for diagram blocks, so a user can opt in to images
+    /// but not diagrams.  Image blocks with a `source` honor this instead.
     pub diagrams_enabled: bool,
-    /// Monotonically-increasing version counter, bumped every time
-    /// `refresh_parsed` rebuilds the `ParsedDoc` **and** on every deferred
-    /// in-line edit (which leaves `parsed` stale but changes the cursor
-    /// block's geometry).  Consumed by the view state to invalidate
-    /// per-frame snapshot caches only when the parse tree — or the text
-    /// the reveal paints over it — actually changed; a scroll-only change
-    /// leaves the version alone, so `build_snapshots` can reuse the
-    /// previous frame's geometry.  Because the deferred path moves it, this
-    /// is the wrong key for a cache derived from the parse tree *alone* —
-    /// keying on it rebuilds per keystroke for a document whose parse hasn't
-    /// changed.  Such a cache belongs on `ParsedDoc` itself, where a reparse
-    /// drops it by construction (see `ParsedDoc::source_lines`).
+    /// Bumped on every `refresh_parsed` **and** on every deferred in-line edit (which leaves
+    /// `parsed` stale but changes the cursor block's geometry), so the view's per-frame snapshot
+    /// caches invalidate exactly when the painted geometry changed.
+    ///
+    /// Because the deferred path moves it, this is the *wrong* key for a cache derived from the
+    /// parse tree alone — that would rebuild per keystroke.  Such a cache belongs on `ParsedDoc`,
+    /// where a reparse drops it by construction.
     pub parsed_version: u64,
-    /// Live-preview scratch for the column-resize drag.  When
-    /// `Some((table_byte_start, widths))`, the table whose first row begins
-    /// at `table_byte_start` renders with `widths` applied as a
-    /// `user_widths` override — without touching the buffer.  Cleared on
-    /// release (when the drag commits via `write_column_widths`) or on any
-    /// non-resize action that invalidates the drag.
+    /// Live-preview scratch for a column-resize drag: the table at `table_byte_start` renders
+    /// with these widths without the buffer being touched.  Cleared on commit or cancel.
     pub live_table_widths: Option<(usize, Vec<Option<usize>>)>,
-    /// Propagated from `config.table.row_striping`.  Controls
-    /// whether the renderer fills alternating data rows with
-    /// `Theme::table_row_even` / `Theme::table_row_odd`.  Set by the App
-    /// at construction time and re-read on every `refresh_parsed`.
+    /// From `config.table.row_striping`; re-read on every `refresh_parsed`.
     pub row_striping: bool,
-    /// Propagated from `config.editor.big_h1`.  Controls whether H1
-    /// headings render as 4-row "big text" via `tui-big-text` (Quadrant
-    /// pixel size).  Set by the App at construction time and re-read on
-    /// every `refresh_parsed`.
+    /// From `config.editor.big_h1`; re-read on every `refresh_parsed`.
     pub big_h1: bool,
-    /// Propagated from `config.editor.syntax_highlighting`.  Controls
-    /// whether fenced code blocks are tokenized by
-    /// `markdown::highlight`.  Set by the App at construction time (via
-    /// `app::configure_new_editor`, so a document opened mid-session
-    /// gets it too) and re-read on every `refresh_parsed`.
+    /// From `config.editor.syntax_highlighting`; re-read on every `refresh_parsed`.
     pub syntax_highlighting: bool,
-    /// Most-recently observed terminal column width, fed
-    /// into `Renderer::with_viewport_width` on every `refresh_parsed`
-    /// so the min-max proportional column-width algorithm adapts to
-    /// the user's actual viewport.  Set to a sensible 80 default until
-    /// the App posts the real width via [`Self::set_viewport_width`].  Stored
-    /// in the editor (rather than threaded as a parameter through
-    /// `refresh_parsed`) so call-sites that don't know the width — e.g.
-    /// undo/redo, paste, file load — pick up the cached value.
+    /// Propagated from `config.figures.math_preview`.  When true, a revealed `$$...$$` block keeps
+    /// the rendered formula in place and opens its raw source below it (`ImageReveal::preview_rows`);
+    /// when false the reveal shows the source alone, like a mermaid fence.  Set at construction and
+    /// pushed live via [`Self::set_math_preview`]; a bare `EditorState` defaults it off (the
+    /// on-by-default value lives in `FiguresConfig::default`).
+    pub math_preview: bool,
+    /// Most-recent document-area width, fed to the renderer on every `refresh_parsed` so table
+    /// column widths adapt to the viewport.  Stored here rather than threaded as a parameter so
+    /// call sites that don't know the width — undo/redo, paste, file load — pick up the cached
+    /// value.  Defaults to 80 until the App posts the real width.
     pub viewport_width: usize,
-    /// Set on the Release event of a column-border drag, this
-    /// flags the App to either commit the in-progress `live_table_widths`
-    /// (writing the `tui-columns` comment to the buffer) or open the
-    /// width-injection warning modal.  Carries the `table_byte_start` of
-    /// the table whose widths are pending.  Cleared by
+    /// Set on a column-drag release: the App must either commit `live_table_widths` or open the
+    /// width-injection warning.  Carries the table's `table_byte_start`; cleared by
     /// [`Self::commit_pending_column_widths`] / [`Self::cancel_pending_column_widths`].
     pub pending_column_widths_commit: Option<usize>,
-    /// Mouse-ops and edit-ops set this when a click / keypress
-    /// requests a link be followed.  The App consumes it on the next
-    /// loop iteration and dispatches to its own navigation stack /
-    /// worker threads.  Storing the intent on `EditorState` keeps
-    /// `mouse_ops::apply` pure w.r.t. its `&mut EditorState` contract —
-    /// it doesn't need an extra out-parameter or a reference to the App.
+    /// A requested link follow, consumed by the App on the next loop iteration.  Parking the
+    /// intent here keeps `mouse_ops::apply` to its `&mut EditorState` contract.
     pub pending_link_follow: Option<crate::editor::link::LinkTarget>,
-    /// `true` when one or more in-line edits (no newline added or
-    /// removed) have been applied since the last `refresh_parsed`,
-    /// leaving `parsed` stale.  The rendered view keeps the cursor
-    /// block displayed raw from the buffer — independent of
-    /// `source_map` byte ranges — so the staleness is invisible
-    /// until the user moves off the line (or a mouse click / other
-    /// parse-dependent path consults `flush_parsed_if_dirty`).
-    /// Cross-line edits (newline insert, backspace-at-line-start)
-    /// call `refresh_parsed` immediately instead of setting this.
+    /// Set when an in-line edit (no newline added or removed) has left `parsed` stale.  The
+    /// rendered view paints the cursor block raw from the buffer, so the staleness is invisible
+    /// until a parse-dependent path calls [`Self::flush_parsed_if_dirty`].  Cross-line edits
+    /// re-parse immediately instead.
     pub parsed_dirty: bool,
-    /// Buffer line range of the block that currently contains the
-    /// cursor, as of the last `update_cursor_block`.  Stable across
-    /// in-line typing (no newlines → line indices don't shift), so
-    /// the rendered view can extract the cursor block's raw text
-    /// from the live buffer without consulting the stale
-    /// `source_map`.  `None` for empty documents / uninitialized state.
+    /// Whether the current `parsed` was built with paragraph reflow on.  Reflow depends on the
+    /// mode (`want_reflow`: on in Preview and Rendered, off in Raw), but `parsed` is one
+    /// mode-independent spine, so a mode switch that changes it must reparse.
+    /// [`Self::sync_reflow_for_mode`] compares this against the mode each frame.
+    parsed_reflow: bool,
+    /// Master switch for paragraph reflow (soft breaks → spaces, wrapped as one flow), from
+    /// `config.editor.reflow`.  On by default.  Gates both Preview and Rendered (in Rendered the
+    /// revealed cursor block expands to its raw lines via `EffectiveRows`); Raw and Diff never
+    /// reflow.  See `docs/dev/plans/paragraph-reflow.md`.
+    pub(crate) reflow: bool,
+    /// Whether the cursor block was reflow-revealed last frame.  A change means the block's
+    /// height just toggled under a cursor that no keypress moved, which is when
+    /// [`Self::anchor_reflow_reveal`] re-checks cursor visibility.  Inert unless [`Self::reflow`]
+    /// is on.
+    prev_reflow_has_reveal: bool,
+    /// Memo for the reveal patch [`Self::effective_rows`] hands out.  Building it allocates the
+    /// revealed block's source and measures each raw line's wrap; the viewport, scrollbar, cursor
+    /// row, and gutter each query `effective_rows` per frame, so without this that work repeats
+    /// several times a frame.  `RefCell` because `effective_rows` runs behind `&self` (widgets
+    /// query it mid-render).  Keyed on `parsed_version`, so a reparse invalidates it implicitly.
+    effective_cache: std::cell::RefCell<crate::editor::effective_rows::EffectiveRowsCache>,
+    /// Buffer line range of the cursor's block as of the last `update_cursor_block`.  Stable
+    /// across in-line typing, which is what lets the rendered view read the block's raw text from
+    /// the live buffer without consulting the stale `source_map`.
     pub cursor_block_line_range: Option<std::ops::Range<usize>>,
-    /// Blink state for the cursor.  The App ticks this before each
-    /// draw and threads `cursor_visible()` into the view layer.
+    /// Blink state, ticked by the App before each draw.
     pub cursor_blink: CursorBlink,
-    /// Set by the App before each draw: `true` when any modal overlay
-    /// is visible.  While set, the editor cursor is solid (ignores
-    /// blink) and the modal cursor follows `cursor_blink`.
+    /// Set by the App when a modal overlay is visible: the editor cursor goes solid and the modal
+    /// cursor takes over the blink.
     pub modal_open: bool,
-    /// Whether the host terminal window currently has focus.  Driven by
-    /// `Event::FocusGained` / `Event::FocusLost` (xterm `CSI ?1004h`).
-    /// Defaults to `true` because terminals don't emit a FocusGained at
-    /// startup — the window that just launched us is presumed focused.
-    /// While `false`, `cursor_visible()` returns false so the in-buffer
-    /// cursor disappears.
+    /// Terminal window focus, from `Event::FocusGained` / `FocusLost`.  Defaults to `true` because
+    /// terminals emit no FocusGained at startup.  While `false` the in-buffer cursor disappears.
     pub terminal_focused: bool,
-    /// Lazy per-(buffer-version, viewport-width) cache of wrapped row
-    /// counts for the raw view.  Mirrors `ParsedDoc::visual_rows` for
-    /// rendered mode but lives on `EditorState` because raw mode reads
-    /// directly from the buffer.  Without it, every scroll event in raw
-    /// mode runs the wrap algorithm over every line of the document
-    /// twice (`raw_total_visual_rows` plus `raw_line_at_visual_row`),
-    /// which saturates a CPU core on long files when many trackpad-wheel
-    /// events queue up.  `RefCell` because `&EditorState` callers in the
-    /// view layer need shared access; `EditorState` is single-threaded.
+    /// Lazy per-(buffer-version, viewport-width) cache of wrapped row counts for the raw view —
+    /// `ParsedDoc::visual_rows`'s counterpart, living here because raw mode reads the buffer
+    /// directly.  Without it every raw-mode scroll event re-wraps the whole document twice, which
+    /// saturates a core on long files under queued wheel events.  `RefCell` because the view layer
+    /// holds only `&EditorState`.
     pub(crate) raw_visual_rows: RefCell<Vec<RawVisualRowCache>>,
-    /// Inline-diff review session.  `Some` iff `mode == Mode::Diff`;
-    /// the invariant is asserted in `enter_diff_mode` /
-    /// `exit_diff_mode` and enforced indirectly by the App's
-    /// `dispatch_action` (which only emits `Mode::Diff` after
-    /// `enter_diff_mode` returns successfully).
+    /// Inline-diff review session; `Some` iff `mode == Mode::Diff`.
     pub diff: Option<DiffState>,
-    /// Scroll offset saved on `enter_diff_mode` and restored on
-    /// `exit_diff_mode`.  Diff mode resets `scroll` to 0 on entry so
-    /// the user lands at the top of the diff view; restoring on exit
-    /// returns the user to where they were in the live buffer.
+    /// Scroll saved on `enter_diff_mode` and restored on exit, since diff mode zeroes `scroll` to
+    /// land the user at the top of the review.
     pub pre_diff_scroll: usize,
-    /// Set by `enter_diff_mode`; consumed on the next frame by the run
-    /// loop (`App::prepare_viewport`) to scroll the first focused hunk
-    /// into view.  Deferred because the viewport height isn't known at
-    /// the modal-close call site where diff mode is entered.
+    /// Requests a scroll-to-focused-hunk on the next frame.  Deferred because the viewport height
+    /// isn't known where diff mode is entered.
     pub pending_focus_scroll: bool,
-    /// Active search-and-replace flow.  Unlike `diff`, an active search
-    /// does NOT change `mode` — the document keeps rendering in the
-    /// current view mode with match highlights painted on top.  The
-    /// flow is gated on `search.is_some()`: the input handler
-    /// intercepts the flow keys (`search::search_keys`) and the App's
-    /// `search_safe_action` default-denies everything else.
+    /// Active search-and-replace flow.  Unlike `diff` it does *not* change `mode` — the document
+    /// keeps rendering with highlights on top.  While `Some`, the input handler intercepts the
+    /// flow keys and `search_safe_action` default-denies everything else.
     pub search: Option<SearchState>,
-    /// True for a document that cannot be edited — today, a pathless
-    /// page opened out of the embedded manual (`crate::docs`).
+    /// True for a document that cannot be edited — today, a page out of the embedded manual.
     ///
-    /// **The flag does two things, and they are one decision.**  It
-    /// pins the editor in [`Mode::Preview`], which is already this
-    /// codebase's browse-only presentation — no cursor drawn, no raw
-    /// reveal, and `mouse_ops::apply_preview_action` refusing the
-    /// checkbox toggle and the table handles — and it makes
-    /// `edit_ops::enter_edit_if_preview` refuse the transition out of
-    /// it, which turns all twenty-six of that function's call sites
-    /// into no-ops at once.  [`EditorState::apply_delta`] is the second
-    /// backstop, for text rather than for mode.
+    /// It pins the editor in [`Mode::Preview`] (already the browse-only presentation) by making
+    /// `edit_ops::enter_edit_if_preview` refuse the transition, which no-ops all of that
+    /// function's call sites at once; [`Self::apply_delta`] is the second backstop, for text
+    /// rather than mode.  The App reads it too, but only to refuse politely — the *guarantee* is
+    /// made here, below every input path.
     ///
-    /// The App reads it too (`actions::readonly_safe_action`), but only
-    /// to refuse politely — a `Save` that would otherwise detour into a
-    /// Save-as prompt for a document nobody can own.  The *guarantee*
-    /// is made here, below every input path.
-    ///
-    /// Deliberately a bare flag rather than a `DocId`: `editor` is
-    /// layer 5 and has no business knowing what documentation *is*.
-    /// It learns only the fact, exactly as it learns `search` /`diff`
-    /// as opaque session state the App sets.  It is also not a `Mode` —
-    /// a doc page renders in the ordinary Preview / Rendered / Raw
-    /// views, and a fourth variant would force an "effective view
-    /// mode" indirection through every render-dispatch site, the same
-    /// reason the search flow is not one.
+    /// Deliberately a bare flag rather than a `DocId` (layer 5 has no business knowing what
+    /// documentation is) and not a fourth `Mode` (a doc page renders in the ordinary three views).
     pub readonly: bool,
-    /// Recently-yanked span, painted as a brief highlight "flash" to
-    /// confirm the copy (neovim-style).  Armed by `flash_yank` on every
-    /// `y` operator and cleared once its window elapses by the App's
-    /// `tick_timers`.  Independent of `mode` and `search` — it is a
-    /// transient visual overlay, not a flow.  See `editor::yank_flash`.
+    /// Recently-yanked span, painted as a brief highlight to confirm the copy.  A transient
+    /// overlay, not a flow — independent of `mode` and `search`.  See `editor::yank_flash`.
     pub yank_flash: Option<YankFlash>,
-    /// Live `:s` substitution preview (neovim's `inccommand=nosplit`),
-    /// active exactly while the vim `:` command line holds a
-    /// complete-enough substitution.  The preview may have transiently
-    /// rewritten the buffer through the raw `Buffer` primitives — no
-    /// undo delta, `dirty` untouched — with the inverse edit stashed
-    /// inside.  While `Some`, autosave is suspended, mutating mouse ops
-    /// are gated, and search freshness/overlays are paused.  See
-    /// `editor::vim_ops::preview`.
+    /// Live `:s` substitution preview (neovim's `inccommand=nosplit`).  While `Some` the buffer
+    /// may have been transiently rewritten through the raw `Buffer` primitives — no undo delta,
+    /// `dirty` untouched — with the inverse edit stashed inside; autosave is suspended, mutating
+    /// mouse ops are gated, and search freshness is paused.  See `editor::vim_ops::preview`.
     pub substitute_preview: Option<SubstitutePreview>,
-    /// Row reservation for the image block whose raw source is currently
-    /// revealed.
+    /// Row reservation for the image block whose raw source is currently revealed.
     ///
-    /// A `Block::ImageBlock` reserves as many rendered rows as its image
-    /// occupies, which has nothing to do with how many source lines it was
-    /// written on — so the raw-source reveal is clipped to (or padded out
-    /// to) the image's height.  Both promoted diagrams and ordinary
-    /// `![alt](url)` images are affected, in opposite directions: a mermaid
-    /// fence holds many lines and a short-wide render clipped them, while a
-    /// one-line image reference left the rest of a tall reservation as dead
-    /// blank space around it.  While the cursor rests in such a block it
-    /// instead reserves exactly one row per raw source line and the
-    /// document reflows around it.  Kept in sync by
-    /// [`Self::sync_image_reveal`], which the run loop calls once per
-    /// frame; `refresh_parsed` feeds it to the renderer's row override.
+    /// An image block reserves as many rows as its *image* occupies, which has nothing to do with
+    /// how many source lines it was written on — so an unadjusted reveal clips a tall mermaid
+    /// fence and leaves dead space around a one-line `![alt](url)`.  While the cursor rests in
+    /// such a block it instead reserves one row per raw source line and the document reflows.
+    /// Kept in sync by [`Self::sync_image_reveal`] once per frame.
     pub(crate) image_reveal: Option<ImageReveal>,
-    /// Block-level render memoization threaded into every
-    /// `refresh_parsed`.  Blocks whose AST is unchanged since the previous
-    /// reparse reuse their rendered lines instead of re-rendering — the
-    /// renderer was the dominant pipeline cost for table-heavy and mixed
-    /// documents (see docs/dev/performance.md).  Keyed by block value
-    /// plus a render-settings fingerprint, so theme / width / striping
-    /// changes clear it automatically.
+    /// Block-level render memoization: blocks whose AST is unchanged reuse their rendered lines.
+    /// Keyed by block value plus a render-settings fingerprint, so theme / width / striping
+    /// changes clear it automatically.  See `docs/dev/performance.md`.
     render_cache: RenderCache,
-    /// Second render cache, used only for the diff view's rendered
-    /// new-side parse ([`Self::refresh_diff_parse`]).
-    ///
-    /// It cannot share [`Self::render_cache`]: the cache is keyed by
-    /// `Block` value plus a render-settings fingerprint, so two documents
-    /// in one cache collide on every identical block, and eviction is by
-    /// document membership per build — each parse would evict the other's
-    /// entries wholesale.  A dedicated instance pays for itself on the
-    /// first terminal-resize drag, which posts a new width nearly every
-    /// frame and would otherwise re-render the entire new side from
-    /// scratch while 95% of its blocks are trivially reusable.
+    /// A second cache, for the diff's rendered new-side parse only.  It cannot share
+    /// [`Self::render_cache`]: eviction is by document membership per build, so the two parses
+    /// would evict each other's entries wholesale on every frame of a resize drag.
     diff_render_cache: RenderCache,
-    /// `true` when the diff's rendered new-side parse is stale and must
-    /// be rebuilt before the next frame paints.  Set by
-    /// [`Self::enter_diff_mode`], which deliberately does *not* build the
-    /// parse itself: at that moment `viewport_width` still holds the
-    /// *editor* mode's document width, which differs whenever
-    /// `show_line_numbers` is on (`compute_doc_dims` reserves a gutter for
-    /// Preview / Rendered / Raw and none for `Mode::Diff`), so a parse
-    /// built there lays every table out against a width the diff view
-    /// never paints at.  `App::prepare_viewport` resolves it right after
-    /// posting the real width.
+    /// The diff's rendered new-side parse is stale.  Set by [`Self::enter_diff_mode`], which
+    /// deliberately does not build it: at that moment `viewport_width` still holds the *editor*
+    /// mode's width, which reserves a line-number gutter that diff mode does not, so a parse built
+    /// there lays every table out against a width this view never paints at.
     pub(crate) diff_parse_dirty: bool,
 }
 
@@ -467,15 +347,8 @@ pub struct EditorState {
 pub const RAW_REVEAL_DELAY: std::time::Duration = std::time::Duration::from_millis(120);
 
 impl EditorState {
-    /// Create an `EditorState` from a `Buffer` and a theme.  Used by
-    /// integration tests in `tests/`; production callers go through
-    /// `new_with_image_config` so the image layout uses real terminal data.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the theme reference has an insufficiently long lifetime.
-    /// Callers typically pass `Box::leak(Box::new(Theme::default()))` or a
-    /// static reference.
+    /// Test-only convenience; production callers use [`Self::new_with_image_config`] so image
+    /// layout uses real terminal data.
     #[allow(dead_code)]
     pub fn new(buffer: Buffer, theme: &'static Theme) -> Self {
         Self::new_with_config(buffer, theme, true, true, 24)
@@ -501,10 +374,8 @@ impl EditorState {
         )
     }
 
-    /// Full constructor with explicit image-layout inputs.  Callers that
-    /// know the probed font-size and configured max width (i.e. the App
-    /// after terminal capability detection) should use this so
-    /// aspect-aware row computation is driven by real values.
+    /// Full constructor.  The App uses this after capability detection so aspect-aware image row
+    /// computation runs on the probed font size and configured max width.
     pub fn new_with_image_config(
         buffer: Buffer,
         theme: &'static Theme,
@@ -530,6 +401,7 @@ impl EditorState {
             cursor_block_idx: None,
             cursor_line_idx: None,
             cursor_block_entered_at: None,
+            cursor_reveal_latched: false,
             last_table_delete_at: None,
             drag_in_progress: false,
             theme,
@@ -545,16 +417,20 @@ impl EditorState {
             live_table_widths: None,
             row_striping: false,
             big_h1: false,
-            // Off here, like `big_h1`: "on by default" is carried by
-            // `EditorConfig::default()` and applied through
-            // `app::configure_new_editor`, so a bare `EditorState`
-            // (tests, one-shot builds) renders code blocks exactly as it
-            // did before this feature existed.
+            // Off here, like `big_h1`: "on by default" is carried by `EditorConfig::default()`
+            // and applied through `app::configure_new_editor`.
             syntax_highlighting: false,
+            math_preview: false,
             viewport_width: 80,
             pending_column_widths_commit: None,
             pending_link_follow: None,
             parsed_dirty: false,
+            // Matches `ParsedDoc::build` above (reflow off).  The App's initial `refresh_parsed`
+            // reconciles this with the Preview default before the first frame.
+            parsed_reflow: false,
+            reflow: true,
+            prev_reflow_has_reveal: false,
+            effective_cache: std::cell::RefCell::new(Default::default()),
             cursor_block_line_range: None,
             cursor_blink: CursorBlink::default(),
             modal_open: false,
@@ -564,8 +440,6 @@ impl EditorState {
             pre_diff_scroll: 0,
             pending_focus_scroll: false,
             search: None,
-            // Set by `App::open_doc_page` after construction; every
-            // other document is editable.
             readonly: false,
             yank_flash: None,
             substitute_preview: None,
@@ -574,14 +448,9 @@ impl EditorState {
             diff_render_cache: RenderCache::default(),
             diff_parse_dirty: false,
         };
-        // Populate the cursor-block cache so the rendered view's
-        // stale-map-tolerant path has correct line-range info on the
-        // very first frame — before any cursor-move action has run
-        // `update_cursor_block` naturally.  Don't start the reveal
-        // timer: the document just loaded, there's no prior position
-        // to animate from, and tests expect a `None` timer on a
-        // freshly-constructed state so the cursor block reveals raw
-        // immediately without a 120 ms sleep.
+        // Seed the cursor-block cache so the first frame has line-range info, but leave the
+        // reveal timer unarmed: there is no prior position to animate from, and a fresh state
+        // should reveal raw immediately rather than after a 120 ms wait.
         state.update_cursor_block();
         state.cursor_block_entered_at = None;
         state.cursor_line_idx = None;
@@ -596,10 +465,8 @@ impl EditorState {
         self.buffer.contents()
     }
 
-    /// Size of the current selection as `(char_count, line_count)`.
-    /// Returns `None` when there is no active selection.  In Preview
-    /// mode the visual selection is counted over rendered text; in
-    /// Rendered / Raw the raw buffer selection is counted.
+    /// `(char_count, line_count)` of the active selection, counted over rendered text in Preview
+    /// and over the raw buffer otherwise.
     pub fn selection_size(&self) -> Option<(usize, usize)> {
         if self.mode == Mode::Preview {
             let vs = self.visual_selection?;
@@ -617,8 +484,7 @@ impl EditorState {
                 let row_len = full.chars().count();
                 let mut col_start = if row == sr { sc } else { 0 };
                 let mut col_end = if row == er { ec.min(row_len) } else { row_len };
-                // A cell-banded selection counts only the cell's column
-                // band on each row, matching what copy extracts.
+                // A cell-banded selection counts only the band, matching what copy extracts.
                 if let Some(band) = vs.band {
                     col_start = col_start.max(band.cols.0);
                     col_end = col_end.min(band.cols.1.min(row_len));
@@ -639,30 +505,22 @@ impl EditorState {
             }
             let chars = end - start;
             let start_line = self.buffer.char_to_line(start);
-            // Selections that end on a line-start (just past a `\n`)
-            // conceptually cover one fewer line than the raw end index
-            // would suggest; clamp end to a char position that lies
-            // on content rather than on the next line's first byte.
+            // A selection ending just past a `\n` covers one fewer line than its end index
+            // suggests, so clamp onto content rather than the next line's first byte.
             let end_inclusive = end.saturating_sub(1);
             let end_line = self.buffer.char_to_line(end_inclusive.max(start));
             Some((chars, end_line - start_line + 1))
         }
     }
 
-    /// The theme the rendered lines were produced with.  Exposed so
-    /// hit-testing can recognise a rendered span by the style the
-    /// renderer gave it — see `mouse_ops::links::is_link_style`.
+    /// The theme the rendered lines were produced with, so hit-testing can recognize a span by
+    /// the style the renderer gave it.
     pub fn theme(&self) -> &'static Theme {
         self.theme
     }
 
-    /// Swap the editor's theme reference and re-render so styled spans
-    /// pick up the new palette without the user having to reopen the
-    /// document.  Wired to the live theme-change path (settings overlay
-    /// "Theme" cycle and the post-`Config::load` reload after the
-    /// external editor exits).  No-op when the new reference equals
-    /// the current one — same address means same theme, no rebuild
-    /// needed.
+    /// Swap the theme and re-render so styled spans pick up the new palette live.  No-op when the
+    /// reference is unchanged — same address means same theme.
     pub fn set_theme(&mut self, theme: &'static Theme) {
         if std::ptr::eq(self.theme, theme) {
             return;
@@ -671,37 +529,17 @@ impl EditorState {
         self.refresh_parsed();
     }
 
-    /// Replace the editor's buffer with `new_buffer` and reset every
-    /// derived field that the old buffer made stale: history, both
-    /// selection caches, the parsed-doc cache (via `refresh_parsed`),
-    /// and the cursor-block lookup.  The cursor's char offset is
-    /// clamped to the new buffer's length but otherwise preserved
-    /// best-effort, so a silent reload (clean buffer + external edit)
-    /// keeps the user roughly where they were.  Viewport scroll is
-    /// intentionally not reset — preserving it matches user expectations
-    /// when the external rewrite is small.
+    /// The canonical buffer-swap entry point: resets every field the old buffer made stale, so
+    /// adding a derived field is a single edit here rather than a hunt for swap sites.  Never
+    /// mutate `buffer` directly instead.
     ///
-    /// This is the canonical buffer-swap entry point.  New consumers
-    /// (multi-tab switch, future diff-mode resolve, …) should call
-    /// this rather than mutating `buffer` directly and hand-resetting
-    /// derived state, so adding a new derived field is a single-edit
-    /// change instead of a hunt for every swap site.
+    /// The cursor offset is clamped but otherwise preserved, and scroll is deliberately kept, so
+    /// a silent reload after a small external rewrite leaves the user where they were.
     pub fn replace_buffer(&mut self, new_buffer: Buffer) {
-        // A wholesale content swap invalidates any active search flow;
-        // drop the session rather than re-anchoring matches against
-        // unrelated text.  (No scroll restore — the pre-search offset
-        // belongs to the old contents.)
+        // All three name positions in the old contents: the search matches, the `:s` preview's
+        // stashed revert delta, and the reveal's row reservation.  Drop rather than re-anchor.
         self.search = None;
-        // Likewise drop any live `:s` preview — its stashed revert delta
-        // belongs to the old contents (the version stamp would refuse it
-        // anyway; dropping here keeps the invariant explicit).
         self.substitute_preview = None;
-        // And any image reveal — the reservation names a block of the old
-        // contents.  A surviving one is usually inert rather than wrong (a
-        // diagram's URL hashes its source, so a match implies identical
-        // source and identical row count), but an ordinary image URL carries
-        // no such guarantee, and the next `sync_image_reveal` owns the
-        // reservation anyway.
         self.image_reveal = None;
         let new_len = new_buffer.len_chars();
         self.buffer = new_buffer;
@@ -714,36 +552,20 @@ impl EditorState {
         self.update_cursor_block();
     }
 
-    /// Enter diff review mode with `diff_state` as the active review.
-    /// Saves the current `scroll` so [`Self::exit_diff_mode`] can
-    /// restore it, then resets `scroll = 0` and sets
-    /// `mode = Mode::Diff`.  The caller (`App::enter_diff_mode`) is
-    /// responsible for having already verified that
-    /// `DiffState::new` returned `Some` — empty hunk lists must not
-    /// reach this entry point (§4).
+    /// Enter diff review mode.  The caller must already have verified `DiffState::new` returned
+    /// `Some` — an empty hunk list must not reach here.
     pub fn enter_diff_mode(&mut self, diff_state: DiffState) {
         self.pre_diff_scroll = self.scroll;
         self.scroll = 0;
         self.diff = Some(diff_state);
         self.mode = Mode::Diff;
-        // Build the rendered new-side parse on the next frame instead of
-        // here: `viewport_width` still holds the editor mode's document
-        // width, which reserves a line-number gutter that diff mode does
-        // not, so a parse built now would lay every table out against a
-        // width this view never paints at.  See `diff_parse_dirty`.
-        self.diff_parse_dirty = true;
+        self.diff_parse_dirty = true; // Deferred a frame — see the field's doc.
         self.selection = None;
         self.visual_selection = None;
-        // Defer the scroll-to-first-hunk until the next frame, when the
-        // run loop knows the viewport height.
         self.pending_focus_scroll = true;
     }
 
-    /// Scroll so the focused hunk is comfortably visible — a few rows
-    /// of context above it when possible.  No-op outside diff mode.
-    /// Called on entry (via the deferred `pending_focus_scroll` flag)
-    /// and after every hunk-focus change (`DiffNext` / `DiffPrev` /
-    /// accept / reject).
+    /// Scroll the focused hunk comfortably into view.  No-op outside diff mode.
     pub fn scroll_focused_hunk_into_view(&mut self, viewport_height: usize, viewport_width: usize) {
         if viewport_height == 0 {
             return;
@@ -756,19 +578,15 @@ impl EditorState {
         self.scroll_row_comfortably_into_view(row, total, viewport_height);
     }
 
-    /// Scroll so visual `row` is comfortably visible — a few rows of
-    /// context above it when possible.  Repositions only when the row
-    /// isn't already in view: above the current top (+margin) or below
-    /// the bottom.  The shared core of the hunk / match / `:s`-preview /
-    /// incsearch focus scrolls.
+    /// Shared core of the hunk / match / `:s`-preview / incsearch focus scrolls: reposition only
+    /// when `row` isn't already comfortably in view.
     fn scroll_row_comfortably_into_view(
         &mut self,
         row: usize,
         total: usize,
         viewport_height: usize,
     ) {
-        /// Rows of context kept above the focused row when scrolling
-        /// it into view from off-screen.
+        /// Rows of context kept above the focused row.
         const TOP_MARGIN: usize = 3;
         let max_scroll = total.saturating_sub(1);
         let comfortably_visible =
@@ -778,10 +596,8 @@ impl EditorState {
         }
     }
 
-    /// Scroll the cursor's visual row comfortably into view (see
-    /// [`Self::scroll_row_comfortably_into_view`]).  Used by the flows
-    /// that park the cursor somewhere possibly off-screen: search focus,
-    /// the live `:s` preview, vim incsearch.
+    /// [`Self::scroll_row_comfortably_into_view`] targeting the cursor, for the flows that park
+    /// it somewhere possibly off-screen.
     pub fn scroll_cursor_comfortably_into_view(
         &mut self,
         viewport_height: usize,
@@ -795,19 +611,15 @@ impl EditorState {
         self.scroll_row_comfortably_into_view(row, total, viewport_height);
     }
 
-    /// Place the cursor at char `offset` (clamped to the buffer),
-    /// refreshing the preferred column and the cursor-block cache — the
-    /// shared "park the cursor" primitive used by the search flows, the
-    /// live `:s` preview, and `execute_substitute`.
+    /// Park the cursor at char `offset` (clamped), refreshing the preferred column and the
+    /// cursor-block cache.
     pub fn place_cursor(&mut self, offset: usize) {
         self.cursor.offset = offset.min(self.buffer.len_chars());
         self.cursor.preferred_col = self.cursor.cell_col(&self.buffer);
         self.update_cursor_block();
     }
 
-    /// Put the cursor (and optionally the scroll) back where a transient
-    /// flow found them — the restore half of the `:s` preview and vim
-    /// incsearch sessions.
+    /// The restore half of the `:s` preview and vim incsearch sessions.
     pub fn restore_view(&mut self, cursor: usize, scroll: Option<usize>) {
         self.place_cursor(cursor);
         if let Some(scroll) = scroll {
@@ -815,13 +627,8 @@ impl EditorState {
         }
     }
 
-    /// Drop the active diff review, restore the pre-diff scroll, and
-    /// return to `Mode::Rendered`.  Used both on the resolution happy
-    /// path (after `Buffer::set_rope` swaps the merged rope in) and on
-    /// the discard path that abandons the review without applying it
-    /// (e.g. quitting mid-review).  The caller is responsible for any
-    /// buffer / cursor side effects before this; this helper only
-    /// cleans up the diff fields.
+    /// Drop the active review and return to `Mode::Rendered`.  Serves both the resolve and the
+    /// discard paths; the caller owns any buffer / cursor side effects.
     pub fn exit_diff_mode(&mut self) {
         self.diff = None;
         self.scroll = self.pre_diff_scroll;
@@ -831,12 +638,8 @@ impl EditorState {
         }
     }
 
-    /// Start a search flow with `search_state` as the active session.
-    /// Clears any selection (the flow paints its own highlights) and
-    /// defers the scroll-to-first-match to the next frame via
-    /// `pending_focus_scroll`, mirroring `enter_diff_mode`.  Unlike
-    /// diff, `mode` is untouched — the document keeps rendering in the
-    /// current view mode.
+    /// Start a search flow.  Clears the selection (the flow paints its own highlights) and defers
+    /// the scroll-to-first-match a frame.  Unlike diff, `mode` is untouched.
     pub fn enter_search(&mut self, search_state: SearchState) {
         self.search = Some(search_state);
         self.selection = None;
@@ -845,24 +648,18 @@ impl EditorState {
         self.ensure_search_fresh();
     }
 
-    /// Drop the active search flow, leaving the cursor and viewport on
-    /// the match the user navigated to.  Search is a *motion* (matching
-    /// vim's `/` and the VS Code find widget): exiting never scrolls back
-    /// to where the search began.  No-op when no flow is active.
+    /// Drop the active search flow, leaving cursor and viewport on the match reached.  Search is
+    /// a *motion*, like vim's `/`: exiting never scrolls back to where it began.
     pub fn exit_search(&mut self) {
         self.search = None;
     }
 
-    /// Bidirectional raw↔rendered char-column map for `raw_line`, cached
-    /// per buffer line.  This is the only sanctioned way to reach
-    /// `ParsedDoc::inline_map`: the per-line cache is keyed by index
-    /// alone, so initializing it with text that isn't the canonical
-    /// content of `buffer_line_idx` poisons the entry for every later
-    /// caller (blocks whose byte range starts mid-line, rendered sub-rows
-    /// past a block's raw line count, out-of-bounds indices).  When
-    /// `raw_line` doesn't match the buffer line exactly, an uncached map
-    /// is built instead — column math against the caller's slice stays
-    /// correct and the cache stays canonical.
+    /// Bidirectional raw↔rendered char-column map for `raw_line`, cached per buffer line.
+    ///
+    /// **The only sanctioned way to reach `ParsedDoc::inline_map`.**  That cache is keyed by index
+    /// alone, so seeding it with text that isn't the canonical content of `buffer_line_idx`
+    /// poisons the entry for every later caller.  A non-matching `raw_line` therefore gets an
+    /// uncached map: correct column math for the caller, canonical cache for everyone else.
     pub fn inline_map_for(
         &self,
         buffer_line_idx: usize,
@@ -879,9 +676,7 @@ impl EditorState {
         }
     }
 
-    /// Recompute the search match list if the buffer has changed since
-    /// it was built (replace, undo, redo).  No-op outside a search
-    /// flow or when the list is already fresh.
+    /// Recompute the search match list if the buffer changed since it was built.
     pub fn ensure_search_fresh(&mut self) {
         let version = self.buffer.version();
         let Some(s) = self.search.as_mut() else {
@@ -890,17 +685,14 @@ impl EditorState {
         if s.is_fresh(version) {
             return;
         }
-        // Materialize the source only when a recompute is actually due —
-        // `contents()` copies the whole rope into a `String`, and this
+        // Materialize only when a recompute is due: `contents()` copies the whole rope, and this
         // runs on every match-navigation keypress.
         let source = self.buffer.contents();
         s.ensure_fresh(&source, version);
     }
 
-    /// Place the cursor at the start of the focused search match.
-    /// Keeps the exit position meaningful and drives the standard
-    /// scroll / cursor-row machinery.  No-op when the flow has no
-    /// matches.
+    /// Place the cursor at the start of the focused search match, so exit position and the usual
+    /// scroll machinery both stay meaningful.
     pub fn sync_cursor_to_search_focus(&mut self) {
         let Some(range) = self.search.as_ref().and_then(|s| s.focused_range()) else {
             return;
@@ -911,10 +703,8 @@ impl EditorState {
         self.place_cursor(offset);
     }
 
-    /// Scroll so the focused search match is comfortably visible — a
-    /// few rows of context above it when possible.  The cursor has
-    /// already been synced to the match, so its visual row is the
-    /// target.  No-op outside a search flow.
+    /// Scroll the focused search match into view.  The cursor has already been synced to it, so
+    /// its visual row is the target.
     pub fn scroll_focused_match_into_view(
         &mut self,
         viewport_height: usize,
@@ -926,10 +716,8 @@ impl EditorState {
         self.scroll_cursor_comfortably_into_view(viewport_height, viewport_width);
     }
 
-    /// Toggle row striping for table data rows and re-render so the
-    /// change is visible on the next frame.  Wired to
-    /// `config.table.row_striping` at App startup; tests use this as a
-    /// public entrypoint into the otherwise-private `refresh_parsed`.
+    /// Toggle row striping and re-render.  Also the tests' public entry point into the otherwise
+    /// private `refresh_parsed`.
     pub fn set_row_striping(&mut self, on: bool) {
         if self.row_striping == on {
             return;
@@ -938,9 +726,7 @@ impl EditorState {
         self.refresh_parsed();
     }
 
-    /// Toggle big-text H1 rendering and re-render so the change is
-    /// visible on the next frame.  Wired to `config.editor.big_h1` at
-    /// App startup and after a live config reload.
+    /// Toggle big-text H1 rendering and re-render.
     pub fn set_big_h1(&mut self, on: bool) {
         if self.big_h1 == on {
             return;
@@ -949,9 +735,7 @@ impl EditorState {
         self.refresh_parsed();
     }
 
-    /// Toggle syntax highlighting and re-render so the change is visible
-    /// on the next frame.  Wired to `config.editor.syntax_highlighting`
-    /// at App startup and after a live config reload.
+    /// Toggle syntax highlighting and re-render.
     pub fn set_syntax_highlighting(&mut self, on: bool) {
         if self.syntax_highlighting == on {
             return;
@@ -960,10 +744,19 @@ impl EditorState {
         self.refresh_parsed();
     }
 
-    /// Update the cached terminal width and re-render if it changed.
-    /// Called by the App on terminal-resize events so the table
-    /// column-width algorithm picks up the new viewport.  Called with
-    /// the document area width (status bar / hint line excluded).
+    /// Toggle the `$$...$$` live-edit preview.  Wired to `config.figures.math_preview` at startup
+    /// and pushed live by the settings overlay.  Only the reveal reservation depends on it, so
+    /// re-sync the reveal: a formula the cursor is inside reflows immediately, elsewhere a no-op.
+    pub fn set_math_preview(&mut self, on: bool) {
+        if self.math_preview == on {
+            return;
+        }
+        self.math_preview = on;
+        self.sync_image_reveal();
+    }
+
+    /// Post a new *document area* width (chrome excluded) and re-render if it changed, so table
+    /// column widths follow the viewport.
     pub fn set_viewport_width(&mut self, width: usize) {
         let width = width.max(1);
         if self.viewport_width == width {
@@ -973,12 +766,113 @@ impl EditorState {
         self.refresh_parsed();
     }
 
-    /// Commit the pending column-width drag (if any) by writing the
-    /// `<!-- tui-columns: [...] -->` comment into the buffer.  Called by
-    /// the App after a column-border drag release once the
-    /// width-injection warning modal has been resolved (or skipped).
-    /// No-op when no pending commit is recorded — a Cancel from the
-    /// modal goes through [`Self::cancel_pending_column_widths`] instead.
+    /// Reparse if the reflow the current `parsed` was built with no longer matches the mode
+    /// (`want_reflow`), since `parsed` is one mode-independent spine.  Called once per frame from
+    /// `App::prepare_viewport`; a no-op except the first frame after a mode switch that changes it.
+    pub fn sync_reflow_for_mode(&mut self) {
+        if self.parsed_reflow != self.want_reflow() {
+            self.refresh_parsed();
+        }
+    }
+
+    /// Enable (or disable) paragraph reflow (`config.editor.reflow`).  Reparses if this changes
+    /// the effective reflow for the current mode.
+    pub fn set_reflow(&mut self, on: bool) {
+        if self.reflow == on {
+            return;
+        }
+        self.reflow = on;
+        self.sync_reflow_for_mode();
+    }
+
+    /// Whether the current mode should render paragraphs reflowed: Preview and Rendered do when
+    /// `reflow` is on; Raw is verbatim source and Diff has its own parse, so neither ever does.
+    pub(crate) fn want_reflow(&self) -> bool {
+        self.reflow && matches!(self.mode, Mode::Preview | Mode::Rendered)
+    }
+
+    /// The per-frame visual-row view with the raw-reveal patch applied.  Identity unless the
+    /// cursor rests in a *reflowed* paragraph that is currently revealed: only then does the
+    /// block's raw form (its source lines) differ in height from its rendered (one wrapped flow)
+    /// form, so only then must scroll, gutter, and mouse arithmetic count the raw lines instead.
+    pub fn effective_rows(&self, width: usize) -> crate::editor::effective_rows::EffectiveRows<'_> {
+        use crate::editor::effective_rows::EffectiveRows;
+        let width = width.max(1);
+        // The cheap decision (no allocation): does the cursor rest in a revealed reflowed block?
+        // The block's rendered start uniquely identifies it within a parse, so it — with the parse
+        // version and width — keys the memo; an intra-block cursor move stays a hit.
+        let reveal = self.reflow_reveal_target();
+        let key = (
+            self.parsed_version,
+            width,
+            reveal.as_ref().map(|(rendered, _)| rendered.start),
+        );
+        if let Some((base_total, patch)) = self.effective_cache.borrow().get(key) {
+            return EffectiveRows::from_cached(&self.parsed, width, base_total, patch);
+        }
+        // Miss: build the view once (the allocating path — the block's source and its raw-line wrap
+        // counts) and memoize its parts so the frame's remaining queries reuse them.
+        let built = match reveal {
+            Some((rendered, cursor_byte)) => {
+                let raw = crate::ui::rendered_view::raw_block_cursor(self, cursor_byte);
+                // Trailing blanks absorbed into the block range own their own rendered rows, so
+                // exclude them — the reveal stacks only the content lines.
+                let raw_lines = crate::ui::rendered_view::revealed_source_lines(&raw.source);
+                EffectiveRows::with_reveal(&self.parsed, width, rendered, &raw_lines)
+            }
+            None => EffectiveRows::identity(&self.parsed, width),
+        };
+        let (base_total, patch) = built.cache_parts();
+        self.effective_cache
+            .borrow_mut()
+            .store(key, base_total, patch);
+        built
+    }
+
+    /// The revealed reflowed block, if any: its rendered-line range and the cursor byte inside it.
+    /// Only `RenderedView` reveals a block as raw; Preview paints pure rendered lines, so a patch
+    /// there would make the arithmetic count raw rows the paint never shows.  Cheap — no allocation.
+    fn reflow_reveal_target(&self) -> Option<(std::ops::Range<usize>, usize)> {
+        if self.mode != Mode::Rendered || !self.cursor_block_revealed() {
+            return None;
+        }
+        let cursor_byte = self.buffer.rope().char_to_byte(self.cursor.offset);
+        if !self.parsed.is_reflowed_paragraph_at(cursor_byte) {
+            return None;
+        }
+        let block_idx = self.parsed.source_map.block_for_byte(cursor_byte)?;
+        let rendered = self.parsed.source_map.rendered_lines_for_block(block_idx);
+        (!rendered.is_empty()).then_some((rendered, cursor_byte))
+    }
+
+    /// Keep the view sensible across a reflow reveal/un-reveal.  When the cursor rests in a
+    /// reflowed paragraph, entering it (after `RAW_REVEAL_DELAY`) expands the block from one
+    /// wrapped flow row to its raw source lines, and leaving it collapses it back — a height
+    /// change driven by the frame timer, not a keypress.  Called once per frame from
+    /// `App::prepare_viewport`; inert unless `reflow` is on in Rendered mode.
+    ///
+    /// The expansion happens *below* the block's first row, which sits at the same visual row
+    /// before and after (the rows above it are unchanged), so simply leaving `scroll` alone pins
+    /// the block's top and everything above it and lets only the content below reflow — the same
+    /// feel as an image/mermaid reveal.  On the toggle frame we therefore just re-run
+    /// `ensure_cursor_visible`, which scrolls the *minimum* to keep the cursor on screen (usually
+    /// nothing) rather than dragging the whole document to re-pin the cursor's exact row.
+    pub fn anchor_reflow_reveal(&mut self, width: usize, height: usize) {
+        if self.mode != Mode::Rendered || !self.reflow || width == 0 {
+            // Re-entering (mode switch, reflow-enable) should be treated as a fresh toggle, not a
+            // continuation, so the next eligible frame reconciles cursor visibility once.
+            self.prev_reflow_has_reveal = false;
+            return;
+        }
+        let has_reveal = self.effective_rows(width).has_reveal();
+        if has_reveal != self.prev_reflow_has_reveal {
+            self.ensure_cursor_visible(height, width);
+        }
+        self.prev_reflow_has_reveal = has_reveal;
+    }
+
+    /// Commit a pending column-width drag by writing the `<!-- tui-columns: [...] -->` comment
+    /// into the buffer.  Cancel goes through [`Self::cancel_pending_column_widths`].
     pub fn commit_pending_column_widths(&mut self) {
         let Some(table_byte_start) = self.pending_column_widths_commit.take() else {
             return;
@@ -1008,28 +902,21 @@ impl EditorState {
         self.apply_delta(char_delta);
     }
 
-    /// Discard the pending column-width drag without writing the comment.
-    /// Cancels both the live preview (so the table snaps back to its
-    /// pre-drag widths on the next render) and the pending-commit flag.
+    /// Discard a pending column-width drag, snapping the table back to its pre-drag widths.
     pub fn cancel_pending_column_widths(&mut self) {
         self.pending_column_widths_commit = None;
         self.live_table_widths = None;
         self.refresh_parsed();
     }
 
-    /// True if a column-border drag has just released and the App still
-    /// needs to decide whether to commit (or open the warning modal). Used
-    /// by integration tests in `tests/`.
+    /// Whether a released column drag still awaits a commit decision.  Used by `tests/`.
     #[allow(dead_code)]
     pub fn has_pending_column_widths(&self) -> bool {
         self.pending_column_widths_commit.is_some()
     }
 
-    /// Whether the table whose first byte is `table_byte_start` already
-    /// carries a `<!-- tui-columns: [...] -->` comment immediately after
-    /// it.  Used by the App to skip the width-injection warning when the
-    /// comment is already present (the user has already accepted the
-    /// injection on a previous drag for this table).
+    /// Whether that table already carries a `tui-columns` comment, in which case the App skips
+    /// the width-injection warning — the user accepted the injection on an earlier drag.
     pub fn table_has_tui_columns_comment(&self, table_byte_start: usize) -> bool {
         let source = self.buffer.contents();
         let Some(info) = crate::editor::table_edit::find_table_at(&source, table_byte_start) else {
@@ -1046,57 +933,57 @@ impl EditorState {
         crate::markdown::table_layout::parse_column_widths_comment(comment_line).is_some()
     }
 
-    /// Whether the cursor currently sits inside a Markdown table.  Public
-    /// so the vim input reducer can decide whether `Tab` should perform
-    /// cell navigation (mirroring `Shift-Tab` → `TablePrevCell`).
+    /// Whether the cursor sits inside a Markdown table.  Public so the vim reducer can decide
+    /// whether `Tab` means cell navigation.
     pub fn cursor_in_table(&self) -> bool {
         crate::editor::table_edit_ops::cursor_in_table(self)
     }
 
-    /// Re-parse and re-render after an edit. Called automatically by `edit_ops`.
+    /// Re-parse and re-render after an edit.  Called automatically by `edit_ops`.
     pub(crate) fn refresh_parsed(&mut self) {
         let content = self.buffer.contents();
-        // Build a row-override closure that consults the image cache.
-        // Captures by reference so the cache isn't cloned.  See
-        // `ImageCache::reserved_rows` for the per-status decision —
-        // `Ready` → aspect rows, `Failed` → 1 (collapsed placeholder),
-        // `Pending` / unknown → `None` so the renderer falls back to
-        // `image_max_height` for stable layout while the decode is in
-        // flight.  When `images_enabled` is false the override
-        // short-circuits to `Some(1)` so declined blocks collapse to
-        // the one-line placeholder (same row count as a `Failed` entry).
+        // Row-override closure over the image cache; see `ImageCache::reserved_rows` for the
+        // per-status decision.  A `Pending` entry answers `None` so the renderer falls back to
+        // `image_max_height` and layout stays stable while the decode is in flight.
         let images = &self.images;
         let max_w = self.image_max_width as u16;
         let max_h = self.image_max_height as u16;
         let font_size = self.image_font_size;
         let images_enabled = self.images_enabled;
-        // Diagram blocks honour `self.diagrams_enabled` at promotion
-        // time — when false, `build_with_overrides` leaves the mermaid
-        // fenced code blocks intact, so the row override never sees a
-        // diagram URL and only has to think about real images.
-        // A revealed image block reserves one row per raw source line
-        // instead of the image's height, so exactly the source the user is
-        // editing is visible (and the document reflows) while the cursor
-        // rests in it — the whole mermaid fence for a diagram, the single
-        // `![alt](url)` line for an ordinary image.  Checked first: the
-        // reveal replaces the image on screen entirely, so neither the
-        // decode cache nor the images-disabled collapse has a say in how
-        // tall the block is.
-        // Matched on the block's *ordinal* as well as its URL: two blocks
-        // can carry the same URL (the same image used twice in a
-        // document), and only the one the cursor is in may collapse.
+        // `diagrams_enabled` is honored at promotion time, so a disabled diagram or `$$...$$` math
+        // block never reaches this override as a URL at all.
+        //
+        // The reveal is checked first because it replaces the image on screen entirely: neither
+        // the decode cache nor the images-disabled collapse has a say in the block's height.
+        // Matched on ordinal *and* URL — see `ImageReveal`.
         let image_reveal = self.image_reveal.as_ref();
         let override_fn = |url: &str, ordinal: usize| {
             if let Some(reveal) = image_reveal {
                 if reveal.ordinal == ordinal && reveal.url == url {
-                    return Some(reveal.rows);
+                    // The raw-source reveal replaces the image's reserved
+                    // rows with one row per revealed source line; a
+                    // `$$...$$` block with the preview on additionally
+                    // reserves a live-preview band for the formula at the
+                    // block's top, with the source below it (see
+                    // `ImageReveal::preview_rows`).
+                    return Some(reveal.rows + reveal.preview_rows);
                 }
             }
-            if !images_enabled {
+            // The images-disabled collapse applies to *real* images only.
+            // Promoted diagram / `$$...$$` math blocks are gated by
+            // `diagrams_enabled` at promotion time — a diagram URL reaching
+            // this override means figures are enabled, so it keeps its
+            // decoded height regardless of the images toggle.  Without this
+            // exemption, turning "Show images" off collapsed every rendered
+            // formula and diagram to a single row (tiny).
+            if !images_enabled && !crate::diagram::is_diagram_url(url) {
                 return Some(1);
             }
             images.reserved_rows(url, max_w, max_h, font_size)
         };
+        // Reflow applies per `want_reflow`.  It rides in `RenderSettings`, so a mode switch that
+        // changes it clears the render cache; `sync_reflow_for_mode` triggers the reparse.
+        let reflow_paragraphs = self.want_reflow();
         self.parsed = ParsedDoc::build_with_overrides(
             &content,
             self.theme,
@@ -1109,22 +996,27 @@ impl EditorState {
             self.big_h1,
             self.syntax_highlighting,
             self.diagrams_enabled,
+            reflow_paragraphs,
             Some(&mut self.render_cache),
         );
+        self.parsed_reflow = reflow_paragraphs;
         self.parsed_version = self.parsed_version.wrapping_add(1);
         self.parsed_dirty = false;
-        // Drop cache entries whose URL is no longer referenced by any
-        // image block — keeps `images.decoded`/`protocols`/scratches
-        // from growing without bound as the user edits diagrams
-        // (every content change inside a ```mermaid block mints a new
-        // synthetic URL, so the old entry becomes orphaned).
-        //
-        // The live set is the *union* of both parses while a review is
-        // open.  A URL that appears on the diff's new side but not in the
-        // editor's buffer — a diagram whose source changed on disk, an
-        // image the user is about to accept — would otherwise be evicted
-        // here and immediately re-requested by the diff-side dispatch, a
-        // decode/evict loop that runs for the length of the review.
+        // Record the math-preview split so the row ⇄ source-line mapping paints the rendered
+        // formula in the block's top rows and the editable `$$...$$` source below — keeping the
+        // image where it sat before the reveal.  Non-zero only for a revealed `$$...$$` block with
+        // preview on (`ImageReveal::preview_rows`).
+        self.parsed.math_source_offset = self.image_reveal.as_ref().and_then(|r| {
+            if r.preview_rows == 0 {
+                return None;
+            }
+            let block_idx = self.parsed.image_blocks.get(r.ordinal)?.block_idx;
+            Some((block_idx, r.preview_rows))
+        });
+        // Evict unreferenced URLs — editing inside a mermaid fence or `$$...$$` block mints a new
+        // synthetic URL per keystroke, orphaning the old entry.  The live set is the *union* of
+        // both parses while a review is open: a URL only on the diff's new side would otherwise be
+        // evicted here and immediately re-requested, a decode/evict loop lasting the whole review.
         let mut live: std::collections::HashSet<String> = self
             .parsed
             .image_blocks
@@ -1136,42 +1028,27 @@ impl EditorState {
         }
         self.images.gc(&live);
 
-        // Keep the diff's rendered new-side parse in step with the
-        // editor's.  A tail call rather than a hand-maintained list of
-        // sites: everything that re-renders the document — a theme
-        // switch, a width change, big-H1 / striping toggles, an
-        // images-or-diagrams settings change, an arriving decode — goes
-        // through `refresh_parsed`, and several of those are reachable
-        // *during* a review (`OpenSettings`, `SwitchTheme` and
-        // `CreateCustomTheme` are all on the `diff_safe_action`
-        // allowlist).  A stale `parsed_new` would then disagree with the
-        // row cache about block heights.  `refresh_diff_parse` never
-        // calls back into here, so there is no recursion, and it guards
-        // on `self.diff.is_some()` so outside a review this is one
-        // branch.
+        // A tail call rather than a hand-maintained list of sites: everything that re-renders the
+        // document comes through here, and several of those are reachable *during* a review, where
+        // a stale `parsed_new` would disagree with the row cache about block heights.  No
+        // recursion — `refresh_diff_parse` never calls back — and it is one branch outside a
+        // review.
         self.refresh_diff_parse();
     }
 
-    /// Rebuild the diff's rendered new-side parse from
-    /// `diff.new_buffer`.  No-op outside a review.
+    /// Rebuild the diff's rendered new-side parse.  No-op outside a review.
     ///
-    /// Built with exactly the render settings `refresh_parsed` uses, so
-    /// a rendered context row in the diff paints identically to the same
-    /// row in Preview.  Three deliberate differences:
+    /// Uses exactly `refresh_parsed`'s render settings, so a rendered context row paints
+    /// identically here and in Preview.  Three deliberate differences:
     ///
-    /// - `live_table_widths: None` — the column-drag preview belongs to
-    ///   the editor's document, not the diff's.
+    /// - `live_table_widths: None` — the column-drag preview belongs to the editor's document.
     /// - a dedicated [`Self::diff_render_cache`] (see its doc).
-    /// - no `images.gc()` — running the editor's GC from here would
-    ///   evict the *editor* document's URLs.  `refresh_parsed` owns the
-    ///   GC and unions both parses' URLs into its live set.
+    /// - no `images.gc()` — that would evict the *editor* document's URLs; `refresh_parsed` owns
+    ///   the GC and unions both parses into its live set.
     ///
-    /// Reusing the real row override is what makes unchanged media work:
-    /// `ImageCache` is keyed by URL and lives on `EditorState`, so an
-    /// unchanged image or diagram (identical URL, or identical synthetic
-    /// `diagram-mermaid-<sha256>` key) is a cache hit with no second set
-    /// of workers.  There is no `image_reveal` arm — the reveal is a
-    /// cursor affordance, and diff mode has no in-document cursor.
+    /// Reusing the real row override is what makes unchanged media free: `ImageCache` is keyed by
+    /// URL, so an unchanged image or diagram is a cache hit with no second set of workers.  There
+    /// is no `image_reveal` arm — diff mode has no in-document cursor.
     pub(crate) fn refresh_diff_parse(&mut self) {
         self.diff_parse_dirty = false;
         if self.diff.is_none() {
@@ -1207,6 +1084,8 @@ impl EditorState {
                 self.big_h1,
                 self.syntax_highlighting,
                 self.diagrams_enabled,
+                // Diff review has its own parse and never reflows.
+                false,
                 Some(&mut self.diff_render_cache),
             )
         };
@@ -1216,24 +1095,20 @@ impl EditorState {
             .set_rendered_parse(Some(parsed));
     }
 
-    /// If [`Self::diff_parse_dirty`] is set, rebuild the diff parse now.
-    /// Mirrors [`Self::flush_parsed_if_dirty`]; called from
-    /// `App::prepare_viewport` immediately after the real diff-mode
-    /// width is posted.  Free when the width genuinely changed —
-    /// `set_viewport_width`'s own `refresh_parsed` tail call has already
-    /// done the work and cleared the flag.
+    /// [`Self::flush_parsed_if_dirty`]'s counterpart for the diff parse, called right after the
+    /// real diff-mode width is posted.  Free when the width genuinely changed —
+    /// `set_viewport_width` will already have done the work.
     pub(crate) fn flush_diff_parse_if_dirty(&mut self) {
         if self.diff_parse_dirty {
             self.refresh_diff_parse();
         }
     }
 
-    /// If an in-line edit has left `parsed` stale, re-parse now and
-    /// clear the dirty flag.  Returns `true` when a re-parse actually
-    /// fired.  Callers must invoke this before any code path that
-    /// consults `parsed.source_map` byte ranges (mouse hit-tests,
-    /// cursor-move navigation) — otherwise the stale map maps the
-    /// live cursor's byte onto the wrong block.
+    /// Re-parse if an in-line edit left `parsed` stale; `true` when it fired.
+    ///
+    /// **Call this before any path that consults `parsed.source_map` byte ranges** (mouse
+    /// hit-tests, cursor-move navigation) — a stale map puts the live cursor's byte in the wrong
+    /// block.
     pub fn flush_parsed_if_dirty(&mut self) -> bool {
         if self.parsed_dirty {
             self.refresh_parsed();
@@ -1243,41 +1118,24 @@ impl EditorState {
         }
     }
 
-    /// Apply an edit delta to the buffer, record it in history, mark dirty,
-    /// and — for edits that cross a line boundary — refresh the parsed
-    /// document.
+    /// Apply an edit delta, record it in history, mark dirty, and re-parse when the edit crosses
+    /// a line boundary.
     ///
-    /// In-line edits (neither `removed` nor `inserted` contain `\n`) do NOT
-    /// re-parse: the cursor stays in the same block, block line indices
-    /// don't shift, and the rendered view extracts the cursor block's raw
-    /// text from the live buffer via the cached `cursor_block_line_range`.
-    /// The parse is refreshed later — on cursor movement, on mouse events,
-    /// or on any action that reads `source_map` byte ranges — via
-    /// `flush_parsed_if_dirty`.  This batches a whole typing burst into a
-    /// single re-parse at the moment the user moves off the line, and
-    /// eliminates the mid-typing rendered → raw → rendered flash.
+    /// An in-line edit deliberately does *not* re-parse: block line indices don't shift, and the
+    /// rendered view reads the cursor block's raw text from the live buffer via
+    /// `cursor_block_line_range`.  [`Self::flush_parsed_if_dirty`] catches up later.  This batches
+    /// a typing burst into one re-parse and removes the mid-typing rendered → raw → rendered
+    /// flash.
     pub(crate) fn apply_delta(&mut self, delta: EditDelta) {
-        // The text backstop for a read-only document; the mode
-        // backstop is `edit_ops::enter_edit_if_preview`.
-        //
-        // Every edit in the crate lands here, so this is the one place
-        // the guarantee can be made rather than *maintained*.
-        // Enforcing it at each mutation funnel instead was tried first,
-        // and is how `:s`, bracketed paste, `>>`, `~`, `u`/`U`, `J`,
-        // `o`/`O`, Visual `r` and the table-scoped `dd` were each
-        // missed in turn: a per-site rule is only as good as the next
-        // person's audit of it.  Those eight per-site guards are gone
-        // now, and this is what replaced them.
-        //
-        // Silent by design at this depth — `EditorState` has no way to
-        // flash, and every path a user can actually reach reports the
-        // refusal before getting here.
+        // The text backstop for a read-only document (the mode backstop is
+        // `edit_ops::enter_edit_if_preview`).  Every edit lands here, so the guarantee is *made*
+        // rather than maintained: per-site guards were tried first and missed eight paths in turn.
+        // Silent by design at this depth — reachable paths report the refusal before getting here.
         if self.readonly {
             return;
         }
         let crosses_line = delta.inserted.contains('\n') || delta.removed.contains('\n');
         let new_cursor = delta.redo_cursor();
-        // Apply the edit.
         let end = delta.offset + delta.removed.chars().count();
         if !delta.removed.is_empty() {
             self.buffer
@@ -1291,34 +1149,25 @@ impl EditorState {
         self.dirty = true;
 
         if crosses_line {
-            // A newline added or removed reflows block boundaries — re-parse
-            // immediately so the rendered view, source_map, and
-            // cursor_block_line_range all reflect the new block layout.
+            // A newline reflows block boundaries; re-parse so the view, source map, and cached
+            // line range all agree on the new layout.
             self.refresh_parsed();
             self.update_cursor_block();
         } else {
-            // In-line edit: defer the re-parse.  Bump `parsed_version` so
-            // per-frame snapshot caches (image, link, table) invalidate on
-            // the next draw — otherwise they'd paint with stale geometry
-            // against a document whose cursor block has grown / shrunk.
+            // Defer the re-parse, but bump `parsed_version` so the per-frame snapshot caches
+            // don't paint stale geometry against a block that just grew or shrank.
             self.parsed_dirty = true;
             self.parsed_version = self.parsed_version.wrapping_add(1);
             self.cursor_blink.reset();
         }
     }
 
-    /// Estimated screen row (0-indexed within the viewport) at which the
-    /// cursor currently appears.  Sums the visual rows consumed by every
-    /// line between `scroll` and the cursor's line, plus the cursor's
-    /// sub-line within its own (potentially-wrapped) line.  In Rendered /
-    /// Preview mode the unit is rendered lines (mirroring `RenderedView`);
-    /// in Raw mode the unit is buffer lines (mirroring `RawView`).
-    /// Returns 0 when the cursor is currently above the viewport.
+    /// Viewport-relative screen row of the cursor; 0 when it is above the viewport.  Counted in
+    /// rendered lines for Rendered / Preview and buffer lines for Raw, matching each view.
     ///
-    /// Used by `Action::ToggleRawMode` to keep the cursor on the same
-    /// screen row when switching between Rendered and Raw, since the two
-    /// modes use different scroll units and the same `scroll` value
-    /// otherwise jumps to a totally different part of the document.
+    /// Used by `ToggleRawMode` to hold the cursor on the same screen row across the switch — the
+    /// two modes use different scroll units, so the same `scroll` value otherwise lands somewhere
+    /// unrelated.
     pub fn cursor_screen_row(&self, viewport_width: usize) -> usize {
         if viewport_width == 0 {
             return 0;
@@ -1329,11 +1178,8 @@ impl EditorState {
         }
     }
 
-    /// Set `scroll` so the cursor's line appears at `target_row` on
-    /// screen.  Quantized by line boundaries — the cursor will land at
-    /// `target_row` exactly when possible, otherwise on the nearest
-    /// line-start row at or above `target_row` (so the cursor stays
-    /// visible rather than disappearing past the bottom).
+    /// Set `scroll` so the cursor lands at `target_row`, or the nearest line-start row above it
+    /// — quantized by line boundaries, and never past the viewport bottom.
     pub fn set_scroll_for_cursor_screen_row(&mut self, target_row: usize, viewport_width: usize) {
         if viewport_width == 0 {
             return;
@@ -1347,9 +1193,7 @@ impl EditorState {
     }
 }
 
-/// Fetch the text of buffer line `line`, stripped of any trailing newline.
-/// `pub(super)` so sibling state-impl modules (visual nav, viewport) can
-/// reach it without re-deriving.
+/// Text of buffer line `line`, without its trailing newline.
 pub(super) fn line_text_trimmed(buf: &crate::document::Buffer, line: usize) -> String {
     buf.line(line)
         .map(|s| s.trim_end_matches('\n').to_owned())
@@ -1380,6 +1224,16 @@ fn rendered_cursor_screen_row(state: &EditorState, width: usize) -> usize {
 }
 
 pub(super) fn rendered_cursor_visual_row(state: &EditorState, width: usize) -> usize {
+    let er = state.effective_rows(width);
+    if er.has_reveal() {
+        // The cursor rests inside a reflowed, revealed block: its visual row is the rows before
+        // the block, plus the raw lines above the cursor's, plus its sub-row within its raw line.
+        // `cursor_sub_line_in_rendered` already wraps the cursor's *buffer* line — which is its
+        // raw source line — so it supplies that sub-row exactly.
+        let cursor_byte = state.buffer.rope().char_to_byte(state.cursor.offset);
+        let raw = crate::ui::rendered_view::raw_block_cursor(state, cursor_byte);
+        return er.raw_line_visual_row(raw.raw_line) + cursor_sub_line_in_rendered(state, 0, width);
+    }
     let cursor_rendered = cursor_rendered_line_idx(state);
     let rows_before = state.parsed.visual_rows_before(cursor_rendered, width);
     rows_before + cursor_sub_line_in_rendered(state, cursor_rendered, width)
@@ -1389,13 +1243,9 @@ fn set_rendered_scroll_for_screen_row(state: &mut EditorState, target_row: usize
     state.scroll = rendered_cursor_visual_row(state, width).saturating_sub(target_row);
 }
 
-/// Visual sub-line offset of the cursor within its rendered line.  In
-/// Rendered/Preview mode the cursor's line is painted from the live
-/// buffer (the "cursor block reveal" path), so the wrap that determines
-/// the cursor's sub-line is over the buffer text — not the parsed
-/// rendered text, which can drop or expand chars relative to source.
-/// Falls back to the parsed line's wrap when the cursor's buffer-line
-/// text isn't available.
+/// Visual sub-line offset of the cursor within its rendered line.  The wrap is taken over the
+/// *buffer* text, because the reveal path paints the cursor's line from the live buffer and the
+/// rendered text can drop or expand chars relative to source.
 fn cursor_sub_line_in_rendered(
     state: &EditorState,
     _cursor_rendered: usize,
@@ -1408,11 +1258,8 @@ fn cursor_sub_line_in_rendered(
     sub
 }
 
-/// Rendered-line index where the cursor currently appears in `RenderedView`.
-/// Mirrors the `cursor_rendered_line` computation in `ui::rendered_view` so
-/// scroll arithmetic that needs to match the on-screen cursor position
-/// (e.g. preserving the cursor's screen row across a mode switch) lands on
-/// the same line the view actually paints.
+/// Rendered-line index where the cursor appears, mirroring `ui::rendered_view`'s own computation
+/// so scroll arithmetic lands on the line the view actually paints.
 pub(crate) fn cursor_rendered_line_idx(state: &EditorState) -> usize {
     let cursor_offset = state.cursor.offset;
     let cursor_byte = state.buffer.rope().char_to_byte(cursor_offset);
@@ -1430,8 +1277,8 @@ pub(crate) fn cursor_rendered_line_idx(state: &EditorState) -> usize {
     }
     let cursor_block_own = state.parsed.block_own_line_count(cursor_block_idx);
 
-    // Shared with `RenderedView` — see `raw_block_cursor`.  The view has one
-    // extra branch for a stale parse; this path always sees a fresh one.
+    // Shared with `RenderedView`, which has one extra branch for a stale parse; this path always
+    // sees a fresh one.
     let raw = crate::ui::rendered_view::raw_block_cursor(state, cursor_byte);
     let raw_lines: Vec<&str> = crate::ui::rendered_view::raw_source_lines(&raw.source);
 
@@ -1448,23 +1295,16 @@ pub(crate) fn cursor_rendered_line_idx(state: &EditorState) -> usize {
     cursor_block_lines.start + cursor_in_block
 }
 
-/// Map a cursor's raw source line within its block to the rendered sub-line
-/// index (relative to the block's first rendered line) that `RenderedView`
-/// replaces with raw text during the hybrid-edit reveal.
+/// Single-line entry point into [`sub_lines_in_block`]: which rendered sub-line the reveal paints
+/// this raw line onto.
 ///
-/// The relation itself lives in [`sub_lines_in_block`] — this is the
-/// single-line entry point into it, and indexes its result.  `RenderedView`
-/// uses this to decide which rendered row to paint raw source onto,
-/// `cursor_rendered_line_idx` uses it to report where the cursor appears,
-/// and `mouse_ops::coord` uses the latter to decide whether a click lands on
-/// a revealed row.  When those disagree, clicks on a revealed line are
-/// mapped against the *rendered* spans instead of the raw text the user is
-/// looking at — which is exactly wrong for a line containing dropped markers
-/// (`` `code` ``, `**bold**`).
+/// Three callers must agree here — the view (which row to paint raw), `cursor_rendered_line_idx`
+/// (where the cursor appears), and `mouse_ops::coord` (whether a click landed on a revealed row).
+/// When they disagree, clicks on a revealed line map against the *rendered* spans instead of the
+/// raw text on screen, which is wrong for any line with dropped markers.
 ///
-/// `raw_lines` must come from `rendered_view::raw_text::raw_source_lines`
-/// (or an equivalent split that drops a single trailing empty entry).  A
-/// `cursor_raw_line` past the last raw line clamps to the block's end.
+/// `raw_lines` must come from `rendered_view::raw_text::raw_source_lines`.  A `cursor_raw_line`
+/// past the last raw line clamps to the block's end.
 pub(crate) fn cursor_sub_line_in_block(
     parsed: &ParsedDoc,
     cursor_byte: usize,
@@ -1488,24 +1328,15 @@ pub(crate) fn cursor_sub_line_in_block(
         .unwrap_or(0)
 }
 
-/// Rendered sub-line index — relative to the block's first rendered line —
-/// for **every** raw line of one block, plus one trailing entry for a line
-/// index past the block's last (which a stale cursor byte can produce).  So
-/// the result is always `raw_lines.len() + 1` long and never empty.
+/// Rendered sub-line index, relative to the block's first rendered line, for **every** raw line of
+/// one block plus one trailing entry for an index past the last (which a stale cursor byte can
+/// produce).  The result is always `raw_lines.len() + 1` long.
 ///
-/// This is the crate's single raw-line → rendered-row derivation; see
-/// [`cursor_sub_line_in_block`] for who depends on it and what breaks when a
-/// caller re-derives it instead.  It is written as the batch form because
-/// `editor::state_source_lines` needs a whole block's mapping at once to
-/// build the gutter's inverse, and answering that one line at a time was
-/// quadratic in the block's length: the table branch reclassified every
-/// rendered sub-line per query, and the prose branch rescanned every
-/// preceding raw line per query.  One pass now answers the whole block, and
-/// the single-line caller indexes it.
+/// The crate's single raw-line → rendered-row derivation; see [`cursor_sub_line_in_block`] for
+/// what breaks when a caller re-derives it.  Batch form because the gutter needs a whole block at
+/// once and per-line answers were quadratic in the block's length.
 ///
-/// `classify_byte` only picks the block's *flavor* (is it a code block?), so
-/// any byte inside the block will do — `cursor_sub_line_in_block` passes the
-/// cursor's, the gutter builder passes the block's first.
+/// `classify_byte` only picks the block's *flavor*, so any byte inside the block will do.
 pub(crate) fn sub_lines_in_block(
     parsed: &ParsedDoc,
     classify_byte: usize,
@@ -1525,9 +1356,8 @@ pub(crate) fn sub_lines_in_block(
         let block_lines = parsed.lines.get(rendered).unwrap_or(&[]);
         let kinds = crate::ui::table_view::classify_table_sub_lines(block_lines);
         let last_replaceable = block_own.saturating_sub(2);
-        // Invert `kinds` in one pass: header row, thick separator, and the
-        // first sub-line of each data row.  First occurrence wins, matching
-        // the `position()` scans this replaces.
+        // Invert `kinds` in one pass; first occurrence wins, matching the `position()` scans
+        // this replaces.
         let mut header: Option<usize> = None;
         let mut thick: Option<usize> = None;
         let mut data: Vec<Option<usize>> = Vec::new();
@@ -1560,33 +1390,37 @@ pub(crate) fn sub_lines_in_block(
             .collect();
     }
 
-    // Mermaid blocks reserve `image_max_height` rendered rows and the reveal
-    // overlay paints raw source onto them 1:1.  Code blocks render every body
-    // line — including blank ones, emitted as NBSP-padded rows — so they too
-    // map 1:1; counting only rendered-producing lines (below) would drift the
-    // cursor up by one row per blank.  A metadata block renders verbatim for
-    // the same reason: a blank line inside frontmatter is data, and the
-    // renderer emits a row for it.
-    let is_mermaid = parsed.is_mermaid_block(block_idx);
+    // These all map 1:1: a diagram block's reveal (mermaid fence or `$$...$$` math) paints onto
+    // its reserved rows, and code and metadata blocks render every body line including blanks (as
+    // NBSP-padded rows).  Falling through to the counting branch below would drift the cursor up
+    // one row per blank.
+    let is_diagram_reveal = parsed.is_diagram_reveal_block(block_idx);
+    let real_block = parsed.real_block_for_byte(classify_byte);
     let is_verbatim = matches!(
-        parsed.real_block_for_byte(classify_byte),
+        real_block,
         Some(
             crate::markdown::Block::CodeBlock { .. } | crate::markdown::Block::MetadataBlock { .. }
-        )
-    );
-    if is_mermaid || is_verbatim {
+        ) // A figures-off `$$...$$` paragraph renders as a fenced-style `math`
+          // code block (see `display_math_block_body`), so its rendered rows map
+          // 1:1 onto source lines — including any blank line inside the formula,
+          // which the prose branch below would otherwise drop.
+    ) || real_block
+        .is_some_and(|b| crate::markdown::parser::post_pass::display_math_block_body(b).is_some());
+    if is_diagram_reveal || is_verbatim {
         let last = block_own.saturating_sub(1);
-        return (0..=n).map(|r| r.min(last)).collect();
+        // A `$$...$$` block revealed with the math preview reserves a top
+        // band for the rendered formula and paints the raw source below
+        // it, so each source line r lands on rendered row `r + band`.  The
+        // offset is 0 for mermaid, verbatim blocks, and a preview-off math
+        // reveal, leaving those 1:1.
+        let offset = parsed.latex_source_offset(block_idx);
+        return (0..=n).map(|r| (r + offset).min(last)).collect();
     }
 
-    // The renderer emits one rendered line per raw line EXCEPT two collapses:
-    // an interior blank line (between an item's paragraphs) and a soft-break
-    // continuation line produce no rendered line of their own.  A *separator*
-    // blank — one directly before a top-level item marker — DOES render
-    // (loose-list legibility spacing, emitted from
-    // `ListItem::blank_lines_before`).  So a line's sub-row is the count of
-    // preceding raw lines that produce a rendered row: every non-blank line,
-    // plus separator blanks; interior blanks are skipped.
+    // One rendered line per raw line, except that interior blanks and soft-break continuations
+    // produce none.  A *separator* blank — one directly before a top-level item marker — does
+    // render (loose-list spacing).  So a line's sub-row is the count of preceding raw lines that
+    // render: every non-blank, plus separator blanks.
     let base_indent = raw_lines
         .first()
         .map(|l| l.len() - l.trim_start().len())
@@ -1595,12 +1429,9 @@ pub(crate) fn sub_lines_in_block(
         let indent = line.len() - line.trim_start().len();
         indent == base_indent && raw_list_marker_char_width(line).is_some()
     };
-    // Backwards pass: a blank renders only if the contiguous blank run it
-    // belongs to ends at a top-level item marker, which walking from the end
-    // answers in O(1) per line — `run_ends_at_marker` carries the nearest
-    // following non-blank line's verdict, and stays false for a trailing run
-    // with no following line at all.  Interior blanks — whose run resolves to
-    // continuation content or a nested marker — don't render.
+    // Backwards, because a blank renders only if its contiguous run ends at a top-level marker:
+    // walking from the end answers that in O(1) per line, and a trailing run with no following
+    // line correctly stays false.
     let mut renders = vec![false; n];
     let mut run_ends_at_marker = false;
     for i in (0..n).rev() {
@@ -1632,22 +1463,16 @@ mod tests {
         Box::leak(Box::new(Theme::default()))
     }
 
-    /// `inline_map_for` must not let a non-canonical `(index, text)`
-    /// pair poison the per-buffer-line `InlineColMap` cache.  Mouse
-    /// hit-testing can derive a raw line that doesn't match the buffer
-    /// line (rendered sub-rows past a block's raw line count, block
-    /// ranges starting mid-line); such calls get a local map, and the
-    /// later canonical call still sees the correct cached entry.
+    /// A non-canonical `(index, text)` pair must not poison the per-line `InlineColMap` cache;
+    /// mouse hit-testing can derive one.
     #[test]
     fn inline_map_for_does_not_poison_cache_with_noncanonical_text() {
         let state = EditorState::new(Buffer::from_str("hello **world**\nsecond line\n"), theme());
 
-        // Wrong text for line 1 (it belongs to line 0) — must be served
-        // by a locally built map, leaving the cache untouched.
+        // Wrong text for line 1 — must be served by a local map, leaving the cache untouched.
         let wrong = state.inline_map_for(1, "hello **world**");
         assert_eq!(wrong.raw_len(), 15);
 
-        // Canonical call for line 1 still maps its real content.
         let right = state.inline_map_for(1, "second line");
         assert_eq!(right.raw_len(), 11);
 
@@ -1656,10 +1481,143 @@ mod tests {
         assert_eq!(oob.raw_len(), 8);
     }
 
-    /// When `images_enabled == false`, every image block collapses to
-    /// its one-line `[Image: alt]` placeholder: no blank rows are
-    /// reserved underneath.  This matches the `Failed` branch of
-    /// `ImageCache::reserved_rows` and is the declined-session layout.
+    /// Concatenated text of every non-blank rendered line (skips the phantom trailing row and
+    /// any separator blanks), one string per row.
+    fn line_texts(state: &EditorState) -> Vec<String> {
+        state
+            .parsed
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// Reflow is on by default in both Preview and Rendered, off in Raw, and the master switch
+    /// (`set_reflow`) disables it everywhere.  A mode switch that changes the effective reflow
+    /// reparses (via `sync_reflow_for_mode`, as `prepare_viewport` calls it each frame).  Note
+    /// `line_texts` reads the *rendered* spine (`parsed.lines`): the Rendered-mode raw reveal is a
+    /// display overlay, so the rendered spine is the reflowed flow in both view modes.
+    #[test]
+    fn reflow_is_default_on_in_preview_and_rendered_off_in_raw() {
+        let flow = vec!["one two three".to_string()];
+        let split = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+
+        let mut state = EditorState::new(Buffer::from_str("one\ntwo\nthree\n"), theme());
+        assert_eq!(state.mode, Mode::Preview);
+        state.sync_reflow_for_mode();
+        assert_eq!(line_texts(&state), flow, "Preview reflows by default");
+
+        state.mode = Mode::Rendered;
+        state.sync_reflow_for_mode();
+        assert_eq!(line_texts(&state), flow, "Rendered reflows by default too");
+
+        state.mode = Mode::Raw;
+        state.sync_reflow_for_mode();
+        // Raw uses buffer text, not `parsed.lines`, but the parse still tracks `want_reflow`: Raw
+        // never reflows, so the rendered spine is per-line again.
+        assert_eq!(line_texts(&state), split, "Raw never reflows");
+
+        // The master switch turns it off in the view modes too.
+        state.mode = Mode::Rendered;
+        state.set_reflow(false);
+        assert_eq!(
+            line_texts(&state),
+            split,
+            "disabling reflow splits the flow back"
+        );
+    }
+
+    /// When a reflowed paragraph reveals (grows) while the cursor stays on screen, the block's
+    /// top and everything above it must stay put — only content below reflows.  The expansion is
+    /// entirely below the block's first row, so `scroll` is left unchanged (the mermaid-style
+    /// reveal), rather than dragging the document to re-pin the cursor's exact row.
+    #[test]
+    fn reflow_reveal_keeps_block_top_and_content_above_put() {
+        let src = "a\n\nb\n\nc\n\none\ntwo\nthree\nfour\nfive\n\nafter\n";
+        let mut state = EditorState::new(Buffer::from_str(src), theme());
+        state.mode = Mode::Rendered;
+        state.set_viewport_width(20);
+        state.set_reflow(true);
+        let (w, h) = (20usize, 20usize); // tall enough the expansion never pushes the cursor off
+                                         // Cursor into the reflowed paragraph on its first line (a downward entry), the case that
+                                         // keeps the reveal delay; the expansion then happens entirely below the cursor.
+        let byte = state.buffer.contents().find("one").unwrap();
+        state.cursor.offset = state.buffer.rope().byte_to_char(byte);
+        state.update_cursor_block();
+
+        // Frame 1: reveal delay pending (block still one flow row).  Park the flow row at the top
+        // of the viewport so the expansion has ample headroom below.
+        state.cursor_block_entered_at = Some(std::time::Instant::now());
+        assert!(!state.cursor_block_revealed());
+        state.scroll = super::rendered_cursor_visual_row(&state, w);
+        state.anchor_reflow_reveal(w, h);
+        let scroll_before = state.scroll;
+
+        // Frame 2: the reveal fires (block expands to its raw lines) — cursor hasn't moved.
+        state.cursor_block_entered_at = None;
+        assert!(
+            state.effective_rows(w).has_reveal(),
+            "the block must now be reflow-revealed"
+        );
+        state.anchor_reflow_reveal(w, h);
+        assert_eq!(
+            state.scroll, scroll_before,
+            "revealing a paragraph while the cursor stays visible must not move the document",
+        );
+    }
+
+    /// Switching into Rendered mode with the cursor already resting in a reflowed paragraph must
+    /// not yank the view: the first Rendered frame's `anchor_reflow_reveal` only re-checks cursor
+    /// visibility, so the scroll the mode switch established (cursor already visible) survives.
+    #[test]
+    fn switching_into_rendered_mode_leaves_the_scroll_alone() {
+        // A reflowed paragraph deep enough that the cursor sits mid-viewport, not at the top.
+        let mut src = String::new();
+        for i in 0..10 {
+            src.push_str(&format!("filler {i}\n\n"));
+        }
+        src.push_str("alpha beta\ngamma delta\nepsilon zeta\n\ntail\n");
+        let mut state = EditorState::new(Buffer::from_str(&src), theme());
+        let (w, h) = (20usize, 10usize);
+        state.set_viewport_width(w);
+        let byte = state.buffer.contents().find("gamma").unwrap();
+        state.cursor.offset = state.buffer.rope().byte_to_char(byte);
+        state.update_cursor_block();
+        state.cursor_block_entered_at = None; // resting → revealed once in Rendered
+
+        // A few Preview frames (as `prepare_viewport` runs them), then scroll so the cursor is
+        // visible mid-document.
+        for _ in 0..3 {
+            state.sync_reflow_for_mode();
+            state.anchor_reflow_reveal(w, h);
+        }
+        state.mode = Mode::Preview;
+        state.ensure_cursor_visible(h, w);
+
+        // The mode-switch action flips to Rendered and fits the cursor.
+        state.mode = Mode::Rendered;
+        state.ensure_cursor_visible(h, w);
+        let scroll_after_switch = state.scroll;
+
+        // The next frame's per-frame anchor must leave that scroll alone.
+        state.sync_reflow_for_mode();
+        state.anchor_reflow_reveal(w, h);
+        assert_eq!(
+            state.scroll, scroll_after_switch,
+            "entering Rendered mode must not move the view",
+        );
+    }
+
+    /// With images declined, every image block collapses to its one-line placeholder — the same
+    /// layout as the `Failed` branch of `ImageCache::reserved_rows`.
     #[test]
     fn images_enabled_false_collapses_blocks_to_placeholder() {
         // image_max_height = 10 → expanded blocks each reserve 10 rows.
@@ -1672,8 +1630,6 @@ mod tests {
             10, // image_max_height
         );
 
-        // Default path reserves 10 rows per image (plus the blank
-        // between them).  Sanity-check the expanded count.
         let expanded = state.parsed.line_count();
         assert!(
             expanded >= 20,
@@ -1683,51 +1639,40 @@ mod tests {
         state.images_enabled = false;
         state.refresh_parsed();
 
-        // Collapsed: each image block emits exactly its one-line
-        // placeholder — two images + the blank gap + the phantom final
-        // line (the source ends with '\n') = 4 rendered lines.
+        // Two placeholders + the blank gap + the phantom final line = 4.
         assert_eq!(state.parsed.line_count(), 4);
     }
 
-    /// Moving down through a word-wrapped line should land on the visually
-    /// corresponding column, not on `col / col_width`.
+    /// Down through a word-wrapped line lands on the visually corresponding column.
     #[test]
     fn move_down_visual_honours_word_wrap_boundaries() {
-        // Line has a natural wrap point at the last space before col 20.
-        // "hello world foo bar baz quux wibble wobble"
-        // Wrapping at width 20: row 0 ends at last space ≤ 20.
         let text = "hello world foo bar baz quux wibble wobble";
         let mut state = EditorState::new(Buffer::from_str(text), theme());
-        // Cursor on row 0 at visual col 3 ("l" in "hello").
+        // Cursor on row 0 at visual col 3.
         state.cursor.offset = 3;
         state.cursor.preferred_col = 3;
 
         state.move_down_visual(20);
 
-        // After moving down one visual row, cursor should be on row 1 at
-        // visual col 3 — i.e. raw col = row1_start + 3.
         let rows = crate::ui::line_render::visual_rows_of_str(text, 20);
         assert!(rows.len() >= 2, "expected wrap into at least 2 rows");
         let (row1_start, _, _) = rows[1];
         assert_eq!(state.cursor.offset, row1_start + 3);
     }
 
-    /// Moving up from the first visual sub-line of a line should land on the
-    /// LAST visual sub-line of the previous line, preserving the visual col.
+    /// Up from the first sub-line lands on the *last* sub-line of the previous line.
     #[test]
     fn move_up_visual_crosses_to_last_subline_of_previous_line() {
         let long = "aaaaa bbbbb ccccc ddddd eeeee fffff ggggg hhhhh";
-        // Two logical lines separated by \n.
         let text = format!("{}\nshort\n", long);
         let mut state = EditorState::new(Buffer::from_str(&text), theme());
-        // Cursor on line 1 (the "short" line) at col 3.
+        // Cursor on line 1 at col 3.
         let line1_start = state.buffer.line_to_char(1);
         state.cursor.offset = line1_start + 3;
         state.cursor.preferred_col = 3;
 
         state.move_up_visual(20);
 
-        // Expected: land on the LAST visual sub-line of line 0 at visual col 3.
         let rows = crate::ui::line_render::visual_rows_of_str(long, 20);
         let last = *rows.last().unwrap();
         let expected_raw_col = last.0 + 3;
@@ -1737,19 +1682,12 @@ mod tests {
         );
     }
 
-    /// A list item's content must navigate the same way — the 2-char `- `
-    /// prefix should be part of the line's raw col and must NOT shift the
-    /// cursor's visual column by 2.
-    /// When the cursor sits on a wide wrapped sub-row at a visual column that
-    /// exceeds the width of the sub-row above, pressing Up must land the cursor
-    /// visually on the previous sub-row (clamped to its last position), not on
-    /// the wrap boundary — which visually renders at column 0 of the current
-    /// sub-row and leaves Up "stuck" there.
+    /// Up from a visual column wider than the sub-row above must clamp within that sub-row, not
+    /// land on the wrap boundary — which renders at column 0 of the *current* row and leaves Up
+    /// stuck there.
     #[test]
     fn move_up_visual_clamps_within_target_subrow_not_on_wrap_boundary() {
-        // Logical line: prefix that wraps at a space, followed by a long run
-        // of 'a's. Width 40 gives row 0 = "Super long line of inline code ` "
-        // (33 chars) and row 1+ = 40-char runs of 'a's.
+        // Width 40: row 0 is the 33-char prefix, rows 1+ are 40-char runs of 'a'.
         let text = format!("Super long line of inline code ` {}`", "a".repeat(150));
         let mut state = EditorState::new(Buffer::from_str(&text), theme());
         let width = 40;
@@ -1767,8 +1705,6 @@ mod tests {
 
         state.move_up_visual(width);
 
-        // Cursor must now be visually on row 0, not on the row 0/row 1 boundary
-        // (which renders at column 0 of row 1).
         let (sub_idx, _) = crate::ui::line_render::sub_line_of_col(&rows, state.cursor.offset);
         assert_eq!(
             sub_idx, 0,
@@ -1776,8 +1712,7 @@ mod tests {
             state.cursor.offset, sub_idx
         );
 
-        // Pressing Up again from the last position of row 0 should keep moving
-        // (snap to start of line), not stall at the same offset.
+        // Up again must keep moving, not stall.
         let before = state.cursor.offset;
         state.move_up_visual(width);
         assert_ne!(
@@ -1786,16 +1721,12 @@ mod tests {
         );
     }
 
-    /// Regression: a hard break that absorbed the space after it leaves
-    /// `next_start > end`, and the clamp used to run against `next_start`.
-    /// That put the cursor on the absorbed space — a char that owns no cell
-    /// and renders at the *next* row's column 0 — so Up appeared not to move
-    /// and then stalled there forever.  `last_col_in_row` clamps against
-    /// `end` instead, which is the row's real last char.
+    /// Regression: clamping against `next_start` put the cursor on a space absorbed by the wrap —
+    /// a char owning no cell, rendered at the next row's column 0 — so Up stalled there forever.
+    /// `last_col_in_row` clamps against `end`, the row's real last char.
     #[test]
     fn move_up_visual_never_lands_on_a_space_absorbed_by_the_wrap() {
-        // Width 10: every row fills exactly and swallows its trailing space,
-        // so rows are [(0,10,11), (11,21,22), (22,32,32)].
+        // Width 10: every row fills exactly and swallows its trailing space.
         let text = "abcdefghij klmnopqrst uvwxyzabcd";
         let width = 10;
         let mut state = EditorState::new(Buffer::from_str(text), theme());
@@ -1822,25 +1753,15 @@ mod tests {
         );
     }
 
-    /// Regression: pressing Down from a wrapped continuation row of a list
-    /// item used to land at content cell `preferred_col` on the next line,
-    /// off by the hanging-indent width because `preferred_col` was stored
-    /// without the indent.  After the fix, a cursor visually at screen
-    /// cell 5 on a list-item continuation row (= 2 cells of indent + 3
-    /// cells into content) lands at screen cell 5 on the next plain
-    /// paragraph too — no horizontal jump by the indent amount.
+    /// Regression: `preferred_col` stored without the hanging indent made Down off a list-item
+    /// continuation row jump horizontally by the marker width.
     #[test]
     fn move_down_visual_preserves_screen_cell_across_indent_boundary() {
-        // Logical line 0: list item that wraps.  Logical line 1: plain
-        // paragraph (no marker, no indent).
         let text = "- list item content that wraps to a second row\nplain paragraph here";
         let mut state = EditorState::new(Buffer::from_str(text), theme());
         let width = 30;
-        // Place the cursor on the *continuation* row of line 0, then
-        // sync `preferred_col` from that screen position (5 cells from
-        // the screen-row left edge).  The exact char offset of "screen
-        // cell 5 on row 1" depends on the wrap point, so derive it via
-        // the same helpers the editor uses.
+        // The offset of "screen cell 5 on row 1" depends on the wrap point, so derive it with the
+        // same helpers the editor uses.
         let chars: Vec<(char, ratatui::style::Style)> = text
             .lines()
             .next()
@@ -1851,43 +1772,32 @@ mod tests {
         let rows = crate::ui::line_render::visual_rows_of_chars(&chars, width, 2);
         assert!(rows.len() >= 2, "list item must wrap");
         let (row1_start, row1_end, _) = rows[1];
-        // Pick screen cell 5 on row 1 → content cell 3 in row 1 → row1_start + 3.
+        // Screen cell 5 on row 1 → content cell 3.
         state.cursor.offset = row1_start + 3.min(row1_end - row1_start);
         state.cursor.preferred_col = state.current_visual_col(width);
-        // The seeded preferred_col must reflect the screen position, not
-        // the line-relative cell column.  On row 1 with indent 2, screen
-        // col 5 = content cell 3 + indent 2.
         assert_eq!(state.cursor.preferred_col, 5);
 
         state.move_down_visual(width);
 
-        // We're now on logical line 1's first row (plain paragraph, no
-        // indent).  Screen cell 5 there = content cell 5 = char 5.
+        // Line 1 has no indent, so screen cell 5 is char 5.
         let line1_start = state.buffer.line_to_char(1);
         assert_eq!(state.cursor.offset, line1_start + 5);
     }
 
-    /// Regression: clicking on a wrapped continuation row used to seed
-    /// `preferred_col` from the line-relative cell column, which on a
-    /// long wrapped line is huge.  Subsequent vertical nav then clamped
-    /// every target line to its end.  The fix routes click landing
-    /// through `current_visual_col` so `preferred_col` reflects the
-    /// click's screen column.
+    /// Regression: a click on a wrapped continuation row seeded `preferred_col` from the
+    /// line-relative column, which is huge, so later vertical nav clamped every line to its end.
     #[test]
     fn click_on_wrapped_continuation_row_seeds_preferred_col_from_screen() {
-        // 60-cell paragraph that wraps at width 20 to three rows.  No
-        // hanging indent (plain paragraph).
         let text = "the quick brown fox jumps over the lazy dog one more time";
         let mut state = EditorState::new(Buffer::from_str(text), theme());
         state.mode = crate::editor::Mode::Rendered;
         let viewport_w: usize = 20;
 
-        // Compute char offset for "screen cell 4 on row 2".
+        // Char offset for "screen cell 4 on row 2".
         let rows = crate::ui::line_render::visual_rows_of_str(text, viewport_w);
         assert!(rows.len() >= 3);
         let (row2_start, row2_end, _) = rows[2];
         let target_offset = row2_start + 4.min(row2_end - row2_start);
-        // Simulate a click landing at that offset.
         let click_action = crate::input::MouseAction::Click {
             col: 4,
             row: 2,
@@ -1896,22 +1806,16 @@ mod tests {
         let mut anchor: Option<crate::editor::mouse_ops::DragTarget> = None;
         crate::editor::mouse_ops::apply(&mut state, click_action, &mut anchor, &[], 24, viewport_w);
         assert_eq!(state.cursor.offset, target_offset);
-        // The bug: preferred_col would have been ~row2_start + 4 (large).
-        // After the fix it's the *screen* cell column (4).
+        // Must be the *screen* cell column, not ~row2_start + 4.
         assert_eq!(state.cursor.preferred_col, 4);
     }
 
     #[test]
     fn move_down_visual_on_list_item_without_offset_bug() {
-        // A single-line list item whose content wraps at width 20.  The
-        // raw text has a 2-cell hanging indent (the `- ` marker), so the
-        // continuation row's first content char sits at screen cell 2.
-        // `preferred_col = 5` is a *screen* cell col — on the continuation
-        // row it should map to content cell `5 - 2 = 3`.
+        // The `- ` marker gives a 2-cell hanging indent, so screen cell 5 on the continuation row
+        // is content cell 3.
         let text = "- hello world foo bar baz quux wibble";
         let mut state = EditorState::new(Buffer::from_str(text), theme());
-        // Cursor on row 0 at screen cell 5 (the second 'l' in "hello",
-        // since `- ` consumes cells 0–1 and "hell" runs across cells 2–5).
         state.cursor.offset = 5;
         state.cursor.preferred_col = 5;
 
@@ -1927,16 +1831,13 @@ mod tests {
         );
         assert!(rows.len() >= 2);
         let (row1_start, _, _) = rows[1];
-        // Screen cell 5 with indent 2 → content offset 3 within row 1.
         assert_eq!(state.cursor.offset, row1_start + 3);
     }
 
     #[test]
     fn move_down_visual_in_raw_mode_wraps_flat() {
-        // The same list item as above, in Raw mode.  Raw paints wrapped
-        // rows flat (`line_render::render_raw_line_with_cursor`), so
-        // navigation must wrap flat too: screen cell 5 on the continuation
-        // row is content cell 5, not `5 - 2` as in a rendered view.
+        // Raw paints wrapped rows flat, so navigation must too: the same position is content
+        // cell 5 here, not `5 - 2` as in a rendered view.
         let text = "- hello world foo bar baz quux wibble";
         let mut state = EditorState::new(Buffer::from_str(text), theme());
         state.mode = crate::editor::Mode::Raw;
@@ -1953,8 +1854,8 @@ mod tests {
 
     #[test]
     fn current_visual_col_in_raw_mode_takes_no_hanging_indent() {
-        // `preferred_col` is seeded from this, so an indent counted here
-        // would push every vertical move off by the marker width.
+        // `preferred_col` is seeded from this, so an indent counted here would push every
+        // vertical move off by the marker width.
         let text = "- hello world foo bar baz quux wibble";
         let mut state = EditorState::new(Buffer::from_str(text), theme());
         state.mode = crate::editor::Mode::Raw;
@@ -1962,26 +1863,19 @@ mod tests {
         assert!(rows.len() >= 2);
         let (row1_start, row1_end, _) = rows[1];
         state.cursor.offset = row1_start + 3.min(row1_end - row1_start);
-        // Flat wrap: content cell 3 on the continuation row *is* screen
-        // cell 3.  In a rendered view the same position reads as cell 5.
+        // Flat wrap: content cell 3 *is* screen cell 3; a rendered view reads it as 5.
         assert_eq!(state.current_visual_col(20), 3);
         state.mode = crate::editor::Mode::Rendered;
         assert_eq!(state.current_visual_col(20), 5);
     }
 
-    /// When the cursor moves to the last rendered line of a document that
-    /// contains wrapped lines above it, the scroll offset must back up enough
-    /// visual rows (not logical lines) to keep the last line on screen.
-    /// Regression test for "bottom of document is never visible in Rendered
-    /// mode when earlier lines wrap".
+    /// Regression: the bottom of the document was unreachable in Rendered mode when earlier lines
+    /// wrapped, because the scroll bound counted logical lines rather than visual rows.
     #[test]
     fn scroll_to_bottom_accounts_for_wrapped_lines() {
-        // Build a document whose first paragraph wraps across several visual
-        // rows, followed by a short final paragraph.  At viewport_height=5 and
-        // viewport_width=20, the long paragraph occupies >5 visual rows, so a
-        // naive "scroll = total - height" bound (which ignores wrap) would
-        // push the final paragraph past the viewport bottom.
-        let long = "a".repeat(100); // one rendered line, ~5 visual rows @ width 20
+        // The long paragraph occupies more than the 5-row viewport, so a wrap-ignoring bound
+        // would push the final paragraph off the bottom.
+        let long = "a".repeat(100);
         let src = format!("{long}\n\nfinal line.\n");
         let mut state = EditorState::new(Buffer::from_str(&src), theme());
         state.mode = crate::editor::Mode::Rendered;
@@ -1993,7 +1887,6 @@ mod tests {
         state.scroll_to_bottom(vp_h, vp_w);
         state.ensure_cursor_visible(vp_h, vp_w);
 
-        // From scroll..=last_rendered_line, the total visual rows must fit.
         let total = state.parsed.lines.len();
         let last = total - 1;
         let used = state.visual_rows_between(state.scroll, last, vp_w);
@@ -2006,16 +1899,11 @@ mod tests {
         );
     }
 
-    /// `cursor_screen_row` paired with `set_scroll_for_cursor_screen_row`
-    /// should round-trip — switching modes and asking the editor to put the
-    /// cursor at the captured row must end with the cursor at the same
-    /// visual row.  Regression test for the rendered → raw mode-switch
-    /// jumping the visible region.
+    /// Regression: the rendered → raw mode switch jumped the visible region.  The screen-row
+    /// getter and setter must round-trip across it.
     #[test]
     fn cursor_screen_row_round_trips_across_mode_switch() {
-        // Document with enough text that scrolling kicks in.  Plain
-        // paragraphs map 1:1 between rendered and raw, so we can compare
-        // rows precisely.
+        // Plain paragraphs map 1:1 between rendered and raw, so rows compare exactly.
         let mut src = String::new();
         for i in 0..20 {
             src.push_str(&format!("line {i}\n"));
@@ -2023,8 +1911,6 @@ mod tests {
         let vp_w = 40;
         let mut state = EditorState::new(Buffer::from_str(&src), theme());
         state.mode = crate::editor::Mode::Rendered;
-        // Place cursor on line 12 and scroll so it sits a few rows down
-        // from the top of the viewport.
         state.cursor.offset = state.buffer.line_to_char(12);
         state.update_cursor_block();
         state.scroll = 9; // cursor at screen row 3 in Rendered mode.
@@ -2032,67 +1918,53 @@ mod tests {
         let row_before = state.cursor_screen_row(vp_w);
         assert_eq!(row_before, 3);
 
-        // Simulate switching to Raw mode: in Raw the same `scroll` value is
-        // a buffer-line index, but those happen to coincide for plain
-        // paragraphs.  Force an artificial mismatch by shifting scroll
-        // before re-anchoring, so we exercise the helper rather than a
-        // happy 1:1 alignment.
+        // Force a mismatch before re-anchoring, so the helper is exercised rather than a happy
+        // 1:1 alignment.
         state.mode = crate::editor::Mode::Raw;
-        state.scroll = 0; // pretend the mode switch left the cursor far above
+        state.scroll = 0;
 
         state.set_scroll_for_cursor_screen_row(row_before, vp_w);
         let row_after = state.cursor_screen_row(vp_w);
         assert_eq!(row_after, row_before);
     }
 
-    /// `set_theme` must swap the cached reference and bump
-    /// `parsed_version` so dependent caches invalidate, and re-running
-    /// it with the same pointer must be a no-op (parsed_version
-    /// stable).
+    /// `set_theme` bumps `parsed_version` so dependent caches invalidate, and is a no-op for the
+    /// same pointer.
     #[test]
     fn set_theme_swaps_reference_and_refreshes_parsed() {
         let original: &'static Theme = theme();
         let mut state = EditorState::new(Buffer::from_str("# heading\n"), original);
         let v_before = state.parsed_version;
 
-        // Same reference → no rebuild, version unchanged.
         state.set_theme(original);
         assert_eq!(state.parsed_version, v_before);
 
-        // Different reference → rebuild + version bump.
         let other: &'static Theme = Box::leak(Box::new(Theme::default()));
         state.set_theme(other);
         assert!(std::ptr::eq(state.theme, other));
         assert_ne!(state.parsed_version, v_before);
     }
 
-    /// `set_scroll_for_cursor_screen_row` must clamp to scroll = 0 when the
-    /// requested row is larger than the cursor's distance from the document
-    /// start — the cursor will land on a smaller screen row but stay
-    /// visible (no negative scroll, no off-screen cursor).
+    /// A requested row past the cursor's distance from the document start clamps to scroll 0; the
+    /// cursor lands lower but stays visible.
     #[test]
     fn set_scroll_for_cursor_screen_row_clamps_at_top() {
         let src = "line 0\nline 1\nline 2\n";
         let mut state = EditorState::new(Buffer::from_str(src), theme());
         state.mode = crate::editor::Mode::Raw;
-        // Cursor on line 1, asking for screen row 50 (way past the top).
         state.cursor.offset = state.buffer.line_to_char(1);
         state.scroll = 0;
         state.set_scroll_for_cursor_screen_row(50, 40);
         assert_eq!(state.scroll, 0);
-        // Cursor stays visible at row 1 (its line is 1 line below the top).
         assert_eq!(state.cursor_screen_row(40), 1);
     }
 
     // ── Diff scroll-into-view ───────────────────────────────────────────
 
-    /// Entering diff mode sets `pending_focus_scroll`, and
-    /// `scroll_focused_hunk_into_view` brings an off-screen focused hunk
-    /// into view with a small top margin.
+    /// Entry defers the scroll; resolving it brings an off-screen hunk up with a top margin.
     #[test]
     fn scroll_focused_hunk_into_view_scrolls_offscreen_hunk_up() {
-        // 20 context lines precede the change, so the focused hunk's
-        // first row is at visual row 20 — far below a 5-row viewport.
+        // 20 context lines precede the change, far below a 5-row viewport.
         let mut old = String::new();
         for i in 0..20 {
             old.push_str(&format!("ctx{i}\n"));
@@ -2105,16 +1977,14 @@ mod tests {
         let mut state = EditorState::new(Buffer::from_str(&old), theme());
         state.scroll = 0;
         state.enter_diff_mode(diff);
-        // enter_diff_mode requests a deferred scroll and zeroes scroll.
         assert!(state.pending_focus_scroll);
         assert_eq!(state.scroll, 0);
 
-        // Resolve it: focused row 20, top margin 3 → scroll 17.
+        // Focused row 20, top margin 3 → scroll 17.
         state.scroll_focused_hunk_into_view(5, 80);
         assert_eq!(state.scroll, 17);
 
-        // Idempotent: the hunk is now comfortably visible, so a second
-        // call leaves the scroll unchanged.
+        // Idempotent once visible.
         state.scroll_focused_hunk_into_view(5, 80);
         assert_eq!(state.scroll, 17);
     }
@@ -2128,10 +1998,8 @@ mod tests {
         state
     }
 
-    /// The initial build is deferred by one frame so it happens against
-    /// the *diff mode* viewport width, which reserves no line-number
-    /// gutter.  `App::prepare_viewport` resolves it after posting that
-    /// width.
+    /// The initial build is deferred a frame so it happens against the diff-mode width, which
+    /// reserves no line-number gutter.
     #[test]
     fn enter_diff_mode_defers_the_rendered_parse_by_one_frame() {
         let mut state = diff_state_for("# T\n\nbee\n", "# T\n\nBEE\n");
@@ -2143,10 +2011,7 @@ mod tests {
         assert!(state.diff.as_ref().unwrap().parsed_new.is_some());
     }
 
-    /// The build rides on `refresh_parsed`'s tail rather than a
-    /// hand-maintained list of sites, so a mid-review setting change
-    /// (all of `OpenSettings` / `SwitchTheme` / `CreateCustomTheme` are
-    /// on the `diff_safe_action` allowlist) rebuilds it too.
+    /// The build rides `refresh_parsed`'s tail, so a mid-review setting change rebuilds it too.
     #[test]
     fn a_mid_review_render_setting_change_rebuilds_the_diff_parse() {
         let mut state = diff_state_for("| a |\n|---|\n| 1 |\n", "| a |\n|---|\n| 2 |\n");
@@ -2157,8 +2022,7 @@ mod tests {
         assert!(state.diff.as_ref().unwrap().layout_version() > before);
     }
 
-    /// Outside a review the tail call is a single branch and installs
-    /// nothing.
+    /// Outside a review the tail call installs nothing.
     #[test]
     fn refresh_diff_parse_is_inert_without_a_review() {
         let mut state = EditorState::new(Buffer::from_str("hello\n"), theme());
@@ -2174,5 +2038,201 @@ mod tests {
         state.enter_diff_mode(diff);
         state.scroll_focused_hunk_into_view(20, 80);
         assert_eq!(state.scroll, 0);
+    }
+
+    /// Drive a `$$...$$` block's reveal with the cursor inside it and
+    /// return the resolved [`ImageReveal`].
+    fn latex_reveal_with(math_preview: bool) -> ImageReveal {
+        let mut state = EditorState::new(Buffer::from_str("$$\nE = mc^2\n$$\n"), theme());
+        state.mode = crate::editor::Mode::Rendered;
+        state.math_preview = math_preview;
+        state.refresh_parsed();
+        let latex_idx = state
+            .parsed
+            .image_blocks
+            .iter()
+            .find(|i| matches!(i.source, Some(crate::diagram::DiagramSource::Latex(_))))
+            .expect("latex block")
+            .block_idx;
+        // Park the cursor inside the block and let the reveal fire (skip the dwell delay).
+        state.cursor.offset = "$$\n".chars().count() + 1;
+        state.update_cursor_block();
+        state.cursor_block_entered_at = None;
+        assert_eq!(state.cursor_block_idx, Some(latex_idx));
+        assert!(state.cursor_block_revealed());
+        assert!(state.sync_image_reveal());
+        state.image_reveal.clone().expect("reveal active")
+    }
+
+    /// With the math preview off, a `$$...$$` block reveals exactly its
+    /// raw source lines — no image band — so it collapses to the source
+    /// the user edits, the same affordance a mermaid fence gets.
+    #[test]
+    fn latex_reveal_without_preview_reserves_only_source_rows() {
+        let reveal = latex_reveal_with(false);
+        // Source: `$$` / body / `$$` → 3 rows, and no band.
+        assert_eq!(reveal.rows, 3);
+        assert_eq!(reveal.preview_rows, 0);
+    }
+
+    /// With the math preview on, the block reserves a live-preview band
+    /// PLUS its source rows — the image not yet decoded → the
+    /// `image_max_height` placeholder reservation (24), so the image
+    /// doesn't resize when the reveal opens.
+    #[test]
+    fn latex_reveal_with_preview_reserves_a_band_above_the_source() {
+        let reveal = latex_reveal_with(true);
+        assert_eq!(reveal.rows, 3);
+        assert_eq!(reveal.preview_rows, 24);
+    }
+
+    /// The flip: with the preview on, the revealed source rows are pushed
+    /// below the formula band, so `math_source_offset` records the band
+    /// height for `block_idx` and `sub_lines_in_block` maps source line 0
+    /// onto rendered row `band` (not row 0).  With the preview off there is
+    /// no band and the mapping stays 1:1 from the block's top.
+    #[test]
+    fn math_preview_offsets_source_rows_below_the_formula_band() {
+        let with = latex_reveal_with(true);
+        let mut state = EditorState::new(Buffer::from_str("$$\nE = mc^2\n$$\n"), theme());
+        state.mode = crate::editor::Mode::Rendered;
+        state.math_preview = true;
+        state.refresh_parsed();
+        let latex_idx = state
+            .parsed
+            .image_blocks
+            .iter()
+            .find(|i| matches!(i.source, Some(crate::diagram::DiagramSource::Latex(_))))
+            .expect("latex block")
+            .block_idx;
+        state.cursor.offset = "$$\n".chars().count() + 1;
+        state.update_cursor_block();
+        state.cursor_block_entered_at = None;
+        assert!(state.sync_image_reveal());
+        assert_eq!(
+            state.parsed.latex_source_offset(latex_idx),
+            with.preview_rows,
+            "the source offset equals the reserved preview band"
+        );
+        // Source line 0 (`$$`) now renders `band` rows down, not at the top.
+        let raw = crate::ui::rendered_view::raw_block_cursor(
+            &state,
+            state.buffer.rope().char_to_byte(state.cursor.offset),
+        );
+        let raw_lines = crate::ui::rendered_view::raw_source_lines(&raw.source);
+        let subs = sub_lines_in_block(
+            &state.parsed,
+            state.buffer.rope().char_to_byte(state.cursor.offset),
+            latex_idx,
+            state.parsed.block_own_line_count(latex_idx),
+            &raw.source,
+            &raw_lines,
+        );
+        assert_eq!(
+            subs[0], with.preview_rows,
+            "first source line sits below the band"
+        );
+    }
+
+    /// A plain image reveals its single source line, never a preview band.
+    #[test]
+    fn plain_image_reveal_reserves_one_source_row() {
+        let mut state = EditorState::new(Buffer::from_str("![logo](logo.png)\n"), theme());
+        state.mode = crate::editor::Mode::Rendered;
+        // Even with the preview on, a plain image gets no band — the band
+        // is `$$...$$`-only.
+        state.math_preview = true;
+        state.refresh_parsed();
+        state.cursor.offset = 2;
+        state.cursor_block_entered_at = None;
+        state.update_cursor_block();
+        // The reveal timer re-arms on any intra-block line move for a
+        // plain image (unlike diagram blocks, which keep their reveal
+        // time); simulate the 120 ms jitter window having elapsed.
+        state.cursor_block_entered_at = None;
+        assert!(state.cursor_block_revealed());
+        assert!(state.sync_image_reveal());
+        let reveal = state.image_reveal.as_ref().expect("reveal active");
+        assert_eq!(reveal.rows, 1, "single source line");
+        assert_eq!(reveal.preview_rows, 0, "plain image: no preview band");
+    }
+
+    /// Turning "Show images" off must NOT shrink a rendered `$$...$$`
+    /// formula (or a mermaid diagram): figures are gated by their own
+    /// setting, so a promoted diagram URL keeps its reserved height
+    /// regardless of the images toggle.  Regression for the images-off
+    /// collapse that squeezed every formula to one row ("tiny math").
+    /// The cursor stays outside the block so the reveal doesn't override
+    /// the reservation.
+    #[test]
+    fn disabling_images_does_not_collapse_a_rendered_math_block() {
+        let src = "Above.\n\n$$\nE = mc^2\n$$\n\nBelow.\n";
+        let mut state = EditorState::new(Buffer::from_str(src), theme());
+        state.mode = crate::editor::Mode::Rendered;
+        state.diagrams_enabled = true;
+        state.cursor.offset = 0; // outside the math block
+        state.images_enabled = false;
+        state.refresh_parsed();
+        let latex_idx = state
+            .parsed
+            .image_blocks
+            .iter()
+            .find(|i| matches!(i.source, Some(crate::diagram::DiagramSource::Latex(_))))
+            .expect("latex block promoted")
+            .block_idx;
+        // With images off, the (undecoded) formula falls back to the
+        // `image_max_height` placeholder reservation — many rows — not the
+        // single-row collapse a real image gets.
+        assert!(
+            state.parsed.block_own_line_count(latex_idx) > 1,
+            "math block collapsed to {} row(s) with images off",
+            state.parsed.block_own_line_count(latex_idx)
+        );
+    }
+
+    /// Regression: while typing a `$$...$$` formula, an intermediate keystroke
+    /// that leaves the LaTeX invalid must NOT collapse the live-preview band to
+    /// one row.  The band holds its last resolved height, so the document
+    /// doesn't reflow on every not-yet-valid intermediate state — the fix uses
+    /// `aspect_rows` (which reports `None` for a failed decode) rather than
+    /// `reserved_rows` (which collapses a failure to the single placeholder row).
+    #[test]
+    fn invalid_formula_holds_the_last_preview_band() {
+        let mut state = EditorState::new(Buffer::from_str("$$\nE = mc^2\n$$\n"), theme());
+        state.mode = crate::editor::Mode::Rendered;
+        state.math_preview = true;
+        state.refresh_parsed();
+        let url = state
+            .parsed
+            .image_blocks
+            .iter()
+            .find(|i| matches!(i.source, Some(crate::diagram::DiagramSource::Latex(_))))
+            .expect("latex block")
+            .url
+            .clone();
+        // A valid formula has decoded: the band takes the image's fitted height.
+        state
+            .images
+            .set_decoded(&url, image::DynamicImage::new_rgba8(100, 200));
+        state.cursor.offset = "$$\n".chars().count() + 1;
+        state.update_cursor_block();
+        state.cursor_block_entered_at = None;
+        assert!(state.sync_image_reveal());
+        let band = state.image_reveal.as_ref().expect("reveal").preview_rows;
+        assert!(
+            band > 1,
+            "a decoded formula reserves a multi-row band, got {band}"
+        );
+
+        // The current source's decode now fails — the state a half-typed,
+        // not-yet-valid formula lands in.  The band must hold `band`, never
+        // collapse to the single placeholder row `reserved_rows` would give.
+        state.images.set_failed(&url, "invalid latex".into());
+        state.sync_image_reveal();
+        assert_eq!(
+            state.image_reveal.as_ref().expect("reveal").preview_rows,
+            band,
+            "an invalid formula holds the last resolved band, not the 1-row placeholder",
+        );
     }
 }

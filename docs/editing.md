@@ -6,14 +6,14 @@ What edamame does with your Markdown, and the features built on top of it.
 
 ## Markdown support
 
-edamame parses CommonMark plus a set of GitHub extensions.
+edamame parses CommonMark plus [GitHub Flavored Markdown](https://github.github.com/gfm/) and a few other additions.
 
 | Element | Markdown Source |
 | --- | --- |
 | Headings | `#` through `######`, and the underlined (setext) form |
 | Emphasis | `**bold**` · `*italic*` · `` `code` `` · `~~strikethrough~~` |
 | Highlight | `==highlighted==` |
-| Lists | Bullet and ordered, nested, with loose/tight spacing preserved |
+| Lists | Bullet and ordered, nested, with loose or tight spacing |
 | Task lists | `- [ ]` and `- [x]`, clickable |
 | Tables | GitHub pipe tables, drawn as a real grid |
 | Code | Fenced and indented, with the language token styled |
@@ -24,6 +24,7 @@ edamame parses CommonMark plus a set of GitHub extensions.
 | Rules | `---`, drawn as a full-width line |
 | Line breaks | Two trailing spaces, and soft wraps |
 | Diagrams | ` ```mermaid ` fenced blocks |
+| Math | `$$...$$` LaTeX math blocks |
 | Frontmatter | `---` YAML and `+++` TOML metadata blocks |
 
 ### Things to know
@@ -33,6 +34,8 @@ edamame parses CommonMark plus a set of GitHub extensions.
 **Other HTML is shown, not rendered.** A `<details>` block or a `<sub>` tag appears as literal text in a muted code style. edamame does not interpret HTML.
 
 **Smart punctuation is on**, and currently not configurable. Straight quotes render as curly ones, `--` becomes an en dash, `...` becomes an ellipsis. Your source file is untouched — this is display only.
+
+**Paragraphs reflow to the width of your terminal.** If you hard-wrap prose in the source — a line break every 80 columns, say — those single line breaks are treated as spaces. edamame joins them back into one paragraph and wraps it to fit the view, instead of showing a stack of ragged short lines. A deliberate line break — two trailing spaces or a backslash at the end of a line — is kept. Turn reflow off with **Reflow paragraphs** in the settings overlay, or `reflow = false` in `config.toml`.
 
 **Frontmatter is shown as data, not prose.** A `---`-delimited YAML block (or a `+++`-delimited TOML one) at the top of a file renders verbatim — one row per source line, dimmed, with each key picked out from its value. It stays fully editable, and it is left out of an HTML export, since it describes the document rather than belonging to it.
 
@@ -350,15 +353,36 @@ Move the cursor into a diagram and the image is replaced by its full mermaid sou
 
 Rendering happens in the background and results are cached by content, so editing one diagram doesn't re-render the others. Mermaid is the only diagram language supported. A diagram that fails to render reports it on the hint line and leaves the code block visible.
 
+## Math
+
+A paragraph containing only a `$$...$$` block renders a LaTeX formula as a display-math image:
+
+```markdown
+$$
+\sum_{n=1}^{\infty} \frac{1}{n^2} = \frac{\pi^2}{6}
+$$
+```
+
+Rendering is pure Rust — no LaTeX or other program needs to be installed. Math uses the **same terminal requirements and the same consent prompt** (the *Figures* setting) as diagrams.
+
+Move the cursor into a formula and its `$$...$$` source opens just below the rendered image to edit — the image stays put and the document reflows beneath it, with the formula re-rendered live as you type. Move the cursor out and the source collapses away, leaving the rendered formula. To hide the preview and edit the source alone (like a diagram), turn off **Math edit preview** in the settings overlay, or set `math_preview = false` under `[figures]`.
+
+
+![LaTeX math formula rendered in edamame](https://raw.githubusercontent.com/mijowi/mijowi.com/refs/heads/main/edamame/media/math.png)
+
+Only whole-paragraph `$$...$$` math is rendered as an image. Inline `$...$` and math mixed with other text in a paragraph stay as their literal source. An HTML export renders display-math paragraphs as images too — the same *Inline figures* toggle that controls diagrams (see [Exporting](#exporting)).
+
+When *Figures* is off, a `$$...$$` paragraph isn't rendered to an image — it shows as a `math` code block instead (a `math` header over the formula source), exactly the way a ` ```mermaid ` fence stays a code block. Move the cursor onto the opening or closing `$$` line to edit the delimiters.
+
 ---
 
 ## Exporting
 
-"Export…" in the palette opens the export modal. There are four options here:
+"Export…" in the palette opens the export modal. There are these options:
 
 - **Title** — the document title
 - **Inline images** — embed local images in the file as Base64 (self-contained but larger) or leave them as links
-- **Inline diagrams** — render mermaid blocks into the file, or leave them as code blocks
+- **Inline figures** — render mermaid diagrams and `$$...$$` display math into the file as images, or leave them as source
 - **Stylesheet** — the bundled one, or your own
 - **Format** — the output format, HTML by default
 

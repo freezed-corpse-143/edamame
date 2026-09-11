@@ -1,21 +1,8 @@
-//! Shared building blocks for popup overlays.
-//!
-//! `ModalView`, the `searchable_list` component, `SettingsView`, and
-//! `KeybindsView` all need the same primitives:
-//!
-//! - a centred bordered frame, alongside which each overlay paints a narrow
-//!   [`crate::ui::scrollbar`] whenever the body overflows;
-//! - vertical scroll state with keyboard *and* mouse-wheel control;
-//! - content-aware sizing — the frame grows to fit its body, clamped only
-//!   to the terminal area so we never paint a 70%-of-screen modal that's
-//!   mostly empty space.
-//!
-//! This module exposes those primitives as a small struct and a handful of
-//! free functions.  Each overlay keeps its own widget type and bespoke
-//! layout, but routes scroll arithmetic, frame rendering, and centred-rect
-//! sizing through the helpers here.  See `src/ui/modal.rs` for the
-//! canonical text-body consumer and `src/ui/command_palette.rs` for an
-//! example with pinned regions (input row above the scrolling list).
+//! Shared building blocks for popup overlays: the centered frame, vertical scroll state
+//! (keyboard and wheel), and content-aware sizing that grows the frame to fit its body,
+//! clamped only to the terminal.  Each overlay keeps its own widget and layout but routes
+//! scroll arithmetic, frame rendering, and sizing through here.  `ui::modal` is the
+//! canonical text-body consumer; `ui::command_palette` shows pinned regions.
 
 use ratatui::{
     buffer::Buffer,
@@ -26,19 +13,14 @@ use ratatui::{
 
 use crate::config::Theme;
 
-/// Visual urgency of a modal.  Drives the title color (Normal =
-/// `primary`, Warning = `warning`, Error = `error`)
-/// and is independent of dismissability — a Warning may be either
-/// freely dismissable (informational) or gated (must press a button),
-/// depending on the owning `Modal::dismissable` return.
+/// Visual urgency of a modal; drives only the title color and is independent of
+/// dismissability (that comes from `Modal::dismissable`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ModalKind {
     #[default]
     Normal,
     Warning,
-    /// Error variant — used by [`NoticeModal`](crate::app::modal::NoticeModal) for sticky error
-    /// notifications that replaced the old `MessageKind::Error`
-    /// hint-line flashes (save / reload / link-open failures, etc.).
+    /// Used by [`NoticeModal`](crate::app::modal::NoticeModal) for sticky error notices.
     Error,
 }
 
@@ -53,64 +35,39 @@ impl ModalKind {
     }
 }
 
-/// Default maximum horizontal padding inside a modal, in cells per side.
-/// Padding shrinks toward [`MIN_PAD_H`] when the terminal can't
-/// accommodate the full width.  A modal can raise the cap via
-/// [`ContentSize::max_pad_h`] (e.g. the keybinds overlay uses 8).
+/// Default maximum horizontal padding per side; a modal can raise it via
+/// [`ContentSize::max_pad_h`].
 pub const MAX_PAD_H: u16 = 4;
-/// Minimum horizontal padding inside a modal, in cells.
+/// Minimum horizontal padding per side.
 pub const MIN_PAD_H: u16 = 1;
-/// Comfortable maximum *content* width for a prose modal, in columns —
-/// the text column only, so the outer modal is this plus `2 *
-/// max_pad_h`.
-///
-/// A modal whose body is one wrapped paragraph has a natural
-/// [`ContentSize::width`] equal to the paragraph's entire unwrapped
-/// length, so without a cap it stretches to the full terminal width and
-/// renders as a handful of very long lines.  Opt in with
-/// [`crate::ui::ModalView::with_max_content_width`]; modals whose width
-/// is set by tabular content (capability rows, keybinding tables) should
-/// not, since clamping would wrap columns that are meant to align.
+/// Comfortable maximum *content* width for a prose modal.  Without a cap a one-paragraph
+/// body stretches to the full terminal width.  Opt in with
+/// [`crate::ui::ModalView::with_max_content_width`]; tabular modals should not, since
+/// clamping would wrap columns meant to align.
 pub const PROSE_CONTENT_WIDTH: u16 = 64;
-/// Vertical chrome rows reserved by `draw_frame`: 1 top pad + 1 title +
-/// 1 spacer + 1 bottom pad.  Pinned content (button row, footer) sits
-/// above the bottom pad inside the body rect returned in
-/// [`FrameLayout::body`].
+/// Vertical chrome reserved by `draw_frame`: top pad + title + spacer + bottom pad.
 pub const VERTICAL_CHROME_ROWS: u16 = 4;
-/// Row offset (within the modal rect) at which the body begins —
-/// past the top pad, title, and spacer.  Equal to
-/// `VERTICAL_CHROME_ROWS - 1` (one row of chrome, the bottom pad,
-/// sits *below* the body).  Named separately so a layout change to
-/// the chrome doesn't silently desync from this offset.
+/// Row offset of the body within the modal rect (`VERTICAL_CHROME_ROWS - 1`, since the
+/// bottom pad sits below the body).  Named separately so a chrome change can't desync it.
 pub const VERTICAL_CHROME_TOP: u16 = 3;
 
-/// The literal text rendered as the modal close hint / clickable
-/// affordance.  Always 3 cells wide.
+/// Text of the close hint / clickable affordance.  Always 3 cells wide.
 pub const CLOSE_HINT: &str = "esc";
 
-/// Natural size of an overlay's content, in display cells.
-///
-/// `width` and `height` describe the *scrolling region* alone; pinned
-/// regions (palette input row, settings/keybinds error footer, modal
-/// button row) are reported separately via `pinned_top` / `pinned_bottom`.
-/// `centered_rect_for_content` adds frame padding and clamps to the
-/// available terminal area.
+/// Natural size of an overlay's content, in display cells.  `width` / `height` describe the
+/// scrolling region alone; pinned regions are reported separately.
 #[derive(Debug, Clone, Copy)]
 pub struct ContentSize {
     /// Longest body row in display columns.
     pub width: u16,
-    /// Total scrolling-region row count (pre-clamp; if larger than the
-    /// available height the body simply scrolls inside).
+    /// Scrolling-region row count, pre-clamp.
     pub height: u16,
     /// Rows reserved above the scroll viewport (e.g. palette input row).
     pub pinned_top: u16,
     /// Rows reserved below the scroll viewport (e.g. button row, footer).
     pub pinned_bottom: u16,
-    /// Maximum horizontal padding per side, in cells.  Defaults to
-    /// [`MAX_PAD_H`]; raise it on modals that need extra breathing room
-    /// (e.g. the keybinds overlay uses 8).  This is the single source of
-    /// truth — [`FrameOpts`] carries the same `ContentSize` so pre-render
-    /// sizing and post-render padding can never disagree.
+    /// Maximum horizontal padding per side (default [`MAX_PAD_H`]).  Single source of truth:
+    /// [`FrameOpts`] carries the same `ContentSize` so sizing and padding can't disagree.
     pub max_pad_h: u16,
 }
 
@@ -126,14 +83,11 @@ impl Default for ContentSize {
     }
 }
 
-/// Vertical-scroll bookkeeping shared by every overlay.  Embedded as
-/// `scroll_state` on each overlay's state struct.
+/// Vertical-scroll bookkeeping shared by every overlay.
 ///
-/// The contract: each render must call [`Self::observe`] with the
-/// post-layout `total` and `visible` heights.  After that, `scroll`
-/// is guaranteed to lie in `[0, max_scroll()]`, and [`Self::max_scroll`]
-/// reports whether the body overflows at all — which is what each overlay
-/// gates its [`crate::ui::scrollbar`] on.
+/// Contract: each render calls [`Self::observe`] with the post-layout heights; after that
+/// `scroll` lies in `[0, max_scroll()]`, and a nonzero [`Self::max_scroll`] is what gates
+/// the [`crate::ui::scrollbar`].
 #[derive(Debug, Clone, Default)]
 pub struct ScrollContainerState {
     pub scroll: u16,
@@ -147,16 +101,12 @@ impl ScrollContainerState {
         Self::default()
     }
 
-    /// Largest valid `scroll` given the most-recently-observed body
-    /// dimensions.  Returns `0` when the body fits — i.e. scrolling is
-    /// disabled.
+    /// Largest valid `scroll`; `0` when the body fits.
     pub fn max_scroll(&self) -> u16 {
         self.last_total.saturating_sub(self.last_visible)
     }
 
-    /// Adjust scroll by `delta` rows (negative = toward top, positive =
-    /// toward bottom).  Clamped at both ends so callers never need to
-    /// range-check before forwarding wheel events.
+    /// Adjust scroll by `delta` rows, clamped at both ends.
     pub fn scroll_by(&mut self, delta: i32) {
         if delta == 0 {
             return;
@@ -166,12 +116,8 @@ impl ScrollContainerState {
         self.scroll = next as u16;
     }
 
-    /// Handle Up/Down/PgUp/PgDn/Home/End as scroll keys.  Returns
-    /// `true` if the key was consumed.
-    ///
-    /// Used by `ModalView` (text bodies, no focus concept).  Focusable
-    /// overlays should use [`Self::handle_paging_key`] instead so that
-    /// Up/Down remain available for focus moves.
+    /// Handle Up/Down/PgUp/PgDn/Home/End as scroll keys; returns `true` if consumed.  For
+    /// text bodies with no focus concept; focusable overlays use [`Self::handle_paging_key`].
     pub fn handle_scroll_key(&mut self, key: &crossterm::event::KeyEvent) -> bool {
         use crossterm::event::{KeyCode, KeyModifiers};
         match key.code {
@@ -203,9 +149,7 @@ impl ScrollContainerState {
         }
     }
 
-    /// Handle PgUp/PgDn/Home/End as paging keys.  Returns `true` if the
-    /// key was consumed.  Up/Down are intentionally *not* consumed, so
-    /// they remain available for focus moves in row-based overlays.
+    /// Handle PgUp/PgDn/Home/End only, leaving Up/Down free for focus moves.
     pub fn handle_paging_key(&mut self, key: &crossterm::event::KeyEvent) -> bool {
         use crossterm::event::{KeyCode, KeyModifiers};
         match key.code {
@@ -229,9 +173,7 @@ impl ScrollContainerState {
         }
     }
 
-    /// Adjust `scroll` so `focus_row` (in body row coords) lies within
-    /// the visible window `[scroll, scroll + last_visible)`.  Use this
-    /// in row-based overlays after Up/Down move the focus.
+    /// Adjust `scroll` so `focus_row` (body row coords) lies within the visible window.
     pub fn ensure_visible(&mut self, focus_row: u16) {
         if self.last_visible == 0 {
             return;
@@ -241,16 +183,14 @@ impl ScrollContainerState {
         } else if focus_row >= self.scroll + self.last_visible {
             self.scroll = focus_row + 1 - self.last_visible;
         }
-        // Clamp again — `focus_row` could exceed total in a degenerate
-        // call, and observe() may not have run yet for the new layout.
+        // `focus_row` may exceed total, and observe() may not have run for the new layout.
         let max = self.max_scroll();
         if self.scroll > max {
             self.scroll = max;
         }
     }
 
-    /// Update `last_total` / `last_visible` and clamp `scroll`.  Call
-    /// once per render after the layout is known.
+    /// Record the layout heights and clamp `scroll`; once per render.
     pub fn observe(&mut self, total: u16, visible: u16) {
         self.last_total = total;
         self.last_visible = visible;
@@ -261,13 +201,8 @@ impl ScrollContainerState {
     }
 }
 
-/// Centred rectangle sized to fit `content`, clamped to `area`.
-///
-/// The returned rect's interior (after subtracting the 2-cell border)
-/// has room for `pinned_top + height + pinned_bottom` rows and
-/// `width + 2` columns of padding, whenever the terminal allows.  When
-/// the terminal is smaller, height clamps and the body scrolls; width
-/// clamps and lines wrap (caller's responsibility).
+/// Centered rectangle sized to fit `content`, clamped to `area`.  When clamped, height
+/// overflow scrolls and width overflow wraps (the caller's responsibility).
 pub fn centered_rect_for_content(content: ContentSize, area: Rect) -> Rect {
     let (modal_width, modal_height) = modal_dimensions_for(content, area);
     let x = area.x + (area.width.saturating_sub(modal_width)) / 2;
@@ -280,12 +215,8 @@ pub fn centered_rect_for_content(content: ContentSize, area: Rect) -> Rect {
     }
 }
 
-/// Compute the modal's outer width and height for a given content size
-/// and available area.  Padding is `2 * content.max_pad_h` cells on the
-/// horizontal axis (clamped to area), and [`VERTICAL_CHROME_ROWS`]
-/// (top pad + title + spacer + bottom pad) on the vertical axis.
-/// Inside we want `pinned_top + height + pinned_bottom` rows.  Both
-/// dimensions clamp to `area`.
+/// Outer modal width and height: content plus horizontal padding and vertical chrome,
+/// clamped to `area`.
 fn modal_dimensions_for(content: ContentSize, area: Rect) -> (u16, u16) {
     let modal_width = (content.width)
         .saturating_add(2 * content.max_pad_h)
@@ -301,51 +232,34 @@ fn modal_dimensions_for(content: ContentSize, area: Rect) -> (u16, u16) {
     (modal_width, modal_height)
 }
 
-/// Options controlling how `draw_frame` paints the modal chrome.
+/// Options for `draw_frame`.
 pub struct FrameOpts<'a> {
-    /// Title text rendered on row 1 of `area`, left-aligned at the left
-    /// padding edge.  Not formatted — pass the bare title.
+    /// Bare title text, rendered on the title row at the left padding edge.
     pub title: &'a str,
-    /// Visual urgency — drives the title color.
     pub kind: ModalKind,
-    /// When true, render the `esc` close hint at the right edge of the
-    /// title row using `theme.modal_close_hint`, and populate
-    /// [`FrameLayout::esc_hit_rect`] for click hit-testing.
+    /// Render the `esc` hint at the right of the title row and populate
+    /// [`FrameLayout::esc_hit_rect`].
     pub show_close_hint: bool,
-    /// Natural body content spec.  Carries both the width used to derive
-    /// horizontal padding and the per-modal `max_pad_h` cap.  Pass the
-    /// *same* `ContentSize` value that was fed to
-    /// [`centered_rect_for_content`] so pre-render sizing and post-render
-    /// padding can never disagree.
+    /// Must be the *same* value fed to [`centered_rect_for_content`] so sizing and padding
+    /// agree.
     pub content: ContentSize,
     pub theme: &'a Theme,
 }
 
-/// Layout produced by `draw_frame`.  Carries everything callers need to
-/// place the body content, the optional scrollbar, and to hit-test
-/// later clicks against the close hint.
+/// Layout produced by `draw_frame`.
 pub struct FrameLayout {
-    /// Inner area for body + pinned regions.  Excludes the rightmost
-    /// padding column when a scrollbar is to be drawn — the scrollbar
-    /// paints into [`Self::scrollbar_col`] inside the right padding.
+    /// Inner area for body + pinned regions.
     pub body: Rect,
-    /// Absolute terminal coordinates of the `esc` close hint, when
-    /// rendered.  Callers cache this on their state struct so a later
-    /// click event can hit-test against it.
+    /// Absolute rect of the `esc` hint, when rendered; callers cache it for click hit-tests.
     pub esc_hit_rect: Option<Rect>,
-    /// Absolute terminal column of the rightmost padding cell.  Use
-    /// for the scrollbar gutter when the body overflows.
+    /// Absolute column of the rightmost padding cell, the scrollbar gutter.
     pub scrollbar_col: u16,
 }
 
-/// Render the modal chrome: clear, fill with `modal_bg`, draw the title
-/// row with optional close hint, leave a blank spacer, and return the
-/// inner body layout.  No border characters — same-bg padding is the
-/// frame.
+/// Render the modal chrome (clear, fill, title row with optional close hint, spacer) and
+/// return the body layout.  No border characters: same-background padding is the frame.
 pub fn draw_frame(area: Rect, buf: &mut Buffer, opts: FrameOpts<'_>) -> FrameLayout {
     Clear.render(area, buf);
-    // Fill the entire modal rect with modal_bg so the padding picks up
-    // the same surface color as the body.
     Block::default()
         .style(opts.theme.modal_bg)
         .render(area, buf);
@@ -363,7 +277,6 @@ pub fn draw_frame(area: Rect, buf: &mut Buffer, opts: FrameOpts<'_>) -> FrameLay
         height: body_h,
     };
 
-    // Title row: row 1 (after the 1-row top pad).
     let mut esc_hit_rect = None;
     if area.height >= 2 && body_w > 0 {
         let title_row = area.y + 1;
@@ -371,11 +284,9 @@ pub fn draw_frame(area: Rect, buf: &mut Buffer, opts: FrameOpts<'_>) -> FrameLay
         let title_right_edge = area.x + area.width - pad_h; // exclusive
         let title_inner_w = title_right_edge.saturating_sub(title_left);
 
-        // Reserve the close hint at the right edge first so the title
-        // text never overlaps it.
+        // Reserve the hint first (plus one cell of separation) so the title never overlaps it.
         let hint_w: u16 = CLOSE_HINT.len() as u16;
         let (title_w, hint_rect) = if opts.show_close_hint && title_inner_w > hint_w + 1 {
-            // Leave at least one cell of separation between title and hint.
             let hr = Rect {
                 x: title_right_edge.saturating_sub(hint_w),
                 y: title_row,
@@ -418,28 +329,20 @@ pub fn draw_frame(area: Rect, buf: &mut Buffer, opts: FrameOpts<'_>) -> FrameLay
     }
 }
 
-/// Horizontal padding for a modal of `area_w` total width with a
-/// natural body of `content_w` cells.  Centred: each side gets
-/// `(area_w - content_w) / 2`, clamped to `[MIN_PAD_H, max_pad_h]`.
+/// Per-side horizontal padding: half the slack, clamped to `[MIN_PAD_H, max_pad_h]`.
 pub fn compute_pad_h(area_w: u16, content_w: u16, max_pad_h: u16) -> u16 {
     let slack = area_w.saturating_sub(content_w);
     (slack / 2).clamp(MIN_PAD_H, max_pad_h)
 }
 
-/// Total wrapped row count for `lines` at `width` columns under
-/// `Paragraph::wrap(Wrap { trim: false })`.  Delegates to ratatui's own
-/// `Paragraph::line_count` (gated by the `unstable-rendered-line-info`
-/// feature) so the pre-render sizing matches the actual `WordWrapper`
-/// output — character-level `div_ceil` undercounts when a single word
-/// wider than `width` forces an extra row.  Pure; used by `ModalView`
-/// to size text bodies before rendering.
+/// Wrapped row count for `lines` at `width` under `Wrap { trim: false }`.  Delegates to
+/// ratatui's `Paragraph::line_count` (feature `unstable-rendered-line-info`) so sizing
+/// matches the real `WordWrapper`: a character-level `div_ceil` undercounts when a single
+/// word wider than `width` forces an extra row.
 pub fn wrapped_rows(lines: &[Line<'_>], width: u16) -> u16 {
     if width == 0 {
         return lines.len() as u16;
     }
-    // `Paragraph::new` accepts owned `Text`, so clone the lines into a
-    // local `Vec` rather than borrowing the slice (line_count needs
-    // owned storage to feed its grapheme iterator).
     let owned: Vec<Line<'static>> = lines
         .iter()
         .map(|l| Line {
@@ -528,7 +431,6 @@ mod tests {
         assert_eq!(s.scroll, 10);
         s.handle_scroll_key(&key(KeyCode::PageDown));
         assert_eq!(s.scroll, 20);
-        // Clamped at max_scroll.
         s.handle_scroll_key(&key(KeyCode::PageDown));
         assert_eq!(s.scroll, 20);
     }
@@ -594,7 +496,6 @@ mod tests {
             last_visible: 5,
         };
         s.ensure_visible(7);
-        // Focus row 7 must be in [scroll, scroll+5), so scroll = 3.
         assert_eq!(s.scroll, 3);
     }
 
@@ -636,7 +537,6 @@ mod tests {
             last_total: 50,
             last_visible: 10,
         };
-        // Body shrinks to fit entirely.
         s.observe(8, 10);
         assert_eq!(s.scroll, 0);
     }
@@ -663,11 +563,8 @@ mod tests {
             ..Default::default()
         };
         let r = centered_rect_for_content(content, area);
-        // 30 + 2 * MAX_PAD_H (4) horizontal padding.
         assert_eq!(r.width, 38);
-        // 5 + 1 pinned + 4 vertical chrome (top pad + title + spacer + bot pad).
         assert_eq!(r.height, 10);
-        // Centred:
         assert_eq!(r.x, (200 - 38) / 2);
         assert_eq!(r.y, (60 - 10) / 2);
     }
@@ -698,7 +595,6 @@ mod tests {
             ..Default::default()
         };
         let r = centered_rect_for_content(content, area);
-        // 5 + 2 + 3 pinned + 4 vertical chrome.
         assert_eq!(r.height, 14);
     }
 
@@ -706,47 +602,34 @@ mod tests {
 
     #[test]
     fn pad_h_caps_at_max_when_terminal_is_wide() {
-        // 200-wide modal, 30-cell content → slack 170, half = 85,
-        // clamped to MAX_PAD_H = 4.
         assert_eq!(compute_pad_h(200, 30, MAX_PAD_H), MAX_PAD_H);
     }
 
     #[test]
     fn pad_h_floors_at_min_when_content_fills_modal() {
-        // Modal width equals content width: no slack.  Padding still
-        // honours MIN_PAD_H so the title text never kisses the edge.
         assert_eq!(compute_pad_h(30, 30, MAX_PAD_H), MIN_PAD_H);
         assert_eq!(compute_pad_h(20, 30, MAX_PAD_H), MIN_PAD_H);
     }
 
     #[test]
     fn pad_h_uses_full_slack_when_modest() {
-        // 38-wide modal, 30-cell content → slack 8, half = 4 = MAX.
         assert_eq!(compute_pad_h(38, 30, MAX_PAD_H), 4);
-        // 36-wide modal, 30-cell content → slack 6, half = 3.
         assert_eq!(compute_pad_h(36, 30, MAX_PAD_H), 3);
-        // 32-wide modal, 30-cell content → slack 2, half = 1 = MIN.
         assert_eq!(compute_pad_h(32, 30, MAX_PAD_H), MIN_PAD_H);
     }
 
     #[test]
     fn pad_h_raised_cap_in_wide_terminal() {
-        // A modal with max_pad_h = 8 gets 8 cells per side in a wide
-        // terminal.
         assert_eq!(compute_pad_h(200, 30, 8), 8);
     }
 
     #[test]
     fn pad_h_raised_cap_still_floors_at_min_when_narrow() {
-        // Raising the cap doesn't raise the floor — when slack runs out
-        // the modal still degrades to MIN_PAD_H so content isn't clipped.
         assert_eq!(compute_pad_h(32, 30, 8), MIN_PAD_H);
     }
 
     #[test]
     fn pad_h_raised_cap_shrinks_gracefully() {
-        // 40-wide modal, 30-cell content, max_pad_h = 8 → slack 10,
-        // half 5, clamped to [1, 8].  Slack is the binding constraint.
         assert_eq!(compute_pad_h(40, 30, 8), 5);
     }
 
@@ -761,7 +644,6 @@ mod tests {
             max_pad_h: 8,
         };
         let r = centered_rect_for_content(content, area);
-        // 30 + 2 * 8 horizontal padding.
         assert_eq!(r.width, 30 + 2 * 8);
     }
 
@@ -796,7 +678,6 @@ mod tests {
     #[test]
     fn wrapped_rows_wraps_long_lines() {
         let lines = vec![Line::raw("a".repeat(200))];
-        // 200 / 80 = 2.5 → 3 rows.
         assert_eq!(wrapped_rows(&lines, 80), 3);
     }
 

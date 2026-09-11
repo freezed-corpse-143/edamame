@@ -1,13 +1,8 @@
-//! Explanatory modal shown the first time the user enters diff-review
-//! mode for this install.
+//! Explanatory modal shown the first time the user enters diff-review mode.
 //!
-//! Adapter over [`crate::ui::DiffIntroView`] / [`crate::ui::DiffIntroState`]:
-//! it supplies the keybindings body text and persists the opt-out to
-//! `config.editor.show_diff_intro` on close.  The "Don't show this again"
-//! opt-out is an on/off toggle pinned on its own row directly above the
-//! centred `[ Continue ]` button; both join the focus cycle (Tab /
-//! Shift-Tab / arrows move focus, Enter / Space activate, and both are
-//! clickable).
+//! Adapter over [`crate::ui::DiffIntroView`] / [`crate::ui::DiffIntroState`]: supplies the
+//! keybindings body text and persists the "Don't show this again" opt-out to
+//! `config.editor.show_diff_intro` on close.
 
 use std::any::Any;
 
@@ -35,10 +30,8 @@ impl DiffIntroModal {
     }
 
     fn body(&self, theme: &Theme) -> Vec<Line<'static>> {
-        // Keybinding glyphs are painted in the accent color so they stand
-        // out from their plain-text labels; the glyphs themselves come
-        // from the shared `diff_keys` table so this explanatory list can
-        // never teach a key the handler doesn't actually honor.
+        // Glyphs come from the shared `diff_keys` table so this list can never teach a
+        // key the handler doesn't honor.
         let accent = Style::default().fg(theme.palette.accent);
         vec![
             Line::raw("The file on disk has changed. edamame will now enter diff mode, in which you can review and accept or reject changes."),
@@ -69,8 +62,7 @@ impl DiffIntroModal {
         ]
     }
 
-    /// Map a widget response to a modal outcome: Continue keeps the modal
-    /// open, Close persists the opt-out and drops the modal.
+    /// Map a widget response to a modal outcome; Close persists the opt-out.
     fn resolve(&self, response: DiffIntroResponse) -> ModalOutcome {
         match response {
             DiffIntroResponse::Continue => ModalOutcome::Continue,
@@ -89,8 +81,7 @@ impl DiffIntroModal {
     }
 }
 
-/// Build one keybinding row: a fixed-width plain `prefix` (label + padding)
-/// followed by the action glyphs in the accent color, joined by " / ".
+/// One keybinding row: plain `prefix`, then the action glyphs in the accent color.
 fn binding_line(prefix: &str, actions: &[&Action], accent: Style) -> Line<'static> {
     let mut spans = vec![Span::raw(prefix.to_owned())];
     for (i, action) in actions.iter().enumerate() {
@@ -184,9 +175,7 @@ mod tests {
 
     #[test]
     fn body_documents_the_undo_binding() {
-        // Backspace-to-undo isn't surfaced on the hint line, so the intro
-        // modal is where the user learns it.  The glyph comes from the
-        // shared `diff_keys` table (`⌫`).
+        // Backspace-to-undo isn't on the hint line, so this modal is where it's taught.
         let modal = DiffIntroModal::new();
         let theme = Theme::default();
         let undo_glyph = diff_hint(&Action::DiffResetHunk);

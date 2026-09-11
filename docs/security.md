@@ -11,6 +11,7 @@ Concretely, document content reaches several non-trivial subsystems:
 - **Image decoding** — embedded/referenced PNG/JPEG/GIF/BMP/WEBP and SVG.
 - **Remote fetches** — `http(s)` image URLs.
 - **Mermaid diagrams** — fenced ` ```mermaid ` blocks rendered to images.
+- **Display math** — `$$...$$` blocks rendered to images.
 - **Syntax highlighting** — fenced code-block bodies parsed by TextMate grammars.
 - **Link opening** — clicking a link hands a URL/path to the OS.
 - **HTML export** — the document is serialized to a shareable HTML file.
@@ -33,7 +34,7 @@ Mitigations (`src/image/loader.rs`):
 
 - Raster decoding goes through `image::ImageReader` with `image::Limits` in force: `max_image_width`/`max_image_height` capped at 50 000 px and `max_alloc` at 256 MB. A decode bomb returns a `Decode` error instead of exhausting memory. **Do not** revert to `image::load_from_memory`, which allocates the full pixel buffer with no ceiling — and note the cap has to be enforced *at decode time*, because the loader's `pre_resize` downscale runs only *after* the full buffer already exists.
 - Local image files are size-capped (64 MB) via a `metadata` check before `std::fs::read`. Remote bodies are already capped at 10 MB by ureq.
-- SVG rasterization (`src/image/svg.rs`) clamps the output pixmap to the cell envelope when the caller supplies one, and to an absolute ceiling (8192 px per side, 4 M pixels total) in every case — including HTML export, which rasterizes Mermaid diagrams at natural size because an exported PNG isn't sized in terminal cells. An over-size SVG is scaled down to fit rather than refused, so a giant declared size costs resolution, not an unbounded allocation.
+- SVG rasterization (`src/image/svg.rs`) clamps the output pixmap to the cell envelope when the caller supplies one, and to an absolute ceiling (8192 px per side, 4 M pixels total) in every case — including HTML export, which rasterizes Mermaid diagrams and display math at natural size because an exported PNG isn't sized in terminal cells. An over-size SVG is scaled down to fit rather than refused, so a giant declared size costs resolution, not an unbounded allocation.
 
 ### Remote access is consent-gated and IP-filtered
 
@@ -49,7 +50,7 @@ The exported HTML is the one artifact a user typically **shares**, so the export
 
 - **Raw HTML is stripped.** Block-level (`Event::Html`) and inline (`Event::InlineHtml`) events are filtered out before serialization, so a `<script>` tag (or any raw markup) in the source never reaches the output.
 - **Link schemes are allowlisted.** pulldown-cmark's HTML writer performs no URL sanitization, so a `[x](javascript:…)` or `[x](data:text/html,…)` link would otherwise survive verbatim into the `<a href>` and run on click in a browser. `sanitize_link_urls` rewrites any link whose scheme is not in `SAFE_LINK_SCHEMES` (`http`, `https`, `mailto`, `tel`) to a harmless `#`. Relative paths, anchors, and `?query` targets carry no scheme and are preserved; scheme detection follows RFC 3986 (a colon after a `/`, `?`, or `#` is part of the path, not a scheme).
-- **Mermaid diagrams are rasterized, not inlined as SVG.** Inline SVG can carry `<script>`, `foreignObject`, and `on*=` handlers that execute when the file is opened in a browser. `render_mermaid_png_data_uri` renders the diagram, rasterizes it to a PNG, and embeds it as a `data:image/png` `<img>` — flattening any executable payload to pixels. On render failure it falls back to an HTML-escaped code block, so the source is never lost.
+- **Figures are rasterized, not inlined as SVG.** Inline SVG can carry `<script>`, `foreignObject`, and `on*=` handlers that execute when the file is opened in a browser. `render_mermaid_png_data_uri` and `render_latex_png_data_uri` render a Mermaid diagram / `$$...$$` formula, rasterize it to a PNG, and embed it as a `data:image/png` `<img>` — flattening any executable payload to pixels. On render failure each falls back to an HTML-escaped code block (`language-mermaid` / `language-math`), so the source is never lost. Inline `$...$` math is always emitted as literal source, never a math span.
 
 ### HTML export confines local-file reads
 
@@ -67,6 +68,10 @@ A self-contained export base64-embeds referenced images into the output. Because
 `mermaid-rs-renderer` is pure Rust: its dependency set contains no JS engine, no headless browser, and no HTTP client. Mermaid source cannot execute code, read files, or make network requests through the renderer. It is pinned exactly (`=0.2.2`) because it is pre-1.0 with known panic bugs; those panics are contained by `catch_unwind` at two layers (`src/diagram/mermaid.rs`).
 
 The renderer has no internal length, node-count, or timeout bound, so a pathological diagram could otherwise drive unbounded CPU/RAM on the decode worker. `render_mermaid_svg` rejects any source over 64 KiB before dispatch (`MAX_MERMAID_SOURCE_BYTES`) — a single choke point covering both the TUI raster path and the HTML exporter — and an over-cap block falls back to the plain code block.
+
+### Display math shares the same protections
+
+`$$...$$` blocks are rendered by RaTeX (`src/diagram/math.rs`), a pure-Rust KaTeX engine — parser → layout → SVG, with no JS engine, headless browser, or HTTP client, so math source cannot execute code, read files, or make network requests. The KaTeX fonts are compiled into the binary (`src/assets/katex/`, SIL OFL) and registered in the shared fontdb, so nothing is fetched or loaded from disk to render a formula. RaTeX 0.1.x is pre-1.0 with known panic bugs; the render is wrapped in `catch_unwind` (with a `terminal::ExpectedPanic` guard) exactly like the mermaid path. It has no internal size bound either, so `render_latex_svg` rejects any source over 64 KiB (`MAX_LATEX_SOURCE_BYTES`) before dispatch — the one choke point for both the TUI raster path and the HTML exporter — and the resulting SVG rasterizes through the same `src/image/svg.rs` pixmap clamps as every other diagram. Like mermaid, the HTML exporter rasterizes display math to a PNG `data:` URI and never inlines the RaTeX SVG, so no executable markup can reach the exported file (`mermaid_export_never_emits_raw_svg_or_script` and `display_math_exports_as_a_png_figure` in `src/export/html.rs` guard this). The formula is drawn to pixels, never inlined as SVG.
 
 ### Syntax highlighting is bounded and cannot execute code
 

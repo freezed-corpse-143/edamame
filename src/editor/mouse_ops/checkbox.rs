@@ -4,9 +4,8 @@ use crate::editor::{EditorState, Mode};
 
 use super::coord::click_to_char_offset;
 
-/// If `(col, row)` falls on a task-list checkbox glyph, toggle it and return
-/// `true`.  Otherwise returns `false` so the caller can fall through to
-/// cursor-placement behaviour.
+/// If `(col, row)` falls on a task-list checkbox, toggle it and return `true`; `false` lets the
+/// caller fall through to cursor placement.
 pub(super) fn toggle_checkbox_at(
     state: &mut EditorState,
     col: usize,
@@ -16,9 +15,6 @@ pub(super) fn toggle_checkbox_at(
     if state.mode == Mode::Raw {
         return false;
     }
-    // Locate the source line under the click by reusing the click-to-offset
-    // translation, then ask the list machinery whether the click sits inside
-    // a checkbox glyph.
     let Some(offset) = click_to_char_offset(state, col, row, viewport_width) else {
         return false;
     };
@@ -27,7 +23,6 @@ pub(super) fn toggle_checkbox_at(
     let Some(info) = list_edit::find_list_at(&source, click_byte) else {
         return false;
     };
-    // Find which item this is.  `cursor_item_idx` does the work.
     let Some(item_idx) = list_edit::cursor_item_idx(&info, click_byte) else {
         return false;
     };
@@ -36,21 +31,15 @@ pub(super) fn toggle_checkbox_at(
         return false;
     };
 
-    // Toggle hitbox spans the entire bullet+checkbox prefix — `• [ ]`
-    // (i.e. `item.start..task_box + 3` in source bytes).  Clicks anywhere
-    // on the bullet, the leading marker space, or the `[x]` glyph itself
-    // toggle the checkbox; clicks on the trailing space after `]` fall
-    // through to normal cursor placement so the user can put the caret
-    // immediately before the task's text.
+    // Hitbox is the whole `• [ ]` prefix; the trailing space after `]` falls through so the
+    // caret can be placed right before the task text.
     let hit_start = item.start;
     let hit_end = task_box + 3;
     if click_byte >= hit_start && click_byte < hit_end {
         if let Some(res) = list_edit::toggle_checkbox(&info, &source, click_byte) {
-            // Checkbox toggle is a 1-for-1 char replacement, so existing
-            // offsets stay valid.  Apply the edit without touching cursor
-            // tracking state (`update_cursor_block` would reset the reveal
-            // timer, causing the current cursor block to briefly re-render
-            // as "rendered" before snapping back to "raw").
+            // A 1-for-1 char replacement, so offsets stay valid.  Cursor tracking state is
+            // preserved across the edit: `update_cursor_block` would reset the reveal timer
+            // and flash the block rendered → raw.
             let offset_char = state.buffer.rope().byte_to_char(res.delta.offset);
             let delta = EditDelta {
                 offset: offset_char,
