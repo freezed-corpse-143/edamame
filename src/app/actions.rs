@@ -2888,6 +2888,19 @@ mod tests {
         app.clipboard = source;
     }
 
+    /// Point the paste's screenshot directory at a scratch directory.
+    ///
+    /// Every paste test takes one, including those whose payload can only
+    /// be referenced: `destination` is a function that *writes*, so a
+    /// test that left `save_dir` alone would be one policy change away
+    /// from dropping a PNG into the developer's real images directory.
+    /// Dropping the guard deletes the directory.
+    fn scratch_save_dir(app: &mut crate::app::App) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        app.config.images.save_dir = dir.path().to_string_lossy().into_owned();
+        dir
+    }
+
     /// Explorer's `Ctrl+C` on files: a file list, and nothing else.
     fn file_copy(paths: &[&str]) -> ClipboardData {
         ClipboardData {
@@ -2931,11 +2944,11 @@ mod tests {
 
     #[test]
     fn ctrl_v_on_a_file_copied_in_the_file_manager_inserts_a_reference_to_it() {
-        // Explorer copy: CF_HDROP only.  Today nothing happens at all —
-        // the bitmap read and the text read both come back empty.
-        let dir = tempfile::tempdir().expect("tempdir");
+        // Explorer's copy: a file list, no text format and no bitmap — so
+        // the list is the only payload that can answer, and the file is
+        // referenced where it lies rather than copied.
         let mut app = app_with_buffer("prose\n\n", 7);
-        app.config.images.save_dir = dir.path().to_string_lossy().into_owned();
+        let dir = scratch_save_dir(&mut app);
         with_clipboard(
             &mut app,
             Box::new(StubClipboard(file_copy(&[r"C:\Users\me\shot.png"]))),
@@ -2965,6 +2978,7 @@ mod tests {
     fn the_paste_image_command_accepts_a_copied_file_too() {
         // The palette command and the chord are the same code path.
         let mut app = app_with_buffer("prose\n\n", 7);
+        let _scratch = scratch_save_dir(&mut app);
         with_clipboard(&mut app, Box::new(StubClipboard(file_copy(&["C:/a.png"]))));
 
         paste(&mut app, Action::PasteImage);
@@ -2976,6 +2990,7 @@ mod tests {
     #[test]
     fn a_multi_file_selection_inserts_one_reference() {
         let mut app = app_with_buffer("", 0);
+        let _scratch = scratch_save_dir(&mut app);
         with_clipboard(
             &mut app,
             Box::new(StubClipboard(file_copy(&[
@@ -2995,6 +3010,7 @@ mod tests {
         // A directory has no image extension, so the paste must say so
         // rather than insert a reference to the folder.
         let mut app = app_with_buffer("prose\n", 6);
+        let _scratch = scratch_save_dir(&mut app);
         with_clipboard(
             &mut app,
             Box::new(StubClipboard(file_copy(&["C:/Pictures"]))),
@@ -3011,9 +3027,8 @@ mod tests {
     fn a_file_list_wins_over_a_bitmap_so_the_bitmap_is_never_saved() {
         // An image viewer's copy puts both the pixels and the source file
         // on the clipboard; the file wins, and the pixels are dropped.
-        let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_with_buffer("prose\n\n", 7);
-        app.config.images.save_dir = dir.path().to_string_lossy().into_owned();
+        let dir = scratch_save_dir(&mut app);
         let mut data = screenshot();
         data.files = vec![std::path::PathBuf::from("C:/Users/me/shot.png")];
         with_clipboard(&mut app, Box::new(StubClipboard(data)));
@@ -3035,11 +3050,9 @@ mod tests {
 
     #[test]
     fn a_screenshot_with_no_file_list_is_saved_into_the_configured_directory() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let doc = dir.path().join("notes.md");
         let mut app = app_with_buffer("prose\n\n", 7);
-        app.config.images.save_dir = dir.path().to_string_lossy().into_owned();
-        app.file_path = Some(doc);
+        let dir = scratch_save_dir(&mut app);
+        app.file_path = Some(dir.path().join("notes.md"));
         with_clipboard(&mut app, Box::new(StubClipboard(screenshot())));
 
         paste(&mut app, Action::PasteImage);
@@ -3077,9 +3090,8 @@ mod tests {
         // same port is a follow-up, not part of this seam — so the
         // assertion here is "no image was inserted", not "the text
         // appeared".
-        let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_with_buffer("prose\n", 6);
-        app.config.images.save_dir = dir.path().to_string_lossy().into_owned();
+        let dir = scratch_save_dir(&mut app);
         let mut data = file_copy(&["C:/shot.png"]);
         data.text = Some("hello".to_owned());
         with_clipboard(&mut app, Box::new(StubClipboard(data)));
@@ -3089,11 +3101,19 @@ mod tests {
         assert_eq!(app.editor.contents(), "prose\n");
         assert!(app.editor.parsed.image_blocks.is_empty());
         assert!(app.transient.is_none(), "a text copy is not an image miss");
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("tempdir")
+                .next()
+                .is_none(),
+            "a text copy must not write an image either"
+        );
     }
 
     #[test]
     fn an_empty_clipboard_reports_it_without_touching_the_buffer() {
         let mut app = app_with_buffer("prose\n", 6);
+        let _scratch = scratch_save_dir(&mut app);
         with_clipboard(&mut app, Box::new(StubClipboard(ClipboardData::default())));
 
         paste(&mut app, Action::PasteImage);
@@ -3107,6 +3127,7 @@ mod tests {
     fn a_copied_image_path_in_text_is_still_referenced() {
         // The behaviour the branch already ships; the port must keep it.
         let mut app = app_with_buffer("", 0);
+        let _scratch = scratch_save_dir(&mut app);
         with_clipboard(
             &mut app,
             Box::new(StubClipboard(text_copy(r#""C:\Users\me\shot.png""#))),

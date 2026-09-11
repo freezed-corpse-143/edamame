@@ -144,14 +144,18 @@ fn a_non_image_entry_does_not_mask_a_later_image() {
 fn a_copied_folder_is_not_an_image() {
     // Explorer's Ctrl+C on a directory yields a one-entry file list naming
     // the directory.  It must fall through to "no image", never insert a
-    // reference to a folder.
+    // reference to a folder.  The target is a real directory because
+    // `destination` is a function that writes: a case that expects no
+    // write still owes it somewhere harmless to write.
+    let dir = tempfile::tempdir().expect("tempdir");
     let data = explorer_file_copy(&[r"C:\Users\me\Pictures"]);
 
     assert_eq!(select(&data), None);
     assert_eq!(
-        destination(&data, &target("./images", None)),
+        destination(&data, &target(&dir.path().to_string_lossy(), None)),
         Outcome::NoImage
     );
+    assert_eq!(entries(dir.path()), Vec::<String>::new());
 }
 
 // ── Precedence between payload kinds ────────────────────────────────────────
@@ -243,6 +247,10 @@ fn a_screenshot_whose_directory_cannot_be_resolved_reports_a_failure() {
     // A relative `save_dir` needs a document to resolve against; an
     // unsaved buffer has none.  That is a reportable failure, not a
     // silent no-op — the user must hear why nothing appeared.
+    //
+    // The relative literal is the point of the case, and it never reaches
+    // the filesystem: `resolve_save_dir` refuses before anything is
+    // created.
     let data = screenshot(vec![255, 0, 0, 255]);
 
     match destination(&data, &target("./images", None)) {
@@ -293,13 +301,15 @@ fn a_copied_image_url_is_taken_at_face_value() {
 
 #[test]
 fn an_empty_clipboard_offers_no_image() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let data = ClipboardData::default();
 
     assert_eq!(select(&data), None);
     assert_eq!(
-        destination(&data, &target("./images", None)),
+        destination(&data, &target(&dir.path().to_string_lossy(), None)),
         Outcome::NoImage
     );
+    assert_eq!(entries(dir.path()), Vec::<String>::new());
 }
 
 // ── The plain (Ctrl-V) paste's text-first rule ──────────────────────────────
