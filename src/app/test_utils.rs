@@ -1,6 +1,6 @@
 //! Shared fixtures for unit tests under `src/app/`: `App::new` boilerplate in one place.
 
-use crate::config::{Config, KeyBindingOverrides, Theme};
+use crate::config::{Config, KeyBindingOverrides, State, Theme};
 use crate::document::Buffer;
 use crate::terminal::Capabilities;
 
@@ -18,6 +18,7 @@ pub(crate) fn make_app() -> App {
     let theme_file = (&Theme::default()).into();
     App::new(
         Config::default(),
+        State::default(),
         KeyBindingOverrides::default(),
         theme_file,
         None,
@@ -50,7 +51,7 @@ mod theme_downgrade_tests {
 
     use crate::app::modal::types::{Modal, ModalOutcome};
     use crate::app::modal::{TerminalCapabilitiesModal, ThemeDowngradeModal, WelcomeModal};
-    use crate::config::{Config, FiguresEnabled, ImagesEnabled, KeyBindingOverrides, Theme};
+    use crate::config::{Config, FiguresEnabled, ImagesEnabled, KeyBindingOverrides, State, Theme};
     use crate::terminal::{Capabilities, ColorDepth};
 
     use super::App;
@@ -73,9 +74,13 @@ mod theme_downgrade_tests {
         config.editor.show_welcome = show_welcome;
         // Record the running version: an empty `last_version_seen` with `show_welcome`
         // off would put a `PostUpgradeModal` on top of the stack under assertion.
-        config.editor.last_version_seen = crate::app::update_check::INSTALLED_VERSION.to_owned();
+        let state = State {
+            last_version_seen: crate::app::update_check::INSTALLED_VERSION.to_owned(),
+            ..State::default()
+        };
         App::new(
             config,
+            state,
             KeyBindingOverrides::default(),
             (&Theme::default()).into(),
             None,
@@ -117,6 +122,7 @@ mod theme_downgrade_tests {
         config.figures.enabled = FiguresEnabled::Always;
         let app = App::new(
             config,
+            State::default(),
             KeyBindingOverrides::default(),
             (&Theme::default()).into(),
             None,
@@ -146,6 +152,7 @@ mod theme_downgrade_tests {
         config.figures.enabled = FiguresEnabled::Always;
         let app = App::new(
             config,
+            State::default(),
             KeyBindingOverrides::default(),
             (&Theme::default()).into(),
             None,

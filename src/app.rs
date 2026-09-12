@@ -38,7 +38,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::config::sections::{DEFAULT_HANDLER, VIM_HANDLER};
-use crate::config::{Config, ConfigWarning, KeyBindingOverrides, KeyMap, Theme, ThemeFile};
+use crate::config::{Config, ConfigWarning, KeyBindingOverrides, KeyMap, State, Theme, ThemeFile};
 use crate::document::Buffer;
 use crate::editor::{mouse_ops, EditorState};
 use crate::input::{MouseDispatcher, VimState};
@@ -85,6 +85,9 @@ pub struct HintPrompt {
 /// The application: owns all state and drives the event loop.
 pub struct App {
     config: Config,
+    /// Machine-written bookkeeping (seen terminals, update-check stamps, last version seen),
+    /// persisted to `state.toml` in the data dir — separate from the user-facing `config.toml`.
+    state: State,
     /// Overrides from `keybindings.toml`, held so `KeyMap::build` can run in `run()` alongside
     /// capability detection.
     keybindings: KeyBindingOverrides,
@@ -319,6 +322,7 @@ impl App {
     /// Create the app, loading the file if one is given.
     pub fn new(
         mut config: Config,
+        state: State,
         keybindings: KeyBindingOverrides,
         theme_file: ThemeFile,
         file_path: Option<PathBuf>,
@@ -430,17 +434,15 @@ impl App {
         // `tick_update_notice`.  Only the *decision* happens here: the `last_version_seen` write
         // is `App::run`'s, because `App::new` must stay disk-free — `test_utils::make_app` builds
         // an `App` through it, mostly without a config-isolation guard.
-        let post_upgrade_modal = post_upgrade::startup_notice(
-            &config.editor.last_version_seen,
-            config.editor.show_welcome,
-        );
+        let post_upgrade_modal =
+            post_upgrade::startup_notice(&state.last_version_seen, config.editor.show_welcome);
         let config_warning_modal = modal::ConfigWarningModal::from_warnings(&config_warnings);
         let capabilities_notice = if suppress_legacy_prompts {
             None
         } else {
             modal::TerminalCapabilitiesModal::from_capabilities(
                 &capabilities,
-                &config.editor.seen_terminal_fingerprints,
+                &state.seen_terminal_fingerprints,
             )
         };
         // A first visit to a terminal that also can't render the user's theme is one story, not
@@ -524,12 +526,13 @@ impl App {
         // doesn't exist until `run()` spawns the event threads.
         let startup_update_check_due = update_check::network_check_due(
             config.editor.check_for_updates,
-            config.editor.last_update_check,
+            state.last_update_check,
             update_check::now_unix(),
         );
 
         Ok(Self {
             config,
+            state,
             keybindings,
             theme,
             capabilities,
@@ -761,7 +764,7 @@ impl App {
 
 #[cfg(test)]
 mod vim_wiring_tests {
-    use crate::config::{Config, KeyBindingOverrides, Theme};
+    use crate::config::{Config, KeyBindingOverrides, State, Theme};
     use crate::editor::Mode;
     use crate::terminal::Capabilities;
 
@@ -773,6 +776,7 @@ mod vim_wiring_tests {
         let theme_file = (&Theme::default()).into();
         App::new(
             config,
+            State::default(),
             KeyBindingOverrides::default(),
             theme_file,
             None,

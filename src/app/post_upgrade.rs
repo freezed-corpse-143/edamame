@@ -73,12 +73,12 @@ impl App {
     /// Called from `App::run`, not `App::new` — see the module doc.  Stamps regardless of
     /// whether a modal was shown: a release without a changelog section is silent, and leaving
     /// it unrecorded would re-evaluate it on every later launch.  Needs no `--no-config` gate;
-    /// `Config::save` already declines there.
+    /// `State::save` already declines there.
     pub(super) fn stamp_last_version_seen(&mut self) {
-        if self.config.editor.last_version_seen == INSTALLED_VERSION {
+        if self.state.last_version_seen == INSTALLED_VERSION {
             return;
         }
-        self.config.editor.last_version_seen = INSTALLED_VERSION.to_owned();
+        self.state.last_version_seen = INSTALLED_VERSION.to_owned();
         self.save_update_bookkeeping("last-version-seen");
     }
 
@@ -170,28 +170,28 @@ mod tests {
     fn stamping_records_the_running_version() {
         let _iso = crate::test_env::config_isolation();
         let mut app = make_app();
-        app.config.editor.last_version_seen = OLDER.to_owned();
+        app.state.last_version_seen = OLDER.to_owned();
         app.stamp_last_version_seen();
-        assert_eq!(app.config.editor.last_version_seen, INSTALLED_VERSION);
+        assert_eq!(app.state.last_version_seen, INSTALLED_VERSION);
     }
 
     #[test]
     fn stamping_an_already_current_version_changes_nothing() {
         let _iso = crate::test_env::config_isolation();
         let mut app = make_app();
-        app.config.editor.last_version_seen = INSTALLED_VERSION.to_owned();
+        app.state.last_version_seen = INSTALLED_VERSION.to_owned();
         app.stamp_last_version_seen();
-        assert_eq!(app.config.editor.last_version_seen, INSTALLED_VERSION);
+        assert_eq!(app.state.last_version_seen, INSTALLED_VERSION);
     }
 
     #[test]
     fn the_explicit_opening_writes_no_bookkeeping() {
         let _iso = crate::test_env::config_isolation();
         let mut app = make_app();
-        app.config.editor.last_version_seen = OLDER.to_owned();
+        app.state.last_version_seen = OLDER.to_owned();
         app.open_post_upgrade_modal();
         assert!(app.modal_stack.contains::<modal::PostUpgradeModal>());
-        assert_eq!(app.config.editor.last_version_seen, OLDER);
+        assert_eq!(app.state.last_version_seen, OLDER);
     }
 
     /// Build an `App` the way a returning user's launch does: welcome dismissed,
@@ -202,7 +202,7 @@ mod tests {
     /// so it would gate away the behavior under test; the bare lock still excludes another test
     /// setting that suppression concurrently.  Safe without it because `App::new` never writes.
     fn returning_user_app(last_version_seen: &str) -> App {
-        use crate::config::{Config, KeyBindingOverrides, Theme};
+        use crate::config::{Config, KeyBindingOverrides, State, Theme};
         use crate::terminal::{Capabilities, ColorDepth};
 
         let caps = Capabilities {
@@ -211,9 +211,13 @@ mod tests {
         };
         let mut config = Config::default();
         config.editor.show_welcome = false;
-        config.editor.last_version_seen = last_version_seen.to_owned();
+        let state = State {
+            last_version_seen: last_version_seen.to_owned(),
+            ..State::default()
+        };
         App::new(
             config,
+            state,
             KeyBindingOverrides::default(),
             (&Theme::default()).into(),
             None,

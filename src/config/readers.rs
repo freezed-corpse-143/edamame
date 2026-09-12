@@ -66,9 +66,14 @@ where
 /// with no warning; IO or parse failure → `on_parse_failure()` + `ParseError`; unknown
 /// keys → the parsed value + `UnknownKeys`.  The two fallbacks are separate so callers
 /// can treat the missing-file path differently.
+///
+/// `ignored` lists dotted keys to drop silently from the unknown set — keys a struct field no
+/// longer consumes but which are known-legacy and migrated elsewhere, so they must not raise a
+/// warning modal (see the derived list in [`read_main_config`]).
 fn read_and_warn<T, M, F>(
     path: &Path,
     warnings: &mut Vec<ConfigWarning>,
+    ignored: &[&str],
     on_missing: M,
     on_parse_failure: F,
 ) -> T
@@ -89,7 +94,8 @@ where
         }
     };
     match deserialize_with_unknown_keys::<T>(&raw) {
-        Ok((value, unknown)) => {
+        Ok((value, mut unknown)) => {
+            unknown.retain(|k| !ignored.contains(&k.as_str()));
             if !unknown.is_empty() {
                 warnings.push(ConfigWarning {
                     path: path.to_path_buf(),
@@ -110,7 +116,17 @@ where
 
 /// Read `config.toml` via [`read_and_warn`], then apply [`validate_main_config`].
 pub(super) fn read_main_config(path: &Path, warnings: &mut Vec<ConfigWarning>) -> Config {
-    let mut config: Config = read_and_warn(path, warnings, Config::default, Config::default);
+    // The bookkeeping keys migrated to `state.toml` are filtered out of the unknown-key warning,
+    // so an un-migrated file (including one a `--no-config` run can't rewrite) never warns about
+    // keys edamame itself moved.  Derived from `BOOKKEEPING_KEYS_BARE` and prefixed with the
+    // `editor.` table, so the two never drift.
+    let ignored: Vec<String> = super::config::BOOKKEEPING_KEYS_BARE
+        .iter()
+        .map(|k| format!("editor.{k}"))
+        .collect();
+    let ignored: Vec<&str> = ignored.iter().map(String::as_str).collect();
+    let mut config: Config =
+        read_and_warn(path, warnings, &ignored, Config::default, Config::default);
     validate_main_config(path, &mut config, warnings);
     config
 }
@@ -169,6 +185,7 @@ pub(super) fn read_keybindings(
     let mut overrides: KeyBindingOverrides = read_and_warn(
         path,
         warnings,
+        &[],
         KeyBindingOverrides::default,
         KeyBindingOverrides::default,
     );

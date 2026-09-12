@@ -39,8 +39,7 @@ If you later open edamame in a different terminal application, you should see a 
 If your terminal falls short, edamame adapts rather than breaking: it swaps in a theme designed for 256 colors, keeps `[Image: …]` placeholders in place, and tells you which chords won't arrive. [terminal-compatibility.md](terminal-compatibility.md) has the full picture — what each capability affects, the workarounds, and which terminals support what. The command palette reaches everything regardless.
 
 To see the summary again, run [`edamame --doctor`](#command-line-flags), open
-"Open welcome / terminal setup" from the palette, or clear
-`seen_terminal_fingerprints` in `config.toml`.
+"Open welcome / terminal setup" from the palette.
 
 ---
 

@@ -177,6 +177,22 @@ impl App {
             }
         }
     }
+
+    /// Persist `state.toml` and flash `Configuration updated` on success, or notify on failure.
+    /// The state counterpart of [`Self::save_config_with_flash`], for outcomes that record only
+    /// machine bookkeeping (e.g. a newly seen terminal) and change no `config.toml` setting.
+    pub(super) fn save_state_with_flash(&mut self, err_context: &'static str) {
+        match self.state.save() {
+            Ok(()) => {
+                let msg = format!("Configuration updated{}", config::unpersisted_suffix());
+                self.flash(msg, MessageKind::Success);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "{}", err_context);
+                self.notify(format!("Config save failed: {e}"), ModalKind::Error);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

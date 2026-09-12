@@ -1025,7 +1025,7 @@ mod tests {
         // `App::new` suppresses all three prompts below truecolor, where
         // `media_renderable` refuses to decode anyway; navigation owes the same
         // suppression.
-        use crate::config::{Config, KeyBindingOverrides, Theme};
+        use crate::config::{Config, KeyBindingOverrides, State, Theme};
         use crate::terminal::{Capabilities, ColorDepth};
 
         let caps = Capabilities {
@@ -1036,9 +1036,13 @@ mod tests {
         config.editor.show_welcome = false;
         // With no version recorded, the post-upgrade notice would otherwise open
         // over the document this test navigates.
-        config.editor.last_version_seen = crate::app::update_check::INSTALLED_VERSION.to_owned();
+        let state = State {
+            last_version_seen: crate::app::update_check::INSTALLED_VERSION.to_owned(),
+            ..State::default()
+        };
         let mut app = App::new(
             config,
+            state,
             KeyBindingOverrides::default(),
             (&Theme::default()).into(),
             None,

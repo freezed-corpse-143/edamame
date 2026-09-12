@@ -130,18 +130,18 @@ A buffer with unsaved edits always prompts, regardless of this setting. edamame 
 |---|---|---|---|
 | `show_welcome` | bool | `true` | welcome modal |
 | `check_for_updates` | bool | `true` | settings overlay, welcome modal |
-| `last_update_check` | integer | `0` | written by edamame |
-| `update_notified_for` | string | `""` | written by edamame |
-| `last_version_seen` | string | `""` | written by edamame |
-| `seen_terminal_fingerprints` | list of string | `[]` | written by edamame |
-
-`seen_terminal_fingerprints` is used by edamame to record which terminals have already shown the capabilities notice, so it fires once per new terminal rather than every launch.
 
 `check_for_updates` is used by edamame to govern the automatic release check at startup. It runs at most once every 24 hours — and not before the first-run welcome screen has been answered, so turning it off there stops the first check too. It is silent unless there is a new release. Turning it off disables the automatic check.
 
-`last_update_check` and `update_notified_for` are used by edamame to know when the last update check was conducted and whether it already notified you about a specific release.
+### Machine state (`state.toml`)
 
-`last_version_seen` records the version that last ran. This is used by edamame to show you release notes for a specific version only once. The notes are read from the changelog built into the binary — no network is involved, and this is unrelated to the update check above. To read the notes again at any time, press **Release notes** on the About page.
+A handful of values are written by edamame itself rather than by you, such as when it last checked for updates. These live in a separate `state.toml` in the platform data directory, keeping `config.toml` entirely hand-editable and safe to share across machines:
+
+| Platform | Path |
+|---|---|
+| Linux | `$XDG_DATA_HOME/edamame/state.toml`, else `~/.local/share/edamame/state.toml` |
+| macOS | `~/Library/Application Support/edamame/state.toml` |
+| Windows | `%APPDATA%\edamame\state.toml` |
 
 ---
 

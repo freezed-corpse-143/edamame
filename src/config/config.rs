@@ -12,6 +12,7 @@ pub use super::sections::{
     AppearanceMode, CustomExportEntry, DevConfig, EditorConfig, ExportConfig, FiguresConfig,
     FiguresEnabled, ImagesConfig, ImagesEnabled, ModalConfig, RemoteImagePolicy, TableConfig,
 };
+use super::state::State;
 use super::theme::Theme;
 use super::theme_file::ThemeFile;
 pub use super::warnings::{ConfigWarning, WarningKind};
@@ -80,6 +81,10 @@ pub struct LoadedConfig {
     pub config: Config,
     pub keybindings: KeyBindingOverrides,
     pub theme: ThemeFile,
+    /// Machine-written bookkeeping from `state.toml`, loaded (and migrated out of a legacy
+    /// `config.toml`) alongside the config.  Ignored on the external-editor reload — the user
+    /// edited `config.toml`, not this.
+    pub state: State,
     /// Non-fatal parse problems, surfaced by the App in a startup warning modal.
     pub warnings: Vec<ConfigWarning>,
 }
@@ -93,6 +98,7 @@ impl Default for LoadedConfig {
             config: Config::default(),
             keybindings: KeyBindingOverrides::default(),
             theme: (&Theme::default()).into(),
+            state: State::default(),
             warnings: Vec::new(),
         }
     }
@@ -137,22 +143,29 @@ impl Config {
                 }
             }
         }
-        // Migrate legacy section names ([diagrams] → [figures]) in the
-        // on-disk file so it matches the current spelling.  Gated on the
-        // same persist flag as the theme-fallback write above and on config
-        // writes being allowed (test isolation, `--no-config`); the `alias`
-        // on `Config::diagrams` means the session already loaded correctly
-        // whether or not this runs.  Only writes when a legacy name is
-        // actually present, so an up-to-date config never triggers a write.
+        // Migrate the on-disk `config.toml` so it matches the current spelling.  Gated on the same
+        // persist flag as the theme-fallback write above and on config writes being allowed (test
+        // isolation, `--no-config`); each step is a no-op when there is nothing to do, so an
+        // up-to-date config never triggers a write.  The session already loaded correctly whether
+        // or not this runs — the `alias` on `Config::diagrams` covers the rename, and the four
+        // bookkeeping keys are filtered out of the unknown-key warning by `read_main_config`.
         if persist_fallback && config_writes_allowed() {
             if let Some(d) = &dir {
-                migrate_config_file_in_place(&d.join("config.toml"));
+                let config_path = d.join("config.toml");
+                // Order matters: seed `state.toml` from the OLD `config.toml` values *before* the
+                // migration strips them.  A no-op once `state.toml` exists.
+                seed_state_from_legacy_config(&config_path);
+                // Rename [diagrams] → [figures] AND strip the four bookkeeping keys.
+                migrate_config_file_in_place(&config_path);
             }
         }
+        // Read `state.toml` after any seed above wrote it.
+        let state = State::load();
         Ok(LoadedConfig {
             config,
             keybindings,
             theme,
+            state,
             warnings,
         })
     }
@@ -233,9 +246,17 @@ impl Config {
         ensure_default_files_in(&dir, truecolor);
     }
 
+    /// edamame's directory under the platform data dir: `$XDG_DATA_HOME/edamame` or
+    /// `~/.local/share/edamame` on Linux, `~/Library/Application Support/edamame` on macOS,
+    /// `%APPDATA%\edamame` on Windows.  The single home for machine-written files — the tracing
+    /// log ([`Self::log_dir`]) and [`State`]'s `state.toml`.
+    pub fn data_dir() -> Option<PathBuf> {
+        dirs::data_dir().map(|d| d.join("edamame"))
+    }
+
     /// Returns the path to the log directory.
     pub fn log_dir() -> Option<PathBuf> {
-        dirs::data_dir().map(|d| d.join("edamame"))
+        Self::data_dir()
     }
 
     /// Read one named theme from `themes/<name>.toml`, with any non-fatal warnings for
@@ -325,12 +346,26 @@ fn save_merge(config: &Config, path: &Path) -> Result<String> {
 
 // ── config-key migration ──────────────────────────────────────────────────────
 
-/// Rename legacy `diagrams` keys in `doc` to `figures`, preserving each entry's value and decor.
-/// The rename (when display math joined the consent gate) touches two places, migrated together:
-/// the top-level `[diagrams]` section and the `[export.html].diagrams` toggle.  Returns `true`
-/// when anything changed; if both names exist at a level (a hand-edited file), the new one wins.
-/// Going through toml_edit keeps the entry's position and comments, and handles `[ diagrams ]`
-/// with spaces and the nested key that a raw-text swap could not.
+/// Machine-written bookkeeping that once lived in `[editor]` and now lives in `state.toml` (see
+/// [`State`]).  Stripped from `config.toml` by [`migrate_legacy_config_keys`], and — prefixed with
+/// the `editor.` table — filtered out of the unknown-key warning by `read_main_config`, which
+/// derives its dotted list from this one so there is a single source of truth.
+pub(super) const BOOKKEEPING_KEYS_BARE: &[&str] = &[
+    "seen_terminal_fingerprints",
+    "last_update_check",
+    "update_notified_for",
+    "last_version_seen",
+];
+
+/// Bring `doc` up to the current `config.toml` spelling in place: rename the legacy `diagrams`
+/// keys to `figures`, and strip the four [`BOOKKEEPING_KEYS_BARE`] that migrated to `state.toml`.
+/// Returns `true` when anything changed.
+///
+/// The rename (when display math joined the consent gate) touches two places: the top-level
+/// `[diagrams]` section and the `[export.html].diagrams` toggle; if both names exist at a level
+/// (a hand-edited file), the new one wins.  Going through toml_edit keeps each entry's position
+/// and comments, and handles `[ diagrams ]` with spaces and the nested key that a raw-text swap
+/// could not.
 fn migrate_legacy_config_keys(doc: &mut toml_edit::DocumentMut) -> bool {
     let mut changed = rename_table_key(doc.as_table_mut(), "diagrams", "figures");
     // The parallel `[export.html].diagrams` toggle migrates in place too; absent / non-table
@@ -343,7 +378,80 @@ fn migrate_legacy_config_keys(doc: &mut toml_edit::DocumentMut) -> bool {
     {
         changed |= rename_table_key(export_html, "diagrams", "figures");
     }
+    // Strip the bookkeeping keys now owned by `state.toml`; seeding has already read their values
+    // (see `seed_state_from_legacy_config`), so removing them here is safe.
+    if let Some(editor) = doc
+        .get_mut("editor")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        for key in BOOKKEEPING_KEYS_BARE {
+            changed |= remove_table_key(editor, key);
+        }
+    }
     changed
+}
+
+/// Remove `key` from one table in place, keeping the rest of the table's decor.  Returns whether
+/// anything was removed.  The strip counterpart to [`rename_table_key`].
+fn remove_table_key(table: &mut dyn toml_edit::TableLike, key: &str) -> bool {
+    table.remove(key).is_some()
+}
+
+/// Seed `state.toml` from an existing `config.toml`'s legacy `[editor]` bookkeeping, once.
+///
+/// A no-op when [`State::path`] already exists (the migration is one-time, and an existing
+/// `state.toml` must never be clobbered by a stale `config.toml`), when `config_path` is missing
+/// or unparseable, or when the file carries none of the keys (a fresh install stays fileless until
+/// edamame writes bookkeeping of its own).  Reads the raw toml_edit document because the four keys
+/// no longer exist as `EditorConfig` fields.  Fail-soft: any write error is logged, not propagated.
+/// The strip in [`migrate_config_file_in_place`] then runs regardless, so a failed seed drops the
+/// values from disk — but they are re-derivable bookkeeping, so the cost is at worst a repeated
+/// notice, never lost configuration.
+fn seed_state_from_legacy_config(config_path: &Path) {
+    // Gate on the real state-file location (the data dir), not the config dir.
+    if State::path().is_none_or(|p| p.exists()) {
+        return;
+    }
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return;
+    };
+    let Ok(doc) = raw.parse::<toml_edit::DocumentMut>() else {
+        return;
+    };
+    let Some(editor) = doc.get("editor").and_then(toml_edit::Item::as_table_like) else {
+        return;
+    };
+
+    let mut state = State::default();
+    let mut found = false;
+    if let Some(v) = editor.get("last_update_check").and_then(|i| i.as_integer()) {
+        state.last_update_check = v.max(0) as u64;
+        found = true;
+    }
+    if let Some(v) = editor.get("update_notified_for").and_then(|i| i.as_str()) {
+        state.update_notified_for = v.to_owned();
+        found = true;
+    }
+    if let Some(v) = editor.get("last_version_seen").and_then(|i| i.as_str()) {
+        state.last_version_seen = v.to_owned();
+        found = true;
+    }
+    if let Some(arr) = editor
+        .get("seen_terminal_fingerprints")
+        .and_then(|i| i.as_array())
+    {
+        state.seen_terminal_fingerprints = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        found = true;
+    }
+    if !found {
+        return;
+    }
+    if let Err(e) = state.save() {
+        tracing::warn!(error = %e, "failed to seed state.toml from legacy config");
+    }
 }
 
 /// Rename key `from` to `to` within one table, in place, keeping value and decor.  No-op when
@@ -377,7 +485,7 @@ fn migrate_config_file_in_place(path: &Path) {
     }
     match std::fs::write(path, doc.to_string()) {
         Ok(()) => {
-            tracing::info!(path = %path.display(), "migrated [diagrams] → [figures] in config")
+            tracing::info!(path = %path.display(), "migrated legacy keys in config.toml")
         }
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "failed to migrate legacy config keys")
@@ -572,42 +680,16 @@ mod tests {
         assert_eq!(deserialized.editor.mouse_scroll_lines, 3);
     }
 
+    /// `check_for_updates` is a real user setting and stays on `EditorConfig`; the three
+    /// bookkeeping fields it used to sit beside moved to `state.toml` (see `config::state`).
     #[test]
-    fn update_check_fields_default_and_round_trip() {
+    fn check_for_updates_defaults_on_and_round_trips() {
         let mut config = Config::default();
-        // Opt-out, and the bookkeeping fields start empty so the first launch is due.
         assert!(config.editor.check_for_updates);
-        assert_eq!(config.editor.last_update_check, 0);
-        assert_eq!(config.editor.update_notified_for, "");
-        // Empty means "no version recorded", which `App::new` reads with `show_welcome`
-        // to tell a fresh install from an upgrade.
-        assert_eq!(config.editor.last_version_seen, "");
-
         config.editor.check_for_updates = false;
-        config.editor.last_update_check = 1_755_500_000;
-        config.editor.update_notified_for = "v0.2.0".to_owned();
-        config.editor.last_version_seen = "0.1.9".to_owned();
         let serialized = toml::to_string(&config).expect("serialize");
         let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
         assert!(!deserialized.editor.check_for_updates);
-        assert_eq!(deserialized.editor.last_update_check, 1_755_500_000);
-        assert_eq!(deserialized.editor.update_notified_for, "v0.2.0");
-        assert_eq!(deserialized.editor.last_version_seen, "0.1.9");
-    }
-
-    #[test]
-    fn seen_terminal_fingerprints_round_trip() {
-        let mut config = Config::default();
-        assert!(config.editor.seen_terminal_fingerprints.is_empty());
-        config.editor.seen_terminal_fingerprints.push(
-            "WezTerm|xterm-256color||truecolor|kitty|mouse=true|kbd=true|unicode=true".into(),
-        );
-        let serialized = toml::to_string(&config).expect("serialize");
-        let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
-        assert_eq!(
-            deserialized.editor.seen_terminal_fingerprints,
-            config.editor.seen_terminal_fingerprints
-        );
     }
 
     #[test]
@@ -884,6 +966,37 @@ mod tests {
                     keys.iter().any(|k| k == "bogus_top"),
                     "missing top-level key: {keys:?}"
                 );
+            }
+            other => panic!("expected UnknownKeys, got {other:?}"),
+        }
+    }
+
+    /// The four legacy bookkeeping keys (now in `state.toml`) are filtered out of the unknown-key
+    /// warning, but a genuinely unknown key beside them still warns — so the filter stays narrow.
+    #[test]
+    fn legacy_bookkeeping_keys_do_not_warn_but_real_unknowns_still_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[editor]\n\
+             last_update_check = 1\n\
+             update_notified_for = \"v1\"\n\
+             last_version_seen = \"0.1\"\n\
+             seen_terminal_fingerprints = [\"a\"]\n\
+             mouse_scroll_linez = 8\n",
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let _config = read_main_config(&path, &mut warnings);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "only the genuine unknown key should warn: {warnings:?}"
+        );
+        match &warnings[0].kind {
+            WarningKind::UnknownKeys(keys) => {
+                assert_eq!(keys, &vec!["editor.mouse_scroll_linez".to_string()]);
             }
             other => panic!("expected UnknownKeys, got {other:?}"),
         }
@@ -1323,6 +1436,140 @@ appearance = \"dark\"
             after,
             "second run changed the file"
         );
+    }
+
+    // ── bookkeeping → state.toml migration ─────────────────────────────
+
+    /// The migration strips the four `[editor]` bookkeeping keys while leaving real settings and
+    /// their comments untouched, and is idempotent on an already-clean file.
+    #[test]
+    fn strip_removes_the_four_editor_keys_preserving_others() {
+        use toml_edit::DocumentMut;
+        let src = "theme = \"Nord\"\n\n\
+                   [editor]\n\
+                   # keep this\n\
+                   line_wrap = true # trailing\n\
+                   last_update_check = 1\n\
+                   update_notified_for = \"v1\"\n\
+                   last_version_seen = \"0.1\"\n\
+                   seen_terminal_fingerprints = [\"a\"]\n";
+        let mut doc: DocumentMut = src.parse().unwrap();
+        assert!(migrate_legacy_config_keys(&mut doc));
+        let out = doc.to_string();
+        for k in BOOKKEEPING_KEYS_BARE {
+            assert!(!out.contains(k), "bookkeeping key `{k}` survived:\n{out}");
+        }
+        assert!(out.contains("line_wrap = true # trailing"), "{out}");
+        assert!(out.contains("# keep this"), "{out}");
+        // Already clean → no change.
+        let mut clean: DocumentMut = "[editor]\nline_wrap = true\n".parse().unwrap();
+        assert!(!migrate_legacy_config_keys(&mut clean));
+    }
+
+    /// Seeding copies the legacy values into `state.toml`, then is a one-time no-op that never
+    /// clobbers the now-authoritative state file.  Linux-only: `dirs::data_dir()` honors
+    /// `XDG_DATA_HOME` there, so `State`'s real read/write can be redirected to a tempdir.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seed_copies_legacy_values_then_is_idempotent() {
+        let _lock = crate::test_env::env_lock();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let _xdg = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data_dir.path());
+
+        let config_path = cfg_dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "theme = \"Nord\"\n\n[editor]\n\
+             last_update_check = 123\n\
+             last_version_seen = \"0.1.9\"\n\
+             seen_terminal_fingerprints = [\"fp1\"]\n",
+        )
+        .unwrap();
+
+        seed_state_from_legacy_config(&config_path);
+        let state = State::load();
+        assert_eq!(state.last_update_check, 123);
+        assert_eq!(state.last_version_seen, "0.1.9");
+        assert_eq!(state.seen_terminal_fingerprints, vec!["fp1".to_string()]);
+
+        // A different config no longer reaches state: the file exists, so seeding stands down.
+        std::fs::write(&config_path, "[editor]\nlast_version_seen = \"9.9.9\"\n").unwrap();
+        seed_state_from_legacy_config(&config_path);
+        assert_eq!(State::load().last_version_seen, "0.1.9");
+    }
+
+    /// End to end through `Config::load`: a legacy `config.toml` migrates its bookkeeping into
+    /// `state.toml`, the keys are stripped from `config.toml` (comments intact), the returned
+    /// `LoadedConfig` carries the state, and no unknown-key warning fires.  Linux-only for the
+    /// same `XDG_DATA_HOME` reason as the seed tests.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_load_migrates_legacy_bookkeeping_end_to_end() {
+        let _lock = crate::test_env::env_lock();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let _xcfg = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", cfg_dir.path());
+        let _xdata = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data_dir.path());
+
+        let config_path = cfg_dir.path().join("edamame/config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            "theme = \"Edamame\"\n\n[editor]\n\
+             # a real setting\n\
+             line_wrap = true\n\
+             last_update_check = 777\n\
+             last_version_seen = \"0.1.2\"\n\
+             seen_terminal_fingerprints = [\"fp\"]\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load(true, true).expect("load ok");
+        assert_eq!(loaded.state.last_update_check, 777);
+        assert_eq!(loaded.state.last_version_seen, "0.1.2");
+        assert_eq!(
+            loaded.state.seen_terminal_fingerprints,
+            vec!["fp".to_string()]
+        );
+        assert!(
+            loaded.warnings.is_empty(),
+            "no warning: {:?}",
+            loaded.warnings
+        );
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        for key in BOOKKEEPING_KEYS_BARE {
+            assert!(!on_disk.contains(key), "`{key}` not stripped:\n{on_disk}");
+        }
+        assert!(
+            on_disk.contains("# a real setting"),
+            "comment lost:\n{on_disk}"
+        );
+        assert!(
+            on_disk.contains("line_wrap = true"),
+            "setting lost:\n{on_disk}"
+        );
+        assert!(data_dir.path().join("edamame/state.toml").exists());
+    }
+
+    /// A fresh install (no bookkeeping keys in config) writes no `state.toml`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seed_writes_nothing_when_no_legacy_keys_present() {
+        let _lock = crate::test_env::env_lock();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let _xdg = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data_dir.path());
+
+        let config_path = cfg_dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "theme = \"Nord\"\n\n[editor]\nline_wrap = true\n",
+        )
+        .unwrap();
+        seed_state_from_legacy_config(&config_path);
+        assert!(!data_dir.path().join("edamame/state.toml").exists());
     }
 
     /// A non-default value for an absent key is inserted; default-valued siblings are not.

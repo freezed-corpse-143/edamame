@@ -166,19 +166,19 @@ impl WelcomeModal {
             app.config.editor.check_for_updates = check_for_updates;
             app.config.editor.show_welcome = !dont_show_again;
             // This modal already showed the capability summary, so seed the
-            // seen set or the standalone notice fires on the next launch.
-            if !app
-                .config
-                .editor
-                .seen_terminal_fingerprints
-                .contains(&fingerprint)
-            {
-                app.config
-                    .editor
-                    .seen_terminal_fingerprints
-                    .push(fingerprint);
+            // seen set or the standalone notice fires on the next launch.  The
+            // fingerprint now lives in `state.toml`, so this outcome writes both
+            // files: the config settings above and the state below.
+            if !app.state.seen_terminal_fingerprints.contains(&fingerprint) {
+                app.state.seen_terminal_fingerprints.push(fingerprint);
             }
             app.save_config_with_flash("failed to persist welcome modal preferences");
+            // The state write is best-effort: `save_config_with_flash` already flashed for the
+            // config half, so a failure here only logs (a second flash would double up) and the
+            // notice simply re-fires next launch.
+            if let Err(e) = app.state.save() {
+                tracing::warn!(error = %e, "failed to persist welcome modal seen-terminal state");
+            }
             app.dispatch_image_decodes();
             app.editor.refresh_parsed();
         }))

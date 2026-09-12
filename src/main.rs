@@ -143,6 +143,7 @@ fn run(session: Session, opts: RunOpts) -> Result<()> {
         mut config,
         keybindings,
         theme,
+        state,
         warnings: config_warnings,
     } = loaded;
 
@@ -207,6 +208,7 @@ fn run(session: Session, opts: RunOpts) -> Result<()> {
     // propagating — the panic hook only fires on an actual panic.
     let mut app = match App::new(
         config,
+        state,
         keybindings,
         theme,
         file_path,

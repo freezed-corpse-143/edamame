@@ -83,17 +83,6 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    /// Machine-managed bookkeeping that [`Config::save`] writes on its own.  Deliberately absent
-    /// from the shipped template — a fresh config should not carry state the user never sets — so
-    /// [`reference_config_documents_every_default_setting`] both skips these in its coverage sweep
-    /// and asserts they never appear as reference lines.
-    const BOOKKEEPING_KEYS: &[&str] = &[
-        "editor.seen_terminal_fingerprints",
-        "editor.last_update_check",
-        "editor.update_notified_for",
-        "editor.last_version_seen",
-    ];
-
     /// Drop a trailing ` # comment` from a value, leaving quoted `#`s alone.
     fn strip_inline_comment(value: &str) -> &str {
         let mut in_string = false;
@@ -145,7 +134,8 @@ mod tests {
     /// The shipped `config.toml` must list every configurable setting exactly once, at its
     /// compiled-in default — so adding a `Config` field without documenting it, or letting a
     /// default drift from the comment beside it, is a test failure rather than a silent gap.
-    /// Machine-written bookkeeping is the sole, asserted, exception.
+    /// (Machine-written bookkeeping is no longer a `Config` field at all — it lives in
+    /// `state.toml`; see [`crate::config::State`].)
     #[test]
     fn reference_config_documents_every_default_setting() {
         let serialized = toml::to_string_pretty(&Config::default()).expect("serialize default");
@@ -155,7 +145,7 @@ mod tests {
         for (key, default_value) in &defaults {
             // Empty arrays (`export.custom = []`) have no scalar reference line; the custom-export
             // block is shown as a commented `[[export.custom]]` example instead.
-            if default_value == "[]" || BOOKKEEPING_KEYS.contains(&key.as_str()) {
+            if default_value == "[]" {
                 continue;
             }
             match reference.get(key) {
@@ -165,17 +155,9 @@ mod tests {
                      `{default_value}` — update the reference line",
                 ),
                 None => panic!(
-                    "config.toml has no line for `{key}` (default `{default_value}`) — document \
-                     it, or add it to BOOKKEEPING_KEYS if edamame writes it automatically",
+                    "config.toml has no line for `{key}` (default `{default_value}`) — document it",
                 ),
             }
-        }
-
-        for key in BOOKKEEPING_KEYS {
-            assert!(
-                !reference.contains_key(*key),
-                "`{key}` is machine-written bookkeeping and must not ship in config.toml",
-            );
         }
     }
 

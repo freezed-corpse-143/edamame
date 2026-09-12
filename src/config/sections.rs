@@ -12,26 +12,12 @@ pub struct EditorConfig {
     pub preserve_blank_lines: bool,
     /// Up/Down move by **visual** (word-wrapped) lines rather than logical buffer lines.
     pub visual_line_nav: bool,
-    /// Terminals the capabilities notice has already fired for.  Built by
-    /// [`crate::terminal::Capabilities::fingerprint`]; an unseen fingerprint re-fires the notice.
-    pub seen_terminal_fingerprints: Vec<String>,
     /// Show the first-run welcome modal at startup.  Also gates the four legacy startup prompts
     /// (images, remote images, diagrams, capabilities) so the user is never double-prompted.
     pub show_welcome: bool,
     /// Check GitHub for a newer release at startup.  Turning it off suppresses only the
     /// *automatic* check; the explicit entry points always check on request.
     pub check_for_updates: bool,
-    /// Unix epoch seconds of the last automatic release check, stamped when the check is
-    /// *spawned*, so a hung worker or a killed process can't re-check on every launch.  `0` means
-    /// never checked.  Written by edamame, not a knob to hand-edit.
-    pub last_update_check: u64,
-    /// Release tag the startup notice has already fired for.  Written by edamame.
-    pub update_notified_for: String,
-    /// The version that last ran, driving the one-time post-upgrade notes (`app::post_upgrade`);
-    /// no network involved.  Empty covers both a fresh install and an upgrade from a build
-    /// predating the field — `show_welcome` tells them apart, since only a returning user could
-    /// have turned it off.  Written by edamame.
-    pub last_version_seen: String,
     /// Show line numbers in a left gutter in all three modes.  Default: false.
     pub show_line_numbers: bool,
     /// Lines advanced per mouse-wheel tick.  The keyboard scroll actions always step by one.
@@ -111,12 +97,8 @@ impl Default for EditorConfig {
             line_wrap: true,
             preserve_blank_lines: true,
             visual_line_nav: true,
-            seen_terminal_fingerprints: Vec::new(),
             show_welcome: true,
             check_for_updates: true,
-            last_update_check: 0,
-            update_notified_for: String::new(),
-            last_version_seen: String::new(),
             show_line_numbers: false,
             mouse_scroll_lines: 1,
             transient_ms: 1500,

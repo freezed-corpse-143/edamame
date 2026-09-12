@@ -6,6 +6,7 @@ pub mod keymap;
 pub mod persistence;
 pub mod readers;
 pub mod sections;
+pub mod state;
 pub mod theme;
 pub mod theme_file;
 pub mod themes;
@@ -24,5 +25,6 @@ pub use persistence::{
     NOT_PERSISTED_NOTE,
 };
 pub use readers::list_export_stylesheets;
+pub use state::State;
 pub use theme::Theme;
 pub use theme_file::ThemeFile;

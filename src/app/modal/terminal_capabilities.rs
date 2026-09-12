@@ -1,6 +1,6 @@
 //! New-terminal capabilities notice, fired the first time edamame runs in a
 //! terminal whose [`fingerprint`](crate::terminal::Capabilities::fingerprint)
-//! isn't in `editor.seen_terminal_fingerprints`.  Dismissing records the
+//! isn't in `state.seen_terminal_fingerprints`.  Dismissing records the
 //! fingerprint, so it stays quiet here but re-fires somewhere new.
 //!
 //! A new terminal can be *worse* than the last, so the notice is not purely
@@ -128,9 +128,9 @@ impl TerminalCapabilitiesModal {
     ) -> ModalOutcome {
         let fp = self.fingerprint.clone();
         ModalOutcome::CloseAnd(Box::new(move |app| {
-            if !app.config.editor.seen_terminal_fingerprints.contains(&fp) {
-                app.config.editor.seen_terminal_fingerprints.push(fp);
-                app.save_config_with_flash("failed to persist terminal capabilities notice");
+            if !app.state.seen_terminal_fingerprints.contains(&fp) {
+                app.state.seen_terminal_fingerprints.push(fp);
+                app.save_state_with_flash("failed to persist terminal capabilities notice");
             }
             if adjust {
                 app.open_welcome_modal();
@@ -402,8 +402,7 @@ mod click_tests {
         );
         // Recorded on the link path too, or the notice re-fires next launch.
         assert!(app
-            .config
-            .editor
+            .state
             .seen_terminal_fingerprints
             .contains(&Capabilities::minimal().fingerprint()));
     }

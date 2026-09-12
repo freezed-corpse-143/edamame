@@ -137,6 +137,10 @@ src/
     persistence.rs  # the single "is the config dir in play?" gate; NOT_PERSISTED_NOTE
     readers.rs      # read_theme_named, read_keybindings — disk I/O helpers
     sections.rs     # surgical `toml_edit` updates that preserve comments
+    state.rs        # State — machine-written bookkeeping (seen terminals, update-check
+                    #   stamps, last version seen) persisted to state.toml in the DATA dir,
+                    #   kept out of the user-facing config.toml; migrated out of a legacy
+                    #   config.toml by Config::load (seed once + strip)
     theme.rs        # Theme styles; BUILTIN_THEMES; list_theme_names, Palette::builtin
     theme_file/     # ThemeFile, StyleSpec, ColorField — user-authorable TOML format
     themes/         # one file per built-in theme (edamame.rs, dracula.rs, …)
@@ -306,6 +310,7 @@ These decisions are easy to break if you don't know they exist. Each subsystem's
 - [Modals, overlays, and the keybinds editor](docs/dev/modals.md) — the modal/overlay system, footer wrapping, scrolling, and the draft-keymap editor
 - [Update check](docs/dev/update-check.md) — the GitHub release check: one fetch, one cache, four states, three entry points
 - [Post-upgrade notice](docs/dev/post-upgrade.md) — the one-time notice driven from the bundled CHANGELOG, distinct from the update check
+- [Machine state (`state.toml`)](docs/dev/machine-state.md) — the machine-written bookkeeping file, its data-dir home, and the one-time migration out of `config.toml`
 - [Images, diagrams, and export](docs/dev/media-export.md) — the image decode/encode workers, protocol quirks, Mermaid, and HTML/custom export
 
 Longer-standing contributor docs live alongside them:

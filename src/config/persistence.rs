@@ -1,29 +1,36 @@
-//! The single "is `~/.config/edamame` in play at all?" gate behind `--no-config`.
+//! The single "are edamame's own persisted files in play at all?" gate behind `--no-config`.
 //! See `docs/dev/cli.md`.
+//!
+//! Named for the config dir it was born to guard, but the scope is broader than the name: it
+//! governs every file edamame reads or writes on the user's behalf, in *both* the config dir
+//! (`~/.config/edamame` — `config.toml`, themes, keybindings, export stylesheets) and the data
+//! dir (`state.toml`; see [`crate::config::State`]).  `--no-config` means a pristine,
+//! non-persistent session, so the data-dir bookkeeping is suppressed alongside the config.
 //!
 //! A process-global rather than a `Config` field: `App::open_config_in_editor` replaces
 //! `self.config` with a freshly deserialized one mid-session, which reverted a field to
 //! its serde default and silently lapsed the guarantee.
 //!
-//! Both halves matter.  Every write into the directory asks [`config_writes_allowed`];
-//! skipping the *startup* load is not enough for reads, because the theme and export
-//! stylesheet listings re-read the directory long after `main` branched, so they ask
-//! [`config_reads_allowed`].  A new reader or writer owes the matching check.
-//! (`Config::ensure_default_files` is exempt only because `main` never calls it here.)
+//! Both halves matter.  Every write asks [`config_writes_allowed`]; skipping the *startup* load
+//! is not enough for reads, because the theme and export stylesheet listings — and `State::load`
+//! — re-read from disk long after `main` branched, so they ask [`config_reads_allowed`].  A new
+//! reader or writer owes the matching check.  (`Config::ensure_default_files` is exempt only
+//! because `main` never calls it here.)
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Whether `~/.config/edamame` participates in this run at all.  Starts `true`; only
-/// [`disable_config_dir`] ever clears it, and nothing sets it back.
+/// Whether edamame's persisted files (config dir *and* data dir) participate in this run at all.
+/// Starts `true`; only [`disable_config_dir`] ever clears it, and nothing sets it back.
 static CONFIG_DIR_IN_USE: AtomicBool = AtomicBool::new(true);
 
 /// What a "saved" message says instead when the write was suppressed.  The setting *is*
 /// live for the session; only the disk write was skipped.
 pub const NOT_PERSISTED_NOTE: &str = " (not saved: --no-config)";
 
-/// Take `~/.config/edamame` out of play for the rest of the process, in both directions.
-/// Called once from `main` before any config file is touched.  There is deliberately no
-/// way to re-enable: a mid-session reversal is the bug this design exists to prevent.
+/// Take edamame's persisted files (config dir and data dir) out of play for the rest of the
+/// process, in both directions.  Called once from `main` before any such file is touched.  There
+/// is deliberately no way to re-enable: a mid-session reversal is the bug this design exists to
+/// prevent.
 pub fn disable_config_dir() {
     CONFIG_DIR_IN_USE.store(false, Ordering::Relaxed);
 }

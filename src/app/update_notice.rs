@@ -41,7 +41,7 @@ impl App {
         // Stamped at *spawn*, not on arrival: a hung worker or a process killed before
         // the result lands would otherwise re-check on every launch.  The cost is that a
         // transient failure waits out the full interval.
-        self.config.editor.last_update_check = update_check::now_unix();
+        self.state.last_update_check = update_check::now_unix();
         self.save_update_bookkeeping("last-update-check timestamp");
     }
 
@@ -85,9 +85,7 @@ impl App {
             // path too, so a manual check isn't repeated at the next launch.
             self.mark_update_notified(&status);
         } else if was_startup {
-            if let Some(info) =
-                update_check::notice_due(&status, &self.config.editor.update_notified_for)
-            {
+            if let Some(info) = update_check::notice_due(&status, &self.state.update_notified_for) {
                 self.pending_update_notice = Some(info.clone());
             }
         }
@@ -147,19 +145,20 @@ impl App {
         let ReleaseStatus::Available(info) = status else {
             return;
         };
-        if self.config.editor.update_notified_for == info.tag {
+        if self.state.update_notified_for == info.tag {
             return;
         }
-        self.config.editor.update_notified_for = info.tag.clone();
+        self.state.update_notified_for = info.tag.clone();
         self.save_update_bookkeeping("update-notified tag");
     }
 
     /// Persist background bookkeeping *without* the "Configuration updated" flash: the
-    /// user changed no setting.  Under `--no-config`, `Config::save` already declines to
+    /// user changed no setting.  Writes `state.toml`, not `config.toml` — these fields live on
+    /// [`State`](crate::config::State).  Under `--no-config`, `State::save` already declines to
     /// write, so no gate is needed here.  `pub(super)` for [`super::post_upgrade`], whose
     /// `last_version_seen` stamp is the same kind of write.
     pub(super) fn save_update_bookkeeping(&mut self, what: &str) {
-        if let Err(e) = self.config.save() {
+        if let Err(e) = self.state.save() {
             tracing::warn!(
                 target: "update_check",
                 error = %e,
@@ -229,7 +228,7 @@ mod tests {
     #[test]
     fn a_tag_already_notified_about_does_not_queue_again() {
         let (_iso, mut app) = isolated_app();
-        app.config.editor.update_notified_for = NEWER.to_owned();
+        app.state.update_notified_for = NEWER.to_owned();
         app.update_check_is_startup = true;
         app.handle_release_check_result(Ok(info(NEWER)));
         assert_eq!(app.pending_update_notice, None);
@@ -271,7 +270,7 @@ mod tests {
         clear_modals(&mut app);
         app.pending_update_notice = Some(info(NEWER));
         app.tick_update_notice();
-        assert_eq!(app.config.editor.update_notified_for, NEWER);
+        assert_eq!(app.state.update_notified_for, NEWER);
     }
 
     #[test]
@@ -281,7 +280,7 @@ mod tests {
         assert!(app.modal_stack.contains::<modal::UpdateModal>());
         app.handle_release_check_result(Ok(info(NEWER)));
         assert_eq!(
-            app.config.editor.update_notified_for, NEWER,
+            app.state.update_notified_for, NEWER,
             "an explicit check the user watched should not re-notify next launch"
         );
         assert_eq!(app.pending_update_notice, None);
@@ -377,7 +376,7 @@ mod tests {
         assert!(!app.startup_update_check_due, "decision consumed");
         assert!(!app.release_check_in_flight, "and nothing was requested");
         assert_eq!(
-            app.config.editor.last_update_check, 0,
+            app.state.last_update_check, 0,
             "an un-run check stamps no clock"
         );
     }
