@@ -610,9 +610,20 @@ The M4 rows:
 11. **The delete queue drains** (integration): a frame that stops placing emits the
     delete, and the next frame's queue is empty.
 12. **On real hardware — the check M1 could not complete.** WezTerm is installed
-    here and is M4's one target: a partially scrolled image must render at native
-    fidelity, with no `[Image: alt]` text over it, no flash as the band moves, and
-    no ghost left behind once the block is scrolled out of view.
+    here and is M4's one target, and the run is recorded. `--log` reports
+    `image_protocol=Some(KittyDirect)` and the decode worker finishing `ok=true`;
+    a partially scrolled image then renders at native fidelity in the window — the
+    dog photo from `tests/fixtures`, sharp, with no `[Image: alt]` text over it and
+    no halfblocks mosaic, which is the blur this document exists to fix. M1's own
+    check is still outstanding: it needs a terminal edamame resolves to Kitty
+    (kitty or ghostty), and neither is installed here.
+13. **What the hardware run did *not* cover.** The delete path was exercised only
+    against the terminal's *store*: scroll-away and scroll-back were not driven
+    by hand, so "no ghost left behind" rests on the escape being what WezTerm's
+    `KittyImageDelete::ByImageId` expects and on `reconcile_placements` being
+    called every painted frame (`an_unpainted_direct_placement_is_deleted`), not
+    on having watched it. Driving a TUI's scroll needs synthesized input, which
+    this environment can do but not reliably enough to call proof.
 
 ## Known limitations
 
@@ -627,16 +638,16 @@ The M4 rows:
    it is the first thing to confirm in code — if it fails, the fallback is to
    ship the `Kitty` alone and wrap it into `SlicedProtocol::Kitty` on the UI
    side (the enum's variants are public).
-3. **Kitty-compatible terminals without unicode placeholders** would render
-   nothing. Already handled upstream of this change: `resolve_protocol`
-   (`src/terminal/capabilities.rs:276`) maps a probed `Kitty` to `Iterm2` when
-   `iterm2_hint_is_trustworthy()` (`:263`), because iTerm2 answers the Kitty
-   probe but cannot do placeholders. Confirmed empirically and found to be wider
-   than iTerm2 alone (Verification 8): WezTerm implements the graphics protocol
-   but not the placeholders, and ratatui-image's environment inference already
-   lands it on `Iterm2` — so the pin for WezTerm comes from *upstream*, not from
-   edamame's override, and forcing Kitty on it yields literal placeholder glyphs
-   instead of an image.
+3. **Kitty-compatible terminals without unicode placeholders.** M1 renders
+   *nothing* on them — the placeholders are the drawing mechanism — so
+   `resolve_protocol` (`src/terminal/capabilities.rs`) maps a probed `Kitty` to
+   `Iterm2` under the iTerm2 hint, and ratatui-image's own environment inference
+   already lands WezTerm there (Verification 8: forcing Kitty on it yields literal
+   placeholder glyphs and no image). M4 is the answer for such a terminal, but only
+   for one the hint names (WezTerm): the routing is an environment hint rather than
+   a query, because the terminal supports the protocol and lacks a sub-feature of
+   it. Another terminal with the same gap keeps M1's outcome — halfblocks whenever
+   the image is not fully visible — until it is added to the hint.
 4. The sliced path renders at most one viewport's worth of rows natively; an
    image taller than the terminal cannot show more than a screenful at once.
    That is inherent, not a regression.
@@ -646,6 +657,18 @@ The M4 rows:
    each visible image pays one synchronous Kitty build on the UI thread. Bounded
    and once-per-resize, but estimated rather than measured — Verification item 4
    is the gate, and "Rebuild triggers" holds the alternative.
+7. **M4 has no data-delete path.** Its deletes are placements-only (`d=i`), so an
+   evicted image stays resident in the terminal — the same leak as limitation 1,
+   and it would take the same fix (a deferred `d=I` queue). The choice is
+   deliberate: `d=I` would also mean re-transmitting on every scroll back.
+8. **M4 is not covered under tmux.** The hint is distrusted there on purpose:
+   passthrough would have to be enabled by spawning `tmux set -p
+   allow-passthrough on`, which edamame does not do. A tmux pane under WezTerm
+   keeps the iTerm2 path — working, and blurry when partially visible.
+9. **Terminals with a different `--class`-invisible identity.** The hint reads
+   `TERM_PROGRAM`/`WEZTERM_PANE`, so running edamame *over ssh into* a WezTerm
+   desktop does not get M4 (neither variable is forwarded by default) — correct,
+   since the graphics go to whatever terminal is local.
 
 ## Alternatives considered
 

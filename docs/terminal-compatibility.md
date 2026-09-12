@@ -124,7 +124,7 @@ Windows Terminal is the usual host for WSL, so its notes above apply to the term
 |---|---|---|---|---|---|
 | kitty | ? | ? Kitty graphics | ? | ? | The protocols both features are named after |
 | Ghostty | ✓ truecolor | ✓ Kitty graphics | ✓ | ✓ | On macOS, `macos-option-as-alt` for the `Alt` chords outside U.S. layouts |
-| WezTerm | ? truecolor | ? | ? | ? |  |
+| WezTerm | ✓ truecolor | ✓ Kitty direct | ✓ | ✓ | No unicode placeholders, so edamame places the image itself with `a=p` and a source rectangle — a partly scrolled image stays sharp instead of falling back to half-blocks |
 | foot | ? | ? Sixel | ? | ? | Wayland; clipboard needs `wayland-data-control` |
 | iTerm2 | ✓ truecolor | ✓ iTerm2 inline | ✓ | ✓ | Answers the Kitty graphics query without supporting placements; edamame corrects for this |
 | Alacritty | ?  | ? | ? | ? recent | No image protocol |
