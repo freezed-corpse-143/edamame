@@ -107,7 +107,7 @@ pub struct DirectPlacement {
 /// backends.  It also pads to a whole number of cells, which is what makes the band's source
 /// rectangle an exact multiple of the cell height.
 ///
-/// `url` supplies the image id ([`kitty_direct::id_for`]), so the id is a property of the
+/// `url` supplies the image id ([`kitty_direct::image_id`]), so the id is a property of the
 /// image rather than of this build.
 pub fn build_direct_placement(
     url: &str,
