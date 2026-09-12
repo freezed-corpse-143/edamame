@@ -113,6 +113,50 @@ The capability is therefore *not* what separates the protocols; the cost profile
 is. Kitty and Sixel get the feature for free, iTerm2 pays for it in accounting,
 and halfblocks has nothing to gain.
 
+### A fourth route: Kitty *direct placement* (WezTerm today)
+
+The three backends above assume a terminal either renders through `U=1` unicode
+placeholders or does not. WezTerm is a third thing, and it matters because it is
+a common Windows terminal: it implements the Kitty protocol's **direct placement**
+(`a=p`) with a **source rectangle**, but not the placeholder mode that
+ratatui-image's Kitty backend renders *exclusively* through.
+
+Verified in the WezTerm tree (`C:\Projects\wezterm`, d2f3f05):
+
+- `wezterm-escape-parser/src/apc.rs:1022` parses `a='p'` as
+  `KittyImage::Display { image_id, image_number, placement, verbosity }`, and
+  `KittyImagePlacement` (`:593`) carries `x/y/w/h` (the **source rect**),
+  `x_offset/y_offset`, `columns/rows`, `do_not_move_cursor`, `placement_id`,
+  `z_index`.
+- `term/src/terminalstate/kitty.rs:239` **renders** it (`kitty_img_place`), and
+  `:241` handles `KittyImageDelete::ByImageId { image_id, placement_id, … }`, so
+  one placement can be dropped without deleting the image data.
+- `10EEEE` appears **nowhere** in `term/`, `wezterm-escape-parser/src`,
+  `wezterm-gui/src` or `config/src` — the placeholder mode is absent, which is
+  exactly what a forced-Kitty run showed (Verification 8: literal placeholder
+  glyphs, no image composited).
+
+So on such a terminal a band can be had for **free**: transmit once with `a=t`,
+then place the *same stored image* each frame with
+`x=0, y=skip*font_h, w=W, h=visible*font_h, c=rect.width, r=visible`. The
+terminal crops from what it already holds, so moving the band costs one short
+escape — no encode, no re-transmit. The price is a hand-written sequence writer:
+ratatui-image's Kitty backend cannot express this, so the transmit/place/delete
+escapes, their cursor dance, and the `a=d` cleanup on eviction and resize are all
+ours to write.
+
+**Why this beats M3 for WezTerm.** `Iterm2::encode` begins with `clear_area` — an
+ECH sweep of its own rows — and then re-sends the whole PNG. Every band change
+therefore **blanks and redraws the image**: precisely the flash `NativePaint` and
+`mark_rect_skipped` exist to prevent (see `docs/dev/media-export.md`). M3 buys
+sharpness at rest at the cost of a flash per band change, because on iTerm2 the
+band can only change by re-sending. The direct-placement route does not re-send at
+all.
+
+The two are not alternatives for the same audience: direct placement needs `a=p`
+(WezTerm-class terminals), while M3 is the only option for iTerm2 proper and any
+terminal that speaks nothing but OSC 1337.
+
 ### Kitty — M1
 
 Row addressing: the transmit payload contains every row, and the placeholder
@@ -454,7 +498,12 @@ the area width — the same bound today's Kitty path already has.
 |---|---|---|
 | **M1** | Kitty backend (this branch) | now |
 | **M2** | Sixel backend (`SlicedSixel`); extract `image_band()` if the backend needs it outside `SlicedImage` | after M1 is verified on a terminal that resolves to Kitty (Verification 8 explains why WezTerm cannot stand in for one) |
-| **M3** | iTerm2 backend, incl. reworking the payload accounting | **WezTerm users need this one.** WezTerm resolves to the iTerm2 backend, and Verification 8 reproduces the blur there on real hardware; iTerm2 proper is the other audience. |
+| **M3** | iTerm2 band: crop the visible rows and re-send them. The only route for iTerm2 proper | not first — see M4, and the flash cost it carries |
+| **M4** | Kitty **direct placement** (`a=p` with a source rect) — the *free* band for terminals that have `a=p` but not `U=1`, WezTerm being the one to hand | before M3 for a WezTerm user: same sharpness without the per-band-change flash, and verifiable end-to-end here |
+
+**For a WezTerm user, M4 then M3. For an iTerm2 user, M3 alone.** The two cover
+disjoint audiences (see "A fourth route"), so neither can be skipped by doing the
+other.
 
 Also worth landing independently of all three, as measurement rather than
 mechanism, and distinct from Verification item 4's fallback-cost log: log the
