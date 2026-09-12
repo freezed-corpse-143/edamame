@@ -96,22 +96,26 @@ geometry the key holds is in fact stable, and the one case where it is not.
 
 ## Backends
 
-`ratatui_image::sliced` is already this interface — one `SlicedProtocol` variant
-per protocol, plus `SignedPosition` (an `i16` position, so a negative top is
-expressible) and `SlicedImage::skip_and_drop` (private, and already unit-tested
-upstream against negative positions). All four backends are **free at render
-time**; they differ in build cost, build timing, and payload accounting.
+`ratatui_image::sliced` is already this interface for four of the five routes
+below — one `SlicedProtocol` variant per protocol, plus `SignedPosition` (an
+`i16` position, so a negative top is expressible) and `SlicedImage::skip_and_drop`
+(private, and already unit-tested upstream against negative positions). The
+exception is Kitty *direct placement*, which `sliced` cannot express and we would
+write ourselves. The routes differ in build cost, build timing, and payload
+accounting — and the last of those is what decides iTerm2.
 
-| Protocol | Upstream implementation | Build | Render | Accounting | Verdict |
+| Protocol | Implementation | Build | Render | Accounting | Verdict |
 |---|---|---|---|---|---|
 | **Kitty** | `Kitty::render_with_skip` (row addressing via unicode placeholders) | 1 raw-RGBA transmit string (~1.3 MB for a full-width image) | no re-encode; per-row placeholder symbol | **none needed** — `Arc<AtomicBool>` transmit latch | **adopt (M1)** |
+| **Kitty `a=p`** | hand-written direct placement with a source rect (see "A fourth route") | 1 transmit string | one short escape per band change | one placement cell; nothing is re-sent | adopt (M4) for WezTerm-class terminals |
 | **Sixel** | `SlicedSixel` (splices the payload's 6-px bands at draw time) | 1 sixel encode + band split | no re-encode; one string build | none | adopt (M2) |
-| **iTerm2** | `Sliced(Vec<Protocol>)` (one PNG per text row) | **N PNG encodes** | no re-encode | **must be reworked** — N payload cells revive the `Buffer::diff` `invalidated` cascade | defer (M3) |
+| **iTerm2** | crop the visible rows and re-send them (see "iTerm2 — M3") | **1 PNG encode per band change** | the PNG is re-sent, so the image blanks and redraws | one payload cell, but that re-send is the flash `NativePaint` / `mark_rect_skipped` exist to prevent | adopt (M3), iTerm2 proper only |
 | **Halfblocks** | `Halfblocks::render_with_skip` (row copy) | 1 encode | no re-encode | none | **never** — zero fidelity gain; `paint_scratch_partial` already does exactly this |
 
 The capability is therefore *not* what separates the protocols; the cost profile
-is. Kitty and Sixel get the feature for free, iTerm2 pays for it in accounting,
-and halfblocks has nothing to gain.
+is. Row addressing (Kitty), direct placement (`a=p`) and band splicing (Sixel) all
+get the feature for free; iTerm2 pays one re-send — and its flash — per band
+change; halfblocks has nothing to gain.
 
 ### A fourth route: Kitty *direct placement* (WezTerm today)
 
@@ -177,14 +181,40 @@ skips/truncates them at draw time. Not pixel-accurate (6-px granularity), which
 upstream documents as "good enough". The module comment also explains why the
 generic `Sliced(Vec<…>)` path is *not* used for sixel: it glitches in foot.
 
-### iTerm2 — M3, deferred
+### iTerm2 — M3 (crop and re-send)
 
-Structurally supported: pre-slice into one protocol per text row, render the
-subset. Two costs make it unattractive now: the build is N PNG encodes, and each
-row's escape lands in a cell symbol, which is precisely the situation edamame
-already had to build `NativePaint` + `mark_rect_skipped` + the `Cell::PartialEq`
-dependency to suppress (`docs/dev/media-export.md`). Worth doing only if iTerm2
-users report the blur.
+iTerm2 has neither row addressing nor a source rectangle, and `Iterm2::encode`
+opens with `clear_area` — an ECH sweep — before re-sending the whole PNG. A band
+can therefore only change by re-sending, which fixes the mechanism:
+
+```
+crop the visible rows out of the *already-resized* bitmap, then
+Iterm2::new(cropped, Size::new(width, visible), is_tmux).render(dst, buf)
+```
+
+`dst` and `skip` are the same values `image_band` produces for every other
+backend. Cropping the **resized** bitmap rather than the original is
+load-bearing: a band's aspect ratio is not the image's, so `Fit` on a cropped
+original would rescale, and the image would visibly change scale as it scrolls.
+
+Two costs, both real:
+
+- **The flash.** Every re-send blanks and redraws the image — precisely what
+  `NativePaint` / `mark_rect_skipped` exist to suppress
+  (`docs/dev/media-export.md`). M3 therefore buys sharpness at rest and pays one
+  flash per band change, which is why direct placement is preferred wherever the
+  terminal has `a=p`.
+- **One encode per band change, on a worker.** The band is a scroll-time
+  artifact, so unlike M1 it cannot ride the decode worker's one-time prebuilt.
+
+The upstream alternative is rejected on accounting grounds rather than cost:
+`SlicedProtocol::Sliced(Vec<Protocol>)` pre-slices one PNG per text row, free at
+render time but with a payload in **every** row's cell, reviving the
+`Buffer::diff` `invalidated` cascade edamame already fought. One band is one
+payload cell, so the existing suppression machinery applies unchanged.
+
+M3 is the only route for iTerm2 proper, and for any terminal that speaks nothing
+but OSC 1337.
 
 ## Why the existing path cannot be extended
 
@@ -436,8 +466,8 @@ the area width — the same bound today's Kitty path already has.
    - the unrepaired case, reproduced: a fully visible image renders sharply
      through the iTerm2 path, while the same image only partly on screen renders
      as a coarse halfblocks mosaic;
-   - WezTerm lands on the iTerm2 backend, so WezTerm users are the M3 audience,
-     not the M1 one.
+   - WezTerm lands on the iTerm2 backend, so a WezTerm user is the **direct
+     placement (M4)** audience — not the M1 one, and not necessarily M3's either.
 
 ## Known limitations
 
@@ -477,9 +507,10 @@ the area width — the same bound today's Kitty path already has.
 - **Poke a skip parameter into `paint_native`.** Impossible: the primitive is
   `pub(crate)` and `StatefulProtocol` has no skip entry. Would require vendoring
   the protocol writers.
-- **Band re-encode for every protocol (M3).** Uniform, and the only option for
-  iTerm2, but it puts the band in the cache key and re-encodes on every scroll
-  settle. Rejected as the *interface*; retained as the deferred iTerm2 backend.
+- **Band re-encode as the *interface* (i.e. for every protocol).** Uniform, but it
+  puts the band in the cache key and re-encodes on every scroll settle — needless
+  where row addressing or direct placement makes the band free. Rejected as the
+  interface; kept as the iTerm2 backend (M3), where it is the only option.
 - **A second encoder channel for the sliced build.** Rejected: the decode worker
   already produces the analogous `prebuilt_scratch` and already holds every
   input, so a second channel and worker are pure duplication.
