@@ -447,6 +447,10 @@ impl App {
         // `resolve_protocol`'s Kitty -> Iterm2 override, so a terminal that merely answers the
         // Kitty probe never gets a backend it cannot place.
         let native_picker = self.capabilities.image_picker.clone();
+        // Whether this terminal renders by placing an already-transmitted image, in which case the
+        // prebuilt below is what the paint pass uses and no encoded payload is wanted at all.
+        let direct =
+            self.capabilities.image_protocol == Some(crate::terminal::ImageProtocol::KittyDirect);
 
         // Glyph colour for display math: the theme's text colour, so
         // formulas stay legible in the active theme (light or dark) when
@@ -595,6 +599,34 @@ impl App {
                                         ),
                                     }
                                 }
+
+                                // The direct-placement backend, for the same reason: the resize and
+                                // the base64 of a raw-RGBA payload belong off the UI thread.
+                                // Unlike the sliced build this reads no picker — the image id comes
+                                // from the URL — so the resolved protocol is the whole gate.
+                                if direct {
+                                    let built = {
+                                        let _expected = crate::terminal::ExpectedPanic::new();
+                                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                            || {
+                                                crate::image::build_direct_placement(
+                                                    &loaded.url,
+                                                    fs,
+                                                    &loaded.image,
+                                                    rect,
+                                                )
+                                            },
+                                        ))
+                                    };
+                                    match built {
+                                        Ok(Some(direct)) => loaded.direct = Some((rect, direct)),
+                                        Ok(None) => {}
+                                        Err(_) => tracing::warn!(
+                                            target: "image", url = %loaded.url,
+                                            "direct placement build panicked; sending the image without one",
+                                        ),
+                                    }
+                                }
                             }
                         }
                         AppEvent::ImageReady(Ok(loaded))
@@ -660,6 +692,7 @@ mod tests {
                 image: image::DynamicImage::new_rgba8(1, 1),
                 scratch: None,
                 sliced: None,
+                direct: None,
             },
         )));
         assert!(
@@ -686,6 +719,7 @@ mod tests {
                 image: image::DynamicImage::new_rgba8(1, 1),
                 scratch: None,
                 sliced: None,
+                direct: None,
             },
         )));
         assert!(matches!(

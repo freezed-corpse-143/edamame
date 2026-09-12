@@ -95,6 +95,7 @@ pub fn resolve_latex(
         image: fit_latex_to_cell_grid(image, font_size, bg),
         scratch: None,
         sliced: None,
+        direct: None,
     })
 }
 

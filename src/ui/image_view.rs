@@ -314,6 +314,11 @@ pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
     }
     let viewport_top = ctx.area.y as isize;
     let viewport_bottom = (ctx.area.y as isize) + ctx.area.height as isize;
+    // The terminal renders by placing an already-transmitted image, so the pair's `kitty_direct`
+    // is the rendering and no encoded payload is wanted.
+    let direct = ctx.native_protocol == Some(ImageProtocol::KittyDirect);
+    // The ids placed on this frame, reconciled against the last frame's at the end.
+    let mut placed: Vec<u32> = Vec::new();
 
     for snap in snapshots {
         if Some(snap.block_idx) == ctx.suppress_block_idx {
@@ -337,6 +342,7 @@ pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
                 snap.rect.height,
                 ctx.native_picker,
                 ctx.halfblocks_picker,
+                direct,
             )
             .is_none()
         {
@@ -347,6 +353,18 @@ pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
         // padding right of a narrow image — keeps the `[Image: alt]` placeholder visible
         // behind the image.
         clear_visible_reserved_rect(snap, &ctx.area, ctx.buf, ctx.bg);
+
+        // Direct placement paints the same band as Kitty's row addressing, by the same argument
+        // and under the same two gates: the placement re-composites wherever it moves, and
+        // `dim_area` cannot recess an image that writes past the cell buffer.  Yielding to a gate
+        // here is also what *deletes* the placement — an id that is not placed this frame is
+        // reconciled away below.
+        if direct && !ctx.is_scrolling && !ctx.modal_open {
+            if let Some(id) = paint_direct_placement(ctx.images, snap, &ctx.area, ctx.buf) {
+                placed.push(id);
+                continue;
+            }
+        }
 
         // Kitty paints the visible band instead, which is what keeps a clipped image sharp.  It
         // still yields to the scroll window (the gate below) and to an open modal: its placeholders
@@ -372,6 +390,18 @@ pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
             paint_native(ctx.images, snap, ctx.buf, ctx.bg);
         } else {
             paint_scratch_partial(ctx.images, snap, &ctx.area, ctx.buf, ctx.bg);
+        }
+    }
+
+    if direct {
+        // A placement is anchored to *screen cells*, so one that is no longer painted has to be
+        // deleted or it stays on screen while the document moves out from under it.  The set
+        // difference is over ids rather than rects, which is also what catches a block that was
+        // edited away: no snapshot mentions it any more, so nothing else could notice.
+        ctx.images.reconcile_placements(&placed);
+        let deletes = ctx.images.take_pending_deletes();
+        if !deletes.is_empty() {
+            write_control_escapes(ctx.buf, &ctx.area, &deletes);
         }
     }
 }
@@ -419,6 +449,89 @@ fn paint_kitty_sliced(
     };
     SlicedImage::new(sliced, SignedPosition { x: 0, y: -skip }).render(dst, buf);
     true
+}
+
+/// A cell whose symbol carries an escape sequence rather than text, so `Buffer::diff` must treat it
+/// as one column: the diff advances by `cell_width()`, and an escape-laden symbol measures tens of
+/// columns of printable base64.  Without this, the row after such a cell loses those columns from
+/// the update.
+const UNIT_WIDTH: ratatui::buffer::CellDiffOption =
+    ratatui::buffer::CellDiffOption::ForcedWidth(std::num::NonZeroU16::new(1).unwrap());
+
+/// Paint the on-screen band of an image by *placing* it, returning the image id when it painted.
+///
+/// `None` means the caller should paint the scratch instead: no pair at this geometry, no
+/// direct-placement backend on it, or a band that does not meet the viewport at all.
+///
+/// The band is one placement — `a=p` with a source rectangle — so exactly one cell carries a
+/// symbol.  The transmit rides it on the image's first placement and is *taken* rather than
+/// cloned, because a payload is megabytes and the next frame would otherwise repeat them.
+///
+/// Every other cell of the band is marked `Skip`: they have been blanked by
+/// [`clear_visible_reserved_rect`], but emitting those blanks would paint a background over the
+/// image this placement is drawing.  What keeps *stale* glyphs out from under it — the
+/// `[Image: alt]` placeholder, above all — is the erase sweep the symbol begins with, on the
+/// terminal side, which no buffer-side trick could do: a glyph draws above an image.
+fn paint_direct_placement(
+    images: &mut ImageCache,
+    snap: &ImageLayoutSnapshot,
+    area: &Rect,
+    buf: &mut TuiBuf,
+) -> Option<u32> {
+    let pair = images.protocol_pair_mut(&snap.url, snap.rect.width, snap.rect.height)?;
+    let direct = pair.kitty_direct.as_mut()?;
+    let (skip, dst) = image_band(
+        snap.rect.x,
+        snap.rect.width,
+        snap.natural_top,
+        snap.rect.height,
+        area,
+    )?;
+
+    // The carrier cell has to exist before the transmit is taken: taking it and then failing to
+    // write the symbol would drop the payload for good.
+    let cell = buf.cell_mut((dst.x, dst.y))?;
+    let transmit = direct.transmit.take();
+    let symbol = crate::image::kitty_direct::place(
+        direct.id,
+        direct.geometry,
+        skip,
+        dst,
+        transmit.as_deref(),
+    );
+    cell.set_symbol(&symbol).set_diff_option(UNIT_WIDTH);
+
+    for row in 0..dst.height {
+        for col in 0..dst.width {
+            if row == 0 && col == 0 {
+                continue;
+            }
+            if let Some(cell) = buf.cell_mut((dst.x + col, dst.y + row)) {
+                cell.set_diff_option(CellDiffOption::Skip);
+            }
+        }
+    }
+    Some(direct.id)
+}
+
+/// Hand queued placement deletes to the terminal through a cell that is certain to be emitted.
+///
+/// A delete is an escape with no visual effect, so it needs a cell whose symbol reaches the terminal
+/// *this* frame — and the frame it is queued on is by definition one that stopped painting the image
+/// it belongs to.  The document area's first cell is the one cell such a frame always has: appending
+/// changes its symbol, and a changed, non-skipped cell is always emitted.  [`UNIT_WIDTH`] keeps that
+/// from costing anything in the diff, and the escapes neither draw nor move the cursor, so the
+/// cell's own text is untouched.
+fn write_control_escapes(buf: &mut TuiBuf, area: &Rect, deletes: &[u32]) {
+    let Some(cell) = buf.cell_mut((area.x, area.y)) else {
+        return;
+    };
+    let mut symbol = String::with_capacity(cell.symbol().len() + deletes.len() * 48);
+    symbol.push_str(cell.symbol());
+    for id in deletes {
+        symbol.push_str(&crate::image::kitty_direct::delete_placement(*id));
+    }
+    cell.set_symbol(&symbol).set_diff_option(UNIT_WIDTH);
 }
 
 /// The on-screen band of a reserved image rect: how many of the image's rows sit above it, and the
@@ -722,6 +835,13 @@ mod tests {
                 Self::with_native(urls, kitty_picker(), ImageProtocol::KittyGraphics)
             }
 
+            /// A harness for the terminals that place an already-transmitted image instead of
+            /// rendering unicode placeholders — WezTerm, which the probe reports as iTerm2 and
+            /// which is therefore the picker here.
+            fn direct(urls: &[&str]) -> Self {
+                Self::with_native(urls, iterm2_picker(), ImageProtocol::KittyDirect)
+            }
+
             fn with_native(urls: &[&str], native: Picker, protocol: ImageProtocol) -> Self {
                 let (tx, rx) = mpsc::channel();
                 let mut images = ImageCache::new();
@@ -808,6 +928,19 @@ mod tests {
                 .is_some_and(|c| c.symbol().contains("_Gq=2"))
         }
 
+        /// The symbol written into `rect`'s first cell.
+        fn symbol_at(buf: &TuiBuf, rect: Rect) -> String {
+            buf.cell((rect.x, rect.y))
+                .map(|c| c.symbol().to_owned())
+                .unwrap_or_default()
+        }
+
+        /// The escapes carried by the document area's first cell, which is where a queued delete
+        /// rides: the placement's own cell may not be painted on the frame the delete is owed.
+        fn carried_escapes(buf: &TuiBuf) -> String {
+            symbol_at(buf, Rect::new(AREA.x, AREA.y, 1, 1))
+        }
+
         /// The band a protocol has to paint: which image row the visible slice starts at, and
         /// where it lands.  This is the arithmetic the fix rests on — with the reserved rect held
         /// at full size across scrolls, it is the only thing that changes as the image moves.
@@ -892,6 +1025,81 @@ mod tests {
             assert!(
                 !placed(&h.frame(&whole, false), whole[0].rect),
                 "an open modal must fall back to the scratch"
+            );
+        }
+
+        /// The whole point of the direct-placement route: the band is a *source rectangle* on an
+        /// image the terminal already holds, so a clipped frame re-places it without re-sending
+        /// anything — and the source offset is the skipped rows, in image pixels.
+        #[test]
+        fn direct_placement_bands_without_resending() {
+            let whole = vec![snap_at("a.png", 0, 8)];
+            let mut h = Harness::direct(&["a.png"]);
+
+            let first = h.frame(&whole, false);
+            let symbol = symbol_at(&first, whole[0].rect);
+            assert!(
+                symbol.contains("a=p"),
+                "the image must be placed: {symbol:?}"
+            );
+            assert!(
+                symbol.contains("a=t"),
+                "the first paint carries the payload"
+            );
+            assert!(
+                symbol.contains(",x=0,y=0,w=20,h=16,c=20,r=8,"),
+                "a fully visible band is the whole image: {symbol:?}"
+            );
+
+            // Three rows scrolled off the top, at 2 px per row: source y = 6, and five of the
+            // image's eight rows are on screen.
+            let clipped = vec![snap_at("a.png", -3, 8)];
+            let band = h.frame(&clipped, false);
+            let symbol = symbol_at(&band, clipped[0].rect);
+            assert!(
+                symbol.contains(",x=0,y=6,w=20,h=10,c=20,r=5,"),
+                "the band must be a source rectangle of the visible rows: {symbol:?}"
+            );
+            assert!(
+                !symbol.contains("a=t"),
+                "banding must not re-send the payload the terminal already holds"
+            );
+        }
+
+        /// A placement is anchored to screen cells, so one that stops being painted has to be
+        /// deleted — and the delete needs a cell that reaches the terminal on that very frame.
+        #[test]
+        fn an_unpainted_direct_placement_is_deleted() {
+            let snaps = vec![snap_at("a.png", 0, 8)];
+            let mut h = Harness::direct(&["a.png"]);
+            assert!(
+                symbol_at(&h.frame(&snaps, false), snaps[0].rect).contains("a=p"),
+                "the placement is live after the first frame"
+            );
+
+            // Scrolling falls back to the scratch, and takes the placement with it.
+            let scrolled = h.frame(&snaps, true);
+            assert!(
+                !symbol_at(&scrolled, snaps[0].rect).contains("a=p"),
+                "the scratch painted instead of a placement"
+            );
+            assert!(
+                carried_escapes(&scrolled).contains("a=d"),
+                "the frame that stops placing must delete the placement: {:?}",
+                carried_escapes(&scrolled)
+            );
+            assert_eq!(
+                h.images.pending_deletes(),
+                0,
+                "the queue drains on the frame it is filled"
+            );
+
+            // And nothing is queued again once there is nothing left to remove.
+            let again = h.frame(&snaps, true);
+            assert!(
+                !carried_escapes(&again).contains("a=d"),
+                "one delete is enough: {:?}",
+                carried_escapes(&again)
             );
         }
 

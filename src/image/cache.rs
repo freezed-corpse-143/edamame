@@ -4,7 +4,7 @@
 //! `StatefulProtocol` encodings live on `EditorState` keyed by URL instead.  Protocols are keyed
 //! additionally by target cell dimensions, so a resize invalidates only the affected entries.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
@@ -16,6 +16,8 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::sliced::SlicedProtocol;
 use ratatui_image::thread::{ResizeRequest, ResizeResponse, ThreadProtocol};
 use ratatui_image::{Resize, StatefulImage};
+
+use super::kitty_direct::{self, Geometry};
 
 /// Encode `image` as halfblocks at `rect`, returning the rendered cells.
 ///
@@ -75,6 +77,62 @@ pub fn build_kitty_sliced(
             None
         }
     }
+}
+
+/// One image's Kitty *direct placement* backend at one cell size.
+///
+/// The band is a placement parameter rather than part of an encoding, so this holds nothing
+/// that changes as the image scrolls: the transmit is written once, and every later frame is
+/// one `a=p` escape naming a source rectangle.  That is what keeps a clipped image sharp
+/// without a re-encode — and, unlike the iTerm2 route, without a re-send flash.
+///
+/// Built on the decode worker beside the scratch and the sliced protocol, for the same reason:
+/// the resize plus the base64 of a raw-RGBA payload is far too much work for the UI thread.
+pub struct DirectPlacement {
+    /// The terminal-side image id, stable per URL so a rebuild re-transmits into the same slot
+    /// instead of leaving the previous image resident.
+    pub id: u32,
+    /// The resized bitmap's geometry — its cell size, and one cell in pixels.
+    pub geometry: Geometry,
+    /// The one-time transmit, `Some` until the first placement has carried it.  Taken rather
+    /// than cloned: a payload is megabytes, and writing it twice would double the frame.
+    pub transmit: Option<String>,
+}
+
+/// Build the direct-placement backend for `image` at `rect`, or `None` when the geometry is
+/// empty or the resize produced nothing to send.
+///
+/// The resize is deliberately the **same call the Kitty and iTerm2 paths make** — `Fit(None)`
+/// with the default nearest filter — so an image does not change appearance crossing between
+/// backends.  It also pads to a whole number of cells, which is what makes the band's source
+/// rectangle an exact multiple of the cell height.
+///
+/// `url` supplies the image id ([`kitty_direct::id_for`]), so the id is a property of the
+/// image rather than of this build.
+pub fn build_direct_placement(
+    url: &str,
+    font_size: (u16, u16),
+    image: &DynamicImage,
+    rect: Rect,
+) -> Option<DirectPlacement> {
+    if rect.width == 0 || rect.height == 0 {
+        return None;
+    }
+    let cells = Size::new(rect.width, rect.height);
+    let font = ratatui_image::FontSize::new(font_size.0.max(1), font_size.1.max(1));
+    // `None` background: the letterbox padding stays transparent, so what shows through is the
+    // terminal's own background rather than a colour guessed from the theme.
+    let resized = Resize::Fit(None).resize(image, font, cells, None);
+    let id = kitty_direct::id_for(url);
+    let transmit = kitty_direct::transmit(id, &resized);
+    if transmit.is_empty() {
+        return None;
+    }
+    Some(DirectPlacement {
+        id,
+        geometry: Geometry::new(cells, font_size),
+        transmit: Some(transmit),
+    })
 }
 
 /// Free-function twin of [`ImageCache::aspect_rows`] over a borrowed image, for the decode
@@ -179,6 +237,14 @@ pub struct ProtocolPair {
     /// does not consult `native` or the scratch.  `None` for every other protocol, for a Kitty
     /// terminal whose build failed, and while the prebuilt has not arrived.
     pub kitty_sliced: Option<SlicedProtocol>,
+    /// The direct-placement backend for this `(url, width, height)`, when the terminal places an
+    /// already-transmitted image with a source rectangle.
+    ///
+    /// Mutually exclusive with `kitty_sliced`: a terminal that renders unicode placeholders gets
+    /// that, one that does not gets this.  As with `kitty_sliced`, `native` stays `None` — there
+    /// is no encoded payload to thread, and the iTerm2 route's per-frame re-send (and its flash)
+    /// is exactly what this backend exists to avoid.
+    pub kitty_direct: Option<DirectPlacement>,
 }
 
 /// Cache of decoded images + per-size protocol encodings.
@@ -196,6 +262,16 @@ pub struct ImageCache {
     /// The Kitty counterpart: row-addressed protocols pre-built on the decode worker, claimed by
     /// the same `get_protocol_pair` call and stale on the same events.
     prebuilt_sliced: HashMap<(String, u16, u16), SlicedProtocol>,
+    /// The direct-placement counterpart, claimed and staled the same way.
+    prebuilt_direct: HashMap<(String, u16, u16), DirectPlacement>,
+    /// Image ids the terminal is showing a placement for, as of the last painted frame.
+    ///
+    /// Carried across frames because the snapshots of a frame that *stops* painting an image do
+    /// not mention it — and a placement is anchored to screen cells, so one that is no longer
+    /// painted has to be deleted explicitly or it stays behind while the document moves.
+    live_placements: HashSet<u32>,
+    /// Deletes owed to the terminal, waiting for a cell that will be emitted to carry them.
+    pending_deletes: Vec<u32>,
     /// Outstanding encode requests, FIFO in dispatch order.
     pending: VecDeque<PendingResize>,
     /// Sender into the encoder worker, cloned into each `ThreadProtocol`.  `None` disables image
@@ -250,6 +326,36 @@ impl ImageCache {
         }
     }
 
+    // ── Direct-placement bookkeeping ──────────────────────────────────
+
+    /// Record the placements painted on this frame and queue a delete for every one that was
+    /// live before and is not now.
+    ///
+    /// Called once per frame that painted, with the ids placed on it — the set difference is what
+    /// catches a block that was edited away or navigated off, which no later snapshot mentions.
+    pub fn reconcile_placements(&mut self, placed: &[u32]) {
+        let placed: HashSet<u32> = placed.iter().copied().collect();
+        for id in self.live_placements.difference(&placed) {
+            self.pending_deletes.push(*id);
+        }
+        self.live_placements = placed;
+    }
+
+    /// Take the queued deletes, for the caller to write into a cell that will be emitted.
+    ///
+    /// Taken rather than read: the escapes are carried by a cell whose symbol changes only
+    /// because they were appended, so leaving them in place would stop the diff from emitting
+    /// the next frame's carrier at all.
+    pub fn take_pending_deletes(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.pending_deletes)
+    }
+
+    /// Number of deletes waiting for a carrier.  Used by tests.
+    #[allow(dead_code)]
+    pub fn pending_deletes(&self) -> usize {
+        self.pending_deletes.len()
+    }
+
     /// Mark `url` as `Pending` iff it has no prior entry, returning true when a decode job should
     /// be dispatched.  A `Ready` or `Failed` URL is a no-op: there is no auto-retry.
     pub fn request(&mut self, url: &str) -> bool {
@@ -264,7 +370,7 @@ impl ImageCache {
     /// [`Self::set_decoded_with_prebuilt`] so the halfblocks scratch is captured too.
     #[allow(dead_code)]
     pub fn set_decoded(&mut self, url: &str, image: DynamicImage) {
-        self.set_decoded_with_prebuilt(url, image, None, None);
+        self.set_decoded_with_prebuilt(url, image, None, None, None);
     }
 
     /// [`Self::set_decoded`] plus a halfblocks scratch the decode worker already rendered; the
@@ -275,12 +381,14 @@ impl ImageCache {
         image: DynamicImage,
         prebuilt_scratch: Option<(Rect, Buffer)>,
         prebuilt_sliced: Option<(Rect, SlicedProtocol)>,
+        prebuilt_direct: Option<(Rect, DirectPlacement)>,
     ) {
         self.decoded
             .insert(url.to_owned(), DecodeStatus::Ready(Arc::new(image)));
         self.protocols.retain(|(u, _, _), _| u != url);
         self.prebuilt_scratches.retain(|(u, _, _), _| u != url);
         self.prebuilt_sliced.retain(|(u, _, _), _| u != url);
+        self.prebuilt_direct.retain(|(u, _, _), _| u != url);
         if let Some((rect, buf)) = prebuilt_scratch {
             self.prebuilt_scratches
                 .insert((url.to_owned(), rect.width, rect.height), buf);
@@ -288,6 +396,10 @@ impl ImageCache {
         if let Some((rect, sliced)) = prebuilt_sliced {
             self.prebuilt_sliced
                 .insert((url.to_owned(), rect.width, rect.height), sliced);
+        }
+        if let Some((rect, direct)) = prebuilt_direct {
+            self.prebuilt_direct
+                .insert((url.to_owned(), rect.width, rect.height), direct);
         }
     }
 
@@ -298,6 +410,7 @@ impl ImageCache {
         self.protocols.retain(|(u, _, _), _| u != url);
         self.prebuilt_scratches.retain(|(u, _, _), _| u != url);
         self.prebuilt_sliced.retain(|(u, _, _), _| u != url);
+        self.prebuilt_direct.retain(|(u, _, _), _| u != url);
     }
 
     /// Look up the decode status for `url`.  Used by integration tests.
@@ -314,6 +427,11 @@ impl ImageCache {
     /// pair's `native` stays `None` — the scratch is both the preferred and fallback rendering.
     /// On Kitty it stays `None` too: `kitty_sliced` is the rendering there, and because it carries
     /// the whole image, any visible band can be painted from it without a re-encode.
+    ///
+    /// `direct` says the terminal renders by placing an already-transmitted image with a source
+    /// rectangle, so the pair's `kitty_direct` is the rendering and nothing is encoded for the
+    /// worker.  It is a bool rather than an `ImageProtocol` because `image` sits below
+    /// `terminal` in the layer order and must not name its types.
     pub fn get_protocol_pair(
         &mut self,
         url: &str,
@@ -321,6 +439,7 @@ impl ImageCache {
         height: u16,
         native_picker: Option<&Picker>,
         halfblocks_picker: Option<&Picker>,
+        direct: bool,
     ) -> Option<&mut ProtocolPair> {
         let native_picker = native_picker?;
         let resize_tx = self.resize_tx.as_ref()?.clone();
@@ -391,11 +510,42 @@ impl ImageCache {
                 None
             };
 
-            // A ThreadProtocol runs the slow native encode on the worker.  Two cases skip it: the
-            // native protocol IS halfblocks, where the scratch above is the rendering, and Kitty,
-            // whose rendering is the row-addressed protocol instead — building both would duplicate
-            // the payload and burn a worker encode for bytes nothing reads.
-            let native = if is_halfblocks_native || is_kitty_native {
+            // The direct-placement backend, claimed the same way.  Its build is a resize plus the
+            // base64 of a raw-RGBA payload — the same order as the scratch above, and the same
+            // accepted synchronous cost on a geometry change.
+            let kitty_direct = if direct {
+                match self.prebuilt_direct.remove(&key) {
+                    Some(built) => Some(built),
+                    None => {
+                        let started = Instant::now();
+                        let font = native_picker.font_size();
+                        let built = build_direct_placement(
+                            &key.0,
+                            (font.width, font.height),
+                            &image_arc,
+                            full_rect,
+                        );
+                        tracing::debug!(
+                            target: "image",
+                            url = %key.0,
+                            width,
+                            height,
+                            micros = started.elapsed().as_micros() as u64,
+                            ok = built.is_some(),
+                            "direct placement built synchronously (prebuilt missed)",
+                        );
+                        built
+                    }
+                }
+            } else {
+                None
+            };
+
+            // A ThreadProtocol runs the slow native encode on the worker.  Three cases skip it: the
+            // native protocol IS halfblocks, where the scratch above is the rendering; Kitty, whose
+            // rendering is the row-addressed protocol; and direct placement, which has no encoded
+            // payload at all — building one would duplicate bytes nothing reads.
+            let native = if is_halfblocks_native || is_kitty_native || direct {
                 None
             } else {
                 let native_inner = native_picker.new_resize_protocol((*image_arc).clone());
@@ -411,6 +561,7 @@ impl ImageCache {
                     last_native_paint: None,
                     halfblocks_scratch,
                     kitty_sliced,
+                    kitty_direct,
                 },
             );
         }
@@ -716,7 +867,7 @@ mod tests {
         cache.set_decoded("a.png", DynamicImage::new_rgba8(1, 1));
         let picker = halfblocks_picker();
         assert!(cache
-            .get_protocol_pair("a.png", 10, 10, Some(&picker), Some(&picker))
+            .get_protocol_pair("a.png", 10, 10, Some(&picker), Some(&picker), false)
             .is_some());
         assert_eq!(cache.protocol_count(), 1);
         cache.set_decoded("a.png", DynamicImage::new_rgba8(2, 2));
@@ -734,12 +885,13 @@ mod tests {
             DynamicImage::new_rgba8(8, 4),
             Some((rect, prebuilt)),
             None,
+            None,
         );
         assert_eq!(cache.prebuilt_scratch_count(), 1);
 
         let picker = halfblocks_picker();
         let pair = cache
-            .get_protocol_pair("a.png", 8, 4, Some(&picker), Some(&picker))
+            .get_protocol_pair("a.png", 8, 4, Some(&picker), Some(&picker), false)
             .expect("pair for ready image");
         assert!(pair.halfblocks_scratch.is_some());
         // Prebuilt map was drained.
@@ -759,11 +911,12 @@ mod tests {
             DynamicImage::new_rgba8(8, 4),
             Some((prebuilt_rect, prebuilt)),
             None,
+            None,
         );
 
         let picker = halfblocks_picker();
         let pair = cache
-            .get_protocol_pair("a.png", 16, 4, Some(&picker), Some(&picker))
+            .get_protocol_pair("a.png", 16, 4, Some(&picker), Some(&picker), false)
             .expect("pair for ready image");
         assert!(pair.halfblocks_scratch.is_some());
         // The un-claimed prebuilt remains, for a future paint at matching dims.
@@ -780,6 +933,7 @@ mod tests {
             DynamicImage::new_rgba8(8, 4),
             Some((rect, Buffer::empty(rect))),
             None,
+            None,
         );
         assert_eq!(cache.prebuilt_scratch_count(), 1);
         cache.invalidate_protocols();
@@ -793,7 +947,7 @@ mod tests {
         cache.set_decoded("a.png", DynamicImage::new_rgba8(1, 1));
         let picker = halfblocks_picker();
         cache
-            .get_protocol_pair("a.png", 1, 1, Some(&picker), Some(&picker))
+            .get_protocol_pair("a.png", 1, 1, Some(&picker), Some(&picker), false)
             .expect("pair for ready image");
         cache.invalidate_protocols();
         assert_eq!(cache.protocol_count(), 0);
@@ -810,7 +964,7 @@ mod tests {
         cache.set_decoded("a.png", DynamicImage::new_rgba8(4, 4));
         let picker = halfblocks_picker();
         let pair = cache
-            .get_protocol_pair("a.png", 8, 4, Some(&picker), Some(&picker))
+            .get_protocol_pair("a.png", 8, 4, Some(&picker), Some(&picker), false)
             .expect("pair for ready image");
         assert!(pair.native.is_none());
         assert!(pair.halfblocks_scratch.is_some());
@@ -828,6 +982,7 @@ mod tests {
                 4,
                 Some(&native_picker()),
                 Some(&halfblocks_picker()),
+                false,
             )
             .expect("pair for ready image");
         assert!(pair.native.is_some(), "native encode shipped off-thread");
@@ -866,7 +1021,9 @@ mod tests {
         let mut cache = cache_with_sender();
         cache.request("a.png");
         cache.set_decoded("a.png", DynamicImage::new_rgba8(1, 1));
-        assert!(cache.get_protocol_pair("a.png", 8, 4, None, None).is_none());
+        assert!(cache
+            .get_protocol_pair("a.png", 8, 4, None, None, false)
+            .is_none());
     }
 
     // ── Kitty row-addressed protocol ──────────────────────────────────
@@ -896,11 +1053,12 @@ mod tests {
             DynamicImage::new_rgba8(8, 4),
             None,
             Some((rect, sliced)),
+            None,
         );
         assert_eq!(cache.prebuilt_sliced_count(), 1);
 
         let pair = cache
-            .get_protocol_pair("a.png", 8, 4, Some(&picker), Some(&picker))
+            .get_protocol_pair("a.png", 8, 4, Some(&picker), Some(&picker), false)
             .expect("pair for ready image");
         assert!(pair.kitty_sliced.is_some(), "the prebuilt was claimed");
         assert!(
@@ -919,7 +1077,7 @@ mod tests {
         cache.set_decoded("a.png", DynamicImage::new_rgba8(1, 1));
         let picker = halfblocks_picker();
         assert!(cache
-            .get_protocol_pair("a.png", 8, 4, Some(&picker), Some(&picker))
+            .get_protocol_pair("a.png", 8, 4, Some(&picker), Some(&picker), false)
             .is_none());
     }
 
@@ -929,7 +1087,7 @@ mod tests {
         cache.request("a.png");
         let picker = halfblocks_picker();
         assert!(cache
-            .get_protocol_pair("a.png", 8, 4, Some(&picker), Some(&picker))
+            .get_protocol_pair("a.png", 8, 4, Some(&picker), Some(&picker), false)
             .is_none());
     }
 
@@ -942,7 +1100,7 @@ mod tests {
         cache.set_decoded("a.png", DynamicImage::new_rgba8(4, 4));
         let picker = halfblocks_picker();
         cache
-            .get_protocol_pair("a.png", 8, 4, Some(&picker), Some(&picker))
+            .get_protocol_pair("a.png", 8, 4, Some(&picker), Some(&picker), false)
             .expect("pair built");
         cache.track_pending_resize("a.png", 8, 4);
         assert_eq!(cache.pending.len(), 1);

@@ -14,6 +14,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use crate::config::RemoteImagePolicy;
+use crate::image::cache::DirectPlacement;
 use crate::image::svg::{rasterize_svg, SvgError, SvgScaleMode, SvgSizing};
 use crate::image::SlicedProtocol;
 
@@ -33,6 +34,7 @@ pub struct LoadedImage {
     pub image: DynamicImage,
     pub scratch: Option<(Rect, Buffer)>,
     pub sliced: Option<(Rect, SlicedProtocol)>,
+    pub direct: Option<(Rect, DirectPlacement)>,
 }
 
 impl std::fmt::Debug for LoadedImage {
@@ -42,6 +44,7 @@ impl std::fmt::Debug for LoadedImage {
             .field("image", &self.image)
             .field("scratch", &self.scratch.as_ref().map(|(rect, _)| *rect))
             .field("sliced", &self.sliced.as_ref().map(|(rect, _)| *rect))
+            .field("direct", &self.direct.as_ref().map(|(rect, _)| *rect))
             .finish()
     }
 }
@@ -157,6 +160,7 @@ pub fn resolve(
         // width, and builds them on the worker thread so the first paint is a cache hit.
         scratch: None,
         sliced: None,
+        direct: None,
     })
 }
 
