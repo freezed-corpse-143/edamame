@@ -411,14 +411,13 @@ fn paint_kitty_sliced(
         // No overlap with the viewport: nothing to paint, but nothing left for the caller either.
         return true;
     };
-    SlicedImage::new(
-        sliced,
-        SignedPosition {
-            x: 0,
-            y: -(skip as i16),
-        },
-    )
-    .render(dst, buf);
+    // `SignedPosition` carries an `i16`.  A skip that large needs `images.max_height` in the tens
+    // of thousands — pathological, but wrapping the cast would paint the *wrong rows* silently, so
+    // fall back to the scratch instead.
+    let Ok(skip) = i16::try_from(skip) else {
+        return false;
+    };
+    SlicedImage::new(sliced, SignedPosition { x: 0, y: -skip }).render(dst, buf);
     true
 }
 
