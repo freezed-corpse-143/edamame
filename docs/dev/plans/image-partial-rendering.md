@@ -67,9 +67,16 @@ to exactly today's behaviour**. So the band should not be a second path beside
 the `fully_visible` check; it should *be* the path, and `fully_visible` (`:348`)
 should be deleted rather than joined.
 
-The same argument retires `is_scrolling` for the addressing backends: that gate
-exists solely to avoid a per-frame re-encode, and row addressing does not
-re-encode. It keeps its meaning for iTerm2, which does.
+`is_scrolling` does **not** retire, though — a correction to an earlier revision of
+this plan, which read the gate as being about re-encoding. Its stated purpose is
+the re-*composite*: during scroll every protocol falls back to
+position-independent halfblocks because Kitty's placeholders "still re-composite
+at each new cell position, the dominant source of scroll lag on image-heavy
+documents" (the scroll gate's own comment in `src/ui/image_view.rs`). Row
+addressing removes the re-encode but not the re-composite, so the scroll window
+still applies to Kitty. What changes is what happens when scrolling *stops*: the
+band paints at whatever offset the view came to rest at, instead of requiring the
+image to have become fully visible again.
 
 ### Why the band must stay a render-time parameter
 
@@ -84,8 +91,8 @@ Band re-encoding (the M3 approach) makes the band part of the *encoding*, so the
 key grows a dimension, the cache churns on every scroll settle, and the pair must
 be rebuilt — which, for Kitty, is not merely expensive (limitation 1).
 
-**Keep the band out of the cache key.** See "Rebuild triggers" below for the one
-place the current code violates this already.
+**Keep the band out of the cache key.** "Rebuild triggers" below records why the
+geometry the key holds is in fact stable, and the one case where it is not.
 
 ## Backends
 
@@ -204,69 +211,62 @@ gives `skip' = skip`, `drop = R - skip - V`, and therefore exactly `V` rows
 painted at `dst.y` — the band. Passing `ctx.area` instead of `dst` also works
 for pure scrolling, but `dst` is the form that generalizes (next subsection).
 
-### Rebuild triggers: the rect height is not stable
+### Rebuild triggers: the rect height is stable
 
-This is the one place the current architecture already puts geometry into the
-cache key, and the math/figures feature added since this branch's original base
-makes it reachable by ordinary editing.
+An earlier revision of this plan flagged the `$$...$$` live preview as a rebuild
+trigger, on the theory that `build_snapshots` shrinks the image rect mid-reveal
+(`src/ui/image_view.rs:136`, `ImageReveal` at `src/editor/state.rs:121`). It does
+not, and the reason is worth recording, because the implementation keys the
+protocol as `(url, width, height)` like everything else *because* of it:
 
-`build_snapshots` now shrinks an image block's rect by `source_rows_below` when
-that block is mid raw-reveal with the live preview on (`src/ui/image_view.rs:136`,
-`ImageReveal` at `src/editor/state.rs:121`, `preview_rows` at `:129`). So
-`rect.height` — and therefore the `(url, width, height)` protocol key — **changes
-when the cursor moves into a figure**, not just on a terminal resize.
+- A revealed `$$...$$` block's row override returns
+  `reveal.rows + reveal.preview_rows` (`src/editor/state.rs:969`), and
+  `build_snapshots` subtracts `source_rows_below = reveal.rows`, leaving
+  `preview_rows`.
+- `preview_rows` is `images.aspect_rows(url, …)` (`src/editor/state_cursor_block.rs:202`),
+  documented as "same row count the renderer's override gives the image outside
+  the reveal, so it doesn't resize when the reveal opens".
+- A block that is *not* revealed takes `images.reserved_rows(url, …)`
+  (`src/editor/state.rs:982`).
+- For a decoded image those two are the same call: `reserved_rows` and
+  `aspect_rows` both return `aspect_rows_of(…)`, differing only in what they
+  answer for a `Failed` decode.
 
-Consequences for M1:
+So the image rect has the same height before and during the reveal; the reveal
+only adds source rows *below* it. No new key, no rebuild, no geometry
+indirection — `paint_images` resolves the pair by `snap.rect.height`.
 
-- The prebuilt sliced protocol is produced at **decode time**
-  (`image_dispatch.rs:551`), so a reveal (or resize) makes `get_protocol_pair`
-  miss and fall into the **synchronous** cold path. For Kitty that path would
-  build the ~1.3 MB transmit string **on the UI thread** — a hitch triggered by
-  cursor movement. Today's fallback is cheap by comparison: it only allocates a
-  `StatefulProtocol`, and the encode stays on the worker.
-- Each rebuild mints a fresh random id and leaks the previous one, where today's
-  `StatefulKitty` reuses its id (limitation 1).
+(The equality holds for a decoded image. For a `Failed` one they differ, since
+`reserved_rows` collapses it to a single row — but a failed decode has no protocol
+at all, so `get_protocol_pair` answers `None` before the key matters.)
 
-**Decision:** build the Kitty sliced protocol at the **decode-time reserved
-geometry** — the same `(width, rows)` the halfblocks scratch already uses, and
-`reserved_rows` (`src/image/cache.rs:401`) already computes it — and express
-*both* scrolling and the reveal as bands at paint time. Since `dst` is the
-clipping window, the reveal needs no separate mechanism: it is `skip = 0` with a
-shorter `dst`.
-
-That implies one structural change beyond adding a field: `paint_images` must
-resolve the Kitty pair by the protocol geometry rather than by
-`snap.rect.height`, so a reveal reuses the existing pair instead of minting a new
-one.
-
-**Resolved: accept one synchronous build per image per geometry change, and
-measure it.** The fallback cannot be removed without new plumbing, and the
-mechanics turn out to be exact rather than open:
+**Accepting one synchronous build per image per new geometry.** A terminal resize
+is the remaining trigger, and it cannot be avoided without new plumbing:
 
 - `on_resize` (`src/app/event_loop.rs:607`) calls only
   `invalidate_native_paints()`. It does **not** clear `protocols` or
   `prebuilt_scratches`.
 - `request` (`src/image/cache.rs:202`) is a no-op once a URL is decoded, so the
   decode worker never re-runs and **no fresh prebuilt is ever produced for a new
-  geometry** — stale-keyed scratches just sit unmatched (`:145`).
-- So every `(image, geometry)` pair pays exactly one synchronous build, in the
-  first frame that paints it. That is the path already calibrated as "~5-20 ms
-  sync encode here, rare enough not to regress scroll" (`:275-278`).
+  geometry** — stale-keyed entries simply sit unmatched.
+- Every `(image, geometry)` pair therefore pays exactly one synchronous build, in
+  the first frame that paints it. That is the path already calibrated as "~5-20 ms
+  sync encode here, rare enough not to regress scroll" (`src/image/cache.rs:276`).
 
-For the halfblocks scratch, ~5-20 ms per image per resize is the accepted cost
-today. For Kitty the same moment would build the ~1.3 MB string; the estimate is
-the same order (a `to_rgba8` of ~1 MB plus base64 of the same, plus `String`
-growth), so the existing trade does not look broken — but it is **estimated, not
-measured**, and it is on the UI thread. Kitty also has *more* exposure than the
-scratch path, because M1 deletes the `fully_visible` gate: every visible image at
-a new geometry triggers the build, not only the fully visible ones.
+For the halfblocks scratch, ~5-20 ms per image per resize is today's accepted
+cost. For Kitty the same moment builds the transmit string; the estimate is the
+same order (a `to_rgba8` of ~1 MB plus base64 of the same, plus `String` growth) —
+**estimated, not measured**, and on the UI thread. Kitty's exposure is also wider
+than the scratch path's, since `fully_visible` no longer gates it (though
+`is_scrolling` still does, for the reason below).
 
-Land M1 with the synchronous fallback and instrument it (Verification item 4). If
-it measures badly, the fix is to re-derive the prebuilt off-thread from the
-already-cached `Arc<DynamicImage>` — a "rebuild prebuilt for `(url, w, h)`" job on
-the **existing** decode worker, which would also remove today's 5-20 ms scratch
-hitch. That stays inside this document's rejection of a *second* channel, since
-it rides a worker that already exists and already returns `ImageReady`.
+Both synchronous paths are now instrumented (`tracing::debug!` under the existing
+`[dev] logging` flag, carrying `micros`), so the number is measurable rather than
+assumed. If it measures badly, the fix is to re-derive the prebuilt off-thread
+from the already-cached `Arc<DynamicImage>` — a "rebuild prebuilt for
+`(url, w, h)`" job on the **existing** decode worker, which would also remove
+today's scratch hitch, and which stays inside this document's rejection of a
+*second* channel.
 
 ### Threading: build on the decode worker
 
@@ -319,11 +319,13 @@ the area width — the same bound today's Kitty path already has.
 - No change to the halfblocks scratch, `paint_native`, or
   `paint_scratch_partial` for the other protocols.
 - No new tuning knob or config surface.
-- No `image_band()` helper yet: `SlicedImage` computes skip/drop internally, so
-  writing our own would be duplication. Extract it when a backend needs the band
-  for something other than `SlicedImage` (M2 / iTerm2) — noting that its absence
-  means the arithmetic is covered by integration assertions rather than a unit
-  test, since `skip_and_drop` is private upstream.
+- No geometry indirection for the pair lookup: unnecessary, per "Rebuild
+  triggers".
+- `image_band()` *was* extracted, contrary to this document's first guess. It is
+  not duplication of `SlicedImage` — that widget derives `drop` from the area it
+  is handed, while `image_band` produces the *inputs* (`skip` and the destination
+  rect). Keeping them separate is what makes the clip arithmetic unit-testable at
+  all, since `skip_and_drop` is private upstream.
 
 ## Changes by file
 
@@ -332,44 +334,51 @@ the area width — the same bound today's Kitty path already has.
 | `src/image/loader.rs` | `LoadedImage` gains `sliced: Option<(Rect, SlicedProtocol)>` |
 | `src/app/image_dispatch.rs` | populate `sliced` in the existing scratch-build block (`:551`), gated on the picker being Kitty, inside the same `catch_unwind` |
 | `src/image/cache.rs` | `ImageCache` gains `prebuilt_sliced: HashMap<(String, u16, u16), SlicedProtocol>`; `ProtocolPair` gains `kitty_sliced: Option<SlicedProtocol>`; the Kitty cold path claims the prebuilt entry and **skips building the `ThreadProtocol`**, so there is no wasted encode and no duplicate 1.3 MB payload |
-| `src/ui/image_view.rs` | `paint_images` routes Kitty to `SlicedImage` before the `use_native` gate, resolving the pair by the protocol geometry; `fully_visible` / `is_scrolling` stop applying to Kitty |
+| `src/ui/image_view.rs` | new `image_band` (the clip arithmetic) and `paint_kitty_sliced`; `paint_images` routes Kitty through it before the `use_native` gate. `fully_visible` stops applying to Kitty; `is_scrolling` and `modal_open` still do |
 | `src/image/mod.rs` | re-export `SlicedProtocol` / `SignedPosition` |
+| `src/app/event_loop.rs` | pass `loaded.sliced` into `set_decoded_with_prebuilt` alongside `loaded.scratch` |
 | `docs/dev/media-export.md` | add a bullet to that file's invariants list recording that Kitty bands at paint time and that the partial-visibility → scratch fallback no longer applies to it |
 
 ## Verification
 
-1. **The invocation's arithmetic** (unit, `src/ui/image_view.rs`): for the cases
-   fully visible / top-clipped / bottom-clipped / both-clipped / entirely
-   off-screen / rect-shrunk-by-reveal, assert the `(skip, dst)` pair and the
-   `(skip', drop)` it implies. `skip_and_drop` is private upstream, so this tests
-   our own derivation.
-2. **Paint routing** (integration, the existing `Harness` at
-   `src/ui/image_view.rs:589`, with the pickers at `:566`/`:573`): add a Kitty
-   picker (`Picker::from_fontsize` + `set_protocol_type(ProtocolType::Kitty)`).
-   Assert that a *partially visible* snapshot writes a `\u{10EEEE}` placeholder
-   into the band's first cell (rather than halfblock cells), that the painted
-   rect is the band, and that rows outside it are untouched.
-3. **No rebuild on scroll or reveal**: assert the Kitty protocol pair is reused
-   (and no fresh id minted) across a scroll that only moves `natural_top`, and
-   across a reveal that only shrinks `rect.height`. This is the regression guard
-   for the decision above and for limitation 1.
-4. **Cold-path fallback cost** — instrumented, and the number the decision above
-   rests on: log the synchronous fallback in `get_protocol_pair` (url, geometry,
-   elapsed) under the existing `[dev] logging` flag, and record the real
-   per-image cost of the Kitty sliced build against the halfblocks scratch. This
-   is worth landing as its own small commit *before* M1, since the same log shows
-   how often the fallback fires at all.
-5. **iTerm2 / halfblocks regression**: existing assertions
+1. **The clip arithmetic** (unit, `image_band_reports_the_visible_slice`): six
+   cases — fully visible, top-clipped, bottom-clipped, both-clipped, off the top,
+   off the bottom — plus two against a viewport that does not start at row zero,
+   which is what catches an implementation measuring against the screen instead of
+   the document area. `skip_and_drop` is private upstream, so this tests the inputs
+   we derive, not upstream's `drop`.
+2. **Paint routing** (integration, `kitty_paints_a_clipped_image_as_a_band`): a
+   clipped snapshot writes a `\u{10EEEE}` placeholder — the row-addressed path ran,
+   not the halfblocks scratch.
+3. **No rebuild across a band change** (same test): the first frame carries the
+   payload (`_Gq=2`) and the clipped frame does not, which is only possible if the
+   same `SlicedProtocol` was reused. That pins the no-rebuild property and
+   limitation 1 together, and it subsumes the reveal case — a reveal does not move
+   the key at all ("Rebuild triggers").
+4. **The two surviving gates**
+   (`kitty_yields_the_band_while_scrolling_and_under_a_modal`): asserted with a
+   *fully visible* image, so that only the gate under test can explain a scratch
+   paint.
+5. **The protocol gate and the prebuilt claim**
+   (`build_kitty_sliced_only_answers_for_kitty`,
+   `kitty_prebuilt_is_claimed_at_matching_dims_and_skips_the_threaded_protocol`) —
+   the second of which also pins that Kitty builds no threaded protocol.
+6. **Cold-path cost instrumentation** — landed as its own commit *before* the
+   feature (`perf: time the synchronous halfblocks scratch fallback`), covering
+   the scratch and, once it existed, the Kitty sliced build, under the existing
+   `[dev] logging` flag. The numbers have not been read: no Kitty terminal was
+   available here.
+7. **Regression**: existing assertions
    (`two_native_images_transmit_once_then_go_quiet`,
-   `a_scratch_frame_forces_the_next_native_frame_to_retransmit`, …) must keep
-   passing. The Kitty semantics change deliberately — the `]1337;File=`-based
-   assertions are iTerm2-only and unaffected.
-6. **Manual**: real Kitty/ghostty, scroll a tall image; confirm no blur at rest
-   and none mid-scroll, and that the 150 ms window no longer downgrades. Also
-   confirm that entering a figure's reveal does not hitch, and that a resize with
-   several images on screen does not produce a visible stall.
-7. **Full suite**: `cargo test --no-fail-fast`, plus
-   `cargo clippy --all-targets -- -D warnings`.
+   `a_scratch_frame_forces_the_next_native_frame_to_retransmit`, …) pass
+   unchanged — the `]1337;File=`-based ones are iTerm2-only. `cargo test
+   --no-fail-fast` gives 3188 passed / 0 failed / 12 ignored against a 3183/0/12
+   baseline: exactly the five added tests, so nothing else moved. `cargo clippy
+   --all-targets -- -D warnings` is clean, as is `cargo fmt`.
+8. **Not done here**: the manual check on real Kitty/ghostty hardware. The paint
+   path is pinned at the buffer level by items 1–5, but "does it actually look
+   sharp on a terminal" is unverified, along with the resize-stall question that
+   item 6's log exists to answer.
 
 ## Known limitations
 
@@ -443,9 +452,12 @@ transient scroll window and the permanent cases is known rather than assumed.
   encode off the UI thread, matching the existing invariant and precedent.
 - Interface: the **band is a render-time parameter shared by all backends**, and
   the only paint path — `fully_visible` is deleted rather than branched around.
-- The Kitty protocol is keyed by the **decode-time reserved geometry**, not by
-  the snapshot's (reveal-dependent) rect height, so neither scrolling nor a
-  reveal rebuilds it.
+- The Kitty protocol is keyed by the snapshot's `(url, width, height)` **like
+  everything else**. The geometry indirection this document originally called for
+  turned out to be unnecessary: a reveal does not change the image rect's height
+  ("Rebuild triggers" carries the proof), so a resize is the only miss.
+- `is_scrolling` and `modal_open` still gate Kitty. The planned removal of the
+  scroll gate was wrong: it exists for re-compositing, not for re-encoding.
 - `get_protocol_pair` takes **no new parameter**; the Kitty test is
   `native_picker.protocol_type()`, which already reflects `resolve_protocol`'s
   override.
