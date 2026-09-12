@@ -375,10 +375,25 @@ the area width — the same bound today's Kitty path already has.
    --no-fail-fast` gives 3188 passed / 0 failed / 12 ignored against a 3183/0/12
    baseline: exactly the five added tests, so nothing else moved. `cargo clippy
    --all-targets -- -D warnings` is clean, as is `cargo fmt`.
-8. **Not done here**: the manual check on real Kitty/ghostty hardware. The paint
-   path is pinned at the buffer level by items 1–5, but "does it actually look
-   sharp on a terminal" is unverified, along with the resize-stall question that
-   item 6's log exists to answer.
+8. **The manual check was attempted on real hardware and could not be completed —
+   and the attempt is worth recording.** WezTerm is installed here and does
+   implement the Kitty graphics protocol, yet it is not a usable target:
+   `edamame --doctor` inside it reports `Images: iTerm2 inline images`, so
+   `native_picker.protocol_type()` is never `Kitty` and the band path never
+   engages. Forcing the picker to Kitty (a throwaway patch, reverted) produced
+   literal `\u{10EEEE}` placeholder glyphs with **no image composited at all** —
+   in both the fully-visible and the clipped case. So WezTerm does not implement
+   the unicode-placeholder extension, which is exactly why ratatui-image's own
+   environment inference classifies it as iTerm2. Verifying M1 needs a terminal
+   `edamame` resolves to Kitty — kitty or ghostty — and neither is installed
+   here.
+
+   What the attempt *did* establish, on real hardware:
+   - the unrepaired case, reproduced: a fully visible image renders sharply
+     through the iTerm2 path, while the same image only partly on screen renders
+     as a coarse halfblocks mosaic;
+   - WezTerm lands on the iTerm2 backend, so WezTerm users are the M3 audience,
+     not the M1 one.
 
 ## Known limitations
 
@@ -397,7 +412,12 @@ the area width — the same bound today's Kitty path already has.
    nothing. Already handled upstream of this change: `resolve_protocol`
    (`src/terminal/capabilities.rs:276`) maps a probed `Kitty` to `Iterm2` when
    `iterm2_hint_is_trustworthy()` (`:263`), because iTerm2 answers the Kitty
-   probe but cannot do placeholders.
+   probe but cannot do placeholders. Confirmed empirically and found to be wider
+   than iTerm2 alone (Verification 8): WezTerm implements the graphics protocol
+   but not the placeholders, and ratatui-image's environment inference already
+   lands it on `Iterm2` — so the pin for WezTerm comes from *upstream*, not from
+   edamame's override, and forcing Kitty on it yields literal placeholder glyphs
+   instead of an image.
 4. The sliced path renders at most one viewport's worth of rows natively; an
    image taller than the terminal cannot show more than a screenful at once.
    That is inherent, not a regression.
@@ -433,8 +453,8 @@ the area width — the same bound today's Kitty path already has.
 | | Scope | Trigger to do it |
 |---|---|---|
 | **M1** | Kitty backend (this branch) | now |
-| **M2** | Sixel backend (`SlicedSixel`); extract `image_band()` if the backend needs it outside `SlicedImage` | after M1 is verified on real hardware |
-| **M3** | iTerm2 backend, incl. reworking the payload accounting | only if iTerm2 users report the blur |
+| **M2** | Sixel backend (`SlicedSixel`); extract `image_band()` if the backend needs it outside `SlicedImage` | after M1 is verified on a terminal that resolves to Kitty (Verification 8 explains why WezTerm cannot stand in for one) |
+| **M3** | iTerm2 backend, incl. reworking the payload accounting | **WezTerm users need this one.** WezTerm resolves to the iTerm2 backend, and Verification 8 reproduces the blur there on real hardware; iTerm2 proper is the other audience. |
 
 Also worth landing independently of all three, as measurement rather than
 mechanism, and distinct from Verification item 4's fallback-cost log: log the
