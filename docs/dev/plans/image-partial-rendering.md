@@ -1,6 +1,6 @@
 # Partial image rendering — the visible band as the interface
 
-Branch: `image-kitty-row-addressing` (this branch implements **M1: the Kitty backend**)
+Branch: `image-partial-rendering` (this branch implements **M1: the Kitty backend**)
 Rebased onto `713baaf` (`main`, v0.1.4). All line references below are against that commit.
 Issue: [mijowi/edamame#50](https://github.com/mijowi/edamame/issues/50)
 
@@ -239,13 +239,34 @@ resolve the Kitty pair by the protocol geometry rather than by
 `snap.rect.height`, so a reveal reuses the existing pair instead of minting a new
 one.
 
-**Open risk.** If the decode-time geometry is unavailable (an image decoded
-before a resize, no prebuilt), the sync fallback still runs. For Kitty it must
-not build the 1.3 MB string inline. The cheap answer is to paint the scratch for
-that frame and let a later frame rebuild off-thread; the alternative — a worker
-request type — is the thing "Alternatives considered" rejects. Measure the
-fallback's frequency first; the reveal is the case that would have made it
-common, and the decision above removes it.
+**Resolved: accept one synchronous build per image per geometry change, and
+measure it.** The fallback cannot be removed without new plumbing, and the
+mechanics turn out to be exact rather than open:
+
+- `on_resize` (`src/app/event_loop.rs:607`) calls only
+  `invalidate_native_paints()`. It does **not** clear `protocols` or
+  `prebuilt_scratches`.
+- `request` (`src/image/cache.rs:202`) is a no-op once a URL is decoded, so the
+  decode worker never re-runs and **no fresh prebuilt is ever produced for a new
+  geometry** — stale-keyed scratches just sit unmatched (`:145`).
+- So every `(image, geometry)` pair pays exactly one synchronous build, in the
+  first frame that paints it. That is the path already calibrated as "~5-20 ms
+  sync encode here, rare enough not to regress scroll" (`:275-278`).
+
+For the halfblocks scratch, ~5-20 ms per image per resize is the accepted cost
+today. For Kitty the same moment would build the ~1.3 MB string; the estimate is
+the same order (a `to_rgba8` of ~1 MB plus base64 of the same, plus `String`
+growth), so the existing trade does not look broken — but it is **estimated, not
+measured**, and it is on the UI thread. Kitty also has *more* exposure than the
+scratch path, because M1 deletes the `fully_visible` gate: every visible image at
+a new geometry triggers the build, not only the fully visible ones.
+
+Land M1 with the synchronous fallback and instrument it (Verification item 4). If
+it measures badly, the fix is to re-derive the prebuilt off-thread from the
+already-cached `Arc<DynamicImage>` — a "rebuild prebuilt for `(url, w, h)`" job on
+the **existing** decode worker, which would also remove today's 5-20 ms scratch
+hitch. That stays inside this document's rejection of a *second* channel, since
+it rides a worker that already exists and already returns `ImageReady`.
 
 ### Threading: build on the decode worker
 
@@ -332,25 +353,32 @@ the area width — the same bound today's Kitty path already has.
    (and no fresh id minted) across a scroll that only moves `natural_top`, and
    across a reveal that only shrinks `rect.height`. This is the regression guard
    for the decision above and for limitation 1.
-4. **iTerm2 / halfblocks regression**: existing assertions
+4. **Cold-path fallback cost** — instrumented, and the number the decision above
+   rests on: log the synchronous fallback in `get_protocol_pair` (url, geometry,
+   elapsed) under the existing `[dev] logging` flag, and record the real
+   per-image cost of the Kitty sliced build against the halfblocks scratch. This
+   is worth landing as its own small commit *before* M1, since the same log shows
+   how often the fallback fires at all.
+5. **iTerm2 / halfblocks regression**: existing assertions
    (`two_native_images_transmit_once_then_go_quiet`,
    `a_scratch_frame_forces_the_next_native_frame_to_retransmit`, …) must keep
    passing. The Kitty semantics change deliberately — the `]1337;File=`-based
    assertions are iTerm2-only and unaffected.
-5. **Manual**: real Kitty/ghostty, scroll a tall image; confirm no blur at rest
+6. **Manual**: real Kitty/ghostty, scroll a tall image; confirm no blur at rest
    and none mid-scroll, and that the 150 ms window no longer downgrades. Also
-   confirm that entering a figure's reveal does not hitch.
-6. **Full suite**: `cargo test --no-fail-fast`, plus
+   confirm that entering a figure's reveal does not hitch, and that a resize with
+   several images on screen does not produce a visible stall.
+7. **Full suite**: `cargo test --no-fail-fast`, plus
    `cargo clippy --all-targets -- -D warnings`.
 
 ## Known limitations
 
 1. **Random id per build, no delete.** Every rebuild leaves the previous image id
-   resident in the terminal until Kitty evicts it. Under M1 the rebuild triggers
-   are a terminal resize and (unless the decision above is implemented) any
-   reveal-driven rect change, so the leak would be reachable by cursor movement.
-   Build-geometry keying removes the second trigger; fixing the first properly
-   needs a deferred `d=I` queue flushed on the next frame.
+   resident in the terminal until Kitty evicts it. The build-geometry decision
+   above leaves a terminal resize as the only trigger — removing the
+   reveal-driven rect change is exactly what it buys — so the leak is bounded by
+   resize count rather than by cursor movement. Fixing it properly needs a
+   deferred `d=I` queue flushed on the next frame.
 2. **`SlicedProtocol` must be `Send`** to cross the decode worker's channel.
    Expected (the `Kitty` payload is `Arc<AtomicBool>` + `String` + `Size`), but
    it is the first thing to confirm in code — if it fails, the fallback is to
@@ -365,6 +393,11 @@ the area width — the same bound today's Kitty path already has.
    image taller than the terminal cannot show more than a screenful at once.
    That is inherent, not a regression.
 5. Sixel band granularity is 6 px, so its `skip` is approximate (M2).
+6. **One synchronous build per image per new geometry.** After a resize nothing
+   re-derives the prebuilt map (`request` is a no-op once a URL is decoded), so
+   each visible image pays one synchronous Kitty build on the UI thread. Bounded
+   and once-per-resize, but estimated rather than measured — Verification item 4
+   is the gate, and "Rebuild triggers" holds the alternative.
 
 ## Alternatives considered
 
@@ -395,10 +428,10 @@ the area width — the same bound today's Kitty path already has.
 | **M3** | iTerm2 backend, incl. reworking the payload accounting | only if iTerm2 users report the blur |
 
 Also worth landing independently of all three, as measurement rather than
-mechanism: log the `:348` decision (`protocol`, `fully_visible`, `is_scrolling`,
-band numbers, image pixel height) under the existing `[dev] logging` flag, so the
-split between the transient scroll window and the permanent cases is known rather
-than assumed.
+mechanism, and distinct from Verification item 4's fallback-cost log: log the
+`:348` decision (`protocol`, `fully_visible`, `is_scrolling`, band numbers, image
+pixel height) under the existing `[dev] logging` flag, so the split between the
+transient scroll window and the permanent cases is known rather than assumed.
 
 ## Resolved decisions
 
@@ -416,3 +449,6 @@ than assumed.
 - `get_protocol_pair` takes **no new parameter**; the Kitty test is
   `native_picker.protocol_type()`, which already reflects `resolve_protocol`'s
   override.
+- The post-resize synchronous build is **accepted and measured** rather than
+  engineered around up front; re-deriving the prebuilt off-thread (on the
+  existing decode worker) is the documented follow-up if the number is bad.
