@@ -11,11 +11,14 @@ use std::ops::Range;
 use ratatui::buffer::{Buffer as TuiBuf, Cell, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use ratatui::widgets::Widget;
 use ratatui_image::{Resize, ResizeEncodeRender};
 
 use crate::diff::DiffState;
 use crate::editor::EditorState;
-use crate::image::{paint_halfblocks_partial, ImageCache, NativePaint};
+use crate::image::{
+    paint_halfblocks_partial, ImageCache, NativePaint, SignedPosition, SlicedImage,
+};
 use crate::terminal::ImageProtocol;
 
 /// Per-frame geometry for one visible image block, in terminal cells relative to the document
@@ -289,17 +292,22 @@ pub struct PaintContext<'a> {
 /// The cache builds the halfblocks scratch synchronously, so a fallback is always available;
 /// `native` is encoded off-thread and gated on `pair.native_ready`.  Per snapshot:
 ///
-/// | Image state                                       | Rendering  |
-/// |---------------------------------------------------|------------|
-/// | Native picker IS halfblocks                       | scratch    |
-/// | Native not ready yet                              | scratch    |
-/// | Fully visible, not scrolling                      | native     |
-/// | Fully visible, scrolling, native is Kitty         | native     |
-/// | Fully visible, scrolling, native is Sixel/iTerm2  | scratch    |
-/// | Partially visible (any state)                     | scratch    |
+/// | Image state                                       | Rendering          |
+/// |---------------------------------------------------|--------------------|
+/// | Native picker IS halfblocks                       | scratch            |
+/// | Kitty, at rest, no modal                          | row-addressed band |
+/// | Native not ready yet                              | scratch            |
+/// | Fully visible, not scrolling                      | native             |
+/// | Scrolling, or a modal is open                     | scratch            |
+/// | Partially visible, non-Kitty protocol             | scratch            |
 ///
 /// The scratch path is a cell-copy from the pre-rendered `Buffer` on the pair, so it costs
 /// O(rect area) with no encoding.
+///
+/// **`fully_visible` does not apply to Kitty.** Its protocol carries every image row and addresses
+/// them by index, so a clipped image is a row offset rather than a reason to downgrade — which is
+/// the whole fix for images going blurry the moment they are not fully on screen.  The scroll and
+/// modal gates do still apply, for the reasons on each branch below.
 pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
     if ctx.native_picker.is_none() || ctx.native_protocol.is_none() {
         return;
@@ -340,11 +348,24 @@ pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
         // behind the image.
         clear_visible_reserved_rect(snap, &ctx.area, ctx.buf, ctx.bg);
 
-        // During scroll ALL protocols fall back to halfblocks, Kitty included: Ghostty and
-        // other Kitty-compatible terminals still re-composite at each new cell position, the
-        // dominant source of scroll lag on image-heavy documents.  Halfblocks are
-        // position-independent, so ratatui's diff emits only changed cells.  Native re-engages
-        // once `SCROLL_QUIESCE` elapses.
+        // Kitty paints the visible band instead, which is what keeps a clipped image sharp.  It
+        // still yields to the scroll window (the gate below) and to an open modal: its placeholders
+        // re-composite wherever they move, so painting them on every scroll frame is the lag the
+        // scratch window exists to avoid, and `dim_area` cannot recess an image that writes past the
+        // cell buffer.
+        if ctx.native_protocol == Some(ImageProtocol::KittyGraphics)
+            && !ctx.is_scrolling
+            && !ctx.modal_open
+            && paint_kitty_sliced(ctx.images, snap, &ctx.area, ctx.buf)
+        {
+            continue;
+        }
+
+        // During scroll every protocol falls back to halfblocks, Kitty included — Ghostty and other
+        // Kitty-compatible terminals re-composite at each new cell position, the dominant source of
+        // scroll lag on image-heavy documents.  Halfblocks are position-independent, so ratatui's
+        // diff emits only changed cells.  Native re-engages once `SCROLL_QUIESCE` elapses; for Kitty
+        // that is the band above, which returns with no re-encode.
         let use_native = fully_visible && !ctx.is_scrolling && !ctx.modal_open;
 
         if use_native {
@@ -353,6 +374,79 @@ pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
             paint_scratch_partial(ctx.images, snap, &ctx.area, ctx.buf, ctx.bg);
         }
     }
+}
+
+/// Paint the on-screen band of a Kitty image through the row-addressed protocol, returning whether
+/// it painted.  `false` means no sliced protocol is cached for this geometry — the terminal is not
+/// Kitty, its build failed, or the prebuilt has not arrived — and the caller falls back to the
+/// scratch.
+///
+/// The image is already on the terminal from its first paint, so the band is only a question of
+/// which rows the placeholder grid addresses.  `SlicedImage` derives that from the `area` it is
+/// handed plus a signed position: the band as `area` and `-skip` as the position make it paint
+/// exactly the rows below the clip and drop the rest, with no re-encode and no re-transmit.
+///
+/// Note it treats `area` as the *clipping window*, not as the document rect.  That is also why a
+/// shrunken reserved rect — the `$$...$$` live-preview band — needs no mechanism of its own.
+fn paint_kitty_sliced(
+    images: &mut ImageCache,
+    snap: &ImageLayoutSnapshot,
+    area: &Rect,
+    buf: &mut TuiBuf,
+) -> bool {
+    let pair = match images.protocol_pair_mut(&snap.url, snap.rect.width, snap.rect.height) {
+        Some(pair) => pair,
+        None => return false,
+    };
+    let Some(sliced) = pair.kitty_sliced.as_ref() else {
+        return false;
+    };
+    let Some((skip, dst)) = image_band(
+        snap.rect.x,
+        snap.rect.width,
+        snap.natural_top,
+        snap.rect.height,
+        area,
+    ) else {
+        // No overlap with the viewport: nothing to paint, but nothing left for the caller either.
+        return true;
+    };
+    SlicedImage::new(
+        sliced,
+        SignedPosition {
+            x: 0,
+            y: -(skip as i16),
+        },
+    )
+    .render(dst, buf);
+    true
+}
+
+/// The on-screen band of a reserved image rect: how many of the image's rows sit above it, and the
+/// screen rect it paints into.  `None` when there is no overlap at all.
+///
+/// `natural_top` is the image's top in document-area coordinates and is negative once it has
+/// scrolled out; `height` is the *reserved* height, which `build_snapshots` deliberately keeps at
+/// full size even when the rect runs off the screen.  Both numbers a protocol needs to paint a
+/// slice come out of here: the destination rect supplies the width and the visible row count, and
+/// the skip says which image row to start at (`SlicedImage` derives the matching drop from the
+/// rect's height, so the two are consistent by construction).
+fn image_band(
+    x: u16,
+    width: u16,
+    natural_top: isize,
+    height: u16,
+    area: &Rect,
+) -> Option<(u16, Rect)> {
+    let viewport_top = area.y as isize;
+    let viewport_bottom = viewport_top + area.height as isize;
+    let top = natural_top.max(viewport_top);
+    let bottom = (natural_top + height as isize).min(viewport_bottom);
+    if bottom <= top {
+        return None;
+    }
+    let skip = (top - natural_top) as u16;
+    Some((skip, Rect::new(x, top as u16, width, (bottom - top) as u16)))
 }
 
 /// Blank the on-screen slice of `snap.rect` so the `[Image: alt]` placeholder can't bleed
@@ -576,6 +670,15 @@ mod tests {
             picker
         }
 
+        /// The protocol whose placeholders address image rows by index — the whole reason a
+        /// partially visible image can stay at native fidelity.
+        #[allow(deprecated)]
+        fn kitty_picker() -> Picker {
+            let mut picker = Picker::from_fontsize((1, 2).into());
+            picker.set_protocol_type(ProtocolType::Kitty);
+            picker
+        }
+
         fn snap(url: &str, top: u16, height: u16) -> ImageLayoutSnapshot {
             ImageLayoutSnapshot {
                 block_idx: 0,
@@ -586,15 +689,41 @@ mod tests {
             }
         }
 
+        /// As [`snap`], but with a signed top, the way `build_snapshots` produces one: the rect's
+        /// `y` saturates at 0 while `natural_top` keeps the negative offset.
+        fn snap_at(url: &str, natural_top: isize, height: u16) -> ImageLayoutSnapshot {
+            ImageLayoutSnapshot {
+                block_idx: 0,
+                alt: url.into(),
+                url: url.into(),
+                rect: Rect::new(0, natural_top.max(0) as u16, AREA.width, height),
+                natural_top,
+            }
+        }
+
         struct Harness {
             images: ImageCache,
             rx: mpsc::Receiver<ratatui_image::thread::ResizeRequest>,
             native: Picker,
             halfblocks: Picker,
+            protocol: ImageProtocol,
+            /// A modal forces the scratch so the dim sweep can recess the image; only the tests
+            /// that pin that gate raise it.
+            modal_open: bool,
         }
 
         impl Harness {
             fn new(urls: &[&str]) -> Self {
+                Self::with_native(urls, iterm2_picker(), ImageProtocol::ITerm2)
+            }
+
+            /// A harness whose terminal speaks Kitty, so `paint_images` takes the row-addressed
+            /// band path rather than the `fully_visible` gate.
+            fn kitty(urls: &[&str]) -> Self {
+                Self::with_native(urls, kitty_picker(), ImageProtocol::KittyGraphics)
+            }
+
+            fn with_native(urls: &[&str], native: Picker, protocol: ImageProtocol) -> Self {
                 let (tx, rx) = mpsc::channel();
                 let mut images = ImageCache::new();
                 images.attach_resize_sender(tx);
@@ -612,8 +741,10 @@ mod tests {
                 Self {
                     images,
                     rx,
-                    native: iterm2_picker(),
+                    native,
                     halfblocks: halfblocks_picker(),
+                    protocol,
+                    modal_open: false,
                 }
             }
 
@@ -646,9 +777,9 @@ mod tests {
                     images: &mut self.images,
                     native_picker: Some(&self.native),
                     halfblocks_picker: Some(&self.halfblocks),
-                    native_protocol: Some(ImageProtocol::ITerm2),
+                    native_protocol: Some(self.protocol),
                     is_scrolling: scrolling,
-                    modal_open: false,
+                    modal_open: self.modal_open,
                     suppress_block_idx,
                     bg: Color::Reset,
                 };
@@ -662,6 +793,107 @@ mod tests {
         fn transmitted(buf: &TuiBuf, rect: Rect) -> bool {
             buf.cell((rect.x, rect.y))
                 .is_some_and(|c| c.symbol().contains("]1337;File="))
+        }
+
+        /// True when the cell carries a Kitty placeholder run: the image is placed by those
+        /// characters themselves, not by an escape written somewhere else.
+        fn placed(buf: &TuiBuf, rect: Rect) -> bool {
+            buf.cell((rect.x, rect.y))
+                .is_some_and(|c| c.symbol().contains('\u{10EEEE}'))
+        }
+
+        /// True when the cell carries the Kitty transmit escape, i.e. the raw payload went over on
+        /// this frame.  `_Gq=2` survives tmux passthrough wrapping, so it holds either way.
+        fn transmitted_kitty(buf: &TuiBuf, rect: Rect) -> bool {
+            buf.cell((rect.x, rect.y))
+                .is_some_and(|c| c.symbol().contains("_Gq=2"))
+        }
+
+        /// The band a protocol has to paint: which image row the visible slice starts at, and
+        /// where it lands.  This is the arithmetic the fix rests on — with the reserved rect held
+        /// at full size across scrolls, it is the only thing that changes as the image moves.
+        #[test]
+        fn image_band_reports_the_visible_slice() {
+            let area = Rect::new(0, 0, 20, 20);
+            let band = |top: isize, height: u16| image_band(0, 20, top, height, &area);
+
+            // Fully visible: the whole rect, nothing skipped.
+            assert_eq!(band(4, 6), Some((0, Rect::new(0, 4, 20, 6))));
+            // Top clipped by three rows.
+            assert_eq!(band(-3, 10), Some((3, Rect::new(0, 0, 20, 7))));
+            // Bottom clipped: four of the ten rows are on screen, none skipped.
+            assert_eq!(band(16, 10), Some((0, Rect::new(0, 16, 20, 4))));
+            // Taller than the viewport: five rows skipped, the rest clamped to it.
+            assert_eq!(band(-5, 40), Some((5, Rect::new(0, 0, 20, 20))));
+            // Entirely off either edge: no band at all.
+            assert_eq!(band(-30, 10), None);
+            assert_eq!(band(40, 6), None);
+
+            // A viewport that does not start at row zero: both the skip and the destination are
+            // measured from the document area, not from the top of the screen.
+            let offset = Rect::new(0, 5, 20, 10);
+            assert_eq!(
+                image_band(2, 20, 8, 6, &offset),
+                Some((0, Rect::new(2, 8, 20, 6)))
+            );
+            assert_eq!(
+                image_band(2, 20, 2, 6, &offset),
+                Some((3, Rect::new(2, 5, 20, 3)))
+            );
+        }
+
+        /// The regression the change exists for: a clipped image paints at native fidelity rather
+        /// than dropping to the halfblocks scratch, and banding does not re-send the payload.
+        #[test]
+        fn kitty_paints_a_clipped_image_as_a_band() {
+            let whole = vec![snap_at("a.png", 0, 8)];
+            let clipped = vec![snap_at("a.png", -3, 8)];
+            let mut h = Harness::kitty(&["a.png"]);
+
+            let first = h.frame(&whole, false);
+            assert!(placed(&first, whole[0].rect), "kitty must place the image");
+            assert!(
+                transmitted_kitty(&first, whole[0].rect),
+                "the first paint carries the payload"
+            );
+
+            let band = h.frame(&clipped, false);
+            assert!(
+                placed(&band, clipped[0].rect),
+                "a clipped image must still be placed natively"
+            );
+            assert!(
+                !transmitted_kitty(&band, clipped[0].rect),
+                "banding must not re-send the payload the terminal already holds"
+            );
+        }
+
+        /// The band path yields to the scroll window and to a modal.  Both gates are deliberate:
+        /// Kitty's placeholders re-composite wherever they move, so painting them every scroll
+        /// frame is the lag the scratch window exists to avoid, and `dim_area` cannot recess an
+        /// image that writes past the cell buffer.
+        #[test]
+        fn kitty_yields_the_band_while_scrolling_and_under_a_modal() {
+            // Fully visible on purpose: with the rect entirely on screen, only the gate under test
+            // can explain a scratch paint.  The old `fully_visible` requirement is deliberately
+            // gone for Kitty; these two are not.
+            let whole = vec![snap_at("a.png", 0, 8)];
+            let mut h = Harness::kitty(&["a.png"]);
+            assert!(
+                placed(&h.frame(&whole, false), whole[0].rect),
+                "the band should paint with both gates open"
+            );
+
+            assert!(
+                !placed(&h.frame(&whole, true), whole[0].rect),
+                "scrolling must fall back to the scratch"
+            );
+
+            h.modal_open = true;
+            assert!(
+                !placed(&h.frame(&whole, false), whole[0].rect),
+                "an open modal must fall back to the scratch"
+            );
         }
 
         #[test]
