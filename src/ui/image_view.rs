@@ -354,12 +354,15 @@ pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
         // behind the image.
         clear_visible_reserved_rect(snap, &ctx.area, ctx.buf, ctx.bg);
 
-        // Direct placement paints the same band as Kitty's row addressing, by the same argument
-        // and under the same two gates: the placement re-composites wherever it moves, and
-        // `dim_area` cannot recess an image that writes past the cell buffer.  Yielding to a gate
-        // here is also what *deletes* the placement — an id that is not placed this frame is
-        // reconciled away below.
-        if direct && !ctx.is_scrolling && !ctx.modal_open {
+        // Direct placement paints the same band as Kitty's row addressing, under the same modal
+        // gate — `dim_area` cannot recess an image that writes past the cell buffer — but **not**
+        // under the scroll gate.  A placement is one short escape naming a new source rectangle,
+        // while the halfblocks fallback it would fall back to writes every cell of the band: on
+        // this side of the wire a moving image is *cheaper* to keep placing than to downgrade, and
+        // what the scroll gate exists to avoid is the terminal re-compositing the image at its new
+        // cell position, which is WezTerm's cost to pay and is being measured.  It is also what
+        // *deletes* the placement: an id not placed on a frame is reconciled away below.
+        if direct && !ctx.modal_open {
             if let Some(id) = paint_direct_placement(ctx.images, snap, &ctx.area, ctx.buf) {
                 placed.push(id);
                 continue;
@@ -1077,16 +1080,17 @@ mod tests {
                 "the placement is live after the first frame"
             );
 
-            // Scrolling falls back to the scratch, and takes the placement with it.
-            let scrolled = h.frame(&snaps, true);
+            // The block is gone: edited away, navigated off, or its decode failed.  No snapshot
+            // mentions it any more, which is exactly what the id-set difference catches.
+            let gone = h.frame(&[], false);
             assert!(
-                !symbol_at(&scrolled, snaps[0].rect).contains("a=p"),
-                "the scratch painted instead of a placement"
+                !symbol_at(&gone, snaps[0].rect).contains("a=p"),
+                "nothing placed the image"
             );
             assert!(
-                carried_escapes(&scrolled).contains("a=d"),
+                carried_escapes(&gone).contains("a=d"),
                 "the frame that stops placing must delete the placement: {:?}",
-                carried_escapes(&scrolled)
+                carried_escapes(&gone)
             );
             assert_eq!(
                 h.images.pending_deletes(),
@@ -1095,11 +1099,61 @@ mod tests {
             );
 
             // And nothing is queued again once there is nothing left to remove.
-            let again = h.frame(&snaps, true);
+            let again = h.frame(&[], false);
             assert!(
                 !carried_escapes(&again).contains("a=d"),
                 "one delete is enough: {:?}",
                 carried_escapes(&again)
+            );
+        }
+
+        /// A moving image stays sharp: direct placement keeps painting while scrolling, because a
+        /// placement is one short escape where the halfblocks fallback is a write per cell.
+        #[test]
+        fn direct_placement_keeps_painting_while_scrolling() {
+            let snaps = vec![snap_at("a.png", 0, 8)];
+            let mut h = Harness::direct(&["a.png"]);
+            h.frame(&snaps, false);
+
+            let scrolled = h.frame(&snaps, true);
+            assert!(
+                symbol_at(&scrolled, snaps[0].rect).contains("a=p"),
+                "scrolling must not downgrade a direct placement to halfblocks: {:?}",
+                symbol_at(&scrolled, snaps[0].rect)
+            );
+            assert!(
+                !symbol_at(&scrolled, snaps[0].rect).contains("a=t"),
+                "and must not re-send the payload"
+            );
+
+            // The band moves with the scroll, so the placement names the new source rows: two rows
+            // up at 2 px per row is a source offset of 4.
+            let moved = vec![snap_at("a.png", -2, 8)];
+            let band = h.frame(&moved, true);
+            assert!(
+                symbol_at(&band, moved[0].rect).contains(",y=4,"),
+                "the source rect follows the band: {:?}",
+                symbol_at(&band, moved[0].rect)
+            );
+        }
+
+        /// The modal gate stays: `dim_area` recesses the image by writing over its cells, which it
+        /// cannot do to a placement the terminal is compositing on top.
+        #[test]
+        fn direct_placement_still_yields_to_a_modal() {
+            let snaps = vec![snap_at("a.png", 0, 8)];
+            let mut h = Harness::direct(&["a.png"]);
+            h.frame(&snaps, false);
+
+            h.modal_open = true;
+            let dimmed = h.frame(&snaps, false);
+            assert!(
+                !symbol_at(&dimmed, snaps[0].rect).contains("a=p"),
+                "an open modal must fall back to the scratch"
+            );
+            assert!(
+                carried_escapes(&dimmed).contains("a=d"),
+                "and take the placement with it"
             );
         }
 
