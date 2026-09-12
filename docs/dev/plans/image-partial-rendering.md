@@ -536,6 +536,24 @@ the area width — the same bound today's Kitty path already has.
 disjoint audiences (see "A fourth route"), so neither can be skipped by doing the
 other.
 
+Side by side, because the difference is easy to lose:
+
+| | **M3** — crop and re-send (iTerm2) | **M4** — direct placement (`a=p`) |
+|---|---|---|
+| Where the band lives | **in the encoding** — a band is a new PNG | **in the placement** — a source rect on an image already sent |
+| One-time cost | 1 encode for the full image | 1 encode + 1 transmit string |
+| Cost per band change | 1 PNG encode on a worker **+ a full re-send** | one short escape, written at render time |
+| Visible artifact | **the flash** — `clear_area` (ECH) blanks the rows, then the PNG redraws | none; nothing is re-sent |
+| Threading | cannot be render-time → worker, channel, stale-request handling | **render-time**, on the UI thread — no worker |
+| Upstream support | **reused** — `Iterm2::new(cropped, …).render(dst, buf)` | **none** — ratatui-image's Kitty backend is placeholder-only and `render_with_skip` is `pub(crate)`, so the APC sequences are ours |
+| Accounting | one payload cell per band; `NativePaint` / `mark_rect_skipped` apply unchanged | one placement cell; needs `a=d` on eviction/resize and placement-id bookkeeping |
+| Terminal support | **universal** — anything that speaks OSC 1337, iTerm2 proper included | only `a=p`-with-source-rect terminals → WezTerm today |
+| Correctness trap | the crop must come from the **resized** bitmap, not the original (a band's aspect ratio is not the image's, so `Fit` would rescale it) | none — the rect is in image pixels and the terminal crops |
+
+The one-sentence root: **M3 makes the band part of the encoding; M4 makes it a
+parameter of a placement.** That is why M4 is free and M3 is not — and why M4
+cannot exist for iTerm2, whose protocol has no source rectangle at all.
+
 Also worth landing independently of all three, as measurement rather than
 mechanism, and distinct from Verification item 4's fallback-cost log: log the
 `:348` decision (`protocol`, `fully_visible`, `is_scrolling`, band numbers, image
