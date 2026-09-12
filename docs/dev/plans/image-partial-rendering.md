@@ -401,6 +401,123 @@ the area width — the same bound today's Kitty path already has.
   rect). Keeping them separate is what makes the clip arithmetic unit-testable at
   all, since `skip_and_drop` is private upstream.
 
+## Design (M4 — direct placement)
+
+### Rerouting, and why the probe cannot do it
+
+`edamame --doctor` inside WezTerm reports `Images: iTerm2 inline images`. That is
+not the iTerm2 *hint* path: `TERM_PROGRAM=WezTerm` does not contain `iTerm`, so
+`is_iterm2_app()` is false and `resolve_protocol` leaves the probe alone. The probe
+itself lands on iTerm2 — and WezTerm *does* answer the Kitty query (`a=q` →
+`KittyImage::Query` → a `"OK"` response, `term/src/terminalstate/kitty.rs:181`), so
+what decides is the response ordering inside `Picker::from_query_stdio`, and it
+decides iTerm2.
+
+Routing therefore has to come from the environment hint, exactly as
+`iterm2_hint_is_trustworthy()` already does for iTerm2:
+
+```rust
+fn is_wezterm() -> bool {   // the terminals with `a=p` and no `U=1`
+    env::var("TERM_PROGRAM").is_ok_and(|v| v.contains("WezTerm"))
+        || env::var("WEZTERM_PANE").is_ok()
+}
+```
+
+Like the iTerm2 hint, it is **distrusted inside tmux**: `update-environment` does
+not carry `TERM_PROGRAM`, so a stale hint would pin a protocol the pane cannot
+speak, and M4's escapes would need passthrough wrapping — which upstream enables by
+*spawning* `tmux set -p allow-passthrough on`, a subprocess edamame will not spawn.
+In tmux the pane keeps whatever the probe said: today's iTerm2 path, unchanged.
+
+### What upstream gives us, and what it does not
+
+| Need | Upstream | Verdict |
+|---|---|---|
+| the resized bitmap | `Resize::resize(…)` — `pub` (`lib.rs:409`) | **reuse**: the same call the M1/iTerm2 paths make, `Fit(None)` and `Nearest` (`:496`), so M4's pixels match theirs and the band's pixel grid is cell-aligned by construction |
+| the cell geometry | `Resize::size_for(…)` — `pub` (`:436`) | **reuse** |
+| the transmit string | `transmit_virtual` — private (`kitty.rs:224`); `Kitty::render` reachable only through the `pub(crate)` `ProtocolTrait` | **write ours** |
+| the placement | placeholders only, and WezTerm has no `U=1` | **write ours** |
+
+The transmit is ~25 lines (chunked base64 over `to_rgba8`, `f=32,t=d`; `base64` is
+already a direct dependency) and buys control of both the id and the erase.
+Reaching into upstream for it would mean rendering into a throwaway `Buffer` and
+splitting the transmit prefix back out of the symbol — brittle, for no gain.
+
+### The escape
+
+Everything goes in the band's **first** cell; the rest are `Skip`. Three parts:
+
+```
+// 1 — erase the band on the terminal: ECH per row, absolutely positioned
+for r in 0..rows  →  "\x1b[{dst.y+r+1};{dst.x+1}H"  "\x1b[{cols}X"
+
+// 2 — the one-time transmit, carried by the first placement
+"\x1b_Gq=2,i={id},a=t,f=32,t=d,s={W},v={H},m=1;{b64}\x1b\\"     per 3072-byte chunk
+
+// 3 — the placement: source rect in image pixels, extent in cells
+"\x1b[{dst.y+1};{dst.x+1}H"
+"\x1b_Gq=2,i={id},p={pid},a=p,x=0,y={skip*font_h},w={W},h={rows*font_h},c={cols},r={rows},C=1\x1b\\"
+"\x1b[{dst.y+1};{dst.x+2}H"
+```
+
+WezTerm's own field names are the spec being written against:
+`assign_image_to_cells{ source_width: w, source_height: h, source_origin_x: x,
+source_origin_y: y, columns, rows, z_index, do_not_move_cursor }`
+(`term/src/terminalstate/kitty.rs:116-132`).
+
+Three details are load-bearing, each with its why:
+
+- **The cursor dance is not decoration.** ratatui-crossterm tracks a *cell*
+  coordinate, not a display column (`last_pos = Some(Position { x, y })`,
+  `ratatui-crossterm-0.1.2/src/lib.rs:243-247`), so a symbol that moves the cursor
+  corrupts the next cell unless it ends where the backend believes the cursor is.
+  The escape therefore opens with an absolute move — correct even if some other
+  symbol moved the cursor — and closes at `(x+1, y)`.
+- **ECH, not blank cells, erases the placeholder.** `[Image: alt]` is a *glyph* and
+  glyphs draw above images, so blanks would leave it visible; and emitting blanks is
+  not reliable anyway, because a cell marked `Skip` is dropped from the update stream
+  whether or not its content changed (`ratatui-core-0.1.2/src/buffer/diff.rs`).
+  WezTerm supports ECH (`EraseCharacter`, `wezterm-escape-parser/src/csi.rs:1170`) —
+  the same primitive upstream's `clear_area` uses for iTerm2 and Sixel
+  (`protocol.rs:290`).
+- **`ForcedWidth(1)` on the carrying cell.** The symbol is kilobytes wide; without
+  the forced width, `Buffer::diff` advances its position by `cell_width()` and eats
+  the rest of the row.
+
+### Replacement, deletion, and the ghost problem
+
+A placement is anchored to **screen cells, not to the content**. That is what makes
+the band free, and it is also what makes deletion mandatory. Re-placing the same
+`(id, pid)` is a replacement — WezTerm removes the old placement on entry
+(`:104`) and keys them by that pair (`:26`) — so a moving band cannot double up. But
+when the image *stops* being placed, nothing removes it, and it would sit there while
+the document scrolls out from under it:
+
+| Band stops being placed because | What removes the placement |
+|---|---|
+| scrolling (`is_scrolling`) | the delete rides the **first scratch cell**: during scroll the scratch repaints every frame, so the carrier is guaranteed to be emitted |
+| a modal is open | same carrier |
+| the reserved rect left the viewport entirely | nothing is needed: the placement is off-screen too. It is deleted on the frame it next becomes visible *and* unplaced |
+| the block is gone (edit, nav, reparse) | the delete is queued, then appended to the document area's **first cell** marked `ForcedWidth(1)` — appending changes that cell's symbol, and a changed non-skipped cell is always emitted, so the queue drains; the appended escapes neither draw nor move the cursor |
+
+`paint_images` already runs once per frame with the full snapshot list, so the queue
+is a set difference over the URLs it placed this frame versus last — the same
+"honored only on the immediately following frame" discipline `NativePaint` uses.
+
+### What M4 does not need
+
+- **No `ThreadProtocol`.** The pair's `native` stays `None`: there is no PNG to
+  encode and none to re-send, which is exactly M3's flash this route exists to
+  avoid. The halfblocks scratch still builds, unchanged, for the scroll and modal
+  gates.
+- **No rebuild on a band change.** The band is a placement parameter, so the
+  transmit string is built once per `(url, width, rows)` and re-used. The id is
+  allocated per URL and kept across rebuilds, so a rebuild re-transmits into the
+  *same* id instead of leaking a new one — strictly better than M1's limitation 1.
+- **No new config surface, no `o=z` compression** (upstream sends raw RGBA too),
+  **no sub-cell `X`/`Y` offsets** (WezTerm parses them as `u32`; the band is always
+  cell-aligned), **no tmux** (out of scope above).
+
 ## Changes by file
 
 | File | Change |
@@ -412,6 +529,19 @@ the area width — the same bound today's Kitty path already has.
 | `src/image/mod.rs` | re-export `SlicedProtocol` / `SignedPosition` |
 | `src/app/event_loop.rs` | pass `loaded.sliced` into `set_decoded_with_prebuilt` alongside `loaded.scratch` |
 | `docs/dev/media-export.md` | add a bullet to that file's invariants list recording that Kitty bands at paint time and that the partial-visibility → scratch fallback no longer applies to it |
+
+The M4 rows:
+
+| File | Change |
+|---|---|
+| `src/image/kitty_direct.rs` (new) | the writer — `transmit`, `place`, `delete` and the ECH sweep as pure string builders, plus the cell/pixel geometry they encode. Every function is a pure function of `(id, geometry, band)`, which is what makes M4 testable without a terminal |
+| `src/image/loader.rs` | `LoadedImage` gains `direct: Option<(Rect, DirectPlacement)>` |
+| `src/app/image_dispatch.rs` | populate `direct` in the same block that builds the scratch and the sliced protocol, inside the same `catch_unwind` |
+| `src/image/cache.rs` | `ImageCache` gains `prebuilt_direct` keyed like `prebuilt_sliced`, the per-URL id map, and the live-placement record the delete queue is a set difference over; `ProtocolPair` gains `kitty_direct: Option<DirectPlacement>` and its `native` stays `None` |
+| `src/terminal/capabilities.rs` | `ImageProtocol::KittyDirect`, the `is_wezterm()` hint with its tmux distrust, and the doctor label |
+| `src/ui/image_view.rs` | `paint_direct_placement` (band → one escape in the first cell, `Skip` the rest), the delete queue and its carrier, and the `paint_images` routing arm |
+| `docs/terminal-compatibility.md` | the user-facing row: what WezTerm gets, and what it costs |
+| `docs/dev/media-export.md` | the invariants bullet for the placement lifecycle — who removes a placement, and why nothing else will |
 
 ## Verification
 
@@ -468,6 +598,21 @@ the area width — the same bound today's Kitty path already has.
      as a coarse halfblocks mosaic;
    - WezTerm lands on the iTerm2 backend, so a WezTerm user is the **direct
      placement (M4)** audience — not the M1 one, and not necessarily M3's either.
+
+9. **M4's escape geometry** (unit, in `src/image/kitty_direct.rs`): the band's
+    source rect (`y = skip*font_h`, `h = rows*font_h`), the cell extent, the ECH
+    sweep per row, the chunking (3072-byte payloads, `m=1` on all but the last) and
+    the closing cursor position. Pure string assertions — the one part of M4 that
+    can be pinned without a terminal.
+10. **The band is a placement parameter** (integration): a clipped frame emits
+    `a=p` with a non-zero `y` and **no** transmit, while the first frame carries the
+    transmit. The M1 no-rebuild property, re-checked for M4.
+11. **The delete queue drains** (integration): a frame that stops placing emits the
+    delete, and the next frame's queue is empty.
+12. **On real hardware — the check M1 could not complete.** WezTerm is installed
+    here and is M4's one target: a partially scrolled image must render at native
+    fidelity, with no `[Image: alt]` text over it, no flash as the band moves, and
+    no ghost left behind once the block is scrolled out of view.
 
 ## Known limitations
 
@@ -530,11 +675,11 @@ the area width — the same bound today's Kitty path already has.
 | **M1** | Kitty backend (this branch) | now |
 | **M2** | Sixel backend (`SlicedSixel`); extract `image_band()` if the backend needs it outside `SlicedImage` | after M1 is verified on a terminal that resolves to Kitty (Verification 8 explains why WezTerm cannot stand in for one) |
 | **M3** | iTerm2 band: crop the visible rows and re-send them. The only route for iTerm2 proper | not first — see M4, and the flash cost it carries |
-| **M4** | Kitty **direct placement** (`a=p` with a source rect) — the *free* band for terminals that have `a=p` but not `U=1`, WezTerm being the one to hand | before M3 for a WezTerm user: same sharpness without the per-band-change flash, and verifiable end-to-end here |
+| **M4** | Kitty **direct placement** (`a=p` with a source rect) — the *free* band for terminals that have `a=p` but not `U=1`, WezTerm being the one to hand | **taken — this branch.** It is the route for the very terminal the blur was reported on, and the only one of the four that can be verified end-to-end here |
 
-**For a WezTerm user, M4 then M3. For an iTerm2 user, M3 alone.** The two cover
-disjoint audiences (see "A fourth route"), so neither can be skipped by doing the
-other.
+**M4 is taken on this branch; M3 is what remains, and for iTerm2 alone.** The two
+cover disjoint audiences (see "A fourth route"), so neither is cancelled by doing
+the other — an iTerm2 user still gets the blur until M3 lands.
 
 Side by side, because the difference is easy to lose:
 
