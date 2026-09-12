@@ -511,9 +511,14 @@ is a set difference over the URLs it placed this frame versus last — the same
   avoid. The halfblocks scratch still builds, unchanged, for the scroll and modal
   gates.
 - **No rebuild on a band change.** The band is a placement parameter, so the
-  transmit string is built once per `(url, width, rows)` and re-used. The id is
-  allocated per URL and kept across rebuilds, so a rebuild re-transmits into the
-  *same* id instead of leaking a new one — strictly better than M1's limitation 1.
+  transmit string is built once per `(url, width, rows)` and re-used. The image id
+  hashes the URL **and the geometry**, so a rebuild re-transmits into the *same*
+  id instead of leaking a new one — strictly better than M1's limitation 1 — and
+  two blocks showing one image at one size share a transmit while placing under
+  **their own** placement ids (`placement_id(block_idx)`). A single constant there
+  would be wrong twice: the second block of a repeated image would replace the
+  first's placement and render nothing, and a delete could not name one placement
+  without risking a sibling's.
 - **No new config surface, no `o=z` compression** (upstream sends raw RGBA too),
   **no sub-cell `X`/`Y` offsets** (WezTerm parses them as `u32`; the band is always
   cell-aligned), **no tmux** (out of scope above).

@@ -123,14 +123,15 @@ pub fn build_direct_placement(
     // `None` background: the letterbox padding stays transparent, so what shows through is the
     // terminal's own background rather than a colour guessed from the theme.
     let resized = Resize::Fit(None).resize(image, font, cells, None);
-    let id = kitty_direct::id_for(url);
+    let geometry = Geometry::new(cells, font_size);
+    let id = kitty_direct::image_id(url, geometry);
     let transmit = kitty_direct::transmit(id, &resized);
     if transmit.is_empty() {
         return None;
     }
     Some(DirectPlacement {
         id,
-        geometry: Geometry::new(cells, font_size),
+        geometry,
         transmit: Some(transmit),
     })
 }
@@ -264,14 +265,17 @@ pub struct ImageCache {
     prebuilt_sliced: HashMap<(String, u16, u16), SlicedProtocol>,
     /// The direct-placement counterpart, claimed and staled the same way.
     prebuilt_direct: HashMap<(String, u16, u16), DirectPlacement>,
-    /// Image ids the terminal is showing a placement for, as of the last painted frame.
+    /// `(image_id, placement_id)` pairs the terminal is showing, as of the last painted frame.
     ///
     /// Carried across frames because the snapshots of a frame that *stops* painting an image do
     /// not mention it — and a placement is anchored to screen cells, so one that is no longer
-    /// painted has to be deleted explicitly or it stays behind while the document moves.
-    live_placements: HashSet<u32>,
+    /// painted has to be deleted explicitly or it stays behind while the document moves.  The pair
+    /// is what makes that precise: one stored image can be placed by several blocks at once, and a
+    /// block's index can move when the document is edited, so an id alone would delete a placement
+    /// another block is still using.
+    live_placements: HashSet<(u32, u32)>,
     /// Deletes owed to the terminal, waiting for a cell that will be emitted to carry them.
-    pending_deletes: Vec<u32>,
+    pending_deletes: Vec<(u32, u32)>,
     /// Outstanding encode requests, FIFO in dispatch order.
     pending: VecDeque<PendingResize>,
     /// Sender into the encoder worker, cloned into each `ThreadProtocol`.  `None` disables image
@@ -331,12 +335,13 @@ impl ImageCache {
     /// Record the placements painted on this frame and queue a delete for every one that was
     /// live before and is not now.
     ///
-    /// Called once per frame that painted, with the ids placed on it — the set difference is what
-    /// catches a block that was edited away or navigated off, which no later snapshot mentions.
-    pub fn reconcile_placements(&mut self, placed: &[u32]) {
-        let placed: HashSet<u32> = placed.iter().copied().collect();
-        for id in self.live_placements.difference(&placed) {
-            self.pending_deletes.push(*id);
+    /// Called once per frame that painted, with the `(image_id, placement_id)` pairs placed on it —
+    /// the set difference is what catches a block that was edited away or navigated off, which no
+    /// later snapshot mentions.
+    pub fn reconcile_placements(&mut self, placed: &[(u32, u32)]) {
+        let placed: HashSet<(u32, u32)> = placed.iter().copied().collect();
+        for pair in self.live_placements.difference(&placed) {
+            self.pending_deletes.push(*pair);
         }
         self.live_placements = placed;
     }
@@ -346,7 +351,7 @@ impl ImageCache {
     /// Taken rather than read: the escapes are carried by a cell whose symbol changes only
     /// because they were appended, so leaving them in place would stop the diff from emitting
     /// the next frame's carrier at all.
-    pub fn take_pending_deletes(&mut self) -> Vec<u32> {
+    pub fn take_pending_deletes(&mut self) -> Vec<(u32, u32)> {
         std::mem::take(&mut self.pending_deletes)
     }
 

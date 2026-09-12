@@ -20,14 +20,6 @@ use base64::Engine as _;
 use image::DynamicImage;
 use ratatui::layout::Size;
 
-/// The placement id every image uses.
-///
-/// Placements are keyed by `(image_id, placement_id)` — in WezTerm's own store
-/// (`term/src/terminalstate/kitty.rs`) and in kitty — so a constant is fine and makes
-/// re-placing the same image *replace* its previous placement rather than add one.  That
-/// property is what lets a moving band be re-placed every frame without doubling up.
-pub const PLACEMENT_ID: u32 = 1;
-
 /// Kitty's per-command base64 payload limit.  Chunking mirrors upstream's `transmit_virtual`
 /// so the two backends put the same bytes on the wire, minus `U=1`.
 const CHARS_PER_CHUNK: usize = 4096;
@@ -64,21 +56,44 @@ impl Geometry {
     }
 }
 
-/// The image id for `url`.
+/// The image id for `url` **at one geometry**.
 ///
-/// Derived from the URL rather than allocated, so a rebuild at a new geometry re-transmits
-/// into the **same** id instead of leaving the previous image resident — which is strictly
-/// better than the random id per build that M1 inherits (limitation 1).  Zero is avoided
-/// because it means "no id" to the placement path.
-pub fn id_for(url: &str) -> u32 {
+/// Derived rather than allocated, so a rebuild re-transmits into the same slot instead of leaving
+/// the previous image resident — strictly better than the random id per build that M1 inherits.
+///
+/// The geometry is part of the hash because an id names *one stored bitmap*: the same image at two
+/// sizes is two bitmaps, and a shared id would have the later transmit overwrite the earlier one's
+/// pixels.  Two blocks showing the same image at the same size therefore share one transmit — which
+/// is the point — and still get their own placements ([`placement_id`]).
+///
+/// Zero is avoided because it means "no id" to the placement path.
+pub fn image_id(url: &str, geometry: Geometry) -> u32 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     url.hash(&mut hasher);
+    geometry.cells.width.hash(&mut hasher);
+    geometry.cells.height.hash(&mut hasher);
+    geometry.font.hash(&mut hasher);
     match hasher.finish() as u32 {
         0 => 1,
         id => id,
     }
+}
+
+/// The placement id for the block at `block_idx`.
+///
+/// One id per block is what makes replacement safe in both directions.  Placements are keyed by
+/// `(image_id, placement_id)` — in WezTerm's store and in kitty — and a re-place with the same pair
+/// *replaces* rather than adds, so: the same image shown twice gets two placements and both stay
+/// visible (a constant id would have the second replace the first), and a block that moves is
+/// re-placed under its own id, replacing its old position instead of leaving a copy behind.
+///
+/// Non-zero, since a placement id of zero is the protocol's "no id" case.  A document with more
+/// than `u32::MAX` blocks would collide — unreachable, and the symptom would be one image missing,
+/// not corruption.
+pub fn placement_id(block_idx: usize) -> u32 {
+    (block_idx as u32).saturating_add(1)
 }
 
 /// The one-time transmit: the whole image as raw RGBA (`f=32,t=d`), in base64 chunks.
@@ -115,6 +130,10 @@ pub fn transmit(id: u32, image: &DynamicImage) -> String {
 
 /// The cell symbol that puts the band of `geometry` at `dst`, which is its on-screen rect.
 ///
+/// `placement_id` is this block's ([`placement_id`]) and `id` names the stored image; together they
+/// are the terminal's key for the placement, so re-placing replaces this block's previous placement
+/// and nothing else's.
+///
 /// `skip` is how many of the image's rows sit above `dst`, so the source rectangle starts at
 /// `skip * cell_height` — the band's own rows, cropped by the terminal out of what it already
 /// holds.  `transmit` is carried here when the image has not been sent yet, in the same cell
@@ -126,6 +145,7 @@ pub fn transmit(id: u32, image: &DynamicImage) -> String {
 /// no `MoveTo`.
 pub fn place(
     id: u32,
+    placement_id: u32,
     geometry: Geometry,
     skip: u16,
     dst: ratatui::layout::Rect,
@@ -163,7 +183,7 @@ pub fn place(
     // `C=1` so the terminal leaves the cursor alone.
     write!(
         out,
-        "\x1b[{};{}H\x1b_Gq=2,i={id},p={PLACEMENT_ID},a=p,x=0,y={src_y},w={pixels_w},h={src_h},c={},r={},C=1\x1b\\",
+        "\x1b[{};{}H\x1b_Gq=2,i={id},p={placement_id},a=p,x=0,y={src_y},w={pixels_w},h={src_h},c={},r={},C=1\x1b\\",
         dst.y + 1,
         dst.x + 1,
         dst.width,
@@ -177,15 +197,18 @@ pub fn place(
     out
 }
 
-/// Remove this image's placement, keeping its data — `d=i` (lowercase) is placements-only, so
+/// Remove one block's placement, keeping the image data — `d=i` (lowercase) is placements-only, so
 /// an image that scrolls back into view is re-placed for free.
 ///
 /// This is only needed where nothing else removes it.  A placement is anchored to *screen
 /// cells*, so scrolled content moves out from under it; the data-deleting form (`d=I`) would
 /// also free the stored image, but the resident-image leak it would fix is the one M1 already
 /// documents, and it would cost a re-transmit on every scroll back.
-pub fn delete_placement(id: u32) -> String {
-    format!("\x1b_Gq=2,i={id},p={PLACEMENT_ID},a=d,d=i\x1b\\")
+///
+/// Both ids matter: the same stored image can be placed by several blocks at once, and this must
+/// remove exactly one of them.
+pub fn delete_placement(id: u32, placement_id: u32) -> String {
+    format!("\x1b_Gq=2,i={id},p={placement_id},a=d,d=i\x1b\\")
 }
 
 #[cfg(test)]
@@ -204,18 +227,42 @@ mod tests {
     }
 
     #[test]
-    fn the_id_is_stable_per_url_and_never_zero() {
+    fn the_image_id_is_per_url_and_geometry_and_never_zero() {
+        let small = geometry();
+        let wider = Geometry::new(Size::new(80, 30), (8, 16));
         assert_eq!(
-            id_for("https://example.com/a.png"),
-            id_for("https://example.com/a.png")
+            image_id("https://example.com/a.png", small),
+            image_id("https://example.com/a.png", small)
         );
         assert_ne!(
-            id_for("https://example.com/a.png"),
-            id_for("https://example.com/b.png")
+            image_id("https://example.com/a.png", small),
+            image_id("https://example.com/b.png", small)
+        );
+        // One id names one stored *bitmap*: the same image at another size must not share one, or
+        // whichever transmit lands last would overwrite the other's pixels.
+        assert_ne!(
+            image_id("https://example.com/a.png", small),
+            image_id("https://example.com/a.png", wider)
+        );
+        // A mismatched font is a different pixel grid at the same cell size.
+        assert_ne!(
+            image_id("a.png", small),
+            image_id("a.png", Geometry::new(small.cells, (9, 16)))
         );
         // Whatever it hashes to, it must not be the "no id" value the placement path skips.
-        assert_ne!(id_for(""), 0);
-        assert_ne!(id_for("some/path.png"), 0);
+        assert_ne!(image_id("", small), 0);
+        assert_ne!(image_id("some/path.png", small), 0);
+    }
+
+    #[test]
+    fn the_placement_id_is_per_block_and_never_zero() {
+        // Zero is the protocol's "no id", so the first block must not land on it.
+        assert_ne!(placement_id(0), 0);
+        assert_ne!(placement_id(1), 0);
+        // Two blocks showing one image must not share a placement id: they would replace each
+        // other, and the second block's position would show nothing.
+        assert_ne!(placement_id(0), placement_id(1));
+        assert_ne!(placement_id(7), placement_id(8));
     }
 
     #[test]
@@ -251,7 +298,7 @@ mod tests {
     fn the_band_is_the_source_rectangle_of_the_full_width() {
         // Rows 5..9 of a 30-row image, at 16 px per row: source y = 80, height = 64.
         let dst = Rect::new(3, 11, 40, 4);
-        let symbol = place(9, geometry(), 5, dst, None);
+        let symbol = place(9, 2, geometry(), 5, dst, None);
         assert!(
             symbol.contains(",x=0,y=80,w=320,h=64,c=40,r=4,"),
             "the source rect must be the band, in image pixels: {symbol:?}"
@@ -261,7 +308,7 @@ mod tests {
     #[test]
     fn the_escape_erases_each_row_before_placing_and_restores_the_cursor() {
         let dst = Rect::new(3, 11, 40, 3);
-        let symbol = place(9, geometry(), 0, dst, None);
+        let symbol = place(9, 2, geometry(), 0, dst, None);
 
         // One ECH sweep per row, absolutely positioned, and all of them *before* the placement:
         // the placeholder glyph would otherwise be drawn over the image.
@@ -286,6 +333,7 @@ mod tests {
         let dst = Rect::new(0, 0, 40, 2);
         let symbol = place(
             9,
+            2,
             geometry(),
             0,
             dst,
@@ -299,19 +347,19 @@ mod tests {
         );
 
         // With no transmit to carry, the placement stands alone.
-        let re_placed = place(9, geometry(), 0, dst, None);
+        let re_placed = place(9, 2, geometry(), 0, dst, None);
         assert!(!re_placed.contains("a=t"), "{re_placed:?}");
         assert!(re_placed.contains("a=p"), "{re_placed:?}");
     }
 
     #[test]
-    fn the_delete_keeps_the_image_data() {
-        let seq = delete_placement(9);
-        // Placements-only (`d=i`, lowercase) for this image and this placement.
+    fn the_delete_names_one_placement_and_keeps_the_image_data() {
+        let seq = delete_placement(9, 3);
+        // Placements-only (`d=i`, lowercase) for one (image, placement) pair.
         assert!(seq.contains("a=d"), "{seq:?}");
         assert!(seq.contains("d=i"), "{seq:?}");
         assert!(seq.contains("i=9"), "{seq:?}");
-        assert!(seq.contains(&format!("p={PLACEMENT_ID}")), "{seq:?}");
+        assert!(seq.contains("p=3"), "{seq:?}");
         // `d=I` would drop the data too; that is deliberately not what this emits, so that an
         // image scrolling back into view is re-placed for free.
         assert!(!seq.contains("d=I"), "{seq:?}");

@@ -317,8 +317,9 @@ pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
     // The terminal renders by placing an already-transmitted image, so the pair's `kitty_direct`
     // is the rendering and no encoded payload is wanted.
     let direct = ctx.native_protocol == Some(ImageProtocol::KittyDirect);
-    // The ids placed on this frame, reconciled against the last frame's at the end.
-    let mut placed: Vec<u32> = Vec::new();
+    // The `(image_id, placement_id)` pairs placed on this frame, reconciled against the last
+    // frame's at the end.
+    let mut placed: Vec<(u32, u32)> = Vec::new();
 
     for snap in snapshots {
         if Some(snap.block_idx) == ctx.suppress_block_idx {
@@ -461,14 +462,18 @@ fn paint_kitty_sliced(
 const UNIT_WIDTH: ratatui::buffer::CellDiffOption =
     ratatui::buffer::CellDiffOption::ForcedWidth(std::num::NonZeroU16::new(1).unwrap());
 
-/// Paint the on-screen band of an image by *placing* it, returning the image id when it painted.
+/// Paint the on-screen band of an image by *placing* it, returning the block's
+/// `(image_id, placement_id)` when it painted.
 ///
 /// `None` means the caller should paint the scratch instead: no pair at this geometry, no
 /// direct-placement backend on it, or a band that does not meet the viewport at all.
 ///
 /// The band is one placement — `a=p` with a source rectangle — so exactly one cell carries a
 /// symbol.  The transmit rides it on the image's first placement and is *taken* rather than
-/// cloned, because a payload is megabytes and the next frame would otherwise repeat them.
+/// cloned, because a payload is megabytes and the next frame would otherwise repeat them.  The
+/// placement id is the block's, so a document showing the same image twice gets two placements
+/// (both visible) and a block that moves replaces its own previous placement rather than a
+/// sibling's.
 ///
 /// Every other cell of the band is marked `Skip`: they have been blanked by
 /// [`clear_visible_reserved_rect`], but emitting those blanks would paint a background over the
@@ -480,7 +485,7 @@ fn paint_direct_placement(
     snap: &ImageLayoutSnapshot,
     area: &Rect,
     buf: &mut TuiBuf,
-) -> Option<u32> {
+) -> Option<(u32, u32)> {
     let pair = images.protocol_pair_mut(&snap.url, snap.rect.width, snap.rect.height)?;
     let direct = pair.kitty_direct.as_mut()?;
     let (skip, dst) = image_band(
@@ -494,9 +499,11 @@ fn paint_direct_placement(
     // The carrier cell has to exist before the transmit is taken: taking it and then failing to
     // write the symbol would drop the payload for good.
     let cell = buf.cell_mut((dst.x, dst.y))?;
+    let placement_id = crate::image::kitty_direct::placement_id(snap.block_idx);
     let transmit = direct.transmit.take();
     let symbol = crate::image::kitty_direct::place(
         direct.id,
+        placement_id,
         direct.geometry,
         skip,
         dst,
@@ -514,7 +521,7 @@ fn paint_direct_placement(
             }
         }
     }
-    Some(direct.id)
+    Some((direct.id, placement_id))
 }
 
 /// Hand queued placement deletes to the terminal through a cell that is certain to be emitted.
@@ -525,14 +532,17 @@ fn paint_direct_placement(
 /// changes its symbol, and a changed, non-skipped cell is always emitted.  [`UNIT_WIDTH`] keeps that
 /// from costing anything in the diff, and the escapes neither draw nor move the cursor, so the
 /// cell's own text is untouched.
-fn write_control_escapes(buf: &mut TuiBuf, area: &Rect, deletes: &[u32]) {
+fn write_control_escapes(buf: &mut TuiBuf, area: &Rect, deletes: &[(u32, u32)]) {
     let Some(cell) = buf.cell_mut((area.x, area.y)) else {
         return;
     };
     let mut symbol = String::with_capacity(cell.symbol().len() + deletes.len() * 48);
     symbol.push_str(cell.symbol());
-    for id in deletes {
-        symbol.push_str(&crate::image::kitty_direct::delete_placement(*id));
+    for (id, placement_id) in deletes {
+        symbol.push_str(&crate::image::kitty_direct::delete_placement(
+            *id,
+            *placement_id,
+        ));
     }
     cell.set_symbol(&symbol).set_diff_option(UNIT_WIDTH);
 }
@@ -816,6 +826,20 @@ mod tests {
             }
         }
 
+        /// As [`snap_at`], but for a *given* block: two blocks of one document is exactly what
+        /// makes two placements of one stored image distinguishable.
+        fn snap_block(
+            url: &str,
+            block_idx: usize,
+            natural_top: isize,
+            height: u16,
+        ) -> ImageLayoutSnapshot {
+            ImageLayoutSnapshot {
+                block_idx,
+                ..snap_at(url, natural_top, height)
+            }
+        }
+
         struct Harness {
             images: ImageCache,
             rx: mpsc::Receiver<ratatui_image::thread::ResizeRequest>,
@@ -936,6 +960,19 @@ mod tests {
             buf.cell((rect.x, rect.y))
                 .map(|c| c.symbol().to_owned())
                 .unwrap_or_default()
+        }
+
+        /// A `key=` value from the *placement* command in `symbol`.
+        ///
+        /// The placement is not the first `_G` command in a symbol that also carries the transmit,
+        /// so it is found by `a=p` rather than by position.
+        fn placement_value(symbol: &str, key: &str) -> Option<String> {
+            let wanted = format!("{key}=");
+            symbol
+                .split("\x1b_G")
+                .filter(|command| command.contains("a=p"))
+                .flat_map(|command| command.split(';').next().unwrap_or_default().split(','))
+                .find_map(|pair| pair.strip_prefix(&wanted).map(str::to_owned))
         }
 
         /// The escapes carried by the document area's first cell, which is where a queued delete
@@ -1154,6 +1191,78 @@ mod tests {
             assert!(
                 carried_escapes(&dimmed).contains("a=d"),
                 "and take the placement with it"
+            );
+        }
+
+        /// The same image in two blocks is **one** stored image and **two** placements.  Sharing
+        /// the transmit is the point — identical pixels — but sharing the placement id would let
+        /// the second replace the first, leaving one of the two blocks showing nothing.
+        #[test]
+        fn one_image_in_two_blocks_shares_the_data_and_not_the_placement() {
+            let snaps = vec![snap_block("a.png", 0, 0, 8), snap_block("a.png", 1, 12, 8)];
+            let mut h = Harness::direct(&["a.png"]);
+            let frame = h.frame(&snaps, false);
+
+            let first = symbol_at(&frame, snaps[0].rect);
+            let second = symbol_at(&frame, snaps[1].rect);
+            assert!(
+                first.contains("a=p") && second.contains("a=p"),
+                "both blocks must place the image: {first:?} / {second:?}"
+            );
+
+            assert_eq!(
+                placement_value(&first, "i"),
+                placement_value(&second, "i"),
+                "one stored image, so one id — the second block reuses the first's data"
+            );
+            assert_ne!(
+                placement_value(&first, "p"),
+                placement_value(&second, "p"),
+                "two placements, or the second replaces the first"
+            );
+            assert!(
+                first.contains("a=t") ^ second.contains("a=t"),
+                "the payload goes over exactly once"
+            );
+            // Each block places its own band: the second sits twelve rows further down.
+            assert_eq!(placement_value(&first, "y").as_deref(), Some("0"));
+            assert_eq!(placement_value(&second, "y").as_deref(), Some("0"));
+            assert!(
+                second.contains(&format!("\x1b[{};1H", snaps[1].rect.y + 1)),
+                "{second:?}"
+            );
+        }
+
+        /// When a block stops being painted, only *its* placement is deleted — a sibling block
+        /// showing the same image keeps the data, and keeps its own placement.
+        #[test]
+        fn deleting_one_of_two_placements_leaves_the_other() {
+            let snaps = vec![snap_block("a.png", 0, 0, 8), snap_block("a.png", 1, 12, 8)];
+            let mut h = Harness::direct(&["a.png"]);
+            let frame = h.frame(&snaps, false);
+            let survivor = placement_value(&symbol_at(&frame, snaps[1].rect), "p")
+                .expect("the second block placed it");
+
+            // The first block's snapshot goes away; the second stays.
+            let gone = h.frame(&snaps[1..], false);
+            let carried = carried_escapes(&gone);
+            assert!(
+                carried.contains("a=d"),
+                "its placement must be deleted: {carried:?}"
+            );
+            let deleted = carried
+                .split("\x1b_G")
+                .filter(|command| command.contains("a=d"))
+                .flat_map(|command| command.split(';').next().unwrap_or_default().split(','))
+                .find_map(|pair| pair.strip_prefix("p=").map(str::to_owned))
+                .expect("a placement id");
+            assert_ne!(
+                deleted, survivor,
+                "deleting the gone block's placement must spare the surviving one"
+            );
+            assert!(
+                symbol_at(&gone, snaps[1].rect).contains("a=p"),
+                "and the survivor is still placed"
             );
         }
 
