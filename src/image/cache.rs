@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{mpsc, Arc};
+use std::time::Instant;
 
 use image::DynamicImage;
 use ratatui::buffer::Buffer;
@@ -275,19 +276,30 @@ impl ImageCache {
             let is_halfblocks_native = native_picker.protocol_type() == ProtocolType::Halfblocks;
 
             // Prefer the worker's prebuilt scratch, taken by `remove` so it isn't held twice.
-            // A missing or wrong-dimension one falls back to a ~5-20 ms sync encode here, rare
-            // enough not to regress scroll.
             let halfblocks_scratch = if let Some(buf) = self.prebuilt_scratches.remove(&key) {
                 Some(buf)
-            } else if is_halfblocks_native {
-                Some(render_halfblocks_scratch(
-                    native_picker,
-                    (*image_arc).clone(),
-                    full_rect,
-                ))
             } else {
-                halfblocks_picker
-                    .map(|p| render_halfblocks_scratch(p, (*image_arc).clone(), full_rect))
+                // Cold-path fallback: the prebuilt is missing, or keyed to other dims.  A resize
+                // is the usual cause — `on_resize` does not clear this map and `request` is a
+                // no-op once a URL is decoded, so nothing ever re-derives it.  Timed rather than
+                // assumed; see `docs/dev/plans/image-partial-rendering.md` § Rebuild triggers.
+                let sync_picker = if is_halfblocks_native {
+                    Some(native_picker)
+                } else {
+                    halfblocks_picker
+                };
+                let started = Instant::now();
+                let buf =
+                    sync_picker.map(|p| render_halfblocks_scratch(p, (*image_arc).clone(), full_rect));
+                tracing::debug!(
+                    target: "image",
+                    url = %key.0,
+                    width,
+                    height,
+                    micros = started.elapsed().as_micros() as u64,
+                    "halfblocks scratch built synchronously (prebuilt missed)",
+                );
+                buf
             };
 
             // A ThreadProtocol runs the slow native encode on the worker; unnecessary when the
