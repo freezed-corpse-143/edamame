@@ -1,7 +1,9 @@
 # Partial image rendering — the visible band as the interface
 
-Branch: `image-partial-rendering` (this branch implements **M1: the Kitty backend**)
-Rebased onto `713baaf` (`main`, v0.1.4). All line references below are against that commit.
+Branch: `image-band-rendering` (this branch implements **M1: the Kitty backend**, **M4: Kitty direct placement**, and **M2: the Sixel backend**)
+Base: `unreleased` (`a537f2c`), the branch the pull request targets. The line
+references below were taken against `713baaf` (`main`, v0.1.4) and have drifted
+since — read them as anchors, not offsets.
 Issue: [mijowi/edamame#50](https://github.com/mijowi/edamame/issues/50)
 
 ## Problem
@@ -108,7 +110,7 @@ accounting — and the last of those is what decides iTerm2.
 |---|---|---|---|---|---|
 | **Kitty** | `Kitty::render_with_skip` (row addressing via unicode placeholders) | 1 raw-RGBA transmit string (~1.3 MB for a full-width image) | no re-encode; per-row placeholder symbol | **none needed** — `Arc<AtomicBool>` transmit latch | **adopt (M1)** |
 | **Kitty `a=p`** | hand-written direct placement with a source rect (see "A fourth route") | 1 transmit string | one short escape per band change | one placement cell; nothing is re-sent | adopt (M4) for WezTerm-class terminals |
-| **Sixel** | `SlicedSixel` (splices the payload's 6-px bands at draw time) | 1 sixel encode + band split | no re-encode; one string build | none | adopt (M2) |
+| **Sixel** | `SlicedSixel` (splices the payload's 6-px bands at draw time) | 1 sixel encode + band split | no re-encode; one string build | none | **adopt (M2)** — the route for Windows Terminal, which has no Kitty graphics at all |
 | **iTerm2** | crop the visible rows and re-send them (see "iTerm2 — M3") | **1 PNG encode per band change** | the PNG is re-sent, so the image blanks and redraws | one payload cell, but that re-send is the flash `NativePaint` / `mark_rect_skipped` exist to prevent | adopt (M3), iTerm2 proper only |
 | **Halfblocks** | `Halfblocks::render_with_skip` (row copy) | 1 encode | no re-encode | none | **never** — zero fidelity gain; `paint_scratch_partial` already does exactly this |
 
@@ -125,7 +127,7 @@ a common Windows terminal: it implements the Kitty protocol's **direct placement
 (`a=p`) with a **source rectangle**, but not the placeholder mode that
 ratatui-image's Kitty backend renders *exclusively* through.
 
-Verified in the WezTerm tree (`C:\Projects\wezterm`, d2f3f05):
+Verified in the WezTerm tree (`d2f3f05`):
 
 - `wezterm-escape-parser/src/apc.rs:1022` parses `a='p'` as
   `KittyImage::Display { image_id, image_number, placement, verbosity }`, and
@@ -171,7 +173,7 @@ starting the grid at `skip` — no re-encode, no re-transmit, pixel-exact.
 `render_with_skip(area, buf, skip)` takes no `drop`; the destination height
 encodes it, which is consistent with the invocation below.
 
-### Sixel — M2
+### Sixel — M2 (taken)
 
 The private `sixel_slice::SlicedSixel` (its module is *not* `pub`, so the type
 cannot be named from this crate — but `SlicedProtocol::Sixel(…)` is a public
@@ -180,6 +182,56 @@ deconstructs the sixel payload into its native 6-pixel bands at build time and
 skips/truncates them at draw time. Not pixel-accurate (6-px granularity), which
 upstream documents as "good enough". The module comment also explains why the
 generic `Sliced(Vec<…>)` path is *not* used for sixel: it glitches in foot.
+
+**This is Windows Terminal's route, and the reason M2 stopped being optional.**
+WT is the one terminal the four routes above cannot share a mechanism with: it
+has **no Kitty graphics protocol at all** (its parser has no APC handler; the
+only "kitty" in the tree is the *keyboard* protocol, `CSI u`) and it is
+therefore not an M1, M4 or M3 target. What it has is Sixel, and it advertises it
+in DA1 (`?61;4;…c`, `adaptDispatch.cpp` in `microsoft/terminal`), which is what
+ratatui-image's capability query reads — so an edamame in WT resolves to
+`ImageProtocol::Sixel` with no routing hint of any kind. Read against
+`microsoft/terminal` at main (2026-09-11) and WT 1.24:
+
+- **ConPTY passes the application's VT through unmodified** (commit `450eec48d`,
+  "Goodbye VtEngine Edition" — "any VT output that an application generates will
+  now be given to the terminal unmodified … opening the path towards … sixels").
+  So the band escapes reach WT exactly as written; there is no ConPTY re-encode
+  between edamame and the terminal.
+- **WT rasterises a sixel into per-row `ImageSlice` pixels in its text buffer**
+  (`SixelParser::_maybeFlushImageBuffer` → `ROW::SetImageSlice`, drawn by
+  `AtlasEngine::PaintImageSlice` per visible row) and **erases the slice where
+  text is written** (`TextBuffer::Replace` → `ImageSlice::EraseCells`). Clipping
+  is therefore the terminal's own, which is what makes a re-sliced payload
+  enough — and the erase is the same primitive the scratch path and the
+  payload's `clear_area` sweep already rely on.
+- **A sixel is drawn from the cursor**, and WT's default DECSDM is reset, so a
+  sequence that does not fit below the cursor **scrolls the text buffer** to make
+  room. In a TUI that would push the whole document up, which is why the band —
+  bounded by `image_band` to the visible rows — is not just a fidelity choice but
+  the only safe payload. Sending the full image and letting the terminal clip is
+  not an option here.
+- **WT's sixel cell size is virtual and reported**: `CellSizeForLevel(9) = {10, 20}`,
+  and `CSI 16 t` answers with that same size, so the picker's `font_size` and
+  WT's pixel↔cell mapping agree — the image lands at the intended width and
+  height rather than being rescaled by the terminal.
+
+The implementation is the M1 one with the gate widened: `image::build_sliced`
+(was `build_kitty_sliced`) accepts `Kitty | Sixel`, `ProtocolPair::sliced`
+(was `kitty_sliced`) is the backend for both, and `paint_images` routes
+`ImageProtocol::Sixel` through `paint_sliced` under the same scroll and modal
+gates. `native` stays `None` on Sixel too — the pair's band already *is* the
+payload, so a threaded encode would be a second copy of the same bytes, never
+read. No WT-specific escape writer, no hint, no config surface: unlike M4, the
+terminal supports exactly the protocol `SlicedProtocol` already speaks.
+
+Measured in this tree (a scratch probe, since deleted): a `ProtocolType::Sixel`
+picker builds `SlicedProtocol::Sixel` for a 4×4-cell, 40×80 px fixture and the
+band for `skip = 1` text row comes out **11 sixel bands, bottom-aligned with the
+full payload's last band, opening with an ECH sweep sized to the band (3 rows)**
+rather than to the image. A 20 px cell height is 3⅓ sixel bands, so the skip
+lands on 18 px: that ~2 px of slop (≤ 6 px in general) is M2's known cost, and
+the only fidelity it gives up against M1/M4.
 
 ### iTerm2 — M3 (crop and re-send)
 
@@ -528,12 +580,21 @@ is a set difference over the URLs it placed this frame versus last — the same
 | File | Change |
 |---|---|
 | `src/image/loader.rs` | `LoadedImage` gains `sliced: Option<(Rect, SlicedProtocol)>` |
-| `src/app/image_dispatch.rs` | populate `sliced` in the existing scratch-build block (`:551`), gated on the picker being Kitty, inside the same `catch_unwind` |
-| `src/image/cache.rs` | `ImageCache` gains `prebuilt_sliced: HashMap<(String, u16, u16), SlicedProtocol>`; `ProtocolPair` gains `kitty_sliced: Option<SlicedProtocol>`; the Kitty cold path claims the prebuilt entry and **skips building the `ThreadProtocol`**, so there is no wasted encode and no duplicate 1.3 MB payload |
-| `src/ui/image_view.rs` | new `image_band` (the clip arithmetic) and `paint_kitty_sliced`; `paint_images` routes Kitty through it before the `use_native` gate. `fully_visible` stops applying to Kitty; `is_scrolling` and `modal_open` still do |
+| `src/app/image_dispatch.rs` | populate `sliced` in the existing scratch-build block (`:551`), gated on the picker speaking a band protocol (`Kitty \| Sixel`), inside the same `catch_unwind` |
+| `src/image/cache.rs` | `ImageCache` gains `prebuilt_sliced: HashMap<(String, u16, u16), SlicedProtocol>`; `ProtocolPair` gains `sliced: Option<SlicedProtocol>`; the band cold path claims the prebuilt entry and **skips building the `ThreadProtocol`**, so there is no wasted encode and no duplicate 1.3 MB payload |
+| `src/ui/image_view.rs` | new `image_band` (the clip arithmetic) and `paint_sliced`; `paint_images` routes the band protocols through it before the `use_native` gate. `fully_visible` stops applying to them; `is_scrolling` and `modal_open` still do |
 | `src/image/mod.rs` | re-export `SlicedProtocol` / `SignedPosition` |
 | `src/app/event_loop.rs` | pass `loaded.sliced` into `set_decoded_with_prebuilt` alongside `loaded.scratch` |
-| `docs/dev/media-export.md` | add a bullet to that file's invariants list recording that Kitty bands at paint time and that the partial-visibility → scratch fallback no longer applies to it |
+| `docs/dev/media-export.md` | add a bullet to that file's invariants list recording that the band protocols paint at paint time and that the partial-visibility → scratch fallback no longer applies to them |
+
+The M2 rows — the M1 identifiers above were renamed in the same pass, because one
+field and one paint function now serve both protocols:
+
+| File | Change |
+|---|---|
+| `src/image/cache.rs` | `is_band_protocol(ProtocolType)` becomes the single gate that `build_sliced` and the cold path both consult, so the two cannot drift; `build_kitty_sliced` → `build_sliced`, `ProtocolPair::kitty_sliced` → `sliced`; `native` stays `None` for Sixel exactly as for Kitty |
+| `src/ui/image_view.rs` | the `paint_images` routing arm takes `ImageProtocol::KittyGraphics \| ImageProtocol::Sixel`; `paint_kitty_sliced` → `paint_sliced`. The band arithmetic is untouched — `image_band` is protocol-agnostic by construction, which is the interface paying off |
+| `docs/terminal-compatibility.md`, `docs/dev/windows.md` | the Windows Terminal row and the platform note: what sixel terminals get, and that nobody has watched it there |
 
 The M4 rows:
 
@@ -569,24 +630,28 @@ The M4 rows:
    *fully visible* image, so that only the gate under test can explain a scratch
    paint.
 5. **The protocol gate and the prebuilt claim**
-   (`build_kitty_sliced_only_answers_for_kitty`,
+   (`build_sliced_answers_for_the_band_protocols_only`,
    `kitty_prebuilt_is_claimed_at_matching_dims_and_skips_the_threaded_protocol`) —
    the second of which also pins that Kitty builds no threaded protocol.
 6. **Cold-path cost instrumentation** — landed as its own commit *before* the
    feature (`perf: time the synchronous halfblocks scratch fallback`), covering
-   the scratch and, once it existed, the Kitty sliced build, under the existing
+   the scratch and, once it existed, the band build, under the existing
    `[dev] logging` flag. The numbers have not been read: no Kitty terminal was
-   available here.
+   available for it.
 7. **Regression**: existing assertions
    (`two_native_images_transmit_once_then_go_quiet`,
    `a_scratch_frame_forces_the_next_native_frame_to_retransmit`, …) pass
    unchanged — the `]1337;File=`-based ones are iTerm2-only. `cargo test
    --no-fail-fast` gives 3188 passed / 0 failed / 12 ignored against a 3183/0/12
-   baseline: exactly the five added tests, so nothing else moved. `cargo clippy
-   --all-targets -- -D warnings` is clean, as is `cargo fmt`.
+   baseline for M1 — exactly the five added tests, so nothing else moved. The
+   tree with M4 and M2 on it reports 3207/0/12, of which M2's share is exactly two
+   tests (3205 with `--skip sixel`); the one M2-era rename is
+   `build_kitty_sliced_only_answers_for_kitty` → `build_sliced_answers_for_the_band_protocols_only`,
+   not a new test. `cargo clippy --all-targets -- -D warnings` is clean, as is
+   `cargo fmt`.
 8. **The manual check was attempted on real hardware and could not be completed —
-   and the attempt is worth recording.** WezTerm is installed here and does
-   implement the Kitty graphics protocol, yet it is not a usable target:
+   and the attempt is worth recording.** WezTerm was available for the attempt and
+   does implement the Kitty graphics protocol, yet it is not a usable target:
    `edamame --doctor` inside it reports `Images: iTerm2 inline images`, so
    `native_picker.protocol_type()` is never `Kitty` and the band path never
    engages. Forcing the picker to Kitty (a throwaway patch, reverted) produced
@@ -594,8 +659,7 @@ The M4 rows:
    in both the fully-visible and the clipped case. So WezTerm does not implement
    the unicode-placeholder extension, which is exactly why ratatui-image's own
    environment inference classifies it as iTerm2. Verifying M1 needs a terminal
-   `edamame` resolves to Kitty — kitty or ghostty — and neither is installed
-   here.
+   `edamame` resolves to Kitty — kitty or ghostty — and neither was available.
 
    What the attempt *did* establish, on real hardware:
    - the unrepaired case, reproduced: a fully visible image renders sharply
@@ -614,21 +678,45 @@ The M4 rows:
     transmit. The M1 no-rebuild property, re-checked for M4.
 11. **The delete queue drains** (integration): a frame that stops placing emits the
     delete, and the next frame's queue is empty.
-12. **On real hardware — the check M1 could not complete.** WezTerm is installed
-    here and is M4's one target, and the run is recorded. `--log` reports
+12. **On real hardware — the check M1 could not complete.** WezTerm was available
+    and is M4's one target, and the run is recorded. `--log` reports
     `image_protocol=Some(KittyDirect)` and the decode worker finishing `ok=true`;
     a partially scrolled image then renders at native fidelity in the window — the
     dog photo from `tests/fixtures`, sharp, with no `[Image: alt]` text over it and
     no halfblocks mosaic, which is the blur this document exists to fix. M1's own
     check is still outstanding: it needs a terminal edamame resolves to Kitty
-    (kitty or ghostty), and neither is installed here.
+    (kitty or ghostty), and neither was available.
 13. **What the hardware run did *not* cover.** The delete path was exercised only
     against the terminal's *store*: scroll-away and scroll-back were not driven
     by hand, so "no ghost left behind" rests on the escape being what WezTerm's
     `KittyImageDelete::ByImageId` expects and on `reconcile_placements` being
     called every painted frame (`an_unpainted_direct_placement_is_deleted`), not
     on having watched it. Driving a TUI's scroll needs synthesized input, which
-    this environment can do but not reliably enough to call proof.
+    is doable but not reliable enough to call proof.
+14. **M2, the Sixel band** (`sixel_paints_a_clipped_image_as_a_band`): a clipped
+    snapshot's cell carries a `\x1bP` payload rather than a halfblock glyph, so
+    the band path ran; the top-clipped payload differs from the fully visible
+    one, so the band is a function of the clip; and a reserved rect *taller than
+    the viewport* — the permanent case the issue opened with — carries exactly
+    the bands the same image fully on screen does, and nowhere near the bands its
+    own encoding has. The test was checked against the pre-fix code (the routing
+    arm restricted to Kitty) and fails there with a halfblock glyph in the cell,
+    which is the regression it defends. `build_sliced_answers_for_the_band_protocols_only`
+    and `sixel_prebuilt_is_claimed_before_it_becomes_a_threaded_encode` pin the
+    build gate and the skipped `ThreadProtocol`.
+15. **M2 on real hardware — Windows Terminal 1.24.11911.0.** With
+    `COLORTERM=truecolor`, a partly scrolled image there now renders at its true
+    resolution instead of the coarse halfblock mosaic, which is the check this
+    route exists for. WT is the one target none of the other routes can reach: it
+    implements no Kitty graphics (no APC handler; its only "kitty" is the keyboard
+    protocol) and it does advertise Sixel in DA1, which is why `edamame --doctor`
+    already reported Sixel there before any of this branch.
+16. **What M2 was *not* verified against.** foot and xterm with sixel enabled —
+    the other terminals the route covers — and the band's 6-px slop, which is
+    reasoned from the format and measured in the payload rather than eyeballed:
+    while an image is clipped it can sit up to one band off the cell grid. The
+    suite proves the payload and the routing, not the terminals' rendering of
+    them; scroll-back after an image leaves the viewport was not driven by hand.
 
 ## Known limitations
 
@@ -656,7 +744,12 @@ The M4 rows:
 4. The sliced path renders at most one viewport's worth of rows natively; an
    image taller than the terminal cannot show more than a screenful at once.
    That is inherent, not a regression.
-5. Sixel band granularity is 6 px, so its `skip` is approximate (M2).
+5. Sixel band granularity is 6 px, so its `skip` is approximate (M2). Measured:
+   a 20 px cell height is 3⅓ sixel bands, so a one-row scroll skips 18 px — 3 of
+   the fixture's 14 bands where the model says 4 — leaving the image up to 6 px
+   off while it is clipped. The band's destination row and its `clear_area` sweep
+   stay exact; only the image content inside them can slide. It is the one
+   fidelity M1 and M4 give up nothing on.
 6. **One synchronous build per image per new geometry.** After a resize nothing
    re-derives the prebuilt map (`request` is a no-op once a URL is decoded), so
    each visible image pays one synchronous Kitty build on the UI thread. Bounded
@@ -701,13 +794,15 @@ The M4 rows:
 | | Scope | Trigger to do it |
 |---|---|---|
 | **M1** | Kitty backend (this branch) | now |
-| **M2** | Sixel backend (`SlicedSixel`); extract `image_band()` if the backend needs it outside `SlicedImage` | after M1 is verified on a terminal that resolves to Kitty (Verification 8 explains why WezTerm cannot stand in for one) |
+| **M2** | Sixel backend (`SlicedSixel`); `image_band()` shared with M1 rather than extracted separately | **taken — this branch.** Windows Terminal has no Kitty graphics at all and advertises Sixel in DA1, so it was the terminal the blur still applied to, and the route needed no WT-specific code |
 | **M3** | iTerm2 band: crop the visible rows and re-send them. The only route for iTerm2 proper | not first — see M4, and the flash cost it carries |
 | **M4** | Kitty **direct placement** (`a=p` with a source rect) — the *free* band for terminals that have `a=p` but not `U=1`, WezTerm being the one to hand | **taken — this branch.** It is the route for the very terminal the blur was reported on, and the only one of the four that can be verified end-to-end here |
 
-**M4 is taken on this branch; M3 is what remains, and for iTerm2 alone.** The two
-cover disjoint audiences (see "A fourth route"), so neither is cancelled by doing
-the other — an iTerm2 user still gets the blur until M3 lands.
+**M1, M2 and M4 are taken on this branch; M3 is what remains, and for iTerm2
+alone.** M1 and M4 cover Kitty-shaped terminals and M2 the Sixel ones, so between
+them the bug is fixed for every terminal that has *some* band mechanism — which
+leaves iTerm2 the only protocol that must re-send, and its users still get the
+blur until M3 lands.
 
 Side by side, because the difference is easy to lose:
 
@@ -735,9 +830,6 @@ transient scroll window and the permanent cases is known rather than assumed.
 
 ## Resolved decisions
 
-- Worktree location: `~/worktrees/edamame/<branch>` (outside the repo) — chosen
-  over an in-repo `.worktrees/` so no `.gitignore` entry and no commit on `main`
-  are needed.
 - Build strategy: on the **decode worker**, mirroring `prebuilt_scratch` — not
   synchronous in `get_protocol_pair`, and not a new encoder channel. Keeps the
   encode off the UI thread, matching the existing invariant and precedent.
