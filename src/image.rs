@@ -7,16 +7,16 @@ pub mod loader;
 pub mod render;
 pub mod svg;
 
-// The row-addressed protocol `paint_images` uses for Kitty.  Re-exported so the decode worker
-// (which builds it) and the editor view (which paints it) can name it without each reaching into
-// `ratatui_image` directly.
+// The band protocols `paint_images` uses for Kitty and Sixel.  Re-exported so the decode worker
+// (which builds them) and the editor view (which paints them) can name them without each reaching
+// into `ratatui_image` directly.
 pub use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 
 // `DecodeStatus` is used by integration tests in tests/editing.rs.
 #[allow(unused_imports)]
 pub use cache::DecodeStatus;
 pub use cache::{
-    aspect_rows_of, build_direct_placement, build_kitty_sliced, render_halfblocks_scratch,
+    aspect_rows_of, build_direct_placement, build_sliced, render_halfblocks_scratch,
     DirectPlacement, ImageCache, NativePaint,
 };
 pub use kitty_direct::Geometry;

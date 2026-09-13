@@ -27,7 +27,11 @@ pub enum ColorDepth {
 /// Image protocol supported by the terminal emulator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageProtocol {
-    /// DEC Sixel graphics (xterm with `--enable-sixel-graphics`, foot, wezterm).
+    /// DEC Sixel graphics (Windows Terminal 1.22+, xterm with `--enable-sixel-graphics`, foot).
+    ///
+    /// The one protocol here that keeps no image on the terminal side: every sequence is drawn
+    /// where it is sent, so a partly visible image is a re-slice of the payload rather than a
+    /// placement.  See `docs/dev/plans/image-partial-rendering.md` (M2).
     Sixel,
     /// Kitty graphics protocol (kitty, ghostty, wezterm).
     KittyGraphics,

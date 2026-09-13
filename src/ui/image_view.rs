@@ -295,17 +295,20 @@ pub struct PaintContext<'a> {
 /// | Image state                                       | Rendering          |
 /// |---------------------------------------------------|--------------------|
 /// | Native picker IS halfblocks                       | scratch            |
-/// | Kitty, at rest, no modal                          | row-addressed band |
+/// | Kitty or Sixel, at rest, no modal                 | the visible band   |
 /// | Native not ready yet                              | scratch            |
 /// | Fully visible, not scrolling                      | native             |
 /// | Scrolling, or a modal is open                     | scratch            |
-/// | Partially visible, non-Kitty protocol             | scratch            |
+/// | Partially visible, protocol with no band          | scratch            |
 ///
-/// The scratch path is a cell-copy from the pre-rendered `Buffer` on the pair, so it costs
-/// O(rect area) with no encoding.
+/// The band is one interface with two protocol backends: Kitty addresses image rows with unicode
+/// placeholders, Sixel re-slices its 6-px bands, and neither re-encodes per band.  The scratch path
+/// is a cell-copy from the pre-rendered `Buffer` on the pair, so it costs O(rect area) with no
+/// encoding.
 ///
-/// **`fully_visible` does not apply to Kitty.** Its protocol carries every image row and addresses
-/// them by index, so a clipped image is a row offset rather than a reason to downgrade — which is
+/// **`fully_visible` does not apply to a band protocol.** Kitty carries every image row and
+/// addresses them by index, Sixel carries every band and re-emits only the visible ones, so a
+/// clipped image is a slice of what is already encoded rather than a reason to downgrade — which is
 /// the whole fix for images going blurry the moment they are not fully on screen.  The scroll and
 /// modal gates do still apply, for the reasons on each branch below.
 pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
@@ -370,24 +373,27 @@ pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
             }
         }
 
-        // Kitty paints the visible band instead, which is what keeps a clipped image sharp.  It
-        // still yields to the scroll window (the gate below) and to an open modal: its placeholders
-        // re-composite wherever they move, so painting them on every scroll frame is the lag the
-        // scratch window exists to avoid, and `dim_area` cannot recess an image that writes past the
-        // cell buffer.
-        if ctx.native_protocol == Some(ImageProtocol::KittyGraphics)
-            && !ctx.is_scrolling
+        // Kitty and Sixel paint the visible band instead, which is what keeps a clipped image
+        // sharp.  Both still yield to the scroll window (the gate below) and to an open modal:
+        // Kitty's placeholders re-composite wherever they move, so painting them on every scroll
+        // frame is the lag the scratch window exists to avoid, and `dim_area` cannot recess an
+        // image that writes past the cell buffer.  Sixel's band is re-emitted rather than
+        // re-encoded, but the terminal still re-rasterises the payload, so it pays the same gate.
+        if matches!(
+            ctx.native_protocol,
+            Some(ImageProtocol::KittyGraphics | ImageProtocol::Sixel)
+        ) && !ctx.is_scrolling
             && !ctx.modal_open
-            && paint_kitty_sliced(ctx.images, snap, &ctx.area, ctx.buf)
+            && paint_sliced(ctx.images, snap, &ctx.area, ctx.buf)
         {
             continue;
         }
 
-        // During scroll every protocol falls back to halfblocks, Kitty included — Ghostty and other
-        // Kitty-compatible terminals re-composite at each new cell position, the dominant source of
-        // scroll lag on image-heavy documents.  Halfblocks are position-independent, so ratatui's
-        // diff emits only changed cells.  Native re-engages once `SCROLL_QUIESCE` elapses; for Kitty
-        // that is the band above, which returns with no re-encode.
+        // During scroll every protocol falls back to halfblocks, band protocols included — Ghostty
+        // and other Kitty-compatible terminals re-composite at each new cell position, the dominant
+        // source of scroll lag on image-heavy documents.  Halfblocks are position-independent, so
+        // ratatui's diff emits only changed cells.  Native re-engages once `SCROLL_QUIESCE`
+        // elapses; for a band protocol that is the band above, which returns with no re-encode.
         let use_native = fully_visible && !ctx.is_scrolling && !ctx.modal_open;
 
         if use_native {
@@ -410,19 +416,26 @@ pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
     }
 }
 
-/// Paint the on-screen band of a Kitty image through the row-addressed protocol, returning whether
-/// it painted.  `false` means no sliced protocol is cached for this geometry — the terminal is not
-/// Kitty, its build failed, or the prebuilt has not arrived — and the caller falls back to the
-/// scratch.
+/// Paint the on-screen band of an image through its sliced protocol — Kitty's row addressing or
+/// Sixel's band slicing — returning whether it painted.  `false` means no band backend is cached for
+/// this geometry — the terminal speaks neither protocol, its build failed, or the prebuilt has not
+/// arrived — and the caller falls back to the scratch.
 ///
-/// The image is already on the terminal from its first paint, so the band is only a question of
-/// which rows the placeholder grid addresses.  `SlicedImage` derives that from the `area` it is
-/// handed plus a signed position: the band as `area` and `-skip` as the position make it paint
-/// exactly the rows below the clip and drop the rest, with no re-encode and no re-transmit.
+/// The two protocols differ in *how* the band reaches the terminal, not in how it is computed, and
+/// `SlicedImage` hides the difference: Kitty addresses image rows through its placeholder grid, so
+/// the band costs a different starting row and nothing is re-sent; Sixel splices the payload's 6-px
+/// bands and re-emits the payload, so the band costs a shorter symbol on the same cell.  Either way
+/// `SlicedImage` derives it from the `area` it is handed plus a signed position: the band as `area`
+/// and `-skip` as the position make it paint exactly the rows below the clip and drop the rest, with
+/// no re-encode.
 ///
 /// Note it treats `area` as the *clipping window*, not as the document rect.  That is also why a
 /// shrunken reserved rect — the `$$...$$` live-preview band — needs no mechanism of its own.
-fn paint_kitty_sliced(
+///
+/// Sixel needs no re-send accounting either: its payload *is* the cell's symbol, so ratatui's diff
+/// emits it exactly when the band changes, and the terminal holds the rasterised rows in its text
+/// buffer in between (Windows Terminal stores one `ImageSlice` per row and clips with the viewport).
+fn paint_sliced(
     images: &mut ImageCache,
     snap: &ImageLayoutSnapshot,
     area: &Rect,
@@ -432,7 +445,7 @@ fn paint_kitty_sliced(
         Some(pair) => pair,
         None => return false,
     };
-    let Some(sliced) = pair.kitty_sliced.as_ref() else {
+    let Some(sliced) = pair.sliced.as_ref() else {
         return false;
     };
     let Some((skip, dst)) = image_band(
@@ -804,6 +817,16 @@ mod tests {
             picker
         }
 
+        /// The protocol with no image store at all: a sixel sequence is drawn where it is sent, so
+        /// the band has to be carried in the payload.  Windows Terminal 1.22+, foot, and xterm with
+        /// sixel enabled are the terminals this stands in for.
+        #[allow(deprecated)]
+        fn sixel_picker() -> Picker {
+            let mut picker = Picker::from_fontsize((1, 2).into());
+            picker.set_protocol_type(ProtocolType::Sixel);
+            picker
+        }
+
         fn snap(url: &str, top: u16, height: u16) -> ImageLayoutSnapshot {
             ImageLayoutSnapshot {
                 block_idx: 0,
@@ -860,6 +883,12 @@ mod tests {
             /// band path rather than the `fully_visible` gate.
             fn kitty(urls: &[&str]) -> Self {
                 Self::with_native(urls, kitty_picker(), ImageProtocol::KittyGraphics)
+            }
+
+            /// A harness whose terminal speaks Sixel, so `paint_images` takes the band path through
+            /// a payload re-slice rather than through row addressing.
+            fn sixel(urls: &[&str]) -> Self {
+                Self::with_native(urls, sixel_picker(), ImageProtocol::Sixel)
             }
 
             /// A harness for the terminals that place an already-transmitted image instead of
@@ -953,6 +982,28 @@ mod tests {
         fn transmitted_kitty(buf: &TuiBuf, rect: Rect) -> bool {
             buf.cell((rect.x, rect.y))
                 .is_some_and(|c| c.symbol().contains("_Gq=2"))
+        }
+
+        /// The sixel payload written into `rect`'s first cell — the whole escape, `clear_area`
+        /// sweep included.  Panics when the cell holds a glyph instead, which is what the
+        /// halfblocks scratch writes, so it doubles as "the band path ran".
+        fn sixel_payload(buf: &TuiBuf, rect: Rect) -> String {
+            let symbol = symbol_at(buf, rect);
+            assert!(symbol.contains("\x1bP"), "not a sixel payload: {symbol:?}");
+            symbol
+        }
+
+        /// The sixel bands a payload carries — the unit the band arithmetic works in.  Sixel's
+        /// row separator is `-`, so the band count is the count of non-empty segments after the
+        /// DCS introducer, and a payload that carried the whole image would count all of them.
+        fn sixel_bands(payload: &str) -> usize {
+            payload
+                .split_once("\x1bP")
+                .expect("a sixel payload")
+                .1
+                .split('-')
+                .filter(|band| !band.is_empty())
+                .count()
         }
 
         /// The symbol written into `rect`'s first cell.
@@ -1065,6 +1116,50 @@ mod tests {
             assert!(
                 !placed(&h.frame(&whole, false), whole[0].rect),
                 "an open modal must fall back to the scratch"
+            );
+        }
+
+        /// The same fix for Sixel, whose band cannot be a parameter of anything: a sixel sequence
+        /// is drawn where it is sent and stored per text row by the terminal, so the payload itself
+        /// has to be re-sliced.  Windows Terminal is the terminal this was written for — it answers
+        /// DA1 with sixel support (and speaks no Kitty graphics at all), so before this it was the
+        /// one terminal where a partly visible image could only be the coarse halfblocks mosaic.
+        #[test]
+        fn sixel_paints_a_clipped_image_as_a_band() {
+            let whole = vec![snap_at("a.png", 0, 20)];
+            let top_clipped = vec![snap_at("a.png", -3, 20)];
+            // The permanent case the issue opened with: a reserved rect taller than the viewport
+            // (`images.max_height`), where `fully_visible` could never be true.
+            let taller_than_the_viewport = vec![snap_at("a.png", 0, 40)];
+            let mut h = Harness::sixel(&["a.png"]);
+
+            let full = sixel_payload(&h.frame(&whole, false), whole[0].rect);
+
+            // Three rows scrolled off the top: the payload starts three rows into the image.
+            let clipped = sixel_payload(&h.frame(&top_clipped, false), top_clipped[0].rect);
+            assert_ne!(
+                clipped, full,
+                "the band must be re-sliced for the clip, not the whole payload again"
+            );
+
+            // The payload is the *visible window*, not the reserved rect: a 40-row image that shows
+            // 20 rows carries the same bands as the same image fully on screen — and nowhere near
+            // the bands its own 40-row encoding has.
+            let tall = sixel_payload(
+                &h.frame(&taller_than_the_viewport, false),
+                taller_than_the_viewport[0].rect,
+            );
+            assert_eq!(
+                sixel_bands(&tall),
+                sixel_bands(&full),
+                "the band is the visible rows, not the reserved height"
+            );
+
+            // Sixel's band is re-emitted rather than re-encoded, but the terminal still
+            // re-rasterises the payload, so the scroll window applies here too.
+            assert!(
+                !symbol_at(&h.frame(&whole, true), whole[0].rect).contains("\x1bP"),
+                "scrolling must fall back to the scratch"
             );
         }
 

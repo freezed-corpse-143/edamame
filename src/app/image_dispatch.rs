@@ -572,17 +572,17 @@ impl App {
                                     ),
                                 }
 
-                                // The row-addressed Kitty protocol, for the same reason and behind
-                                // the same guard.  `build_kitty_sliced` answers `None` for every
-                                // other protocol, so the guard only wraps Kitty work — and its
-                                // payload is much larger than the scratch's, which is exactly why
-                                // it must not be built on the UI thread.
+                                // The band protocol (Kitty row addressing, Sixel band slicing), for
+                                // the same reason and behind the same guard.  `build_sliced` answers
+                                // `None` for every other protocol, so the guard only wraps band
+                                // work — and its payload is at least as large as the scratch's,
+                                // which is exactly why it must not be built on the UI thread.
                                 if let Some(native) = native_picker.as_ref() {
                                     let sliced = {
                                         let _expected = crate::terminal::ExpectedPanic::new();
                                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                                             || {
-                                                crate::image::build_kitty_sliced(
+                                                crate::image::build_sliced(
                                                     native,
                                                     &loaded.image,
                                                     rect,
@@ -595,7 +595,7 @@ impl App {
                                         Ok(None) => {}
                                         Err(_) => tracing::warn!(
                                             target: "image", url = %loaded.url,
-                                            "kitty sliced protocol build panicked; sending the image without one",
+                                            "band protocol build panicked; sending the image without one",
                                         ),
                                     }
                                 }
