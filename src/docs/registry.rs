@@ -94,7 +94,7 @@ pub const ALL_DOCS: &[DocPage] = &[
     },
 ];
 
-const INDEX_TITLE: &str = "Documentation";
+const INDEX_TITLE: &str = "Documentation Index";
 
 /// "Help" rather than "Docs" so it sorts away from the per-page entries.
 const INDEX_PALETTE_LABEL: &str = "Help: Documentation";
