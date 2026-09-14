@@ -74,6 +74,18 @@ edamame checks for a new release once a day and tells you when one appears (see 
 | Cargo | `cargo install edamame` (`cargo update` does not touch installed binaries) |
 | Prebuilt binary | Download the new release and replace the file |
 
+### Uninstalling
+
+Homebrew and Cargo remove their own binaries — `brew uninstall edamame` or `cargo uninstall edamame` — but neither removes the config and data directories edamame creates (`~/.config/edamame` and, on Linux, `~/.local/share/edamame`; on macOS `~/Library/Application Support/edamame`).
+
+For the shell installer, a manual binary copy, or to clean up those directories, there's an uninstall script:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/mijowi/edamame/main/uninstall.sh | sh
+```
+
+It removes the binary (unless Homebrew or Cargo manages it, in which case it prints the right command instead) and then **asks** before touching your config and data — keeping them by default. Add `--purge` to remove everything without prompting, or `--yes` to remove only the binary.
+
 ## Documentation
 
 - [Getting started](https://github.com/mijowi/edamame/blob/main/docs/getting-started.md) — first run, the three view modes, reading the status bar

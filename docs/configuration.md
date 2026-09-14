@@ -30,6 +30,10 @@ All four are created on first run and **never overwritten afterwards**. The ship
 
 To find the folder from inside edamame: `Ctrl-P` → "Open settings" → the first row is "Open config folder". The second, "Open config.toml", opens the file in `$VISUAL` / `$EDITOR`.
 
+Separately, edamame keeps a small machine-written bookkeeping file (`state.toml` — which terminals it has seen, update-check timestamps) in the platform data directory, not here: `$XDG_DATA_HOME/edamame` or `~/.local/share/edamame` on Linux, `~/Library/Application Support/edamame` on macOS. You never edit it.
+
+To remove both directories along with the binary, see the [uninstall script](https://github.com/mijowi/edamame#uninstalling).
+
 ### When something is wrong with your config
 
 Nothing about config loading is fatal. A missing file means defaults. A file that doesn't parse means defaults plus a warning. An unrecognized key is kept in the file and reported. Warnings appear in a modal at startup, naming the file and the key — so a typo tells you rather than silently doing nothing.
