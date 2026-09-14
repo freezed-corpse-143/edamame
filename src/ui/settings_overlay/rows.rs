@@ -30,6 +30,7 @@ pub(crate) const LABEL_LIMIT_WIDTH: &str = "Limit editor width";
 pub(crate) const LABEL_DIFF_ON_CHANGE: &str = "Diff when file changes";
 pub(crate) const LABEL_TABLE_BUTTONS: &str = "Show table buttons";
 pub(crate) const LABEL_CHECK_UPDATES: &str = "Check for updates";
+pub(crate) const LABEL_DAILY_TIPS: &str = "Daily tips";
 
 /// Minimum accepted value for [`LABEL_SCROLL_SPEED`].  Rejecting at the input boundary (rather
 /// than relying on the dispatcher's clamp) keeps the persisted value and the live wheel step equal.
@@ -349,6 +350,25 @@ pub(super) fn build_rows() -> Vec<RowDef> {
                 write_value: Some(|c, v| {
                     if let controls::ControlValue::Toggle(b) = v {
                         c.editor.check_for_updates = b;
+                    }
+                }),
+                options: Some(controls::Control::Toggle),
+                disabled: None,
+            },
+        },
+        RowDef {
+            label: LABEL_DAILY_TIPS,
+            description: Some("\nShow an occasional startup tip about a feature, once a day"),
+            describe: None,
+            kind: RowKind {
+                focusable: true,
+                action: RowAction::Cycle,
+                read: |c, _| bool_label(c.editor.daily_tips).to_owned(),
+                write_string: no_write,
+                read_value: Some(|c| controls::ControlValue::Toggle(c.editor.daily_tips)),
+                write_value: Some(|c, v| {
+                    if let controls::ControlValue::Toggle(b) = v {
+                        c.editor.daily_tips = b;
                     }
                 }),
                 options: Some(controls::Control::Toggle),

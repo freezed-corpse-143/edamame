@@ -79,7 +79,7 @@ impl App {
             return;
         }
         self.state.last_version_seen = INSTALLED_VERSION.to_owned();
-        self.save_update_bookkeeping("last-version-seen");
+        self.save_state_bookkeeping("last-version-seen");
     }
 
     /// Open the release notes on demand — the About page's `[ Release notes ]` button.

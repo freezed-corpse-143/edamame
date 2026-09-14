@@ -105,9 +105,18 @@ src/
                     #   image_dispatch.rs, nav.rs (back / forward history), pointer.rs
     update_check.rs / update_check/  # fetch.rs (the only network half: one worker,
                     #   one GET), parse.rs (tag_name + release body; bounds the
-                    #   notes), policy.rs (pure: is a check due?), status.rs
-                    #   (ReleaseInfo / ReleaseStatus; version comparison)
-    update_notice.rs  # spawn / route / deferred-push orchestration
+                    #   notes), policy.rs (pure: interval_elapsed — the daily gate
+                    #   shared with the tip — plus network_check_due / notice_due),
+                    #   status.rs (ReleaseInfo / ReleaseStatus; version comparison)
+    update_notice.rs  # spawn / route / deferred-push orchestration; owns
+                    #   save_state_bookkeeping (shared by post_upgrade + tip_notice)
+    tips.rs         # the daily-tip registry: ALL_TIPS (id + text + optional doc
+                    #   link) and next_unseen; pure data, no network.  When adding
+                    #   a significant, non-obvious feature, consider appending a tip
+                    #   here (new id at the end; existing ids never change)
+    tip_notice.rs   # daily-tip orchestration: the local counterpart to
+                    #   update_notice, gated on tips + a State timestamp, deferring
+                    #   to the update check within a short startup grace window
     post_upgrade.rs / post_upgrade/  # the one-time post-upgrade notice:
                     #   post_upgrade_action (pure policy), the last_version_seen
                     #   stamp, changelog.rs (the `## [x.y.z]` section out of the
@@ -117,12 +126,12 @@ src/
                     #   trait, ModalKind, ModalOutcome, ModalRenderCtx),
                     #   docs_link.rs (the shared "see the manual" footnote), then
                     #   one adapter per file: command_palette, config_warning,
-                    #   diagrams_enabled, diff_bulk_confirm, diff_intro,
+                    #   daily_tip, diagrams_enabled, diff_bulk_confirm, diff_intro,
                     #   diff_quit_confirm, diff_resolve_confirm, dirty_guard,
                     #   export_success, export_theme, images_enabled, insert_table,
                     #   keybinds, markdown_cheat_sheet, notice, overwrite_confirm,
                     #   post_upgrade, quit_confirm, remote_image, save_as, settings,
-                    #   terminal_capabilities, theme_picker, update, welcome,
+                    #   terminal_capabilities, theme_picker, tips_index, update, welcome,
                     #   width_injection
 
   cli.rs / cli/

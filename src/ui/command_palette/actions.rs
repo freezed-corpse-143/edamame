@@ -7,6 +7,7 @@ use crate::config::Action;
 /// `OpenConfigFolder` lives on the settings overlay instead.
 pub(super) const ALL_ACTIONS: &[Action] = &[
     Action::ShowMarkdownCheatSheet,
+    Action::BrowseTips,
     // One entry per manual page, written out because this is a `const`; held in step with
     // `docs::ALL_DOCS` by `tests::the_palette_lists_every_embedded_page_exactly_once`.
     Action::OpenDoc(crate::docs::DocId::Index),
@@ -85,6 +86,7 @@ pub(super) const ALL_ACTIONS: &[Action] = &[
 pub(super) fn label_for(action: &Action) -> Option<&'static str> {
     Some(match action {
         Action::ShowMarkdownCheatSheet => "Show Markdown cheat sheet",
+        Action::BrowseTips => "Browse tips",
         Action::OpenDoc(id) => id.palette_label(),
         Action::OpenSettings => "Open settings",
         Action::OpenWelcome => "Open welcome / terminal setup",

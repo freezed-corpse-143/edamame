@@ -117,6 +117,9 @@ pub enum Action {
     ShowCommandPalette,
     /// Show the static Markdown syntax cheat sheet.
     ShowMarkdownCheatSheet,
+    /// Open the "Browse tips" index — the list of daily tips (`crate::app::tips`), any of which
+    /// can be opened on demand.
+    BrowseTips,
     /// Open a page of the built-in manual (`crate::docs`) read-only.
     ///
     /// Payload-bearing, hence excluded from `action_variants!` and unnameable in
@@ -318,7 +321,7 @@ action_variants! {
     TableInsertBreak,
     FollowLinkUnderCursor,
     NavigateBack, NavigateForward,
-    ShowCommandPalette, ShowMarkdownCheatSheet, ShowAbout, CheckForUpdates,
+    ShowCommandPalette, ShowMarkdownCheatSheet, BrowseTips, ShowAbout, CheckForUpdates,
     OpenSettings, OpenWelcome, OpenKeybinds, OpenConfigFolder, SwitchTheme, CreateCustomTheme,
     ExportHtml, OpenInExternalEditor,
     ToggleTableButtons, InsertTable, InsertImage, InsertLink,

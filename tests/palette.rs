@@ -185,6 +185,7 @@ impl SettingsStateExt for SettingsState {
             "Reflow paragraphs",
             "Blink cursor",
             "Check for updates",
+            "Daily tips",
             "Limit editor width",
             "  Char limit",
             "Scroll speed",

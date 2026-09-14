@@ -42,7 +42,7 @@ impl App {
         // the result lands would otherwise re-check on every launch.  The cost is that a
         // transient failure waits out the full interval.
         self.state.last_update_check = update_check::now_unix();
-        self.save_update_bookkeeping("last-update-check timestamp");
+        self.save_state_bookkeeping("last-update-check timestamp");
     }
 
     /// Spawn a check unless one is in flight; returns whether a worker started.  The
@@ -149,21 +149,22 @@ impl App {
             return;
         }
         self.state.update_notified_for = info.tag.clone();
-        self.save_update_bookkeeping("update-notified tag");
+        self.save_state_bookkeeping("update-notified tag");
     }
 
     /// Persist background bookkeeping *without* the "Configuration updated" flash: the
     /// user changed no setting.  Writes `state.toml`, not `config.toml` — these fields live on
     /// [`State`](crate::config::State).  Under `--no-config`, `State::save` already declines to
-    /// write, so no gate is needed here.  `pub(super)` for [`super::post_upgrade`], whose
-    /// `last_version_seen` stamp is the same kind of write.
-    pub(super) fn save_update_bookkeeping(&mut self, what: &str) {
+    /// write, so no gate is needed here.  `pub(super)` for the other machine-written stamps that
+    /// share it: [`super::post_upgrade`]'s `last_version_seen` and [`super::tip_notice`]'s
+    /// daily-tip bookkeeping.
+    pub(super) fn save_state_bookkeeping(&mut self, what: &str) {
         if let Err(e) = self.state.save() {
             tracing::warn!(
                 target: "update_check",
                 error = %e,
                 field = what,
-                "failed to persist update-check bookkeeping",
+                "failed to persist state bookkeeping",
             );
         }
     }

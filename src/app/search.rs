@@ -188,6 +188,7 @@ impl App {
             | Action::SaveAs
             | Action::ShowCommandPalette
             | Action::ShowMarkdownCheatSheet
+            | Action::BrowseTips
             | Action::ShowAbout
             | Action::OpenSettings
             | Action::OpenWelcome

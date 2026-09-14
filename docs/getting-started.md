@@ -113,6 +113,8 @@ Preview  ──any key──▶  Edit  ──Ctrl-`──▶  Raw
 
 **Undo is per-action.** `Ctrl-Z`. Typing a word is one undo step, not one per character.
 
+**Did you know?** Once a day, on startup, edamame may show a short tip about a useful feature. To read them whenever you like, `Ctrl-P` → "Browse tips" lists them all.
+
 ---
 
 ## Command-line flags

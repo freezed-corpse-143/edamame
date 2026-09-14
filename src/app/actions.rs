@@ -148,6 +148,7 @@ pub(super) fn action_caps(action: &Action) -> ActionCaps {
             | Quit
             | ShowCommandPalette
             | ShowMarkdownCheatSheet
+            | BrowseTips
             | ShowAbout
             | CheckForUpdates
             | OpenSettings
@@ -161,7 +162,8 @@ pub(super) fn action_caps(action: &Action) -> ActionCaps {
     // joins — including "none of them", the real answer for mode transitions and config toggles.
     match action {
         ScrollUp | ScrollDown | ScrollPageUp | ScrollPageDown | ScrollToTop | ScrollToBottom
-        | Quit | ShowCommandPalette | ShowMarkdownCheatSheet | ShowAbout | CheckForUpdates
+        | Quit | ShowCommandPalette | ShowMarkdownCheatSheet | BrowseTips | ShowAbout
+        | CheckForUpdates
         | OpenSettings | OpenWelcome | OpenKeybinds | SwitchTheme | CreateCustomTheme
         | OpenConfigFolder | MoveLeft | MoveRight | MoveUp | MoveDown | MoveWordLeft
         | MoveWordRight | MoveLineStart | MoveLineEnd | MoveDocStart | MoveDocEnd | SelectLeft
@@ -398,6 +400,10 @@ impl App {
             }
             Action::ShowMarkdownCheatSheet => {
                 self.open_markdown_cheat_sheet();
+                true
+            }
+            Action::BrowseTips => {
+                self.open_tips_index();
                 true
             }
             Action::OpenDoc(id) => {
@@ -1128,6 +1134,9 @@ impl App {
             }
             Action::ShowMarkdownCheatSheet => {
                 self.open_markdown_cheat_sheet();
+            }
+            Action::BrowseTips => {
+                self.open_tips_index();
             }
             Action::ShowAbout => {
                 self.open_about_modal();
@@ -2259,6 +2268,7 @@ mod tests {
             Quit,
             ShowCommandPalette,
             ShowMarkdownCheatSheet,
+            BrowseTips,
             ShowAbout,
             CheckForUpdates,
             OpenSettings,

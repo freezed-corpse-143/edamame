@@ -36,6 +36,13 @@ pub struct State {
     /// predating the field — `show_welcome` tells them apart, since only a returning user could
     /// have turned it off.
     pub last_version_seen: String,
+    /// IDs of the daily tips (`app::tips`) already shown, so no tip repeats.  A `Vec`, not a set:
+    /// TOML has no set type, the list stays small, and a stable order keeps the machine file's
+    /// diffs quiet.
+    pub seen_daily_tips: Vec<u32>,
+    /// Unix epoch seconds the last daily tip was shown, stamped when it fires; `0` means never.
+    /// The daily-tip gate reads it exactly as the update check reads [`Self::last_update_check`].
+    pub last_tip_shown: u64,
 }
 
 impl State {
@@ -110,6 +117,9 @@ mod tests {
         // fresh install from an upgrade.
         assert_eq!(state.last_version_seen, "");
 
+        assert!(state.seen_daily_tips.is_empty());
+        assert_eq!(state.last_tip_shown, 0);
+
         let state = State {
             seen_terminal_fingerprints: vec![
                 "WezTerm|xterm-256color||truecolor|kitty|mouse=true|kbd=true|unicode=true".into(),
@@ -117,6 +127,8 @@ mod tests {
             last_update_check: 1_755_500_000,
             update_notified_for: "v0.2.0".to_owned(),
             last_version_seen: "0.1.9".to_owned(),
+            seen_daily_tips: vec![1, 2],
+            last_tip_shown: 1_755_600_000,
         };
         let serialized = toml::to_string_pretty(&state).expect("serialize");
         let deserialized: State = toml::from_str(&serialized).expect("deserialize");
@@ -127,6 +139,8 @@ mod tests {
         assert_eq!(deserialized.last_update_check, 1_755_500_000);
         assert_eq!(deserialized.update_notified_for, "v0.2.0");
         assert_eq!(deserialized.last_version_seen, "0.1.9");
+        assert_eq!(deserialized.seen_daily_tips, vec![1, 2]);
+        assert_eq!(deserialized.last_tip_shown, 1_755_600_000);
     }
 
     /// A partial file still loads: a `state.toml` from an older build missing a field defaults it

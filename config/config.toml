@@ -76,6 +76,9 @@ appearance = "dark"
 # Check GitHub for a newer release at startup, silent unless one exists.  See docs/security.md.
 # check_for_updates = true
 
+# Show an occasional startup tip about a less-obvious feature, at most once a day.
+# daily_tips = true
+
 # ── Modal ─────────────────────────────────────────────────────────────────────
 # [modal]
 

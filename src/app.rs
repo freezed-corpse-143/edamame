@@ -19,6 +19,8 @@ mod pointer;
 mod post_upgrade;
 mod search;
 mod section_jump;
+mod tip_notice;
+mod tips;
 mod update_check;
 mod update_notice;
 
@@ -251,6 +253,13 @@ pub struct App {
     /// True while the in-flight check is the silent startup one — the only flavor that may arm
     /// `pending_update_notice`.
     update_check_is_startup: bool,
+    /// Whether a daily tip is owed this launch, decided in [`App::new`] and acted on by
+    /// [`App::tick_daily_tip`] once startup settles.  Split from the act like the update check,
+    /// and for the same reason: the tip waits out the update result and any startup modal.
+    startup_tip_due: bool,
+    /// Deadline for [`App::tick_daily_tip`] to show its tip, set on the first frame it runs.  Past
+    /// it the tip is skipped this launch, so one never lands while the user is already mid-task.
+    tip_deadline: Option<Instant>,
     /// A `#section` named on the command line, parked until the first frame knows the document's
     /// dimensions and consumed there by [`App::apply_startup_anchor`].
     pub(crate) startup_anchor: Option<String>,
@@ -523,12 +532,19 @@ impl App {
         }
 
         // Decided here, before any modal can have been dismissed, but acted on later: `app_tx`
-        // doesn't exist until `run()` spawns the event threads.
+        // doesn't exist until `run()` spawns the event threads.  Both gates read one clock so a
+        // launch can't see the tip window as elapsed and the update window as not, or vice versa.
+        let now = update_check::now_unix();
         let startup_update_check_due = update_check::network_check_due(
             config.editor.check_for_updates,
             state.last_update_check,
-            update_check::now_unix(),
+            now,
         );
+        // A tip is owed only when enabled, a day has passed, and there is actually one left to
+        // show — so an exhausted registry stops re-evaluating every launch.
+        let startup_tip_due = config.editor.daily_tips
+            && update_check::interval_elapsed(state.last_tip_shown, now)
+            && tips::next_unseen(&state.seen_daily_tips).is_some();
 
         Ok(Self {
             config,
@@ -591,6 +607,8 @@ impl App {
             syntax_warm_generation,
             pending_update_notice: None,
             update_check_is_startup: false,
+            startup_tip_due,
+            tip_deadline: None,
             startup_anchor: None,
             vim,
         })

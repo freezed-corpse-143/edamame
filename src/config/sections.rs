@@ -18,6 +18,9 @@ pub struct EditorConfig {
     /// Check GitHub for a newer release at startup.  Turning it off suppresses only the
     /// *automatic* check; the explicit entry points always check on request.
     pub check_for_updates: bool,
+    /// Show an occasional startup tip pointing at a less-obvious feature, at most once a day and
+    /// never when an update notice is already due.  Default: true.
+    pub daily_tips: bool,
     /// Show line numbers in a left gutter in all three modes.  Default: false.
     pub show_line_numbers: bool,
     /// Lines advanced per mouse-wheel tick.  The keyboard scroll actions always step by one.
@@ -99,6 +102,7 @@ impl Default for EditorConfig {
             visual_line_nav: true,
             show_welcome: true,
             check_for_updates: true,
+            daily_tips: true,
             show_line_numbers: false,
             mouse_scroll_lines: 1,
             transient_ms: 1500,

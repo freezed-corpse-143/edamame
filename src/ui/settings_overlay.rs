@@ -856,6 +856,7 @@ mod tests {
                 "Reflow paragraphs",
                 "Blink cursor",
                 "Check for updates",
+                "Daily tips",
                 "Limit editor width",
                 "  Char limit",
                 "Scroll speed",
@@ -1056,6 +1057,17 @@ mod tests {
         let resp = state.handle_key(&key(KeyCode::Enter), &mut config);
         assert!(matches!(resp, SettingsResponse::FieldChanged(_)));
         assert!(!config.editor.check_for_updates);
+    }
+
+    #[test]
+    fn daily_tips_row_toggles_config_flag() {
+        let mut config = Config::default();
+        let mut state = SettingsState::new();
+        focus_row(&mut state, &config, "Daily tips");
+        assert!(config.editor.daily_tips, "opt-out, so on by default");
+        let resp = state.handle_key(&key(KeyCode::Enter), &mut config);
+        assert!(matches!(resp, SettingsResponse::FieldChanged(_)));
+        assert!(!config.editor.daily_tips);
     }
 
     // ── Click dispatch ──────────────────────────────────────────────────

@@ -196,6 +196,8 @@ impl App {
         self.tick_search_advance();
         self.spawn_startup_update_check();
         self.tick_update_notice();
+        // After the update notice: a tip yields to an update, and reads whether one is pending.
+        self.tick_daily_tip();
         self.tick_syntax_warm();
         self.editor.modal_open = self.any_modal_open();
     }

@@ -14,5 +14,5 @@ pub(crate) mod policy;
 pub(crate) mod status;
 
 pub(crate) use fetch::{release_url, spawn_release_check, GITHUB_URL};
-pub(crate) use policy::{network_check_due, notice_due, now_unix};
+pub(crate) use policy::{interval_elapsed, network_check_due, notice_due, now_unix};
 pub(crate) use status::{ReleaseInfo, ReleaseStatus, INSTALLED_VERSION};

@@ -100,6 +100,7 @@ fn preview_safe_action(action: &Action) -> bool {
             // Overlay openers pop a modal that absorbs later input, so they change nothing.
             | Action::ShowCommandPalette
             | Action::ShowMarkdownCheatSheet
+            | Action::BrowseTips
             // The manual replaces the document rather than popping a modal, but starts no edit
             // and the dirty guard protects anything unsaved.
             | Action::OpenDoc(_)

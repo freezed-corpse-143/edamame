@@ -160,6 +160,7 @@ const SUGGESTED_ACTIONS: &[Action] = &[
     Action::ExportHtml,
     Action::OpenInExternalEditor,
     Action::ShowMarkdownCheatSheet,
+    Action::BrowseTips,
     Action::ShowAbout,
 ];
 
@@ -225,6 +226,7 @@ fn section_of(action: &Action) -> &'static str {
         | Action::SwitchTheme
         | Action::CreateCustomTheme
         | Action::ShowMarkdownCheatSheet
+        | Action::BrowseTips
         | Action::OpenDoc(_)
         | Action::OpenInExternalEditor
         | Action::ShowAbout
@@ -333,6 +335,7 @@ mod tests {
                 "Export…".to_owned(),
                 "Open current file in system editor".to_owned(),
                 "Show Markdown cheat sheet".to_owned(),
+                "Browse tips".to_owned(),
                 "About edamame".to_owned()
             ]
         );

@@ -130,8 +130,11 @@ A buffer with unsaved edits always prompts, regardless of this setting. edamame 
 |---|---|---|---|
 | `show_welcome` | bool | `true` | welcome modal |
 | `check_for_updates` | bool | `true` | settings overlay, welcome modal |
+| `daily_tips` | bool | `true` | settings overlay, tip modal |
 
 `check_for_updates` is used by edamame to govern the automatic release check at startup. It runs at most once every 24 hours — and not before the first-run welcome screen has been answered, so turning it off there stops the first check too. It is silent unless there is a new release. Turning it off disables the automatic check.
+
+`daily_tips` shows an occasional startup tip pointing at a less-obvious feature. Like the update check it fires at most once a day, and never when an update notice is due — an update always takes precedence, so the two can't stack. Each tip is shown once and then not repeated. Turn it off here, in the settings overlay, or with the tip's own "Don't show tips" button. To read them on your own schedule, `Ctrl-P` → "Browse tips" lists every tip and opens any of them.
 
 ### Machine state (`state.toml`)
 

@@ -19,14 +19,21 @@ pub(crate) fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Should the startup check hit the network?
+/// Has a full [`CHECK_INTERVAL_SECS`] passed since `last`?  The pure once-a-day gate shared by
+/// the update check and the daily tip, each over its own timestamp.
 ///
-/// `last_check == 0` (never checked) is spelled out rather than left to the arithmetic, which would
-/// only agree on a machine whose clock has already passed the interval since the epoch.  A
-/// `last_check` in the future means the clock moved backwards, and is treated as due rather than
-/// letting a bogus timestamp disable the check for what could be years.
+/// `last == 0` (never) is spelled out rather than left to the arithmetic, which would only agree on
+/// a machine whose clock has already passed the interval since the epoch.  A `last` in the future
+/// means the clock moved backwards, and is treated as elapsed rather than letting a bogus timestamp
+/// disable the gate for what could be years.
+pub(crate) fn interval_elapsed(last: u64, now: u64) -> bool {
+    last == 0 || last > now || now - last >= CHECK_INTERVAL_SECS
+}
+
+/// Should the startup check hit the network?  The daily [`interval_elapsed`] gate, plus the config
+/// flag — kept a plain bool so this stays a pure function of primitives.
 pub(crate) fn network_check_due(enabled: bool, last_check: u64, now: u64) -> bool {
-    enabled && (last_check == 0 || last_check > now || now - last_check >= CHECK_INTERVAL_SECS)
+    enabled && interval_elapsed(last_check, now)
 }
 
 /// Should this result raise the startup notice?  Only for a newer release the user hasn't been
@@ -84,6 +91,18 @@ mod tests {
     #[test]
     fn a_timestamp_from_the_future_is_due_rather_than_stuck() {
         assert!(network_check_due(true, DAY * 100, DAY * 10));
+    }
+
+    #[test]
+    fn the_shared_gate_treats_never_and_a_future_stamp_as_elapsed() {
+        assert!(interval_elapsed(0, DAY * 10), "never");
+        assert!(interval_elapsed(DAY * 100, DAY * 10), "clock moved back");
+        assert!(!interval_elapsed(DAY * 10, DAY * 10), "same instant");
+        assert!(
+            !interval_elapsed(DAY * 10 - 1, DAY * 10),
+            "inside the window"
+        );
+        assert!(interval_elapsed(DAY * 9, DAY * 10), "a full day on");
     }
 
     #[test]
