@@ -10,68 +10,62 @@ edamame                   # start with an empty, unnamed buffer
 
 A `#section` after the file name opens the document scrolled to that heading. This works the same way as a GitHub-style slug, so `## Getting started` is `#getting-started`. If nothing matches, the file still opens and the hint line says so.
 
-There is no in-app file picker (yet). Once you're inside, you get to other documents by following links: put the cursor on a link to another `.md` file and press `Ctrl-Enter` (or click it in Preview). `Alt-←` and `Alt-→` walk back and forward through where you've been, like a browser.
+With a file open in edamame, you can navigate to other documents by following links: put the cursor on a link to another `.md` file on your system and press `Ctrl-Enter` (or click it in Preview). `Alt-←` and `Alt-→` walk back and forward through where you've been, like a browser.
 
 ---
 
 ## Your first launch
 
-A welcome screen appears the first time you run edamame. It shows a short introduction, a summary of what your terminal supports — color depth, images, mouse, keyboard — and asks about five things:
+A welcome screen appears the first time you run edamame. It shows a short introduction, a summary of what your terminal supports (color depth, images, mouse, keyboard) and a few initial options to decide on:
 
-- **Theme** — opens the picker; you can change this any time.
+- **Theme** — choose light or dark mode and one of edamame's dozens of built-in themes
 - **Images** and **Figures** — whether to render them inline. *Figures* covers both ` ```mermaid ` diagrams and `$$...$$` math. Each can be *Ask*, *Always* or *Never*, and they're independent.
-- **Remote images** — whether to fetch images from the web. This one is worth a thought: a document you didn't write can use a remote image to find out when you opened it, which is why it's a separate question and defaults to asking. See [security.md](security.md).
-- **Vim mode** — off by default. See [vim-mode.md](vim-mode.md).
-- **Check for updates** — on by default. edamame asks GitHub once a day whether a newer release exists, and tells you once when one appears. It says nothing when you're up to date. This is the one thing edamame does over the network without being asked each time, so it's a question here rather than a buried setting — and nothing is requested until you've answered it; see [security.md](security.md).
+- **Remote images** — whether to fetch images from the web. Leave this on "Ask" if you are concerned about e.g. tracking pixels in documents you open. See [security.md](security.md).
+- **Vim mode** — edamame supports a focused subset of vim features. See [vim-mode.md](vim-mode.md).
+- **Check for updates** — edamame checks GitHub once a day so it can notify you of a new release. This is on by default, but the first check doesn't occur until after the welcome screen is dismissed. 
 
 ![edamame's welcome screen on first launch](https://raw.githubusercontent.com/mijowi/mijowi.com/refs/heads/main/edamame/media/welcome.jpg)
 
-Everything here can be changed later, so don't worry about it. To get back to it: `Ctrl-P` → "Open welcome / terminal setup".
+To show the welcome screen again: `Ctrl-P` → "Open welcome / terminal setup".
 
-edamame also writes its config files on this first run, to `~/.config/edamame/` (details in [configuration.md](configuration.md#where-config-lives)). They're heavily commented and safe to edit; edamame never overwrites them afterwards.
+edamame also writes its config files on this first run, to `~/.config/edamame/` (details in [configuration.md](configuration.md#where-config-lives)).
 
 ### The terminal capabilities notice
 
-If you later open edamame in a different terminal application, you should see a notice for what the new terminal supports — color depth, images, mouse, keyboard, unicode. This appears **once per terminal**, not every launch, and it matters because a few features are delivered by the terminal rather than by edamame: images and diagrams, most themes, mouse selection, and a handful of chords.
+If you later open edamame in a different terminal application, you should see a notice for what the new terminal supports — color depth, images, mouse, keyboard, unicode. This appears **once per terminal**, not every launch, and it matters because a few features are delivered by the terminal rather than by edamame: images and diagrams, most themes (due to color support), mouse selection, and a handful of chords.
 
 ![The terminal capabilities notice, listing color, image, mouse and keyboard support](https://raw.githubusercontent.com/mijowi/mijowi.com/refs/heads/main/edamame/media/terminal_capabilities.jpg)
 
-If your terminal falls short, edamame adapts rather than breaking: it swaps in a theme designed for 256 colors, keeps `[Image: …]` placeholders in place, and tells you which chords won't arrive. [terminal-compatibility.md](terminal-compatibility.md) has the full picture — what each capability affects, the workarounds, and which terminals support what. The command palette reaches everything regardless.
+If your terminal falls short, edamame adapts rather than breaking: it swaps in a theme designed for 256 colors, shows image placeholders, and tells you which chords won't arrive. See [terminal-compatibility.md](terminal-compatibility.md) for more info — what each capability affects, the workarounds, and which terminals support what.
 
-To see the summary again, run [`edamame --doctor`](#command-line-flags), open
+To see the summary again, run [`edamame --doctor`](#command-line-flags) or choose
 "Open welcome / terminal setup" from the palette.
 
 ---
 
 ## The three view modes
 
-This is the one concept worth understanding up front. edamame shows your document rendered — real headings, drawn table borders, actual bullet characters — while you edit it. The modes control how much of that rendering gets out of your way.
+ edamame shows your document rendered with real headings, drawn table borders, and actual bullet characters, while you edit it. The modes control how much of that rendering gets out of your way.
 
 ![The same document rendered and in raw Markdown, side by side](https://raw.githubusercontent.com/mijowi/mijowi.com/refs/heads/main/edamame/media/render_raw.jpg)
 
-### Preview — reading
+### PREVIEW — reading
 
-Files open here. There's no cursor and nothing can be modified. Scroll around, click links.
+Files open here for viewing. There's no cursor and nothing can be modified. You can scroll around and click links. **Any key that would edit or move the cursor takes you into Edit mode.**
 
-**Any key that would edit or move the cursor takes you into Edit mode.** The hint line says "Press any key to edit". Scrolling doesn't count, so you can read through a long document without leaving Preview.
+### EDIT — the one you'll use
 
-### Edit — the one you'll use
+The document stays rendered, except for the line your cursor is on, which shows its raw Markdown. Move away and it renders again. Inside a table only the *cell* you're in goes raw, inside the drawn grid.
 
-The document stays rendered, except for the line your cursor is on, which turns into its raw Markdown. Move away and it renders again.
-
-So a heading you're editing shows `## Heading`, while every other heading on screen is styled. Inside a table it's finer-grained still: only the *cell* you're in goes raw, inside the drawn grid.
-
-The reveal waits about 120 ms before it fires, so arrowing quickly through a document doesn't flicker.
-
-This is what edamame is for: you see the formatted document nearly all the time, and the raw syntax exactly where you need it.
+This is what edamame is for: it shows you a formatted document, with the raw source exactly where you need it.
 
 ![The cursor moving through a list, each line showing its Markdown source in turn](https://raw.githubusercontent.com/mijowi/mijowi.com/refs/heads/main/edamame/media/raw_reveal_and_list_ops.gif)
 
-### Raw — plain Markdown
+### RAW — plain Markdown
 
-The whole document as source text, like any text editor. Reach for it when you want to fix something structural — a broken table, an HTML comment, syntax that's confusing the renderer. edamame's helpful behaviors get out of the way here: no auto-renumbering of lists, no table-cell guardrails. A line too long for the terminal still wraps, but its continuation rows start at column 0 rather than aligning under a list marker — every space you see in Raw mode is a space in the file.
+Raw mode shows the whole document as source, like a plain text editor. It's useful when you want to fix something structural, like a broken table, an HTML comment, or syntax that's confusing the renderer. edamame's helpful behaviors get out of the way here. There is no auto-renumbering of lists, no table-cell guardrails, etc.
 
-Toggle with ``Ctrl-` `` — or, if your terminal doesn't deliver that chord, from the palette or a chord you pick yourself.
+Toggle with ``Ctrl-` `` — or, if your terminal doesn't deliver that chord, from the palette or a chord you configure yourself.
 
 ### Moving between them
 
@@ -99,11 +93,11 @@ Preview  ──any key──▶  Edit  ──Ctrl-`──▶  Raw
 
 ## Things worth knowing early
 
-**`Ctrl-P` is the way in.** Every command is there, fuzzy-searchable. Many features deliberately ship without a keybinding — the palette is how you reach them, and how you discover what exists.
+**`Ctrl-P` command palette.** Every command is here, fuzzy-searchable. Many features deliberately ship without a keybinding — the palette is how you reach them.
 
 ![Filtering commands in edamame's fuzzy command palette](https://raw.githubusercontent.com/mijowi/mijowi.com/refs/heads/main/edamame/media/command_palette.gif)
 
-**`Ctrl-G` jumps to a heading.** The same fuzzy search field, over the document's own structure — quicker than scrolling in anything longer than a screen.
+**`Ctrl-G` jumps to a heading.** This works like a searchable table of contents. It's a fuzzy search field over the document's own structure — quicker than scrolling in anything longer than a screen.
 
 ![Jumping to a heading with the go-to-section picker](https://raw.githubusercontent.com/mijowi/mijowi.com/refs/heads/main/edamame/media/go_to_section.gif)
 
@@ -131,7 +125,7 @@ The flag list is short by design — everything else is configured from inside t
 | `--log` | Write a debug log for this run |
 | `--` | Treat everything after it as the file name |
 
-`--doctor` is the one to reach for when something looks wrong. It reports which edamame you're running, which terminal you're running it in, and what that terminal supports — the same five capabilities the [terminal capabilities notice](#the-terminal-capabilities-notice) shows, without having to launch the app to find them:
+Use `--doctor` when you're experiencing a problem with edamame. It reports which version you're running, which terminal you're running it in, and what that terminal supports:
 
 ```bash
 $ edamame --doctor
@@ -155,19 +149,15 @@ Terminal capabilities
 
 Paste that into a [bug report](https://github.com/mijowi/edamame/issues) — it gives us valuable context about your system and terminal. Note that redirecting either stream (`edamame --doctor > report.txt`, or piping something in) means the Images and Keyboard rows come back as `unknown`: detecting those two means writing a question to the terminal and reading its reply back, so it needs both stdout and stdin attached to a real one. Copy from the screen instead.
 
-`--no-config` is the other one worth knowing. It starts edamame as if you'd never configured it — no theme file, no keybinding overrides, no settings — which separates "edamame is broken" from "my config is broken" in one step. The folder stays out of the way for the whole run, not just at startup: the theme picker lists the built-in themes only, and HTML export offers only its built-in stylesheet, so a custom theme can't sneak back in halfway through the session you started to rule it out.
-
-Your real config is safe: settings you change during a `--no-config` run apply to that session only, and the app tells you so.
+`--no-config` can be useful for troubleshooting. It starts edamame with no theme files, no keybinding overrides, and no other settings. This helps separate "edamame is broken" from "my config is broken" in one step. Your real config is safe: settings you change during a `--no-config` run apply to that session only.
 
 ---
 
 ## The manual is inside the app
 
-Everything under `docs/` ships **inside the binary**, so you can read it without a browser or a network connection. Open the command palette (`Ctrl-P`) and pick **Help: Documentation** for the index, or jump straight to a page — the palette lists each one as **Docs: Editing**, **Docs: Keybindings**, and so on, so typing `docs vim` gets you there in two keystrokes.
+Everything under `docs/` ships **inside the binary**, so you can read it without a browser or a network connection. Open the command palette (`Ctrl-P`) and choose **Help: Documentation** for the index, or jump straight to a page — the palette lists each one as **Docs: Editing**, **Docs: Keybindings**, and so on.
 
-Docs open in **Preview mode**: the rendered view, with no cursor and nothing to edit. The page you are reading is the one that shipped with your build, and it stays that way. Everything that makes sense for reading still works — search it with `Ctrl-F`, jump between headings with `Ctrl-G`, follow the links between pages, select and copy. `Alt+Left` goes back, including back to whatever you were writing before you opened it. If that document had unsaved changes, you get the usual save-or-discard prompt first; nothing is lost by taking a look at the manual mid-sentence.
-
-Scroll with the arrow keys, `PageUp` / `PageDown`, `Home` / `End` or the mouse wheel — the same keys that scroll any other document. A page introduces no reading-only shortcuts of its own, so nothing you learn here stops working when you go back to editing.
+Docs are not editable and open in **Preview mode**. The pages you read are the ones that shipped with your build of edamame. `Alt+Left` navigates back to whatever you were writing before you opened it.
 
 ---
 
