@@ -7,7 +7,7 @@ use ratatui::style::Style;
 use ratatui::text::Span;
 
 use crate::config::Theme;
-use crate::markdown::table_layout::preferred_cut;
+use crate::markdown::table_layout::{char_cells, preferred_cut};
 
 /// One character tagged with its source span's style, so the table renderer's
 /// inline-aware wrap keeps styling across a cell's row breaks.
@@ -15,6 +15,12 @@ use crate::markdown::table_layout::preferred_cut;
 pub(super) struct StyledChar {
     pub(super) ch: char,
     pub(super) style: Style,
+}
+
+/// Terminal columns a styled run occupies — the unit every table-cell width decision uses, so a
+/// CJK glyph costs two.
+pub(super) fn styled_cells(chars: &[StyledChar]) -> usize {
+    chars.iter().map(|c| char_cells(c.ch)).sum()
 }
 
 /// Whitespace that wrapping may break at or drop: everything
@@ -69,7 +75,7 @@ pub(super) fn wrap_styled_chars(chars: &[StyledChar], width: usize) -> Vec<Vec<S
     let mut current_w = 0usize;
 
     for token in tokens {
-        let w = token.len();
+        let w = styled_cells(&token);
         if current.is_empty() {
             if w <= width {
                 current.extend(&token);
@@ -93,7 +99,7 @@ pub(super) fn wrap_styled_chars(chars: &[StyledChar], width: usize) -> Vec<Vec<S
                 .skip_while(|c| is_soft_break_space(c.ch))
                 .copied()
                 .collect();
-            let tw = trimmed.len();
+            let tw = styled_cells(&trimmed);
             if tw <= width {
                 current.extend(&trimmed);
                 current_w = tw;
@@ -114,21 +120,32 @@ pub(super) fn wrap_styled_chars(chars: &[StyledChar], width: usize) -> Vec<Vec<S
     rows
 }
 
-/// Hard-split an over-wide token into chunks of size ≤ `width`, preferring a
-/// break just after punctuation.  Styled counterpart of
-/// `table_layout::hard_split`.
+/// Hard-split an over-wide token into chunks of width ≤ `width` terminal columns, preferring a
+/// break just after punctuation.  Styled counterpart of `table_layout::hard_split`.
 fn hard_split_styled(token: &[StyledChar], width: usize) -> Vec<Vec<StyledChar>> {
     if width == 0 || token.is_empty() {
         return vec![token.to_vec()];
     }
-    let mut rows = Vec::new();
-    let mut rest = token;
-    while rest.len() > width {
-        let cut = preferred_cut(width, |i| rest[i].ch);
-        rows.push(rest[..cut].to_vec());
-        rest = &rest[cut..];
+    let mut rows: Vec<Vec<StyledChar>> = Vec::new();
+    let mut cur: Vec<StyledChar> = Vec::new();
+    let mut cur_w = 0usize;
+    for &c in token {
+        let cw = char_cells(c.ch);
+        if cur_w + cw > width && !cur.is_empty() {
+            let cut = preferred_cut(cur.len(), |i| cur[i].ch);
+            rows.push(cur[..cut].to_vec());
+            cur.drain(..cut);
+            cur_w = styled_cells(&cur);
+        }
+        cur.push(c);
+        cur_w += cw;
     }
-    rows.push(rest.to_vec());
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
     rows
 }
 
@@ -155,9 +172,20 @@ pub(super) fn extend_with_styled_chars(out: &mut Vec<Span<'static>>, chars: &[St
 
 /// Truncate `text` to at most `width` character cells.  The table renderer's
 /// single-line path uses this rather than overflow the trailing border when an
-/// inline-formatted cell exceeds its column allocation.
+/// inline-formatted cell exceeds its column allocation.  A wide glyph that would
+/// straddle the limit is dropped rather than half-drawn.
 pub(super) fn truncate_to_width(text: &str, width: usize) -> String {
-    text.chars().take(width).collect()
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let cw = char_cells(ch);
+        if used + cw > width {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out
 }
 
 /// Display text for a link/image with empty bracket content: the full URL for

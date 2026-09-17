@@ -6,11 +6,11 @@ use ratatui::text::{Line, Span};
 
 use crate::markdown::ast::Inline;
 use crate::markdown::renderer::util::{
-    extend_with_styled_chars, is_soft_break_space, link_fallback, truncate_to_width,
+    extend_with_styled_chars, is_soft_break_space, link_fallback, styled_cells, truncate_to_width,
     wrap_styled_chars, StyledChar,
 };
 use crate::markdown::renderer::Renderer;
-use crate::markdown::table_layout::{self, MIN_COL_WIDTH};
+use crate::markdown::table_layout::{self, char_cells, MIN_COL_WIDTH};
 
 /// Floor contribution of a cell token containing *breakable* content (inline code or link
 /// text).  Such tokens hard-split across rendered rows, so they don't pin the column to
@@ -19,7 +19,7 @@ use crate::markdown::table_layout::{self, MIN_COL_WIDTH};
 const BREAKABLE_MIN_WIDTH: usize = 8;
 
 /// Per-cell `min` width for `compute_widths`: the longest run of characters that cannot
-/// be broken across rendered rows.
+/// be broken across rendered rows, in terminal cells.
 ///
 /// Prose words are unbreakable ("never break a prose word to fit").  A token containing
 /// inline-code or link content contributes at most [`BREAKABLE_MIN_WIDTH`] — but never
@@ -29,25 +29,37 @@ fn cell_min_width(inlines: &[Inline]) -> usize {
     let mut chars: Vec<(char, bool)> = Vec::new();
     flatten_breakable_chars(inlines, false, &mut chars);
 
+    let run_cells = |run: &[(char, bool)]| run.iter().map(|&(ch, _)| char_cells(ch)).sum();
+
     let mut best = 0usize;
     for token in chars.split(|&(ch, _)| is_soft_break_space(ch)) {
         if token.is_empty() {
             continue;
         }
-        let len = token.len();
+        let cells = run_cells(token);
         let contribution = if token.iter().any(|&(_, breakable)| breakable) {
             let longest_prose_run = token
                 .split(|&(_, breakable)| breakable)
-                .map(<[(char, bool)]>::len)
+                .map(run_cells)
                 .max()
                 .unwrap_or(0);
-            longest_prose_run.max(len.min(BREAKABLE_MIN_WIDTH))
+            longest_prose_run.max(cells.min(BREAKABLE_MIN_WIDTH))
         } else {
-            len
+            cells
         };
         best = best.max(contribution);
     }
     best
+}
+
+/// Whether `ch` may be split from its neighbours inside a wrapped cell.
+///
+/// A glyph wider than one cell is a word to itself in every CJK/Kana/Hangul run: those scripts
+/// carry no inter-word spaces, so a run of them breaks between any two glyphs.  Treating the run
+/// as one prose word would pin the column to its full width and push the table past a narrow
+/// viewport.
+fn breaks_anywhere(ch: char) -> bool {
+    char_cells(ch) > 1
 }
 
 /// Flatten a cell's inline tree to `(char, breakable)` pairs, mirroring
@@ -56,7 +68,7 @@ fn cell_min_width(inlines: &[Inline]) -> usize {
 fn flatten_breakable_chars(inlines: &[Inline], breakable: bool, out: &mut Vec<(char, bool)>) {
     for inline in inlines {
         match inline {
-            Inline::Text(t) => out.extend(t.chars().map(|c| (c, breakable))),
+            Inline::Text(t) => out.extend(t.chars().map(|c| (c, breakable || breaks_anywhere(c)))),
             Inline::Bold(inner)
             | Inline::Italic(inner)
             | Inline::Strikethrough(inner)
@@ -106,7 +118,7 @@ impl<'t> Renderer<'t> {
         let header_max: Vec<usize> = headers
             .iter()
             .take(col_count)
-            .map(|c| self.rendered_inlines_char_width(c))
+            .map(|c| self.rendered_inlines_width(c))
             .collect();
         let header_min: Vec<usize> = headers
             .iter()
@@ -119,7 +131,7 @@ impl<'t> Renderer<'t> {
             cell_max_widths.push(
                 row.iter()
                     .take(col_count)
-                    .map(|c| self.rendered_inlines_char_width(c))
+                    .map(|c| self.rendered_inlines_width(c))
                     .collect(),
             );
             cell_min_widths.push(
@@ -270,7 +282,7 @@ impl<'t> Renderer<'t> {
             for i in 0..col_count {
                 let width = widths.get(i).copied().unwrap_or(MIN_COL_WIDTH);
                 let row: &[StyledChar] = cell_rows[i].get(sub).map(|v| v.as_slice()).unwrap_or(&[]);
-                let row_w: usize = row.iter().map(|c| c.ch.to_string().chars().count()).sum();
+                let row_w = styled_cells(row);
                 // Overflow truncates with `…` — rare, and only for a single unbreakable
                 // token.  Plain text there, to avoid painting a partial styled run.
                 spans.push(Span::styled(" ", default_style));

@@ -17,6 +17,10 @@ Each released version's section is also what ships as the GitHub release notes: 
 
 - The bookkeeping edamame writes for itself (e.g. update-check timestamps) moved from config.toml to state.toml in your data directory. edamame migrates these values on the next launch, leaving config.toml fully hand-editable and safe to share across machines. No action needed.
 
+### Fixed
+
+- Tables with CJK text (or any other wide glyph) now size their columns in terminal cells, so the borders line up and the table narrows to fit a small terminal instead of overflowing its own box.
+
 ## [0.1.4] - 2026-09-11
 
 ### Added

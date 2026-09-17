@@ -1,5 +1,7 @@
 use std::time::Instant;
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::document::EditDelta;
 use crate::editor::table_edit;
 use crate::editor::EditorState;
@@ -52,8 +54,8 @@ fn natural_widths(info: &table_edit::TableInfo) -> Vec<usize> {
         let mut row_min_widths = Vec::with_capacity(col_count);
         for cell in row.cells.iter().take(col_count) {
             let trimmed = cell.raw.trim();
-            row_widths.push(trimmed.chars().count());
-            row_min_widths.push(longest_word_chars(trimmed));
+            row_widths.push(UnicodeWidthStr::width(trimmed));
+            row_min_widths.push(longest_word_cells(trimmed));
         }
         while row_widths.len() < col_count {
             row_widths.push(0);
@@ -66,11 +68,11 @@ fn natural_widths(info: &table_edit::TableInfo) -> Vec<usize> {
     table_layout::compute_widths(&cell_widths, &cell_min_widths, col_count, usize::MAX, None)
 }
 
-/// Longest whitespace-delimited word in `text`, in chars — the per-cell width floor that keeps
-/// the column-width algorithm from breaking a word across rendered rows.
-fn longest_word_chars(text: &str) -> usize {
+/// Longest whitespace-delimited word in `text`, in terminal cells — the per-cell width floor
+/// that keeps the column-width algorithm from breaking a word across rendered rows.
+fn longest_word_cells(text: &str) -> usize {
     text.split_whitespace()
-        .map(|w| w.chars().count())
+        .map(UnicodeWidthStr::width)
         .max()
         .unwrap_or(0)
 }
@@ -347,5 +349,16 @@ mod tests {
         assert_eq!(state.buffer.contents(), src);
         assert_eq!(state.history.undo_depth(), 0);
         assert!(!state.dirty, "a refused chain must not dirty the buffer");
+    }
+
+    /// Ten wide glyphs are twenty cells of content, and the drag anchors must say so: they are
+    /// compared against (and persisted into) the renderer's column widths, so a char-counted
+    /// anchor would snap a CJK column to half the width it is drawn at.
+    #[test]
+    fn natural_widths_measure_wide_glyphs_in_cells() {
+        let src = format!("| {} |\n| --- |\n| 值 |\n", "哈".repeat(10));
+        let info = table_edit::find_table_at(&src, 0).expect("table at offset 0");
+
+        assert_eq!(natural_widths(&info), vec![20]);
     }
 }

@@ -6,11 +6,19 @@ use edamame::config::Theme;
 /// that alters rendered output to review and accept updated snapshots.
 use edamame::markdown::parser::parse;
 use edamame::markdown::renderer::Renderer;
+use unicode_width::UnicodeWidthStr;
+
+/// Render `md` at an arbitrary viewport width (terminal columns).
+fn render_at(md: &str, viewport: usize) -> Vec<ratatui::text::Line<'static>> {
+    let theme = Theme::default();
+    let blocks = parse(md);
+    Renderer::new(&theme)
+        .with_viewport_width(viewport)
+        .render(&blocks)
+}
 
 fn render(md: &str) -> Vec<ratatui::text::Line<'static>> {
-    let theme = Box::leak(Box::new(Theme::default()));
-    let blocks = parse(md);
-    Renderer::new(theme).render(&blocks)
+    render_at(md, 80)
 }
 
 /// Collect all text content from a rendered line (spans concatenated).
@@ -934,5 +942,59 @@ fn display_math_paragraph_renders_as_a_math_code_block_without_promotion() {
     assert!(
         !text.contains("$$"),
         "the styled block hides the `$$` delimiters (they reveal on cursor), got: {text:?}"
+    );
+}
+
+// ── Table column widths are display columns ──────────────────────────────────
+
+/// Terminal columns a rendered line occupies — two per CJK glyph.
+fn line_cells(line: &ratatui::text::Line<'_>) -> usize {
+    UnicodeWidthStr::width(line_text(line).as_str())
+}
+
+fn table_widths(lines: &[ratatui::text::Line<'static>]) -> Vec<usize> {
+    lines
+        .iter()
+        .filter(|l| {
+            matches!(
+                line_text(l).chars().next(),
+                Some('┌' | '│' | '├' | '┝' | '└')
+            )
+        })
+        .map(line_cells)
+        .collect()
+}
+
+/// A cell holding ten wide glyphs is twenty columns of content, not ten: every line of the
+/// table — top rule, header, header rule, data row, bottom rule — must therefore occupy the
+/// same number of terminal columns.  Measuring a cell in `chars` sizes the column at half its
+/// content width, so the header row spills past the closing border.
+#[test]
+fn cjk_table_lines_all_span_the_border_width() {
+    // Ten wide glyphs = 20 content columns; box = "│ " + 20 + " │" = 24.
+    let wide = "哈".repeat(10);
+    let lines = render_at(&format!("| {wide} |\n| --- |\n| 值 |\n"), 40);
+    let widths = table_widths(&lines);
+    assert!(
+        widths.len() >= 4,
+        "expected a bordered table, got {widths:?}"
+    );
+    assert!(
+        widths.iter().all(|w| *w == 24),
+        "every table line must be 24 columns wide (20 content + padding + borders), got {widths:?}"
+    );
+}
+
+/// CJK prose has no spaces, but it breaks between any two glyphs — so a viewport narrower than
+/// the cell content must narrow the column and wrap the glyph run, not push the table past the
+/// right edge.  The budget for one column is `viewport - 4` (two pad cells, two borders).
+#[test]
+fn cjk_table_shrinks_into_a_narrow_viewport() {
+    let wide = "哈".repeat(10);
+    let lines = render_at(&format!("| {wide} |\n| --- |\n| 值 |\n"), 12);
+    let widths = table_widths(&lines);
+    assert!(
+        widths.iter().all(|w| *w == 12),
+        "every table line must fill the 12-column viewport without exceeding it, got {widths:?}"
     );
 }

@@ -28,6 +28,16 @@ use unicode_width::UnicodeWidthStr;
 /// Minimum column width — narrower leaves no room for a `...` truncation indicator.
 pub const MIN_COL_WIDTH: usize = 3;
 
+/// Terminal columns `ch` occupies — the unit every width decision in this module and the table
+/// renderer is expressed in.  Control characters contribute none, matching `unicode-width`'s
+/// `None`.
+///
+/// `ui::line_render` carries its own copy of this one-liner: `ui` sits above `markdown` in the
+/// module layering, so the two cannot share it without a new low-level text module.
+pub fn char_cells(ch: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
 /// Per-column overhead for `│ content ` — the separator plus one space each side.  The
 /// trailing `│` at row end is [`ROW_END_OVERHEAD`].
 pub const PER_COL_OVERHEAD: usize = 3;
@@ -269,15 +279,12 @@ fn hard_split(word: &str, width: usize) -> Vec<String> {
     let mut cur: Vec<char> = Vec::new();
     let mut cur_w = 0usize;
     for ch in word.chars() {
-        let cw = UnicodeWidthStr::width(ch.to_string().as_str());
+        let cw = char_cells(ch);
         if cur_w + cw > width && !cur.is_empty() {
             let cut = preferred_cut(cur.len(), |i| cur[i]);
             rows.push(cur[..cut].iter().collect());
             cur.drain(..cut);
-            cur_w = cur
-                .iter()
-                .map(|c| UnicodeWidthStr::width(c.to_string().as_str()))
-                .sum();
+            cur_w = cur.iter().map(|c| char_cells(*c)).sum();
         }
         cur.push(ch);
         cur_w += cw;
