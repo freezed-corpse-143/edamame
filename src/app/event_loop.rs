@@ -329,6 +329,15 @@ impl App {
                 .ensure_cursor_visible(dims.doc_height, dims.doc_width);
             self.needs_draw = true;
         }
+        // The inline-math spike's reveal is a *build* input (the atom's reserved width is the
+        // image's ink; the revealed form is the wider source), so a click into a formula needs the
+        // same per-frame trigger a block's rows do — and the widened line can wrap to another row,
+        // so the cursor is re-anchored too.
+        if self.editor.sync_inline_math_reveal() {
+            self.editor
+                .ensure_cursor_visible(dims.doc_height, dims.doc_width);
+            self.needs_draw = true;
+        }
         // A non-capturing navigate flow lets the buffer be edited freely, so the
         // match list can go stale.  Version-guarded, hence a no-op when nothing
         // changed.  Paused under a `:s` preview: recomputing against transient

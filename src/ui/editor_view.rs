@@ -375,6 +375,14 @@ impl<'a> StatefulWidget for EditorView<'a> {
             image_view::paint_images(snapshots, ctx);
         }
 
+        // ── Inline-math spike overlay ─────────────────────────────
+        // After the text layer (which filled the atom's cells with `$…$`) and after the block
+        // images, so an atom's cells are erased and covered in the same frame.  Preview and
+        // Rendered only: Raw shows source on purpose, and Diff has its own geometry.
+        if matches!(mode, Mode::Preview | Mode::Rendered) {
+            crate::image::inline_math::paint(self.state, doc_area, buf);
+        }
+
         // ── Scrollbar gutter ──────────────────────────────────────
         // Painted last so its glyphs win on the gutter cells, and published on
         // `state.scrollbar` for the App's mouse handler to hit-test.

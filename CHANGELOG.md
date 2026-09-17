@@ -10,6 +10,7 @@ Each released version's section is also what ships as the GitHub release notes: 
 
 ### Added
 
+- Inline LaTeX: a `$...$` formula inside a sentence now renders as an image on the text's own line, sized to its ink and aligned to the text baseline. Put the cursor on that line and it shows the source again, like a code block's reveal. Renders in WezTerm and Windows Terminal; other terminals keep showing the source text. Like display math it follows the *Figures* setting. Set `EDAMAME_INLINE_MATH=0` to turn it off.
 - An uninstall script that removes edamame's config and state files, and the binary (deferring to the package manager if applicable).
 - Daily tips: once a day at startup, edamame shows a short tip about a feature you might not know about. Turn it off with the tip's "Don't show tips" button or the "Daily tips" setting. See all tips with Ctrl-P → "Browse tips".
 

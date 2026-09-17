@@ -780,6 +780,25 @@ mod tests {
     use super::*;
     use ratatui::text::Span;
 
+    /// `image::inline_math::atom_span` emits an atom as a run of `U+00A0` with a private-use
+    /// sentinel **last**, and this is the rule that makes that order load-bearing: no-break
+    /// characters give the wrapper nowhere to split the run, so only the trailing sentinel offers
+    /// a break — and a break there moves the whole atom to the next row rather than cutting it in
+    /// half.  A sentinel in the *first* cell would let it break inside the atom.
+    #[test]
+    fn an_atom_run_breaks_only_after_its_trailing_sentinel() {
+        let chars: Vec<(char, Style)> = "\u{00A0}\u{00A0}\u{E001}"
+            .chars()
+            .map(|c| (c, Style::default()))
+            .collect();
+        assert!(
+            !is_break_after(&chars, 0, None),
+            "a no-break space is not a break"
+        );
+        assert!(!is_break_after(&chars, 1, None));
+        assert!(is_break_after(&chars, 2, None), "the trailing sentinel is");
+    }
+
     #[test]
     fn visual_rows_short_line() {
         let rows = visual_rows_of_str("hello", 10);

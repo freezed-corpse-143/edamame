@@ -358,6 +358,20 @@ pub fn rasterize_svg(
     sizing: SvgSizing,
     background: Option<[u8; 4]>,
 ) -> Result<DynamicImage, SvgError> {
+    rasterize_svg_scaled(svg, sizing, background).map(|(image, _scale)| image)
+}
+
+/// [`rasterize_svg`] plus the scale it actually applied to the SVG's user units.
+///
+/// The inline-math path needs it: a formula's baseline sits at a known point in *user* units, and
+/// the terminal has to place the raster so that point lands on the text baseline — which is only
+/// computable if the user-unit → pixel scale is known rather than assumed.  Every other caller
+/// wants pixels only.
+pub fn rasterize_svg_scaled(
+    svg: &str,
+    sizing: SvgSizing,
+    background: Option<[u8; 4]>,
+) -> Result<(DynamicImage, f32), SvgError> {
     let mut opt = usvg::Options {
         fontdb: shared_fontdb(),
         ..Default::default()
@@ -411,7 +425,9 @@ pub fn rasterize_svg(
     // *external* bytes.  These are the PNG encoded one line above, from a pixmap already bounded by
     // the envelope and `MAX_RASTER_PIXELS`.  Don't copy this call to a site fed by a file, a
     // socket, or a document.
-    image::load_from_memory(&png_bytes).map_err(|e| SvgError::Decode(format!("{e}")))
+    image::load_from_memory(&png_bytes)
+        .map(|image| (image, scale))
+        .map_err(|e| SvgError::Decode(format!("{e}")))
 }
 
 #[cfg(test)]

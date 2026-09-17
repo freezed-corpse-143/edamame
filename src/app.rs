@@ -289,6 +289,7 @@ fn configure_new_editor(
     config: &Config,
     images_layout_on: bool,
     diagrams_layout_on: bool,
+    figures_paint_on: bool,
 ) {
     editor.cursor_blink = crate::editor::CursorBlink::from_config(
         config.editor.cursor_blink,
@@ -300,12 +301,16 @@ fn configure_new_editor(
     if !diagrams_layout_on {
         editor.diagrams_enabled = false;
     }
+    // Inline `$...$` atoms rasterize on the render path, outside the decode dispatch where
+    // `config.figures.enabled` is otherwise enforced, so the editor carries the *paint* answer:
+    // an unanswered `Ask` reserves rows (`diagrams_layout_on`) but must draw nothing.
+    editor.figures_consent = figures_paint_on;
     editor.set_row_striping(config.table.row_striping);
     editor.set_big_h1(config.editor.big_h1);
     editor.set_syntax_highlighting(config.editor.syntax_highlighting);
     editor.set_reflow(config.editor.reflow);
     editor.set_math_preview(config.figures.math_preview);
-    if !images_layout_on || !diagrams_layout_on {
+    if !images_layout_on || !diagrams_layout_on || !figures_paint_on {
         editor.refresh_parsed();
     }
     leave_preview_under_vim(config, editor);
@@ -423,7 +428,13 @@ impl App {
         if config.editor.syntax_highlighting {
             crate::markdown::highlight::spawn_warm_worker();
         }
-        configure_new_editor(&mut editor, &config, !images_off, !diagrams_off);
+        configure_new_editor(
+            &mut editor,
+            &config,
+            !images_off,
+            !diagrams_off,
+            !diagrams_off,
+        );
 
         // The Preview escape vim needs is handled by `configure_new_editor` above, shared with
         // every document opened later, so the `NORMAL` badge shows from the first frame.

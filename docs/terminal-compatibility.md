@@ -46,6 +46,8 @@ Inline images and Mermaid diagrams need **an image protocol** — Kitty graphics
 
 Where an image can't be shown you get an `[Image: alt text]` placeholder, so the document still reads. Diagrams and images are separate settings — you can enable one without the other. Details in [editing.md](editing.md#images).
 
+An inline `$...$` formula is the one image that has to sit *inside* a text row, so it asks more of the terminal than a block image does: the protocol must place a picture at an arbitrary cell. **WezTerm** (kitty direct placement) and **Windows Terminal** (Sixel) can, and inline formulas render there; everywhere else an inline formula stays its source text, while the display `$$...$$` form renders wherever diagrams do. Both forms answer to the *Figures* setting, and `EDAMAME_INLINE_MATH=0` turns the inline form off — see [editing.md](editing.md#math).
+
 ## Mouse
 
 With mouse reporting, you get click-to-place-cursor, drag selection, double- and triple-click, wheel scrolling, clickable links and checkboxes, and the drag handles on tables (`⠿` to reorder, `⇔` to resize, `✕` to delete).

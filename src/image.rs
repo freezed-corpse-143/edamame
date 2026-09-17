@@ -2,8 +2,10 @@
 //! `DynamicImage`). The UI half (decoded image → terminal cells) lives in `ui::image_view`.
 
 pub mod cache;
+pub mod inline_math;
 pub mod loader;
 pub mod render;
+pub mod sixel;
 pub mod svg;
 
 // `DecodeStatus` is used by integration tests in tests/editing.rs.
@@ -12,4 +14,4 @@ pub use cache::DecodeStatus;
 pub use cache::{aspect_rows_of, render_halfblocks_scratch, ImageCache, NativePaint};
 pub use loader::{resolve, LoadedImage};
 pub use render::paint_halfblocks_partial;
-pub use svg::{rasterize_svg, SvgError, SvgScaleMode, SvgSizing};
+pub use svg::{rasterize_svg, rasterize_svg_scaled, SvgError, SvgScaleMode, SvgSizing};

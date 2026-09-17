@@ -366,7 +366,15 @@ Move the cursor into a formula and its `$$...$$` source opens just below the ren
 
 ![LaTeX math formula rendered in edamame](https://raw.githubusercontent.com/mijowi/mijowi.com/refs/heads/main/edamame/media/math.png)
 
-Only whole-paragraph `$$...$$` math is rendered as an image. Inline `$...$` and math mixed with other text in a paragraph stay as their literal source. An HTML export renders display-math paragraphs as images too — the same *Inline figures* toggle that controls diagrams (see [Exporting](#exporting)).
+A paragraph containing only a `$$...$$` block renders as an image, and so does an inline `$...$`
+formula inside a sentence: it is placed on the text's own row, sized to the formula's ink and aligned
+to the text baseline, and moving the cursor onto that row shows its formulas as source again (moving
+off restores the images). Inline formulas render in **WezTerm** and **Windows Terminal** — the two
+terminals whose image protocols can place a picture inside a text row; in every other terminal an
+inline `$...$` stays its literal source, as it did before. Like the display form they follow the
+*Figures* setting, so turning it off leaves `$...$` as source, and `EDAMAME_INLINE_MATH=0` turns
+inline rendering off without touching display math. An HTML export renders display-math paragraphs as
+images too — the same *Inline figures* toggle that controls diagrams (see [Exporting](#exporting)).
 
 When *Figures* is off, a `$$...$$` paragraph isn't rendered to an image — it shows as a `math` code block instead (a `math` header over the formula source), exactly the way a ` ```mermaid ` fence stays a code block. Move the cursor onto the opening or closing `$$` line to edit the delimiters.
 

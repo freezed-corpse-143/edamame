@@ -389,6 +389,7 @@ impl App {
             &self.config,
             self.images_layout_enabled(),
             self.diagrams_layout_enabled(),
+            self.effective_diagrams_enabled(),
         );
         new_editor
     }
@@ -1102,7 +1103,14 @@ fn main() {}
         app.config.editor.cursor_blink = false;
 
         let (images_on, diagrams_on) = (app.images_layout_enabled(), app.diagrams_layout_enabled());
-        crate::app::configure_new_editor(&mut app.editor, &app.config, images_on, diagrams_on);
+        let figures_paint = app.effective_diagrams_enabled();
+        crate::app::configure_new_editor(
+            &mut app.editor,
+            &app.config,
+            images_on,
+            diagrams_on,
+            figures_paint,
+        );
 
         assert!(app.editor.syntax_highlighting, "syntax_highlighting stale");
         assert!(app.editor.big_h1, "big_h1 stale");

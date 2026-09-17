@@ -958,12 +958,48 @@ impl<'t> Renderer<'t> {
             // `Block::ImageBlock` by the post-pass before it ever reaches
             // this arm, so the display form here is the mixed-paragraph
             // fallback only.
+            //
+            // The inline-math spike paints an image over these cells, and reserves the formula's
+            // *measured* width for it ([`inline_math::measure`]) instead of the source's — the
+            // source's width is the wrong number (`$Y_1$` is five characters and about three cells
+            // of ink), and reserving it left visible whitespace after every short formula.  A
+            // formula holding the cursor keeps its source, so the line re-wraps by the difference:
+            // the inline counterpart of the block reveal.
             Inline::Math { source, display } => {
                 let delim = if *display { "$$" } else { "$" };
-                vec![Span::styled(
-                    format!("{delim}{source}{delim}"),
-                    base.patch(self.theme.code_span),
-                )]
+                let literal = || {
+                    vec![Span::styled(
+                        format!("{delim}{source}{delim}"),
+                        base.patch(self.theme.code_span),
+                    )]
+                };
+                if *display {
+                    return literal();
+                }
+                let Some(cell) = crate::image::inline_math::cell_size() else {
+                    return literal();
+                };
+                let ordinal = crate::image::inline_math::atom_count();
+                if crate::image::inline_math::is_revealed(ordinal, source) {
+                    crate::image::inline_math::register(source, None);
+                    return literal();
+                }
+                match crate::image::inline_math::measure(source, cell) {
+                    // An atom wider than the viewport could never be painted whole, and the
+                    // wrapper would force-break it anyway: keep the source.
+                    Some(cells) if usize::from(cells) <= self.viewport_width.max(1) => {
+                        crate::image::inline_math::register(source, Some(cells));
+                        vec![crate::image::inline_math::atom_span(
+                            cells,
+                            ordinal,
+                            base.patch(self.theme.code_span),
+                        )]
+                    }
+                    _ => {
+                        crate::image::inline_math::register(source, None);
+                        literal()
+                    }
+                }
             }
 
             Inline::SoftBreak => vec![Span::raw(" ")],

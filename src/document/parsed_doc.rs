@@ -261,6 +261,9 @@ impl ParsedDoc {
         if let Some(override_fn) = image_row_override {
             renderer = renderer.with_image_row_override(override_fn);
         }
+        // The inline-math spike's atom table is process-global (see `image::inline_math`), so the
+        // build that is about to render must start it empty.
+        crate::image::inline_math::begin_build();
         let (rendered_lines, real_per_block_counts) = match render_cache {
             Some(cache) => renderer.render_with_counts_cached(&blocks, cache),
             None => renderer.render_with_counts(&blocks),

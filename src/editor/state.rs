@@ -201,6 +201,16 @@ pub struct EditorState {
     /// Font size in pixels from the detected image picker; the default mirrors
     /// `Picker::from_fontsize`'s Halfblocks default.
     pub image_font_size: (u16, u16),
+    /// The start byte of the source line whose inline formulas the last build left *unpainted*,
+    /// so the line shows their source instead (see `image::inline_math`).  `None` while the cursor
+    /// sits on a line with no formula at all, which is what keeps a move between plain lines from
+    /// rebuilding.  The reveal is a build input — the atom's width is the image's, the revealed
+    /// form is the wider source text — so a cursor move onto or off a formula's line has to
+    /// rebuild, and this is what [`Self::sync_inline_math_reveal`] compares against.
+    pub(crate) inline_math_revealed: Option<usize>,
+    /// The cursor offset the last reveal check ran at, so the per-frame check costs one comparison
+    /// and only a real move pays for the scan.
+    pub(crate) inline_math_last_cursor: usize,
     /// Decoded-image cache keyed by URL, retained across reparses so ordinary edits don't
     /// invalidate the expensive `StatefulProtocol` encoding.  Filled by the decode worker.
     pub images: ImageCache,
@@ -210,6 +220,13 @@ pub struct EditorState {
     /// [`Self::images_enabled`]'s counterpart for diagram blocks, so a user can opt in to images
     /// but not diagrams.  Image blocks with a `source` honor this instead.
     pub diagrams_enabled: bool,
+    /// Whether the session's *Figures* consent currently allows drawing inline `$...$` atoms.  The
+    /// App records `effective_diagrams_enabled` here — `configure_new_editor` first, then every
+    /// prompt answer and settings change — and it is deliberately separate from
+    /// [`Self::diagrams_enabled`], which answers the *layout* question and stays `true` while an
+    /// `Ask` prompt is still on screen.  Defaults to `true` like the two flags above, so an editor
+    /// a test builds paints; the App is what narrows it.
+    pub figures_consent: bool,
     /// Bumped on every `refresh_parsed` **and** on every deferred in-line edit (which leaves
     /// `parsed` stale but changes the cursor block's geometry), so the view's per-frame snapshot
     /// caches invalidate exactly when the painted geometry changed.
@@ -386,6 +403,12 @@ impl EditorState {
         image_font_size: (u16, u16),
     ) -> Self {
         let content = buffer.contents();
+        // The inline-math spike's build inputs have to be in place for the *first* build too, or
+        // the opening frame renders every formula as its source; this constructor builds the parse
+        // directly rather than through `refresh_parsed`.  The cursor is fresh, so nothing is
+        // revealed yet, and the consent matches the field's permissive default — the App narrows
+        // both in `configure_new_editor` before the first frame.
+        crate::image::inline_math::set_build_inputs(Some(image_font_size), None, true);
         let parsed = ParsedDoc::build(&content, theme, preserve_blank_lines, image_max_height);
         let mut state = Self {
             buffer,
@@ -410,9 +433,14 @@ impl EditorState {
             image_max_height,
             image_max_width,
             image_font_size,
+            inline_math_revealed: None,
+            inline_math_last_cursor: 0,
             images: ImageCache::new(),
             images_enabled: true,
             diagrams_enabled: true,
+            // Permissive like the two above: `app::configure_new_editor` narrows it from the
+            // session's recorded *Figures* answer before the first frame.
+            figures_consent: true,
             parsed_version: 0,
             live_table_widths: None,
             row_striping: false,
@@ -942,6 +970,9 @@ impl EditorState {
     /// Re-parse and re-render after an edit.  Called automatically by `edit_ops`.
     pub(crate) fn refresh_parsed(&mut self) {
         let content = self.buffer.contents();
+        // Before the image cache is borrowed for the row-override closure below: this needs
+        // `&mut self` (it records which formula the cursor sits in).
+        self.install_inline_math_inputs(&content);
         // Row-override closure over the image cache; see `ImageCache::reserved_rows` for the
         // per-status decision.  A `Pending` entry answers `None` so the renderer falls back to
         // `image_max_height` and layout stays stable while the decode is in flight.
@@ -1061,6 +1092,13 @@ impl EditorState {
             .new_buffer
             .contents();
         let parsed = {
+            // Diff mode has no in-document cursor, so nothing is revealed; the widths still come
+            // from the same measurement, under the same *Figures* consent.
+            crate::image::inline_math::set_build_inputs(
+                Some(self.image_font_size),
+                None,
+                self.figures_consent,
+            );
             let images = &self.images;
             let max_w = self.image_max_width as u16;
             let max_h = self.image_max_height as u16;
@@ -1102,6 +1140,75 @@ impl EditorState {
         if self.diff_parse_dirty {
             self.refresh_diff_parse();
         }
+    }
+
+    /// Hand the inline-math spike its build inputs: the terminal's cell, which the atom's width is
+    /// measured at, which source line the cursor sits on — every formula on that line keeps its
+    /// source, so the line re-wraps by the difference between the sources' width and their ink's —
+    /// and the session's *Figures* consent.
+    ///
+    /// The spike is inert unless its gate is open **and** the session consented, and then the
+    /// renderer asks for a cell size and gets `None`, which is exactly the literal-source path.
+    fn install_inline_math_inputs(&mut self, content: &str) {
+        use crate::image::inline_math;
+        let consent = self.figures_consent;
+        if !inline_math::is_active() || !consent {
+            self.inline_math_revealed = None;
+            inline_math::set_build_inputs(None, None, false);
+            return;
+        }
+        // The scan is how the reveal names formulas: the renderer enumerates them through
+        // pulldown-cmark, and the predicate compares this scan's text against the formula it is
+        // asked about, so a disagreement can only mean "do not reveal".
+        let spans = inline_math::scan_inline_math(content);
+        let rope = self.buffer.rope();
+        let cursor_byte = rope.char_to_byte(self.cursor.offset.min(rope.len_chars()));
+        let line = inline_math::line_bounds(content, cursor_byte);
+        let (line_start, line_end) = (line.start, line.end);
+        self.inline_math_revealed = spans
+            .iter()
+            .find(|(range, _)| range.start >= line_start && range.start < line_end)
+            .map(|_| line_start);
+        inline_math::set_build_inputs(
+            Some(self.image_font_size),
+            Some(Box::new(move |ordinal: usize, source: &str| {
+                spans.get(ordinal).is_some_and(|(range, text)| {
+                    text == source && range.start >= line_start && range.start < line_end
+                })
+            })),
+            consent,
+        );
+    }
+
+    /// Rebuild when the cursor moved onto or off a line carrying inline math, so the spike can
+    /// swap those atoms' images for their sources and back.  `true` when it rebuilt.
+    ///
+    /// Unlike a block's reveal, this one cannot be resolved in the painter: the atom's *width* is
+    /// the reveal state (the image's ink vs the wider source text), and the width comes from the
+    /// renderer.  So a cursor move onto or off such a line — a click being the case that made this
+    /// necessary — has to rebuild, exactly as [`Self::sync_image_reveal`] rebuilds for a block's
+    /// rows.  The check is skipped unless the cursor actually moved, and a move between two lines
+    /// with no formula on either rebuilds nothing.
+    pub fn sync_inline_math_reveal(&mut self) -> bool {
+        use crate::image::inline_math;
+        if !inline_math::is_painting() || self.cursor.offset == self.inline_math_last_cursor {
+            return false;
+        }
+        self.inline_math_last_cursor = self.cursor.offset;
+        let content = self.buffer.contents();
+        let spans = inline_math::scan_inline_math(&content);
+        let rope = self.buffer.rope();
+        let cursor_byte = rope.char_to_byte(self.cursor.offset.min(rope.len_chars()));
+        let line = inline_math::line_bounds(&content, cursor_byte);
+        let revealed = spans
+            .iter()
+            .find(|(range, _)| range.start >= line.start && range.start < line.end)
+            .map(|_| line.start);
+        if revealed == self.inline_math_revealed {
+            return false;
+        }
+        self.refresh_parsed();
+        true
     }
 
     /// Re-parse if an in-line edit left `parsed` stale; `true` when it fired.

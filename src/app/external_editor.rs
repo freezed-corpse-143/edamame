@@ -106,7 +106,14 @@ impl App {
                 // deferred to the next launch.
                 let (images_on, diagrams_on) =
                     (self.images_layout_enabled(), self.diagrams_layout_enabled());
-                super::configure_new_editor(&mut self.editor, &self.config, images_on, diagrams_on);
+                let figures_paint = self.effective_diagrams_enabled();
+                super::configure_new_editor(
+                    &mut self.editor,
+                    &self.config,
+                    images_on,
+                    diagrams_on,
+                    figures_paint,
+                );
                 if let Some(modal) = modal::ConfigWarningModal::from_warnings(&loaded.warnings) {
                     self.modal_stack.push(Box::new(modal));
                     self.needs_draw = true;

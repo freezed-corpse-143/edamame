@@ -203,6 +203,13 @@ impl App {
             self.editor.diagrams_enabled = layout_on;
             self.editor.refresh_parsed();
         }
+        // The inline-atom gate answers the *paint* question, not the layout one: an unanswered
+        // `Ask` reserves rows but draws nothing yet.
+        let paint_on = self.effective_diagrams_enabled();
+        if self.editor.figures_consent != paint_on {
+            self.editor.figures_consent = paint_on;
+            self.editor.refresh_parsed();
+        }
         // Any queued prompt reflects the pre-change value; rebuild below.
         self.modal_stack
             .remove_first::<super::modal::FiguresEnabledPromptModal>();
@@ -408,6 +415,15 @@ impl App {
     pub(super) fn dispatch_image_decodes_for(&mut self, infos: &[crate::document::ImageBlockInfo]) {
         let images_on = self.effective_images_enabled();
         let diagrams_on = self.effective_diagrams_enabled();
+        // Inline `$...$` atoms rasterize on the render path — their cache is a side effect of
+        // rendering — so unlike a block figure they never pass through this dispatch, which is the
+        // only place the *Figures* consent is otherwise enforced.  Mirror the same answer into the
+        // editor here, **before** the early return below or a decline would never reach them; the
+        // inequality guard is what keeps the re-parse from recursing.
+        if self.editor.figures_consent != diagrams_on {
+            self.editor.figures_consent = diagrams_on;
+            self.editor.refresh_parsed();
+        }
         if !images_on && !diagrams_on {
             return;
         }

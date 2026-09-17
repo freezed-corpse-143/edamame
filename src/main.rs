@@ -172,6 +172,14 @@ fn run(session: Session, opts: RunOpts) -> Result<()> {
         terminal,
         keyboard_enhancement,
     } = terminal::setup()?;
+    // The inline-math spike's image protocol is a property of the terminal, and this is the
+    // one path that has actually asked it (WezTerm places kitty images directly, Windows
+    // Terminal renders sixel into the text row).  Deciding here rather than letting the spike
+    // read the environment is what keeps a `cargo test` run inside either terminal on the
+    // literal-source path: tests build an `App` directly and never reach this.
+    edamame::image::inline_math::set_terminal_support(
+        edamame::image::inline_math::detect_terminal_support(),
+    );
 
     // Restore the terminal on panic.  The hook runs *before* unwinding and cannot see whether
     // anyone will catch the panic, so guarded sections tell it via `terminal::ExpectedPanic`:

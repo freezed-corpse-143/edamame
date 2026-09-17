@@ -27,6 +27,10 @@ use super::common::{panic_message, DiagramError};
 /// placeholder path as an over-cap mermaid diagram.
 const MAX_LATEX_SOURCE_BYTES: usize = 64 * 1024;
 
+/// What one SVG point is in pixels (96 dpi / 72 pt).  Named once, because both the em-per-cell
+/// factor and the raster sizing are derived from it and must not drift apart.
+const PT_TO_PX: f64 = 96.0 / 72.0;
+
 /// Cell-height → RaTeX `font_size` conversion factor.
 ///
 /// Two unit mismatches stand between the terminal's cell *height* (pixels)
@@ -44,7 +48,7 @@ const MAX_LATEX_SOURCE_BYTES: usize = 64 * 1024;
 /// prominent, and large enough to keep subscripts and superscripts legible
 /// in the terminal.  Exactness is impossible without font metrics from the
 /// terminal, so the factor targets a look within ±10% across terminals.
-const LATEX_EM_TO_CELL: f64 = 1.25 / (96.0 / 72.0 * 1.25);
+const LATEX_EM_TO_CELL: f64 = 1.25 / (PT_TO_PX * 1.25);
 
 /// Internal margin baked into every formula's SVG, as a fraction of its em
 /// (RaTeX's `padding` is in the same user units as the glyph coordinates,
@@ -95,6 +99,261 @@ pub fn resolve_latex(
         image: fit_latex_to_cell_grid(image, font_size, bg),
         scratch: None,
     })
+}
+
+/// `ratex_svg` writes the SVG's size in **points** (`width="…pt"`) while every coordinate in it is
+/// a user unit, and `usvg` resolves points at 96 dpi — so a formula laid out `h` user units tall
+/// rasterizes `h × 4/3` pixels tall.  Every pixel budget in [`render_inline_latex`] folds this in;
+/// without it the baseline lands a third of a formula too low (measured: 3 px on a 20 px cell,
+/// which is what the ink-bottom test in this module pins).
+const SVG_PT_TO_PX: f64 = PT_TO_PX;
+
+/// Inline padding, as a fraction of the em.  A hair of margin, not display math's
+/// `LATEX_PADDING_EMS` (0.3em): 0.3em is a quarter of the cell budget here, and it is the
+/// *descent* side that runs out first.
+const INLINE_PAD_EMS: f64 = 0.05;
+
+/// The em an inline formula is set at, as a fraction of the cell height.
+///
+/// Display math's [`LATEX_EM_TO_CELL`] is the starting point — the same cell-height → em factor
+/// `resolve_latex` uses — and inline math takes 0.74 of it, measured rather than derived: at the
+/// display factor a formula's capital `Y` rasterizes 21 px against the text's own 18 px capitals
+/// and ascenders in the same *frame* — a 21 px capital against the text's own 18 px — and
+/// 18/21 ≈ 0.86 of that em, i.e. 0.74 of the display factor.  A formula sharing
+/// a line with prose has to read as part of the sentence; display math keeps the larger factor on
+/// purpose, being a display element.
+///
+/// Font-dependent, like the baseline ratio: `EDAMAME_INLINE_MATH_SIZE` scales it for re-measuring
+/// against another terminal font.
+const INLINE_EM_TO_CELL: f64 = LATEX_EM_TO_CELL * 0.74;
+
+/// `EDAMAME_INLINE_MATH_SIZE`, defaulting to 1: a multiplier on [`INLINE_EM_TO_CELL`], so the
+/// inline formula's size can be re-measured per font without a rebuild.
+fn inline_size_factor() -> f64 {
+    static FACTOR: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+        std::env::var("EDAMAME_INLINE_MATH_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.4, 1.5)
+    });
+    *FACTOR
+}
+
+/// One inline formula's layout plus the em it will be rasterized at.
+///
+/// The width measurement and the raster both go through this, which is the point: the atom's cell
+/// width has to be the ink's width *at the size the image will actually have*, or the text after
+/// the formula lands in the wrong place.
+struct InlinePlan {
+    list: ratex_types::display_item::DisplayList,
+    em: f64,
+}
+
+impl InlinePlan {
+    fn layout(
+        source: &str,
+        font_size: Option<(u16, u16)>,
+        fg: [u8; 4],
+        ratio: f32,
+    ) -> Result<Self, DiagramError> {
+        use ratex_layout::layout_options::LayoutOptions;
+        use ratex_layout::{layout, to_display_list};
+        use ratex_parser::parse;
+        use ratex_types::color::Color;
+        use ratex_types::math_style::MathStyle;
+
+        if source.len() > MAX_LATEX_SOURCE_BYTES {
+            return Err(DiagramError::RenderFailed(format!(
+                "latex source too large: {} bytes (max {MAX_LATEX_SOURCE_BYTES})",
+                source.len()
+            )));
+        }
+        let ast = parse(source).map_err(|e| DiagramError::RenderFailed(format!("{e:#}")))?;
+        let [r, g, b, a] = fg;
+        let options = LayoutOptions::default()
+            .with_style(MathStyle::Text)
+            .with_color(Color::new(
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+                f32::from(a) / 255.0,
+            ));
+        let list = to_display_list(&layout(&ast, &options));
+
+        let (_cell_w, cell_h) = font_size.unwrap_or((8, 16));
+        let cell_h = f64::from(cell_h.max(1));
+        let ratio = f64::from(ratio.clamp(0.40, 0.95));
+        let ascent = list.height.max(0.01);
+        let depth = list.depth.max(0.0);
+        // The whole budget is in *raster pixels*; the em that produces them is a user unit, so
+        // every constraint is divided by the pt→px factor before it becomes an em.
+        //
+        // Capped at the em display math uses for body-sized text: the two room constraints below
+        // only say the ink has to fit above and below the baseline, and a *short* formula (a lone
+        // `x`) satisfies them at a huge em — which rendered inline letters noticeably larger than
+        // the prose around them.  `LATEX_EM_TO_CELL` is the same cell-height → em factor
+        // `resolve_latex` uses to match the body text's x-height.
+        let body_em = cell_h * INLINE_EM_TO_CELL * inline_size_factor();
+        let em = ((ratio * cell_h / (ascent + INLINE_PAD_EMS))
+            .min((1.0 - ratio) * cell_h / (depth + INLINE_PAD_EMS))
+            / SVG_PT_TO_PX)
+            .min(body_em);
+        Ok(Self { list, em })
+    }
+
+    fn pad(&self) -> f64 {
+        self.em * INLINE_PAD_EMS
+    }
+
+    fn ascent(&self) -> f64 {
+        self.list.height.max(0.01)
+    }
+
+    /// The whole SVG's size in raster pixels — ink plus padding, at the pt→px factor the SVG's
+    /// `pt` units imply.
+    fn px(&self) -> (f64, f64) {
+        let pad = self.pad();
+        (
+            (self.list.width * self.em + 2.0 * pad) * SVG_PT_TO_PX,
+            ((self.list.height + self.list.depth) * self.em + 2.0 * pad) * SVG_PT_TO_PX,
+        )
+    }
+}
+
+/// Cells an inline formula needs on its own row at `font_size`: its ink width rounded up, measured
+/// at the same em the raster will use.
+///
+/// This is what replaces "as many cells as the source text is wide" — the source's own width is
+/// the wrong number (the delimiters and the ASCII transcription of `\alpha` have nothing to do
+/// with the ink), and reserving it leaves visible whitespace after every short formula.
+///
+/// `None` when RaTeX cannot lay the formula out, or the width is not representable in cells; the
+/// caller then keeps the literal source, which is the same fallback a failed diagram gets.
+pub fn inline_latex_width_cells(
+    source: &str,
+    font_size: Option<(u16, u16)>,
+    ratio: f32,
+) -> Option<u16> {
+    let (cell_w, _) = font_size.unwrap_or((8, 16));
+    let cell_w = f64::from(cell_w.max(1));
+    // The colour cannot change the metrics; white keeps this call independent of the theme.
+    let plan = InlinePlan::layout(source, font_size, [255, 255, 255, 255], ratio).ok()?;
+    let (px_w, _) = plan.px();
+    u16::try_from((px_w / cell_w).ceil().max(1.0) as i64).ok()
+}
+
+/// Render an **inline** formula into a bitmap exactly one cell row tall, with its baseline at
+/// `baseline_ratio` of the cell height.
+///
+/// Display math ([`resolve_latex`]) solves the easy version of this: it owns whole rows, so it
+/// lays out in display style and centres itself in an exact number of cells.  An inline formula
+/// must share a text row, which changes three things:
+///
+/// * layout runs in `MathStyle::Text`, not the default display style — otherwise a `\frac`'s
+///   parts are set at display size and nothing fits one row;
+/// * the em comes from the *cell* budget, not from [`LATEX_EM_TO_CELL`]: the ink has to fit above
+///   and below the intended baseline, so the em is the smaller of the two room constraints—
+///   `ascent·em ≤ ratio·cell_h`, `depth·em ≤ (1-ratio)·cell_h`;
+/// * the returned image is the whole `cells_w × 1` cell box with the formula pasted at the pixel
+///   offset that lands its baseline on `baseline_ratio·cell_h`.  Filling the box (rather than
+///   returning the ink's own extent) is what keeps the terminal from stretching a narrow formula
+///   across the atom's cells, and what leaves the text on either side exactly where the source
+///   put it.
+///
+/// `cells_w` is the atom's reserved width, which the caller takes from
+/// [`inline_latex_width_cells`] — the *ink's* width, never the source text's.  Reserving the
+/// source's width was the first cut, and it left visible whitespace after every short formula
+/// (`$Y_1$` is five source characters and about three cells of ink).
+pub fn render_inline_latex(
+    source: &str,
+    cells_w: u16,
+    font_size: Option<(u16, u16)>,
+    fg: [u8; 4],
+    bg: [u8; 4],
+    baseline_ratio: f32,
+) -> Result<image::DynamicImage, DiagramError> {
+    if source.len() > MAX_LATEX_SOURCE_BYTES {
+        return Err(DiagramError::RenderFailed(format!(
+            "latex source too large: {} bytes (max {MAX_LATEX_SOURCE_BYTES})",
+            source.len()
+        )));
+    }
+    let outcome = {
+        let _expected = crate::terminal::ExpectedPanic::new();
+        catch_unwind(AssertUnwindSafe(|| {
+            render_inline_latex_inner(source, cells_w, font_size, fg, bg, baseline_ratio)
+        }))
+    }
+    .map_err(|payload| {
+        DiagramError::RenderFailed(format!("latex render panic: {}", panic_message(&payload)))
+    })?;
+    outcome
+}
+
+fn render_inline_latex_inner(
+    source: &str,
+    cells_w: u16,
+    font_size: Option<(u16, u16)>,
+    fg: [u8; 4],
+    bg: [u8; 4],
+    baseline_ratio: f32,
+) -> Result<image::DynamicImage, DiagramError> {
+    use ratex_svg::{render_to_svg, SvgOptions};
+
+    let plan = InlinePlan::layout(source, font_size, fg, baseline_ratio)?;
+    let (cell_w, cell_h) = font_size.unwrap_or((8, 16));
+    let (cell_w, cell_h) = (f64::from(cell_w.max(1)), f64::from(cell_h.max(1)));
+    let ratio = f64::from(baseline_ratio.clamp(0.40, 0.95));
+
+    let svg = render_to_svg(
+        &plan.list,
+        &SvgOptions {
+            embed_glyphs: false,
+            font_size: plan.em,
+            padding: plan.pad(),
+            ..SvgOptions::default()
+        },
+    );
+
+    let (raster, scale) = crate::image::rasterize_svg_scaled(
+        &svg,
+        crate::image::svg::SvgSizing {
+            envelope: Some((cells_w.max(1), 1)),
+            font_size: Some((cell_w as u16, cell_h as u16)),
+            mode: crate::image::svg::SvgScaleMode::Natural,
+        },
+        None,
+    )
+    .map_err(DiagramError::from)?;
+
+    // The SVG puts the baseline `pad + ascent·em` from its top *in user units*; the raster scaled
+    // that by the pt→px factor and by `scale` (the envelope can force one down when the formula is
+    // wider than the atom).
+    let baseline_px = (plan.pad() + plan.ascent() * plan.em) * SVG_PT_TO_PX * f64::from(scale);
+    let top = (ratio * cell_h - baseline_px).round().max(0.0) as i64;
+
+    let mut canvas = image::ImageBuffer::from_pixel(
+        (cells_w.max(1) as u32) * (cell_w as u32),
+        cell_h as u32,
+        image::Rgba([0, 0, 0, 0]),
+    );
+    // The box is a whole number of cells and the ink is not, so `ceil` leaves up to a cell of
+    // slack; splitting it evenly reads as optical spacing, where leaving it all on the right reads
+    // as a missing glyph (and pushes a following comma away from the formula it belongs to).
+    let left = ((canvas.width() as i64 - raster.width() as i64) / 2).max(0);
+    image::imageops::overlay(&mut canvas, &raster.to_rgba8(), left, top);
+    // Opaque, on the document background — *not* left transparent, even though the terminal
+    // composites with alpha.  The atom's cells hold the source text, styled `code_span`, whose
+    // background the placement's erase sweep (ECH) refills before the image lands: a transparent
+    // bitmap would let that chip show straight through the formula's empty pixels.  Painting the
+    // page colour instead makes the formula float on the document, and does it only where an
+    // image was actually placed — the literal `$x$` elsewhere keeps whatever style it had.
+    // Same convention (and the same helper) as display math's `fit_latex_to_cell_grid`.
+    Ok(flatten_to_background(
+        image::DynamicImage::ImageRgba8(canvas),
+        bg,
+    ))
 }
 
 /// Prepare a formula image for the terminal's cell grid: symmetric
@@ -307,6 +566,100 @@ fn render_latex_svg_inner(
         },
     );
     Ok(svg)
+}
+
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+
+    /// The measurement is the whole point of this half: the source's own width is the wrong
+    /// number — the delimiters and an ASCII transcription like `Y_1` say nothing about the ink.
+    #[test]
+    fn the_measured_width_is_the_ink_not_the_source() {
+        let cell = Some((10u16, 20u16));
+        for (source, source_cells) in [("Y_1", 5usize), ("\\alpha", 7), ("\\frac{1}{2}", 11)] {
+            let cells = inline_latex_width_cells(source, cell, 0.74).expect("layouts") as usize;
+            assert!(cells >= 1, "{source:?}");
+            assert!(
+                cells < source_cells,
+                "{source:?}: {cells} cells of ink must be narrower than the {source_cells} source characters"
+            );
+        }
+        // Width follows the *raster's* ink, not the source and not the natural ink either: the
+        // one-row budget trades height for width, so a `\frac` (deep, therefore squeezed hard)
+        // measures *narrower* than a single letter while its source is far longer.  That is the
+        // squeeze, stated as a number.
+        let letter = inline_latex_width_cells("x", cell, 0.74).expect("layouts");
+        let wide = inline_latex_width_cells("\\sum_{i=1}^{n} x_i", cell, 0.74).expect("layouts");
+        assert!(wide > letter, "wide {wide} must exceed letter {letter}");
+        // A source RaTeX refuses yields no width, so the caller keeps the literal source.
+        assert!(inline_latex_width_cells("\\notacommand{", cell, 0.74).is_none());
+    }
+
+    /// An inline formula is set at *body* size: the room constraints alone let a short formula
+    /// double its em, which rendered lone letters noticeably larger than the prose around them.
+    /// Measured on the raster: a lowercase `x`'s ink must stay within the x-height a terminal font
+    /// gives body text (≈ 0.35 of the cell), not fill the cell's ascent.
+    #[test]
+    fn an_inline_formula_is_set_at_body_size() {
+        let cell = (10u16, 20u16);
+        let fg = [230, 230, 230, 255];
+        let bg = [26, 26, 26, 255];
+        for source in ["x", "a", "c"] {
+            let img = render_inline_latex(source, 3, Some(cell), fg, bg, 0.74).expect("renders");
+            let rgba = img.to_rgba8();
+            let ink_rows: Vec<u32> = (0..rgba.height())
+                .filter(|&y| (0..rgba.width()).any(|x| rgba.get_pixel(x, y).0 != bg))
+                .collect();
+            let height =
+                ink_rows.last().copied().unwrap_or(0) - ink_rows.first().copied().unwrap_or(0) + 1;
+            assert!(
+                height <= 10,
+                "{source:?}: the ink is {height} px of a 20 px cell — a lowercase letter must not \
+                 exceed the body text's x-height"
+            );
+        }
+    }
+
+    /// The one claim the whole spike rests on: the formula's ink bottom — its baseline, for a
+    /// glyph without a descender — lands on `baseline_ratio · cell_h`, which is where the text's
+    /// own baseline sits.  Asserted on the raster, where the answer is a number rather than an
+    /// impression.
+    #[test]
+    fn the_ink_bottom_lands_on_the_baseline() {
+        let cell = (10u16, 20u16);
+        let fg = [230, 230, 230, 255];
+        // The bitmap is opaque on the page colour, so "ink" is a pixel that differs from it.
+        let bg = [26, 26, 26, 255];
+        let ink_bottom = |source: &str, ratio: f32| -> u32 {
+            let img = render_inline_latex(source, 3, Some(cell), fg, bg, ratio).expect("renders");
+            assert_eq!(img.width(), 30, "the bitmap is the atom's cell box");
+            assert_eq!(img.height(), 20, "exactly one cell row tall");
+            let rgba = img.to_rgba8();
+            (0..rgba.height())
+                .rev()
+                .find(|&y| (0..rgba.width()).any(|x| rgba.get_pixel(x, y).0 != bg))
+                .expect("the formula has ink")
+        };
+
+        // `X` has no descender: its ink bottom *is* the baseline.
+        for ratio in [0.7f32, 0.8, 0.9] {
+            let want = (ratio * 20.0).round() as i64;
+            let got = i64::from(ink_bottom("X", ratio));
+            assert!(
+                (got - want).abs() <= 1,
+                "ratio {ratio}: ink bottom {got} must land on the baseline {want}"
+            );
+        }
+
+        // A subscript descends below it, and by less than a cell — the sub-cell offset a
+        // cell-aligned placement cannot express, which is what the padded raster is for.
+        let bottom = ink_bottom("Y_1", 0.8);
+        assert!(
+            (16..20).contains(&bottom),
+            "Y_1's descender must stay inside its own cell row, got {bottom}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use ratatui::text::Line;
 use rustc_hash::FxBuildHasher;
 
-use super::ast::Block;
+use super::ast::{Block, Inline};
 
 /// The cache's block map. Keyed by whole `Block` AST values, so a lookup hashes a deep
 /// structure — many small `write_*` calls — on every query. std's DoS-resistant SipHash is
@@ -35,10 +35,37 @@ pub(super) type BlockMap = HashMap<Block, Vec<Line<'static>>, FxBuildHasher>;
 /// the cache and re-render each build. `ImageBlock` is handled separately by the caller — it is
 /// never cached for an unrelated reason (its rows track the out-of-band decode cache).
 pub(super) fn is_cache_worthy(block: &Block) -> bool {
+    // A block whose render registers inline-math atoms must re-run every build: the atom table is
+    // a side effect of *rendering* (see `image::inline_math`), so a cache hit would leave a hole in
+    // it and shift every later formula's ordinal — the painter would then name the wrong atom.
+    //
+    // Only while the spike is actually *painting*, though.  With it off — an unsupported terminal,
+    // `EDAMAME_INLINE_MATH=0`, or a session that declined the *Figures* consent — those inlines
+    // render as plain text with no side effect, and bypassing the cache for them is a pure
+    // regression for readers of documents that merely mention `$`.
+    if crate::image::inline_math::is_painting() && has_inline_math(block) {
+        return false;
+    }
     match block {
         Block::Table { .. } | Block::CodeBlock { .. } => true,
         Block::BlockQuote { blocks } => blocks.iter().any(is_cache_worthy),
         Block::List { items, .. } => items.iter().flat_map(|it| &it.blocks).any(is_cache_worthy),
+        _ => false,
+    }
+}
+
+/// Whether `block` contains an inline `$…$` anywhere it would be rendered.
+fn has_inline_math(block: &Block) -> bool {
+    let inlines = |v: &Vec<Inline>| v.iter().any(|i| matches!(i, Inline::Math { .. }));
+    match block {
+        Block::Paragraph { inlines: i } | Block::Heading { inlines: i, .. } => inlines(i),
+        Block::Table { headers, rows, .. } => {
+            headers.iter().any(inlines) || rows.iter().flatten().any(inlines)
+        }
+        Block::BlockQuote { blocks } | Block::FootnoteDefinition { blocks, .. } => {
+            blocks.iter().any(has_inline_math)
+        }
+        Block::List { items, .. } => items.iter().flat_map(|it| &it.blocks).any(has_inline_math),
         _ => false,
     }
 }
@@ -93,6 +120,33 @@ impl RenderCache {
 
 #[cfg(test)]
 mod tests {
+
+    /// F5: the bypass in `is_cache_worthy` exists because rendering *registers* atoms — a side
+    /// effect that only happens while the spike is painting.  With it off (an unsupported terminal,
+    /// `EDAMAME_INLINE_MATH=0`, or a session that declined *Figures*) a table that merely mentions
+    /// `$` must keep its cache entry; the unconditional bypass cost those readers the whole table's
+    /// memoization.
+    #[test]
+    fn a_table_with_math_is_cache_worthy_again_while_the_spike_is_off() {
+        let blocks = crate::markdown::parser::parse("| $x$ | b |\n|---|---|\n| 1 | 2 |\n");
+        let table = blocks.first().expect("a table block");
+        crate::image::inline_math::force_enabled(false);
+        assert!(
+            is_cache_worthy(table),
+            "no atom side effect while the spike is off, so caching is safe"
+        );
+        crate::image::inline_math::force_enabled(true);
+        crate::image::inline_math::set_build_inputs(Some((10, 20)), None, false);
+        assert!(
+            is_cache_worthy(table),
+            "a declined *Figures* consent registers no atoms either"
+        );
+        crate::image::inline_math::set_build_inputs(Some((10, 20)), None, true);
+        assert!(
+            !is_cache_worthy(table),
+            "the atom table is a side effect of rendering, so a cache hit would shift the ordinals"
+        );
+    }
     use super::*;
 
     fn settings() -> RenderSettings {
