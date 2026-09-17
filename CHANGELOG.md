@@ -12,10 +12,17 @@ Each released version's section is also what ships as the GitHub release notes: 
 
 - An uninstall script that removes edamame's config and state files, and the binary (deferring to the package manager if applicable).
 - Daily tips: once a day at startup, edamame shows a short tip about a feature you might not know about. Turn it off with the tip's "Don't show tips" button or the "Daily tips" setting. See all tips with Ctrl-P → "Browse tips".
+- Images in WezTerm now stay sharp when only part of one is on screen. WezTerm lacks the Kitty protocol's unicode-placeholder extension, so edamame places the image itself with a source rectangle — no re-encode, and no flash as it scrolls.
+- Images in Sixel terminals — Windows Terminal 1.22 and later, foot, xterm with sixel enabled — now stay sharp when only part of one is on screen too, instead of dropping to half-blocks.
 
 ### Changed
 
 - The bookkeeping edamame writes for itself (e.g. update-check timestamps) moved from config.toml to state.toml in your data directory. edamame migrates these values on the next launch, leaving config.toml fully hand-editable and safe to share across machines. No action needed.
+
+### Fixed
+
+- A partly visible image is no longer drawn as coarse blocks. Scrolling an image only part of the way off screen used to drop it to a low-resolution half-block rendering; it now keeps its true resolution, in kitty, Ghostty, WezTerm and Sixel terminals alike. (Terminals that speak only iTerm2 inline images still fall back — a separate change.)
+- A document that shows the same image twice now displays it in both places, instead of only the second.
 
 ## [0.1.4] - 2026-09-11
 
