@@ -1034,6 +1034,11 @@ impl EditorState {
         // recursion — `refresh_diff_parse` never calls back — and it is one branch outside a
         // review.
         self.refresh_diff_parse();
+        // The rebuild may have *shortened* the document — a decoded image block replaces its
+        // `image_max_height` reservation with the image's real height the moment its decode lands,
+        // and a scrolled reader would otherwise be left past the last row, where the viewport
+        // paints nothing.  Clamping here covers every rebuild, not just the image one.
+        self.clamp_scroll_to_document();
     }
 
     /// Rebuild the diff's rendered new-side parse.  No-op outside a review.

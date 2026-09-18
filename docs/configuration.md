@@ -96,11 +96,14 @@ Change both from the theme picker: `Ctrl-P` → "Switch theme". There is no defa
 | `visual_line_nav` | bool | `true` | overlay, palette |
 | `cursor_blink` | bool | `true` | overlay, palette |
 | `cursor_blink_ms` | integer | `530` | file only |
+| `remember_cursor` | bool | `true` | overlay |
 | `mouse_scroll_lines` | integer | `1` | overlay |
 
 `visual_line_nav` makes `↑`/`↓` move by visual rows, so the cursor keeps its screen column across a wrapped line. Set `false` to move by logical lines.
 
 `cursor_blink_ms` is the half-period — the cursor toggles every this many milliseconds.
+
+`remember_cursor` reopens each file where its cursor was when you last quit, centered in the view, instead of at the top. The positions are machine state, not settings: they live in `state.toml` (see [Machine state](#machine-state-statetoml)) and are capped at the 50 most recently left files. Turning the switch off stops both the remembering and the restoring, and leaves what is already recorded alone — switching it back on brings those positions back.
 
 `mouse_scroll_lines` is lines per wheel tick, and also governs trackpad scrolling (where `1` usually feels best). Keyboard scrolling always steps one line and ignores this.
 
@@ -142,7 +145,7 @@ A buffer with unsaved edits always prompts, regardless of this setting. edamame 
 
 ### Machine state (`state.toml`)
 
-A handful of values are written by edamame itself rather than by you, such as when it last checked for updates. These live in a separate `state.toml` in the platform data directory, keeping `config.toml` entirely hand-editable and safe to share across machines:
+A handful of values are written by edamame itself rather than by you, such as when it last checked for updates or where you left the cursor in each file (see [`remember_cursor`](#cursor-and-movement)). These live in a separate `state.toml` in the platform data directory, keeping `config.toml` entirely hand-editable and safe to share across machines:
 
 | Platform | Path |
 |---|---|

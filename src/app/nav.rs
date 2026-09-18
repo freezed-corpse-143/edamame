@@ -9,6 +9,7 @@ use anyhow::Result;
 
 use crate::app::flash::MessageKind;
 use crate::app::modal;
+use crate::config::cursor_key;
 use crate::docs::DocId;
 use crate::document::Buffer;
 use crate::editor::link::LinkTarget;
@@ -275,6 +276,60 @@ impl App {
         None
     }
 
+    /// Restore the cursor parked by [`App::new`] and park the viewport's vertical middle on it,
+    /// re-centring for the first few frames while image decodes land and the row space settles.
+    ///
+    /// Runs from `prepare_viewport`, like [`Self::apply_startup_anchor`], and clears itself: a
+    /// later frame must not yank a reader who has scrolled away.  Centering (rather than an
+    /// `ensure_cursor_visible` nudge) is what keeps the cursor clear of both edges, so the
+    /// `ensure_cursor_visible` calls that follow this in the same frame are no-ops and the restored
+    /// scroll survives them.  A position within `height / 2` rows of the top clamps to the top,
+    /// which is as close to centered as the document allows.
+    ///
+    /// The settle loop exists because a one-shot centre is computed in the wrong row space:
+    /// [`crate::image::ImageCache::reserved_rows`] answers `None` — the `image_max_height` fallback
+    /// — until a decode lands, and every figure then collapses to its real height.  Centred on
+    /// frame 0 and never revisited, the viewport ended up past the *end* of the settled document,
+    /// which paints nothing at all.
+    pub(super) fn apply_pending_cursor_restore(&mut self, doc_height: usize, doc_width: usize) {
+        let Some(mut pending) = self.pending_cursor_restore else {
+            return;
+        };
+        // Placed once; only the scroll is re-derived, so the loop doesn't re-run the cursor-block
+        // bookkeeping (which re-arms the raw-reveal dwell) on every frame it stays armed.
+        if self.editor.cursor.offset != pending.offset {
+            self.editor.place_cursor(pending.offset);
+        }
+        self.editor
+            .set_scroll_for_cursor_screen_row(doc_height / 2, doc_width);
+        pending.frames_left = pending.frames_left.saturating_sub(1);
+        self.pending_cursor_restore = if pending.frames_left > 0 && self.row_space_still_settling()
+        {
+            Some(pending)
+        } else {
+            None
+        };
+        self.needs_draw = true;
+    }
+
+    /// Whether any image or figure block is still reserving the `image_max_height` fallback instead
+    /// of its real height, i.e. whether the row space the viewport is centred in can still change
+    /// under it.
+    ///
+    /// A block with no cache entry counts: on the first frame the decodes have not been *requested*
+    /// yet — `prepare_viewport` dispatches them after this — so "no entry" is the normal state of a
+    /// document whose figures are about to land, not a settled one. A block that is never requested
+    /// at all (it is outside the near-viewport decode window) keeps the loop armed, which is why
+    /// the loop has a frame budget.
+    fn row_space_still_settling(&self) -> bool {
+        self.editor.parsed.image_blocks.iter().any(|b| {
+            matches!(
+                self.editor.images.status(&b.url),
+                None | Some(crate::image::DecodeStatus::Pending)
+            )
+        })
+    }
+
     /// Apply the `#section` the command line named (`edamame notes.md#setup`),
     /// then clear it so it happens once.
     ///
@@ -393,8 +448,41 @@ impl App {
         new_editor
     }
 
+    /// Remember where the cursor sits in the file about to be replaced, so reopening it resumes
+    /// there.  Called from [`Self::load_file_into_editor`] — the only place a switch can observe
+    /// the outgoing cursor, since the swap replaces the editor wholesale — and from the tail of
+    /// [`App::run`], where every quit path funnels.
+    ///
+    /// Four deliberate no-ops: the switch off, no file to reopen (a `--diff` review, an embedded
+    /// manual page), an offset of `0` (already the default, so recording it would add an entry for
+    /// every file the user merely looked at), and an unchanged position, which must not rewrite
+    /// the machine file.
+    ///
+    /// The write goes through `save_state_bookkeeping`, so a `--no-config` session records nothing
+    /// — the same gate that suppresses `state.toml` everywhere else.
+    pub(super) fn record_cursor_position(&mut self) {
+        if !self.config.editor.remember_cursor {
+            return;
+        }
+        let Some(path) = self.file_path.clone() else {
+            return;
+        };
+        let offset = self.editor.cursor.offset;
+        if offset == 0 {
+            return;
+        }
+        let key = cursor_key(&path);
+        if self.state.cursor_for(&key) == Some(offset) {
+            return;
+        }
+        self.state.remember_cursor(key, offset);
+        self.save_state_bookkeeping("remembered cursor position");
+    }
+
     pub(super) fn load_file_into_editor(&mut self, path: PathBuf) -> Result<()> {
         let buffer = Buffer::load_file(&path)?;
+        // The document being left keeps its position; this is the last moment it is knowable.
+        self.record_cursor_position();
         // Stamp the own-write filter from the bytes just read, so the inotify
         // event some backends synthesize on `open(2)` is suppressed.
         self.set_disk_hash(buffer.contents().as_bytes());
@@ -1199,5 +1287,217 @@ fn main() {}
             1,
             "one pending images prompt, not one per document"
         );
+    }
+
+    // ── Remembered cursor ─────────────────────────────────────────────────
+
+    /// Build an app the way `main` does: a real file on disk, and the state `state.toml` holds.
+    fn app_on_file(
+        path: PathBuf,
+        config: crate::config::Config,
+        state: crate::config::State,
+    ) -> App {
+        use crate::config::{KeyBindingOverrides, Theme};
+        use crate::terminal::{Capabilities, ColorDepth};
+
+        let caps = Capabilities {
+            color_depth: ColorDepth::TrueColor,
+            ..Capabilities::default()
+        };
+        App::new(
+            config,
+            state,
+            KeyBindingOverrides::default(),
+            (&Theme::default()).into(),
+            Some(path),
+            caps,
+            Vec::new(),
+        )
+        .expect("build app")
+    }
+
+    /// Blank-line-separated paragraphs: one rendered line each, so rendered row == paragraph index
+    /// and the centering arithmetic in these tests needs no wrap model.
+    fn paragraphs(count: usize) -> String {
+        (0..count).map(|i| format!("para {i}\n\n")).collect()
+    }
+
+    #[test]
+    fn a_remembered_cursor_lands_at_the_vertical_middle_on_the_first_frame() {
+        let src = paragraphs(40);
+        let (_f, path) = md_file(&src);
+        let offset = src.find("para 20").expect("paragraph 20");
+        let mut state = crate::config::State::default();
+        state.remember_cursor(cursor_key(&path), offset);
+
+        let mut app = app_on_file(path, crate::config::Config::default(), state);
+        assert_eq!(
+            app.pending_cursor_restore.map(|p| p.offset),
+            Some(offset),
+            "opening the file parks the position it was left at"
+        );
+
+        app.apply_pending_cursor_restore(H, W);
+
+        assert_eq!(app.editor.cursor.offset, offset);
+        assert_eq!(
+            app.editor.cursor_screen_row(W),
+            H / 2,
+            "the remembered position is centered, not merely visible"
+        );
+        assert!(app.pending_cursor_restore.is_none(), "consumed once");
+
+        // A later frame must leave it alone: the reader owns the scroll from here.
+        let scroll = app.editor.scroll;
+        app.apply_pending_cursor_restore(H, W);
+        assert_eq!(app.editor.scroll, scroll);
+    }
+
+    #[test]
+    fn a_remembered_cursor_near_the_top_clamps_to_the_top() {
+        let src = paragraphs(40);
+        let (_f, path) = md_file(&src);
+        let offset = src.find("para 2").expect("paragraph 2");
+        let mut state = crate::config::State::default();
+        state.remember_cursor(cursor_key(&path), offset);
+
+        let mut app = app_on_file(path, crate::config::Config::default(), state);
+        app.apply_pending_cursor_restore(H, W);
+
+        assert_eq!(
+            app.editor.scroll, 0,
+            "a document cannot scroll above its own top"
+        );
+        assert_eq!(app.editor.cursor.offset, offset);
+    }
+
+    #[test]
+    fn the_restore_re_centres_while_a_decode_is_still_landing() {
+        // An image block reserves `image_max_height` rows until its decode lands and only then
+        // takes the image's real height, so a centre computed on the first frame is computed for a
+        // row space the reader never ends up in.  Measured in the wild: a math-heavy document lost
+        // 100 of its 178 rows over the first five frames, and the one-shot centre left the viewport
+        // past the end of the settled document, painting an empty screen.
+        let src = format!(
+            "{}![a](a.png)\n\n{}",
+            "para\n\n".repeat(20),
+            "para\n\n".repeat(20)
+        );
+        let (_f, path) = md_file(&src);
+        let offset = src.find("![a]").expect("image paragraph");
+        let mut state = crate::config::State::default();
+        state.remember_cursor(cursor_key(&path), offset);
+        let mut app = app_on_file(path, crate::config::Config::default(), state);
+
+        // No decode worker runs in a unit test, so ask the cache for the decode by hand — what the
+        // settle loop keys off is `DecodeStatus::Pending`.
+        let urls: Vec<String> = app
+            .editor
+            .parsed
+            .image_blocks
+            .iter()
+            .map(|b| b.url.clone())
+            .collect();
+        assert_eq!(urls.len(), 1, "the image paragraph promoted to a block");
+        for url in &urls {
+            app.editor.images.request(url);
+        }
+
+        app.apply_pending_cursor_restore(H, W);
+        let reserved = app.editor.total_visual_rows_for_mode(W);
+        assert!(
+            app.pending_cursor_restore.is_some(),
+            "a decode in flight keeps the restore armed, so it can re-centre on the settled space"
+        );
+
+        // The decode lands — as a failure, which collapses the block to one row — and the document
+        // gets much shorter under the reader.
+        app.editor.images.set_failed(&urls[0], "test".to_owned());
+        app.editor.refresh_parsed();
+        app.apply_pending_cursor_restore(H, W);
+        let settled = app.editor.total_visual_rows_for_mode(W);
+
+        assert!(settled < reserved, "the collapse shortened the document");
+        assert!(
+            app.editor.scroll < settled,
+            "the re-centred scroll stays inside the document ({settled} rows, was {reserved})"
+        );
+        assert!(
+            app.pending_cursor_restore.is_none(),
+            "nothing is pending, so the restore lets go"
+        );
+        assert_eq!(app.editor.cursor.offset, offset);
+    }
+
+    #[test]
+    fn remember_cursor_off_neither_parks_nor_records() {
+        let src = paragraphs(40);
+        let (_f, path) = md_file(&src);
+        let key = cursor_key(&path);
+        let mut config = crate::config::Config::default();
+        config.editor.remember_cursor = false;
+        let mut state = crate::config::State::default();
+        state.remember_cursor(key.clone(), 30);
+
+        let mut app = app_on_file(path, config, state);
+        assert_eq!(
+            app.pending_cursor_restore.map(|p| p.offset),
+            None,
+            "nothing is restored"
+        );
+
+        // ...and the recording half writes nothing either: off is a pause, not a purge, so the
+        // entry already on disk is left exactly as it was rather than following the cursor.
+        app.editor.cursor.offset = 999;
+        app.record_cursor_position();
+        assert_eq!(app.state.cursor_for(&key), Some(30));
+        assert_eq!(app.state.cursors.len(), 1);
+    }
+
+    #[test]
+    fn leaving_a_file_records_its_cursor_once() {
+        // The switch writes to `state.toml`; isolation keeps that off the real data dir.
+        let _iso = crate::test_env::config_isolation();
+        let src = paragraphs(40);
+        let (_a, first) = md_file(&src);
+        let (_b, second) = md_file(&src);
+        let offset = src.find("para 30").expect("paragraph 30");
+
+        let mut app = app_on_file(
+            first.clone(),
+            crate::config::Config::default(),
+            crate::config::State::default(),
+        );
+        app.editor.cursor.offset = offset;
+        app.load_file_into_editor(second).expect("load second file");
+
+        assert_eq!(app.state.cursor_for(&cursor_key(&first)), Some(offset));
+        assert_eq!(app.state.cursors.len(), 1, "one entry for the file left");
+
+        // Leaving it again at the same place must not rewrite the machine file, which shows up as
+        // nothing changing — a second file would have joined the list otherwise.
+        app.record_cursor_position();
+        assert_eq!(app.state.cursors.len(), 1);
+    }
+
+    #[test]
+    fn an_untouched_or_pathless_buffer_records_nothing() {
+        let src = paragraphs(40);
+        let (_f, path) = md_file(&src);
+
+        // Cursor at the top: the default the user already gets, so it earns no entry.
+        let mut app = app_on_file(
+            path,
+            crate::config::Config::default(),
+            crate::config::State::default(),
+        );
+        app.record_cursor_position();
+        assert!(app.state.cursors.is_empty());
+
+        // No file to reopen: a `--diff` review, or an embedded manual page.
+        let mut pathless = app_with_buffer(&src, 0);
+        pathless.editor.cursor.offset = 30;
+        pathless.record_cursor_position();
+        assert!(pathless.state.cursors.is_empty());
     }
 }

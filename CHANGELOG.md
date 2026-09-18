@@ -11,6 +11,7 @@ Each released version's section is also what ships as the GitHub release notes: 
 ### Added
 
 - An uninstall script that removes edamame's config and state files, and the binary (deferring to the package manager if applicable).
+- edamame remembers where you left the cursor in each file and reopens it there, centered in the view, instead of at the top. Turn it off with the "Remember cursor position" setting (Ctrl-P → Open settings).
 - Daily tips: once a day at startup, edamame shows a short tip about a feature you might not know about. Turn it off with the tip's "Don't show tips" button or the "Daily tips" setting. See all tips with Ctrl-P → "Browse tips".
 
 ### Changed

@@ -308,6 +308,9 @@ impl App {
         // stay put and only content below reflows.  Inert unless reflow is on in Rendered mode.
         self.editor
             .anchor_reflow_reveal(dims.doc_width, dims.doc_height);
+        // The cursor this file was left at lands at the viewport's vertical middle.  Applied
+        // *before* the anchor below, which is explicit command-line intent and wins.
+        self.apply_pending_cursor_restore(dims.doc_height, dims.doc_width);
         // A command-line `#section` applies on the first frame that knows the
         // document's dimensions and clears itself.
         self.apply_startup_anchor(dims.doc_height, dims.doc_width);

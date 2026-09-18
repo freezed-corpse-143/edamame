@@ -185,6 +185,7 @@ mod tests {
         "Daily tips",
         "Diff when file changes",
         "Limit editor width",
+        "Remember cursor position",
         "Show line numbers",
         "Show table buttons",
     ];

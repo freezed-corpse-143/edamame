@@ -79,6 +79,10 @@ appearance = "dark"
 # Show an occasional startup tip about a less-obvious feature, at most once a day.
 # daily_tips = true
 
+# Reopen each file where its cursor was when the last session left it, centered in the viewport.
+# The remembered positions are machine bookkeeping, kept in state.toml beside this config's log.
+# remember_cursor = true
+
 # ── Modal ─────────────────────────────────────────────────────────────────────
 # [modal]
 

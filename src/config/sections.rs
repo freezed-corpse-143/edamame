@@ -60,6 +60,10 @@ pub struct EditorConfig {
     /// Cursor blink half-period (ms); consulted only when `cursor_blink` is true.  File-only — the
     /// settings overlay exposes the toggle but not this value.
     pub cursor_blink_ms: u64,
+    /// Reopen each file where its cursor was when the last session left it, centered in the
+    /// viewport.  The positions themselves are machine bookkeeping and live in `state.toml`
+    /// ([`super::state`]); this is only the switch.  Default: true.
+    pub remember_cursor: bool,
 }
 
 /// Floor applied to `EditorConfig::max_width_cols` so a stray small value can't break layout.
@@ -117,6 +121,7 @@ impl Default for EditorConfig {
             show_diff_intro: true,
             cursor_blink: true,
             cursor_blink_ms: 530,
+            remember_cursor: true,
         }
     }
 }

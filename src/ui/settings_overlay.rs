@@ -854,6 +854,7 @@ mod tests {
                 "Autosave",
                 "Big H1 headings",
                 "Reflow paragraphs",
+                "Remember cursor position",
                 "Blink cursor",
                 "Check for updates",
                 "Daily tips",
@@ -1057,6 +1058,17 @@ mod tests {
         let resp = state.handle_key(&key(KeyCode::Enter), &mut config);
         assert!(matches!(resp, SettingsResponse::FieldChanged(_)));
         assert!(!config.editor.check_for_updates);
+    }
+
+    #[test]
+    fn remember_cursor_row_toggles_config_flag() {
+        let mut config = Config::default();
+        let mut state = SettingsState::new();
+        focus_row(&mut state, &config, "Remember cursor position");
+        assert!(config.editor.remember_cursor, "opt-out, so on by default");
+        let resp = state.handle_key(&key(KeyCode::Enter), &mut config);
+        assert!(matches!(resp, SettingsResponse::FieldChanged(_)));
+        assert!(!config.editor.remember_cursor);
     }
 
     #[test]

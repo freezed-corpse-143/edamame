@@ -25,6 +25,6 @@ pub use persistence::{
     NOT_PERSISTED_NOTE,
 };
 pub use readers::list_export_stylesheets;
-pub use state::State;
+pub use state::{cursor_key, State};
 pub use theme::Theme;
 pub use theme_file::ThemeFile;

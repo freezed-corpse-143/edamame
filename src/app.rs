@@ -40,7 +40,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::config::sections::{DEFAULT_HANDLER, VIM_HANDLER};
-use crate::config::{Config, ConfigWarning, KeyBindingOverrides, KeyMap, State, Theme, ThemeFile};
+use crate::config::{
+    cursor_key, Config, ConfigWarning, KeyBindingOverrides, KeyMap, State, Theme, ThemeFile,
+};
 use crate::document::Buffer;
 use crate::editor::{mouse_ops, EditorState};
 use crate::input::{MouseDispatcher, VimState};
@@ -83,6 +85,29 @@ pub struct HintPrompt {
     pub chords: Vec<HintChord>,
     pub handler: fn(&mut App, crossterm::event::KeyCode),
 }
+
+/// A cursor remembered for the file this session opened, parked until the viewport can place it.
+///
+/// Applied on the first frame's [`App::prepare_viewport`], then kept armed for a few frames while
+/// the row space settles: an image or figure block reserves `image_max_height` rows until its
+/// decode lands and then shrinks to the image's real height, so the space a centre is computed in
+/// can be far larger than the one the reader ends up in — a math-heavy document was measured
+/// losing 100 of 178 rows in the first five frames.
+#[derive(Debug, Clone, Copy)]
+struct PendingCursorRestore {
+    /// Char offset into the rope.
+    offset: usize,
+    /// Frames the settle loop may still spend re-centring.  Bounded because a document whose media
+    /// never resolves — an unanswered remote-image prompt keeps a URL `Pending` for the whole
+    /// session — would otherwise re-centre, and so redraw, every frame.
+    frames_left: u8,
+}
+
+/// Frames a remembered-cursor restore may spend re-centring while decodes land.  A decode landing
+/// in the first few frames is the normal case; the budget is slack, not a deadline — but it also
+/// bounds how long the loop can hold the viewport, so it stays short enough that a keystroke
+/// arriving right after launch is not fought by a late re-centre.
+const CURSOR_RESTORE_FRAMES: u8 = 12;
 
 /// The application: owns all state and drives the event loop.
 pub struct App {
@@ -263,6 +288,14 @@ pub struct App {
     /// A `#section` named on the command line, parked until the first frame knows the document's
     /// dimensions and consumed there by [`App::apply_startup_anchor`].
     pub(crate) startup_anchor: Option<String>,
+    /// The cursor this file was left at by the last session, parked until the first frame knows
+    /// the document's dimensions — and for a few frames after that, while image decodes land and
+    /// the row space stops moving.  See [`PendingCursorRestore`].
+    ///
+    /// Only the file named on the command line restores: a link follow lands where the link points
+    /// (see `docs/dev/link-following.md`), so the load paths that switch documents must not look
+    /// one up.
+    pending_cursor_restore: Option<PendingCursorRestore>,
     /// Vim modal-editing state; `Some` iff the vim handler is configured, which keeps every vim
     /// code path inert otherwise.  Carries counts, pending operators, and the active sub-mode.
     vim: Option<VimState>,
@@ -546,6 +579,21 @@ impl App {
             && update_check::interval_elapsed(state.last_tip_shown, now)
             && tips::next_unseen(&state.seen_daily_tips).is_some();
 
+        // The cursor this file was left at last session, applied on the first frame — the same
+        // park/consume shape `startup_anchor` uses, and for the same reason: centering it needs
+        // the live document height, which nothing knows until a frame is measured.
+        let pending_cursor_restore = if config.editor.remember_cursor {
+            file_path
+                .as_deref()
+                .and_then(|path| state.cursor_for(&cursor_key(path)))
+        } else {
+            None
+        }
+        .map(|offset| PendingCursorRestore {
+            offset,
+            frames_left: CURSOR_RESTORE_FRAMES,
+        });
+
         Ok(Self {
             config,
             state,
@@ -610,6 +658,7 @@ impl App {
             startup_tip_due,
             tip_deadline: None,
             startup_anchor: None,
+            pending_cursor_restore,
             vim,
         })
     }
@@ -753,6 +802,11 @@ impl App {
                 break;
             }
         }
+
+        // Every quit path in the loop above funnels here, and this is the last moment the outgoing
+        // position is knowable.  A no-op unless there is somewhere to resume to — see
+        // [`App::record_cursor_position`].
+        self.record_cursor_position();
 
         Ok(())
     }

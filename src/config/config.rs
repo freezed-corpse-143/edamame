@@ -692,6 +692,18 @@ mod tests {
         assert!(!deserialized.editor.check_for_updates);
     }
 
+    /// The switch is a real user setting and lives in `config.toml`; the positions it gates are
+    /// machine bookkeeping in `state.toml`, and none of them is a `Config` field.
+    #[test]
+    fn remember_cursor_defaults_on_and_round_trips() {
+        let mut config = Config::default();
+        assert!(config.editor.remember_cursor);
+        config.editor.remember_cursor = false;
+        let serialized = toml::to_string(&config).expect("serialize");
+        let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
+        assert!(!deserialized.editor.remember_cursor);
+    }
+
     #[test]
     fn theme_name_round_trips() {
         let toml = r#"theme = "catppuccin"

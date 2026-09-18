@@ -30,6 +30,20 @@ impl EditorState {
         self.scroll = 0;
     }
 
+    /// Pull `scroll` back inside the document when a rebuild has shrunk the row space under a
+    /// reader who is scrolled down.  Without it the viewport sits past the last row and paints
+    /// nothing at all — a blank screen for a document that is merely shorter than it was.
+    ///
+    /// The bound is the one the scroll ops use ([`Self::scroll_down`]: the last row may reach the
+    /// top of the viewport), not `scroll_to_bottom`'s tighter one, so this can only ever undo a
+    /// scroll the reader could not have asked for.
+    pub fn clamp_scroll_to_document(&mut self) {
+        let max = self
+            .total_visual_rows_for_mode(self.viewport_width)
+            .saturating_sub(1);
+        self.scroll = self.scroll.min(max);
+    }
+
     /// Scroll so the last document line sits at the bottom of the viewport.
     pub fn scroll_to_bottom(&mut self, viewport_height: usize, viewport_width: usize) {
         let total = self.total_visual_rows_for_mode(viewport_width);
