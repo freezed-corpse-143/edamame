@@ -18,6 +18,8 @@ impl App {
     /// / `handle_file_removed` return early unless `file_path` matches). Do not add a second
     /// guard here that could drift from it.
     pub(super) fn load_doc_into_editor(&mut self, id: DocId) {
+        // The file being left keeps its position, as on a file switch; after this its path is gone.
+        self.record_cursor_position();
         let buffer = Buffer::from_str(&id.source());
         let mut new_editor = self.editor_for_buffer(buffer);
         new_editor.readonly = true;

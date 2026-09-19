@@ -21,7 +21,6 @@ pub(crate) const LABEL_LINE_NUMBERS: &str = "Show line numbers";
 pub(crate) const LABEL_SCROLL_SPEED: &str = "Scroll speed";
 pub(crate) const LABEL_VIM_MODE: &str = "Vim mode";
 pub(crate) const LABEL_BLINK_CURSOR: &str = "Blink cursor";
-pub(crate) const LABEL_REMEMBER_CURSOR: &str = "Remember cursor position";
 pub(crate) const LABEL_SHOW_IMAGES: &str = "Show images";
 pub(crate) const LABEL_SHOW_DIAGRAMS: &str = "Show figures";
 pub(crate) const LABEL_MATH_PREVIEW: &str = "  Math edit preview";
@@ -312,25 +311,6 @@ pub(super) fn build_rows() -> Vec<RowDef> {
                 write_value: Some(|c, v| {
                     if let controls::ControlValue::Toggle(b) = v {
                         c.editor.reflow = b;
-                    }
-                }),
-                options: Some(controls::Control::Toggle),
-                disabled: None,
-            },
-        },
-        RowDef {
-            label: LABEL_REMEMBER_CURSOR,
-            description: Some("\nReopen each file where you left it, centered in the view"),
-            describe: None,
-            kind: RowKind {
-                focusable: true,
-                action: RowAction::Cycle,
-                read: |c, _| bool_label(c.editor.remember_cursor).to_owned(),
-                write_string: no_write,
-                read_value: Some(|c| controls::ControlValue::Toggle(c.editor.remember_cursor)),
-                write_value: Some(|c, v| {
-                    if let controls::ControlValue::Toggle(b) = v {
-                        c.editor.remember_cursor = b;
                     }
                 }),
                 options: Some(controls::Control::Toggle),

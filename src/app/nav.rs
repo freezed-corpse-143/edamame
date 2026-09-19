@@ -291,10 +291,25 @@ impl App {
     /// — until a decode lands, and every figure then collapses to its real height.  Centred on
     /// frame 0 and never revisited, the viewport ended up past the *end* of the settled document,
     /// which paints nothing at all.
+    ///
+    /// An explicit `#section` on the command line outranks the remembered cursor: when a
+    /// [`Self::startup_anchor`] is still pending — it is consumed just after this in the same frame
+    /// — the restore is dropped entirely, so the anchor is not re-centred away on a later settle
+    /// frame.
     pub(super) fn apply_pending_cursor_restore(&mut self, doc_height: usize, doc_width: usize) {
         let Some(mut pending) = self.pending_cursor_restore else {
             return;
         };
+        if self.startup_anchor.is_some() {
+            self.pending_cursor_restore = None;
+            return;
+        }
+        // A file rewritten shorter can no longer hold the offset, so past end-of-file opens at the
+        // top instead.  `==` is the valid end position, so the guard is `>`.
+        if pending.offset > self.editor.buffer.len_chars() {
+            self.pending_cursor_restore = None;
+            return;
+        }
         // Placed once; only the scroll is re-derived, so the loop doesn't re-run the cursor-block
         // bookkeeping (which re-arms the raw-reveal dwell) on every frame it stays armed.
         if self.editor.cursor.offset != pending.offset {
@@ -453,10 +468,13 @@ impl App {
     /// the outgoing cursor, since the swap replaces the editor wholesale — and from the tail of
     /// [`App::run`], where every quit path funnels.
     ///
-    /// Four deliberate no-ops: the switch off, no file to reopen (a `--diff` review, an embedded
-    /// manual page), an offset of `0` (already the default, so recording it would add an entry for
-    /// every file the user merely looked at), and an unchanged position, which must not rewrite
-    /// the machine file.
+    /// Three deliberate no-ops: the switch off, no file to reopen (a `--diff` review, an embedded
+    /// manual page), and an unchanged position, which must not rewrite the machine file.
+    ///
+    /// Offset `0` *is* recorded, but only to *update* a file that already has an entry — a reader
+    /// who scrolls back to the top wants to resume there next time.  A file with no entry left at
+    /// the top earns none: an offset-`0` restore and no restore land in the same place, so a fresh
+    /// entry would only spend a slot (and a `state.toml` write) on every file merely looked at.
     ///
     /// The write goes through `save_state_bookkeeping`, so a `--no-config` session records nothing
     /// — the same gate that suppresses `state.toml` everywhere else.
@@ -468,12 +486,11 @@ impl App {
             return;
         };
         let offset = self.editor.cursor.offset;
-        if offset == 0 {
-            return;
-        }
         let key = cursor_key(&path);
-        if self.state.cursor_for(&key) == Some(offset) {
-            return;
+        match self.state.cursor_for(&key) {
+            Some(existing) if existing == offset => return,
+            None if offset == 0 => return,
+            _ => {}
         }
         self.state.remember_cursor(key, offset);
         self.save_state_bookkeeping("remembered cursor position");
@@ -1481,6 +1498,26 @@ fn main() {}
     }
 
     #[test]
+    fn opening_an_embedded_page_records_the_outgoing_file() {
+        // Switching to a manual page clears `file_path`, so it is the last moment the file's
+        // position is knowable — like a file switch, it must be recorded before the swap.
+        let _iso = crate::test_env::config_isolation();
+        let src = paragraphs(40);
+        let (_f, path) = md_file(&src);
+        let offset = src.find("para 30").expect("paragraph 30");
+
+        let mut app = app_on_file(
+            path.clone(),
+            crate::config::Config::default(),
+            crate::config::State::default(),
+        );
+        app.editor.cursor.offset = offset;
+        app.load_doc_into_editor(crate::docs::DocId::Index);
+
+        assert_eq!(app.state.cursor_for(&cursor_key(&path)), Some(offset));
+    }
+
+    #[test]
     fn an_untouched_or_pathless_buffer_records_nothing() {
         let src = paragraphs(40);
         let (_f, path) = md_file(&src);
@@ -1499,5 +1536,92 @@ fn main() {}
         pathless.editor.cursor.offset = 30;
         pathless.record_cursor_position();
         assert!(pathless.state.cursors.is_empty());
+    }
+
+    #[test]
+    fn a_startup_anchor_outranks_a_remembered_cursor() {
+        // A command-line `#section` is explicit intent and must win, on every settle frame — not
+        // just frame 0.  The restore runs before the anchor each frame, so it drops itself when an
+        // anchor is pending rather than re-centring it away once the anchor has consumed itself.
+        let src = format!("{}## setup\n\n{}", "para\n\n".repeat(5), paragraphs(30));
+        let (_f, path) = md_file(&src);
+        let offset = src.rfind("para").expect("a paragraph near the end");
+        let mut state = crate::config::State::default();
+        state.remember_cursor(cursor_key(&path), offset);
+
+        let mut app = app_on_file(path, crate::config::Config::default(), state);
+        app.startup_anchor = Some("setup".to_owned());
+
+        // The event-loop order: restore first, then anchor.
+        app.apply_pending_cursor_restore(H, W);
+        assert!(
+            app.pending_cursor_restore.is_none(),
+            "a pending anchor drops the restore outright"
+        );
+        assert_eq!(
+            app.editor.scroll, 0,
+            "the restore left the viewport for the anchor"
+        );
+        app.apply_startup_anchor(H, W);
+        assert_eq!(
+            app.editor.scroll,
+            app.heading_line_for_fragment("setup")
+                .expect("setup heading"),
+            "the anchor lands on its section, unopposed on this and every later frame"
+        );
+    }
+
+    #[test]
+    fn an_offset_past_end_of_file_opens_at_the_top() {
+        // The file was rewritten shorter since the cursor was left, so the offset can no longer
+        // name a place: open at the top rather than clamping to a spot the reader never chose.
+        let src = paragraphs(3);
+        let (_f, path) = md_file(&src);
+        let mut state = crate::config::State::default();
+        state.remember_cursor(cursor_key(&path), 100_000);
+
+        let mut app = app_on_file(path, crate::config::Config::default(), state);
+        app.apply_pending_cursor_restore(H, W);
+
+        assert_eq!(app.editor.scroll, 0, "opened at the top");
+        assert_eq!(
+            app.editor.cursor.offset, 0,
+            "the stale offset was not applied"
+        );
+        assert!(
+            app.pending_cursor_restore.is_none(),
+            "and the restore let go"
+        );
+    }
+
+    #[test]
+    fn moving_to_the_top_updates_an_existing_entry_but_creates_none() {
+        // `record_cursor_position` writes to `state.toml`; isolation keeps that off the data dir.
+        let _iso = crate::test_env::config_isolation();
+        let src = paragraphs(40);
+        let (_f, path) = md_file(&src);
+        let key = cursor_key(&path);
+
+        // A file with an entry, left at the top, resumes at the top: offset 0 updates the entry.
+        let mut state = crate::config::State::default();
+        state.remember_cursor(key.clone(), 30);
+        let mut app = app_on_file(path.clone(), crate::config::Config::default(), state);
+        app.editor.cursor.offset = 0;
+        app.record_cursor_position();
+        assert_eq!(
+            app.state.cursor_for(&key),
+            Some(0),
+            "the entry followed to the top"
+        );
+
+        // A file with no entry, left at the top, earns none: an offset-0 restore is the same as no
+        // restore, so a fresh entry would only cost a cap slot.
+        let mut fresh = app_on_file(
+            path,
+            crate::config::Config::default(),
+            crate::config::State::default(),
+        );
+        fresh.record_cursor_position();
+        assert!(fresh.state.cursors.is_empty());
     }
 }

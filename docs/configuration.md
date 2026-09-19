@@ -96,14 +96,14 @@ Change both from the theme picker: `Ctrl-P` → "Switch theme". There is no defa
 | `visual_line_nav` | bool | `true` | overlay, palette |
 | `cursor_blink` | bool | `true` | overlay, palette |
 | `cursor_blink_ms` | integer | `530` | file only |
-| `remember_cursor` | bool | `true` | overlay |
+| `remember_cursor` | bool | `true` | file only |
 | `mouse_scroll_lines` | integer | `1` | overlay |
 
 `visual_line_nav` makes `↑`/`↓` move by visual rows, so the cursor keeps its screen column across a wrapped line. Set `false` to move by logical lines.
 
 `cursor_blink_ms` is the half-period — the cursor toggles every this many milliseconds.
 
-`remember_cursor` reopens each file where its cursor was when you last quit, centered in the view, instead of at the top. The positions are machine state, not settings: they live in `state.toml` (see [Machine state](#machine-state-statetoml)) and are capped at the 50 most recently left files. Turning the switch off stops both the remembering and the restoring, and leaves what is already recorded alone — switching it back on brings those positions back.
+`remember_cursor` reopens each file where its cursor was when you last quit, instead of at the top. Turning the switch off stops both the remembering and the restoring, but does not delete existing data. This setting can only be changed in `config.toml`.
 
 `mouse_scroll_lines` is lines per wheel tick, and also governs trackpad scrolling (where `1` usually feels best). Keyboard scrolling always steps one line and ignores this.
 

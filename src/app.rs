@@ -89,10 +89,7 @@ pub struct HintPrompt {
 /// A cursor remembered for the file this session opened, parked until the viewport can place it.
 ///
 /// Applied on the first frame's [`App::prepare_viewport`], then kept armed for a few frames while
-/// the row space settles: an image or figure block reserves `image_max_height` rows until its
-/// decode lands and then shrinks to the image's real height, so the space a centre is computed in
-/// can be far larger than the one the reader ends up in — a math-heavy document was measured
-/// losing 100 of 178 rows in the first five frames.
+/// the row space settles under landing image decodes — see [`App::apply_pending_cursor_restore`].
 #[derive(Debug, Clone, Copy)]
 struct PendingCursorRestore {
     /// Char offset into the rope.

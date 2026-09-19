@@ -60,8 +60,9 @@ pub const MAX_REMEMBERED_CURSORS: usize = 50;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RememberedCursor {
     pub path: String,
-    /// Char offset into the rope — [`crate::document::Cursor::offset`]'s unit, not bytes — clamped
-    /// to the buffer on restore, so a file rewritten shorter lands at its end rather than panicking.
+    /// Char offset into the rope — [`crate::document::Cursor::offset`]'s unit, not bytes.  Ignored
+    /// on restore when it is past the file's current end (the file was rewritten shorter, so the
+    /// offset can no longer name a real place); the file then opens at the top.
     pub offset: usize,
 }
 

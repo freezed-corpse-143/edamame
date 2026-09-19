@@ -183,7 +183,6 @@ impl SettingsStateExt for SettingsState {
             "Autosave",
             "Big H1 headings",
             "Reflow paragraphs",
-            "Remember cursor position",
             "Blink cursor",
             "Check for updates",
             "Daily tips",
