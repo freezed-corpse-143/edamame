@@ -318,6 +318,7 @@ impl ImageCache {
         self.pending.clear();
         self.prebuilt_scratches.clear();
         self.prebuilt_sliced.clear();
+        self.prebuilt_direct.clear();
     }
 
     /// Whether an encoder-worker sender has been attached.  Exists for the App-level test that a
@@ -649,6 +650,7 @@ impl ImageCache {
         // Prebuilt scratches are keyed by the old dims, so they are stale after a resize.
         self.prebuilt_scratches.clear();
         self.prebuilt_sliced.clear();
+        self.prebuilt_direct.clear();
     }
 
     /// Rows a decoded image occupies when fitted into `max_width_cells × max_height_cells` at
@@ -712,6 +714,7 @@ impl ImageCache {
         self.protocols.retain(|(u, _, _), _| u != url);
         self.prebuilt_scratches.retain(|(u, _, _), _| u != url);
         self.prebuilt_sliced.retain(|(u, _, _), _| u != url);
+        self.prebuilt_direct.retain(|(u, _, _), _| u != url);
     }
 
     /// Drop every entry for a remote URL, so the next dispatch re-resolves it under a changed
@@ -726,6 +729,8 @@ impl ImageCache {
             .retain(|(url, _, _), _| !crate::image::loader::is_remote(url));
         self.prebuilt_sliced
             .retain(|(url, _, _), _| !crate::image::loader::is_remote(url));
+        self.prebuilt_direct
+            .retain(|(url, _, _), _| !crate::image::loader::is_remote(url));
         // `pending` is deliberately untouched: responses for evicted URLs become orphan pops,
         // which is what keeps the FIFO pairing correct.
     }
@@ -738,6 +743,8 @@ impl ImageCache {
         self.prebuilt_scratches
             .retain(|(url, _, _), _| live.contains(url));
         self.prebuilt_sliced
+            .retain(|(url, _, _), _| live.contains(url));
+        self.prebuilt_direct
             .retain(|(url, _, _), _| live.contains(url));
     }
 
@@ -759,6 +766,11 @@ impl ImageCache {
     #[cfg(test)]
     pub fn prebuilt_sliced_count(&self) -> usize {
         self.prebuilt_sliced.len()
+    }
+
+    #[cfg(test)]
+    pub fn prebuilt_direct_count(&self) -> usize {
+        self.prebuilt_direct.len()
     }
 }
 
@@ -1126,6 +1138,33 @@ mod tests {
             "a second sixel encode on the worker would never be read"
         );
         assert_eq!(cache.prebuilt_sliced_count(), 0, "the prebuilt was drained");
+    }
+
+    /// An unclaimed direct-placement prebuilt must be reaped like its sibling maps.  `gc` is the
+    /// unbounded-growth guard for the churning URLs of a mermaid block, and each entry pins a
+    /// megabytes-sized transmit string, so a leak here is the costliest of the three.
+    #[test]
+    fn gc_reaps_an_unclaimed_prebuilt_direct() {
+        let mut cache = cache_with_sender();
+        cache.request("a.png");
+        let rect = Rect::new(0, 0, 8, 4);
+        let direct = build_direct_placement("a.png", (1, 2), &DynamicImage::new_rgba8(8, 8), rect)
+            .expect("direct placement");
+        cache.set_decoded_with_prebuilt(
+            "a.png",
+            DynamicImage::new_rgba8(8, 4),
+            None,
+            None,
+            Some((rect, direct)),
+        );
+        assert_eq!(cache.prebuilt_direct_count(), 1);
+
+        cache.gc(&std::collections::HashSet::new());
+        assert_eq!(
+            cache.prebuilt_direct_count(),
+            0,
+            "a URL no longer live must drop its prebuilt direct placement"
+        );
     }
 
     #[test]

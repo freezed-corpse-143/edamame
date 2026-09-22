@@ -374,11 +374,10 @@ pub fn paint_images(snapshots: &[ImageLayoutSnapshot], ctx: PaintContext) {
         }
 
         // Kitty and Sixel paint the visible band instead, which is what keeps a clipped image
-        // sharp.  Both still yield to the scroll window (the gate below) and to an open modal:
-        // Kitty's placeholders re-composite wherever they move, so painting them on every scroll
-        // frame is the lag the scratch window exists to avoid, and `dim_area` cannot recess an
-        // image that writes past the cell buffer.  Sixel's band is re-emitted rather than
-        // re-encoded, but the terminal still re-rasterises the payload, so it pays the same gate.
+        // sharp.  Unlike direct placement they *do* yield to the scroll window (the gate below):
+        // Kitty re-composites its placeholders wherever they move, and Sixel re-rasterises the
+        // re-emitted payload, so both pay the scroll cost the scratch window exists to avoid.  The
+        // modal gate is the direct block's above.
         if matches!(
             ctx.native_protocol,
             Some(ImageProtocol::KittyGraphics | ImageProtocol::Sixel)
