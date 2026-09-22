@@ -122,12 +122,12 @@ Windows Terminal is the usual host for WSL, so its notes above apply to the term
 
 | Terminal | Color | Images | Mouse | Keyboard | Notes |
 |---|---|---|---|---|---|
-| kitty | ? | ? Kitty graphics | ? | ? | The protocols both features are named after |
-| Ghostty | ✓ truecolor | ✓ Kitty graphics | ✓ | ✓ | On macOS, `macos-option-as-alt` for the `Alt` chords outside U.S. layouts |
-| WezTerm | ✓ truecolor | ✓ Kitty direct | ✓ | ✓ | No unicode placeholders, so edamame places the image itself with `a=p` and a source rectangle — a partly scrolled image stays sharp instead of falling back to half-blocks |
-| foot | ? | ? Sixel | ? | ? | Wayland; clipboard needs `wayland-data-control`. A partly visible image uses the sixel band path |
+| kitty | ✓ | ✓ Kitty direct | ✓ | ✓ | The protocols both features are named after. |
+| Ghostty | ✓ truecolor | ✓ Kitty direct | ✓ | ✓ |  On macOS, `macos-option-as-alt` for the `Alt` chords outside U.S. layouts |
+| WezTerm | ✓ truecolor | ✓ Kitty direct | ✓ | ✓ |  |
+| foot | ✓ | ✓ Sixel | ✓ | ✓ | Wayland; clipboard needs `wayland-data-control`. A partly visible image uses the sixel band path |
 | iTerm2 | ✓ truecolor | ✓ iTerm2 inline | ✓ | ✓ | Answers the Kitty graphics query without supporting placements; edamame corrects for this |
-| Alacritty | ?  | ? | ? | ? recent | No image protocol |
+| Alacritty | ✓  | ✗| ✓ | ✓ recent | No image protocol |
 | Apple Terminal | ✗ 256 | ✗ | ✓ | ✗ | Themes fall back to `256 Dark` / `256 Light`; see the `Option` notes above |
 | VS Code terminal | ? | ? | ? | ? |  |
 | Windows Terminal | ? | ? Sixel (1.22+) | ? | ? | Best-effort platform, not yet tested — see [Windows and WSL](#windows-and-wsl). A partly visible image uses the sixel band path, so the half-block fallback is scroll-only there too |

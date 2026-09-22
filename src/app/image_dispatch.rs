@@ -577,7 +577,10 @@ impl App {
                                 // `None` for every other protocol, so the guard only wraps band
                                 // work — and its payload is at least as large as the scratch's,
                                 // which is exactly why it must not be built on the UI thread.
-                                if let Some(native) = native_picker.as_ref() {
+                                // Skipped under `direct`: a kitty/Ghostty picker routed to direct
+                                // placement still speaks `Kitty`, so `build_sliced` would answer
+                                // `Some` with a megabytes backend `paint_images` never touches.
+                                if let Some(native) = native_picker.as_ref().filter(|_| !direct) {
                                     let sliced = {
                                         let _expected = crate::terminal::ExpectedPanic::new();
                                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(

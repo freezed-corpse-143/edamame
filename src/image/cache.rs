@@ -510,8 +510,10 @@ impl ImageCache {
             // for Kitty the transmit string is megabytes of base64, for Sixel a full re-encode —
             // the same accepted cost as the scratch above, and reachable only when the geometry
             // changed since the decode, since the renderer's reserved height is otherwise exactly
-            // the height the dispatch built at.
-            let is_band_native = is_band_protocol(native_picker.protocol_type());
+            // the height the dispatch built at.  `!direct` because a kitty/Ghostty picker routed to
+            // direct placement still reports `Kitty` here, and its rendering is `kitty_direct`
+            // below — building the sliced backend too would be a megabytes payload nothing paints.
+            let is_band_native = is_band_protocol(native_picker.protocol_type()) && !direct;
             let sliced = if is_band_native {
                 match self.prebuilt_sliced.remove(&key) {
                     Some(sliced) => Some(sliced),
@@ -1138,6 +1140,32 @@ mod tests {
             "a second sixel encode on the worker would never be read"
         );
         assert_eq!(cache.prebuilt_sliced_count(), 0, "the prebuilt was drained");
+    }
+
+    /// A kitty/Ghostty picker routed to direct placement still reports `Kitty`, so the `!direct`
+    /// guard is what stops it building the sliced backend too — its rendering is `kitty_direct`, and
+    /// a second megabytes payload would be built on the worker and never painted.
+    #[test]
+    fn the_direct_route_builds_the_placement_and_not_the_sliced_backend() {
+        let mut cache = cache_with_sender();
+        cache.request("a.png");
+        cache.set_decoded("a.png", DynamicImage::new_rgba8(8, 8));
+        let picker = kitty_picker();
+        let pair = cache
+            .get_protocol_pair("a.png", 8, 4, Some(&picker), Some(&picker), true)
+            .expect("pair for ready image");
+        assert!(
+            pair.kitty_direct.is_some(),
+            "direct placement is the rendering"
+        );
+        assert!(
+            pair.sliced.is_none(),
+            "the sliced backend must not be built under direct placement"
+        );
+        assert!(
+            pair.native.is_none(),
+            "no threaded encode for direct placement"
+        );
     }
 
     /// An unclaimed direct-placement prebuilt must be reaped like its sibling maps.  `gc` is the

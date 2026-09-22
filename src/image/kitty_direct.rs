@@ -3,10 +3,17 @@
 //!
 //! The band is a **placement parameter**, not part of an encoding, so moving it costs one
 //! short escape — no re-encode, no re-transmit, no `clear_area` flash.  That is what makes
-//! this route cheaper than cropping and re-sending ([M3]), and it is the only route for a
-//! terminal that places an already-transmitted image but does not implement the `U=1`
-//! unicode-placeholder extension — `WezTerm` today, which is why `ratatui-image`'s Kitty
-//! backend (placeholders only, and `pub(crate)`) cannot serve it.
+//! this route cheaper than cropping and re-sending ([M3]), and cheaper *while scrolling* than
+//! `ratatui-image`'s Kitty backend, which re-composites its `U=1` unicode-placeholder grid
+//! wherever it moves.  Two kinds of terminal are served here (both gated on
+//! `images.sharp_scrolling`, and never under tmux):
+//!
+//! - `WezTerm`, for which this is the *only* route: it places an already-transmitted image but
+//!   does not implement the `U=1` extension that `ratatui-image`'s Kitty backend
+//!   (placeholders only, and `pub(crate)`) renders through.
+//! - genuine kitty and Ghostty, which *do* implement `U=1` and could use that backend, but opt
+//!   into direct placement because a placement stays sharp under scroll where the placeholder
+//!   grid drops to halfblocks.
 //!
 //! Every function here is a pure function of its arguments, so the escape formats and the
 //! band's pixel geometry are unit-tested without a terminal.  See
