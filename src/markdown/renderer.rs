@@ -10,7 +10,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use tui_big_text::{BigText, PixelSize};
-use unicode_width::UnicodeWidthStr;
 
 use crate::config::Theme;
 
@@ -19,6 +18,7 @@ use super::ast::{inlines_to_plain, Block, Inline, MetadataKind};
 use super::code_layout;
 use super::highlight::{self, Token};
 use super::render_cache::{is_cache_worthy, RenderCache, RenderSettings};
+use super::table_layout::str_cells;
 
 const IMAGE_PREFIX: &str = "Image: ";
 
@@ -791,18 +791,18 @@ impl<'t> Renderer<'t> {
     /// column width calculation so borders align with content: a CJK glyph is two cells.
     fn rendered_inline_width(&self, inline: &Inline) -> usize {
         match inline {
-            Inline::Text(t) => UnicodeWidthStr::width(t.as_str()),
+            Inline::Text(t) => str_cells(t),
             Inline::Bold(inner)
             | Inline::Italic(inner)
             | Inline::Strikethrough(inner)
             | Inline::Highlight(inner) => self.rendered_inlines_width(inner),
             // Content only; the backticks are dropped, with no pad cells.
-            Inline::Code(c) => UnicodeWidthStr::width(c.as_str()),
+            Inline::Code(c) => str_cells(c),
             // The visible text, or a URL/filename fallback when empty.
             Inline::Link { text, url, .. } => {
                 let text_width = self.rendered_inlines_width(text);
                 if text_width == 0 {
-                    UnicodeWidthStr::width(link_fallback(url).as_str())
+                    str_cells(&link_fallback(url))
                 } else {
                     text_width
                 }
@@ -810,11 +810,11 @@ impl<'t> Renderer<'t> {
             // Image renders as "[Image: <alt-or-filename>]".
             Inline::Image { alt, url } => {
                 let name_width = if alt.trim().is_empty() {
-                    UnicodeWidthStr::width(link_fallback(url).as_str())
+                    str_cells(&link_fallback(url))
                 } else {
-                    UnicodeWidthStr::width(alt.as_str())
+                    str_cells(alt)
                 };
-                UnicodeWidthStr::width(IMAGE_PREFIX) + name_width + 2
+                str_cells(IMAGE_PREFIX) + name_width + 2
             }
             Inline::HtmlComment(_) => 0,
             // Unreachable: `footnote_run_at` matches a run of one as readily as
@@ -823,15 +823,13 @@ impl<'t> Renderer<'t> {
             // `reference_marker` so it can't state a second format.
             Inline::FootnoteReference { label } => {
                 let marker = reference_marker(std::iter::once(label.as_str()));
-                UnicodeWidthStr::width(marker.as_str())
+                str_cells(&marker)
             }
-            // Math renders as its delimited source — width equals the rendered
+            // Math renders as its delimited source — width equals the raw
             // text width, so table borders and cursor columns stay aligned.
             Inline::Math { source, display } => {
                 let delim = if *display { "$$" } else { "$" };
-                UnicodeWidthStr::width(delim)
-                    + UnicodeWidthStr::width(source.as_str())
-                    + UnicodeWidthStr::width(delim)
+                str_cells(delim) + str_cells(source) + str_cells(delim)
             }
             Inline::SoftBreak | Inline::HardBreak => 1,
         }
@@ -844,7 +842,7 @@ impl<'t> Renderer<'t> {
             // Adjacent references fuse, so measure the run through the same
             // helper that renders it.
             if let Some((marker, run_len)) = footnote_run_at(inlines, i) {
-                total += UnicodeWidthStr::width(marker.as_str());
+                total += str_cells(&marker);
                 i += run_len;
                 continue;
             }

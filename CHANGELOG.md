@@ -19,7 +19,7 @@ Each released version's section is also what ships as the GitHub release notes: 
 
 ### Fixed
 
-- Tables with CJK text (or any other wide glyph) now size their columns in terminal cells, so the borders line up and the table narrows to fit a small terminal instead of overflowing its own box.
+- CJK and other wide characters now cursor-place, render, and wrap correctly in table cells.
 
 ## [0.1.4] - 2026-09-11
 
